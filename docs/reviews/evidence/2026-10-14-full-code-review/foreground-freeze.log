@@ -1,0 +1,19 @@
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-review-worktree-20261014/crates/pty)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.63s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pty-2cb6fe6d1ccaea41)
+
+running 1 test
+test tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell ...
+thread 'tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell' (47989427) panicked at crates/pty/src/lib.rs:3088:9:
+freeze returned Ok but only shell group stopped: shell=17919:Ts, foreground=17921:S+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 46 filtered out; finished in 0.59s
+
+error: test failed, to rerun pass `-p pty --lib`

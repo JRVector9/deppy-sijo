@@ -1,0 +1,210 @@
+{
+  "totals": {
+    "passed": 642,
+    "failed": 0,
+    "ignored": 17
+  },
+  "harnesses": [
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)",
+      "log": "app-cloud.log",
+      "result": {
+        "passed": 161,
+        "failed": 0,
+        "ignored": 3
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)",
+      "log": "cloud-history-worker.log",
+      "result": {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/agent_mcp-039ead103e850e59)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 67,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/web_remote-e81492fb24ebd9d3)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 388,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-5ed16239f375f66a)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-874d8736ca8cbccd)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-fd94636e9e6f8ff0)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-7f687d7e60268f4d)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-64e1517afd2546c2)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-332a12e33857345b)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-07ba0f9b821a2103)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-a7f03a97b976cf43)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/transport_independence.rs (target/debug/deps/transport_independence-770846fa11232886)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-c534b1f3655acec4)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-11da7e85e70a46af)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-a6350aa39ca0da8e)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-6e03d6243a279e14)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-1fff785def027634)",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests agent_mcp",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests web_remote",
+      "log": "agent-mcp-web.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    }
+  ],
+  "note": "App cloud and worker disjoint filters; final summary per harness; nested process result excluded."
+}

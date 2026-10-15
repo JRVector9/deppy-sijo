@@ -1,0 +1,5 @@
+Incremental text patch reverse check: exit 0
+Baseline files: 412; changed: 25; missing: 0
+Task text files: 33; new binary fixtures: 2
+Six prior product files: byte-identical to task start
+Locale verification: removing only the new notice restores HEAD bytes in all five locales

@@ -52,3 +52,7 @@ subtle = "2"
 # 컴파일 타임에 묶어 두기 위해 참조한다 — 두 값이 갈라지면 한쪽이 만든 프레임을 다른 쪽이
 # 거부하는데, 그건 실제 기기에서만 드러난다.
 relay-protocol = { path = "../relay-protocol" }
+
+[dev-dependencies]
+# Synthetic loopback TLS fixtures exercise the actual Rustls stream without changing production trust.
+rustls = { workspace = true }

@@ -1,0 +1,5 @@
+ui_usage_function_blocked_after_250ms=true; after_writer_release=Some((Some(1), Some(2)))
+
+thread 'main' (48038490) panicked at /private/tmp/deppy-full-review-usage-fifo-20261014.rs:83:2:
+usage read called on UI frame must reject nonregular path without waiting for writer
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

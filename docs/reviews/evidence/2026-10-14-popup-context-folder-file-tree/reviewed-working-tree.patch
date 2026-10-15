@@ -1,0 +1,163 @@
+diff --git a/crates/runtime/src/in_process.rs b/crates/runtime/src/in_process.rs
+index 6699ec46..d2063c1a 100644
+--- a/crates/runtime/src/in_process.rs
++++ b/crates/runtime/src/in_process.rs
+@@ -14243,6 +14243,98 @@ mod tests {
+         (worker, group)
+     }
+ 
++    #[test]
++    #[cfg(unix)]
++    fn composer_wide_placeholder_accepts_input_without_moving_viewport() {
++        for offset in [0, 5, i32::MAX] {
++            let (mut worker, group) =
++                scrolled_composer_worker("› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H", true);
++            let id = SessionId(1);
++            worker.sessions.get_mut(&id).unwrap().scroll(offset);
++            let before = worker
++                .sessions
++                .get_mut(&id)
++                .unwrap()
++                .take_snapshot()
++                .unwrap();
++            let deadline = Instant::now() + Duration::from_secs(5);
++            let admission =
++                crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
++                    .with_agent_guard(crate::AgentInputGuard {
++                        foreground_process_group: group,
++                        provider: crate::AgentPromptKind::Codex,
++                        intent: crate::AgentInputIntent::ExplicitPrompt,
++                    });
++            let body = "\x1b[200~한글 새 입력\nWIDE-COMPOSER-END\x1b[201~";
++            assert_eq!(
++                worker.admit_input_batch_checked(id, &[body.as_bytes(), b"\r"], Some(&admission)),
++                Ok(()),
++                "an untouched wide hint must accept explicit input at scroll offset {offset}"
++            );
++            let after = worker
++                .sessions
++                .get_mut(&id)
++                .unwrap()
++                .take_snapshot()
++                .unwrap();
++            assert_eq!(after.scroll_offset, before.scroll_offset);
++            assert_eq!(after.visible_cells, before.visible_cells);
++            while !worker.sessions[&id]
++                .screen_text()
++                .contains("WIDE-COMPOSER-END")
++            {
++                assert!(Instant::now() < deadline, "input must reach the owned PTY");
++                let effects = worker.collect_session_pump_effects(&[id], false, true);
++                worker.finish_session_pump_effects(effects);
++                std::thread::sleep(Duration::from_millis(1));
++            }
++        }
++    }
++
++    #[test]
++    #[cfg(unix)]
++    fn composer_wide_cursor_still_protects_drafts_and_automatic_input() {
++        for (editor, intent) in [
++            (
++                "› 한글 초안\x1b[1;4H",
++                crate::AgentInputIntent::ExplicitPrompt,
++            ),
++            (
++                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;6H",
++                crate::AgentInputIntent::ExplicitPrompt,
++            ),
++            (
++                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H",
++                crate::AgentInputIntent::AutomaticPrompt,
++            ),
++        ] {
++            for offset in [0, 5, i32::MAX] {
++                let (mut worker, group) = scrolled_composer_worker(editor, false);
++                let id = SessionId(1);
++                worker.sessions.get_mut(&id).unwrap().scroll(offset);
++                let admission = crate::InputAdmission::new(
++                    crate::InputPermit::new(),
++                    Instant::now() + Duration::from_secs(5),
++                    |write| write(),
++                )
++                .with_agent_guard(crate::AgentInputGuard {
++                    foreground_process_group: group,
++                    provider: crate::AgentPromptKind::Codex,
++                    intent,
++                });
++                assert_eq!(
++                    worker.admit_input_batch_checked(
++                        id,
++                        &[b"must-not-send", b"\r"],
++                        Some(&admission)
++                    ),
++                    Err(pty::PtyInputRejectReason::AdmissionDenied),
++                    "wide cursor normalization must preserve {intent:?} protection at offset {offset}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     #[cfg(unix)]
+     fn composer_scrollback_submit_uses_live_editor_and_preserves_viewport() {
+diff --git a/crates/terminal/src/alacritty_backend.rs b/crates/terminal/src/alacritty_backend.rs
+index 7cd0c2df..3727d5c0 100644
+--- a/crates/terminal/src/alacritty_backend.rs
++++ b/crates/terminal/src/alacritty_backend.rs
+@@ -802,7 +802,12 @@ impl TerminalBackend for AlacrittyBackend {
+             }
+         }
+         // A navigation/vi cursor is not the editor cursor that will receive input.
+-        let cursor = grid.cursor.point;
++        let mut cursor = grid.cursor.point;
++        // Match rendered cursor coordinates at a wide glyph's trailing cell,
++        // without moving the native editor cursor or the user's viewport.
++        if grid[cursor].flags.contains(Flags::WIDE_CHAR_SPACER) {
++            cursor.column -= 1;
++        }
+         let (shape, shape_visible) = map_cursor_shape(self.term.cursor_style().shape);
+         Some(TerminalViewportSnapshot {
+             cols: cols as u16,
+@@ -1562,6 +1567,41 @@ mod tests {
+     use super::*;
+     use crate::backend::TerminalBackend;
+ 
++    #[test]
++    fn input_snapshot_normalizes_wide_cursor_without_moving_native_cursor() {
++        for hint in ["한글 힌트", "界面提示", "😀 hint"] {
++            for alternate in [false, true] {
++                let mut backend = AlacrittyBackend::new(80, 4, 100);
++                feed(&mut backend, "past output\r\n".repeat(20).as_bytes());
++                if alternate {
++                    feed(&mut backend, b"\x1b[?1049h");
++                }
++                feed(
++                    &mut backend,
++                    format!("\x1b[2J\x1b[H› \x1b[2m{hint}\x1b[0m\x1b[1;4H").as_bytes(),
++                );
++                let native = backend.term.grid().cursor.point;
++                assert_eq!(native.column.0, 3);
++                assert!(
++                    backend.term.grid()[native]
++                        .flags
++                        .contains(Flags::WIDE_CHAR_SPACER)
++                );
++                for offset in [0, 5] {
++                    backend.scroll(offset);
++                    let viewport = backend.viewport_snapshot().unwrap();
++                    let input = backend.input_snapshot().unwrap();
++                    assert_eq!(input.cursor.col, 2, "{hint}, alternate={alternate}");
++                    assert_eq!(input.cursor.row, 0);
++                    assert_eq!(input.scroll_offset, 0);
++                    assert_eq!(input.is_alt_screen, alternate);
++                    assert_eq!(backend.term.grid().cursor.point, native);
++                    assert_eq!(backend.viewport_snapshot().unwrap(), viewport);
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn input_snapshot_uses_native_cursor_in_vi_mode_and_alternate_screen() {
+         let mut backend = AlacrittyBackend::new(80, 4, 100);

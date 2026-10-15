@@ -492,7 +492,7 @@ fn file_row_context_menu(
     catalog: &i18n::Catalog,
 ) -> Option<GitPanelAction> {
     let mut action = None;
-    response.context_menu(|ui| {
+    super::context_menu::show(response, |ui| {
         let target = GitPathTarget::for_row(repo_root, row);
         if ui
             .button(catalog.t("git.path.copy", &[]))

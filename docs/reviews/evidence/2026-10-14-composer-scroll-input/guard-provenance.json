@@ -1,0 +1,11 @@
+{
+  "commit": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "deps": {
+    "session": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libsession-d36024abcd6c8002.rlib",
+    "deppy_core": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libdeppy_core-5f627694dfb236a2.rlib",
+    "tracing": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libtracing-2c55e81417ff531f.rlib",
+    "terminal": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libterminal-0e23aa3583b88de7.rlib",
+    "pty": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libpty-ecec04e6b5dc9460.rlib"
+  },
+  "source_hash": "9be5f36eba2114befd95b1c42518d2a46f019caa6e60a0efec6166e5948c6959"
+}

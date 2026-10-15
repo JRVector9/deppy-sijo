@@ -1,0 +1,30 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.81s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_core-01a5006e37067a2a)
+
+running 2 tests
+test fs::tests::full_fix_20261014_atomic_write_parallel_saves_have_distinct_temporary_objects ... actual concurrent production saves: failed=90/120 final_payload_valid=true
+
+thread 'fs::tests::full_fix_20261014_atomic_write_parallel_saves_have_distinct_temporary_objects' (48472419) panicked at crates/core/src/fs.rs:147:9:
+assertion `left == right` failed: unrelated successful writers share one temporary name and fail rename
+  left: 90
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test fs::tests::full_fix_20261014_atomic_write_preserves_preexisting_temp_symlink_target ... production helper result: victim="new config", published_config_is_symlink=true
+
+thread 'fs::tests::full_fix_20261014_atomic_write_preserves_preexisting_temp_symlink_target' (48472449) panicked at crates/core/src/fs.rs:100:9:
+assertion `left == right` failed: atomic save truncated a different existing user file through its fixed temp symlink
+  left: [110, 101, 119, 32, 99, 111, 110, 102, 105, 103]
+ right: [109, 117, 115, 116, 32, 112, 114, 101, 115, 101, 114, 118, 101]
+FAILED
+
+failures:
+
+failures:
+    fs::tests::full_fix_20261014_atomic_write_parallel_saves_have_distinct_temporary_objects
+    fs::tests::full_fix_20261014_atomic_write_preserves_preexisting_temp_symlink_target
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-core --lib`

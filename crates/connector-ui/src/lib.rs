@@ -18,7 +18,11 @@ use egui::{Button, ComboBox, Label, ScrollArea, TextEdit, Ui};
 use i18n::Catalog;
 
 pub use connector_contract as contract;
+mod draft_text_edit;
 pub mod popup;
+
+#[cfg(test)]
+mod oauth_secret_tests;
 
 const SERVER_ROW_HEIGHT: f32 = 30.0;
 const SERVER_LIST_HEIGHT: f32 = 180.0;
@@ -1068,11 +1072,15 @@ fn render_oauth_client_form(
             .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
     );
     ui.label(&labels.client_secret);
-    ui.add(
-        TextEdit::singleline(&mut current.client_secret)
-            .password(true)
-            .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes),
-    );
+    let secret_id = ui.make_persistent_id("connector_oauth_client_secret");
+    current.secret_input_state.track(ui.ctx(), secret_id);
+    {
+        let mut secret = popup::MaskedSecretBuffer::new(
+            &mut current.client_secret,
+            ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
+        );
+        popup::secret_input(ui, &mut secret, secret_id, "", false);
+    }
     ui.label(&labels.workspace_hint);
     ui.add(
         TextEdit::singleline(&mut current.workspace_hint)
@@ -1587,6 +1595,7 @@ struct OAuthClientDraft {
     server_id: ServerId,
     client_id: String,
     client_secret: String,
+    secret_input_state: draft_text_edit::DraftTextEditState,
     workspace_hint: String,
 }
 
@@ -1604,6 +1613,7 @@ impl OAuthClientDraft {
             server_id: oauth.server_id.clone(),
             client_id: String::new(),
             client_secret: String::new(),
+            secret_input_state: draft_text_edit::DraftTextEditState::default(),
             workspace_hint: String::new(),
         }
     }

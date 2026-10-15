@@ -1,8 +1,13 @@
 //! PTY 격리 crate (설계문서 1.2 / 9장).
 //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
 
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod foreground_teardown_tests;
 mod input_queue;
 mod process_identity;
+pub mod query_fence;
+#[cfg(unix)]
+mod workload_signal;
 
 use std::collections::VecDeque;
 #[cfg(not(unix))]
@@ -25,6 +30,19 @@ pub use process_identity::{ProcessIdentity, ProcessIdentitySource};
 pub type PtyOutputWake = Arc<dyn Fn() + Send + Sync>;
 
 const PTY_OUTPUT_QUEUE_CAPACITY: usize = 64;
+
+struct InputMessage {
+    bytes: Vec<u8>,
+    response_owner: Option<(query_fence::QueryFence, bool)>,
+}
+
+impl InputMessage {
+    fn permits_write(&self) -> bool {
+        self.response_owner
+            .as_ref()
+            .is_none_or(|(fence, after)| fence.permits_response(*after))
+    }
+}
 
 struct PtyOutputQueueState {
     chunks: VecDeque<Vec<u8>>,
@@ -309,6 +327,16 @@ pub trait PtySession: Send {
         let combined: Vec<u8> = parts.iter().flat_map(|part| part.iter().copied()).collect();
         self.write_input(&combined)
     }
+    fn terminal_response_fence(&self) -> Option<query_fence::QueryFence> {
+        None
+    }
+    fn write_terminal_response(
+        &mut self,
+        bytes: &[u8],
+        _after_boundary: bool,
+    ) -> anyhow::Result<PtyInputEnqueueResult> {
+        self.write_input(bytes)
+    }
     /// 입력 큐가 비었는가 — backpressure 해소 이벤트 판정용(2026-07-09).
     fn input_queue_idle(&self) -> bool;
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()>;
@@ -499,6 +527,19 @@ impl PortablePtyBackend {
             worker_spawn_failure,
         )?;
 
+        #[cfg(unix)]
+        let wrapped_agent = (cmd.program == "/bin/sh"
+            && cmd.args.first().is_some_and(|arg| arg == "-c")
+            && cmd
+                .args
+                .get(2)
+                .is_some_and(|arg| arg == "deppy-agent-session"))
+        .then(|| {
+            (
+                query_fence::sentinel_directory(cmd),
+                std::time::SystemTime::now(),
+            )
+        });
         #[cfg(not(windows))]
         let child = pair
             .slave
@@ -521,6 +562,7 @@ impl PortablePtyBackend {
             pair.master,
             pair.slave,
             child,
+            wrapped_agent,
             output_wake,
             #[cfg(test)]
             worker_liveness,
@@ -550,17 +592,37 @@ type ChildPtyBox = Box<dyn portable_pty::Child + Send + Sync>;
 /// 양쪽 `try_wait`가 안전하다.
 #[cfg(unix)]
 type SharedChild = std::sync::Arc<std::sync::Mutex<ChildPtyBox>>;
+/// A naturally exiting shell must retain authority over its already captured group members after
+/// its PID is reaped. Only an unreaped direct child's kernel exit observation can publish it.
+#[cfg(unix)]
+#[derive(Default)]
+struct ExitWorkloadState {
+    captured: Option<workload_signal::FrozenGroup>,
+    // Successful reap, ECHILD or explicit teardown permanently retires fresh exit authority.
+    reaped: bool,
+}
+#[cfg(unix)]
+type ExitWorkload = Arc<Mutex<ExitWorkloadState>>;
 
 #[cfg(unix)]
 fn spawn_unix_session(
     master: MasterPtyBox,
     slave: SlavePtyBox,
     mut child: ChildPtyBox,
+    wrapped_agent: Option<(std::path::PathBuf, std::time::SystemTime)>,
     output_wake: Option<PtyOutputWake>,
     #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
     #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
 ) -> anyhow::Result<PortablePtySession> {
     let process_group = master.process_group_leader();
+    let owner_process = child
+        .process_id()
+        .and_then(|pid| workload_signal::inspect(pid as i32));
+    let query_fence = wrapped_agent.and_then(|(directory, spawned_after)| {
+        child
+            .process_id()
+            .map(|pid| query_fence::QueryFence::with_exit_sentinel(pid, directory, spawned_after))
+    });
     let io = (|| -> anyhow::Result<_> {
         let raw_fd = master
             .as_raw_fd()
@@ -605,6 +667,7 @@ fn spawn_unix_session(
     #[cfg(test)]
     let reader_liveness = worker_liveness.clone();
     let reader_exit_flag = std::sync::Arc::clone(&exit_flag);
+    let reader_query_fence = query_fence.clone();
     let reader_spawn = || {
         std::thread::Builder::new()
             .name("pty-reader".into())
@@ -617,6 +680,7 @@ fn spawn_unix_session(
                     output_tx,
                     output_wake,
                     reader_exit_flag,
+                    reader_query_fence,
                     slave,
                 );
             })
@@ -641,7 +705,7 @@ fn spawn_unix_session(
     let input_policy = PtyInputQueuePolicy::default();
     let input_queue = input_queue::PtyInputQueueState::new(input_policy);
     let writer_queue = input_queue.clone();
-    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    let (input_tx, input_rx) = sync_channel::<InputMessage>(input_policy.max_messages.max(1));
     #[cfg(test)]
     let writer_liveness = worker_liveness;
     let writer_spawn = || {
@@ -678,6 +742,7 @@ fn spawn_unix_session(
     // reaper: 자식 자연 종료를 감지해 reader를 깨운다. cancel 쓰기 끝은 dup해 넘기고
     // 세션 쪽(reader_cancel)은 teardown cancel 용도로 그대로 둔다.
     let child: SharedChild = std::sync::Arc::new(std::sync::Mutex::new(child));
+    let exit_workload: ExitWorkload = Arc::new(Mutex::new(ExitWorkloadState::default()));
     let reaper = (|| -> anyhow::Result<_> {
         let cancel = duplicate_nonblocking_fd(reader_cancel_write.as_raw_fd())
             .context("PTY reaper cancellation descriptor 생성 실패")?;
@@ -687,7 +752,17 @@ fn spawn_unix_session(
                 let child = std::sync::Arc::clone(&child);
                 let exit_flag = std::sync::Arc::clone(&exit_flag);
                 let reaper_stop = std::sync::Arc::clone(&reaper_stop);
-                move || unix_reaper_loop(child, exit_flag, reaper_stop, cancel)
+                let exit_workload = Arc::clone(&exit_workload);
+                move || {
+                    unix_reaper_loop(
+                        child,
+                        owner_process,
+                        exit_workload,
+                        exit_flag,
+                        reaper_stop,
+                        cancel,
+                    )
+                }
             })
             .context("PTY reaper thread 생성 실패")?;
         Ok(thread)
@@ -719,6 +794,10 @@ fn spawn_unix_session(
         reader_cancel: Some(reader_cancel_write),
         writer_cancel: Some(writer_cancel_write),
         process_group,
+        owner_process,
+        exit_workload,
+        query_fence,
+        frozen_groups: Mutex::new(Vec::new()),
         exit_flag,
         reaper_stop,
         reaper_thread: Some(reaper_thread),
@@ -813,7 +892,7 @@ fn spawn_windows_session(
     let input_policy = PtyInputQueuePolicy::default();
     let input_queue = input_queue::PtyInputQueueState::new(input_policy);
     let writer_queue = input_queue.clone();
-    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    let (input_tx, input_rx) = sync_channel::<InputMessage>(input_policy.max_messages.max(1));
     #[cfg(test)]
     let writer_liveness = worker_liveness;
     let writer_spawn = || {
@@ -822,7 +901,8 @@ fn spawn_windows_session(
             .spawn(move || {
                 #[cfg(test)]
                 let _live = TestWorkerGuard::new(writer_liveness, TestWorkerKind::Writer);
-                for bytes in input_rx {
+                for message in input_rx {
+                    let bytes = message.bytes;
                     let len = bytes.len();
                     if writer
                         .write_all(&bytes)
@@ -943,7 +1023,7 @@ fn spawn_other_session(
     let input_policy = PtyInputQueuePolicy::default();
     let input_queue = input_queue::PtyInputQueueState::new(input_policy);
     let writer_queue = input_queue.clone();
-    let (input_tx, input_rx) = sync_channel::<Vec<u8>>(input_policy.max_messages.max(1));
+    let (input_tx, input_rx) = sync_channel::<InputMessage>(input_policy.max_messages.max(1));
     #[cfg(test)]
     let writer_liveness = worker_liveness;
     let writer_spawn = || {
@@ -952,7 +1032,8 @@ fn spawn_other_session(
             .spawn(move || {
                 #[cfg(test)]
                 let _live = TestWorkerGuard::new(writer_liveness, TestWorkerKind::Writer);
-                for bytes in input_rx {
+                for message in input_rx {
+                    let bytes = message.bytes;
                     let len = bytes.len();
                     if writer
                         .write_all(&bytes)
@@ -1193,6 +1274,7 @@ fn unix_reader_loop(
     output: PtyOutputSender,
     output_wake: Option<PtyOutputWake>,
     exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    query_fence: Option<query_fence::QueryFence>,
     slave: SlavePtyBox,
 ) {
     // reader fd는 non-blocking(duplicate_nonblocking_fd). macOS는 PTY read를 ~1KB로
@@ -1201,6 +1283,7 @@ fn unix_reader_loop(
     // 블로킹으로 더 기다리지는 않아(상호작용 지연 없음) EAGAIN이면 즉시 flush 후 다음
     // poll을 기다린다 — idle이면 poll(-1)에서 블로킹해 0 CPU.
     let mut buf = vec![0u8; PTY_READ_CHUNK_BYTES];
+    let mut fence_scanner = query_fence.as_ref().map(query_fence::QueryFence::observer);
     // 측정용 baseline 토글은 프로세스 수명 내내 불변이라 한 번만 읽는다(EAGAIN마다
     // env 조회하던 비용 제거 — B-L2). 켜지면 코얼레싱을 **완전히** 끄고 read당 즉시
     // flush해 진짜 "read당 1송신" baseline을 만든다.
@@ -1215,6 +1298,9 @@ fn unix_reader_loop(
             let count =
                 unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if count > 0 {
+                if let (Some(fence), Some(scanner)) = (&query_fence, &mut fence_scanner) {
+                    fence.observe(scanner, &buf[..count as usize]);
+                }
                 if no_coalesce {
                     // baseline: 합치지 않고 read당 즉시 flush.
                     if !flush_pty_chunk(&output, &output_wake, buf[..count as usize].to_vec()) {
@@ -1283,6 +1369,9 @@ fn unix_reader_loop(
             let count =
                 unsafe { libc::read(reader.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
             if count > 0 {
+                if let (Some(fence), Some(scanner)) = (&query_fence, &mut fence_scanner) {
+                    fence.observe(scanner, &buf[..count as usize]);
+                }
                 if !flush_pty_chunk(&output, &output_wake, buf[..count as usize].to_vec()) {
                     break; // 수신자 종료
                 }
@@ -1305,6 +1394,8 @@ fn unix_reader_loop(
 #[cfg(unix)]
 fn unix_reaper_loop(
     child: SharedChild,
+    owner: Option<workload_signal::Process>,
+    exit_workload: ExitWorkload,
     exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     reader_cancel: OwnedFd,
@@ -1314,7 +1405,7 @@ fn unix_reaper_loop(
             return; // kill/Drop 경로 — reader는 이미 cancel로 낙는다
         }
         let exited = match child.lock() {
-            Ok(mut child) => match child.try_wait() {
+            Ok(mut child) => match try_wait_unix_child(&mut child, owner, &exit_workload) {
                 Ok(Some(_)) => true,
                 Ok(None) => false,
                 Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
@@ -1330,23 +1421,141 @@ fn unix_reaper_loop(
     }
 }
 
+/// Fresh waitid observations are valid only while the caller holds the original child mutex.
+#[cfg(unix)]
+enum ChildExitObservation {
+    PendingOwned,
+    ExitedOwned,
+    Retired,
+    Deferred,
+}
+
+/// macOS hides an exiting/zombie child from proc_pidinfo/getsid. WNOWAIT keeps that original
+/// direct child's PID allocated while its exact workload members are captured. Running polls
+/// never scan group membership; cached/reaped PIDs never grant new signal authority.
+#[cfg(unix)]
+fn observe_unix_child_exit(
+    owner: Option<workload_signal::Process>,
+    retained: &mut ExitWorkloadState,
+) -> std::io::Result<ChildExitObservation> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        if retained.reaped {
+            return Ok(ChildExitObservation::Retired);
+        }
+        let Some(owner) = owner else {
+            return Ok(ChildExitObservation::Retired);
+        };
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: the caller's child mutex serializes every reap of this original child.
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                owner.pid as libc::id_t,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EINTR) {
+                return Ok(ChildExitObservation::Deferred);
+            }
+            if error.raw_os_error() != Some(libc::ECHILD) {
+                return Err(error);
+            }
+            retained.reaped = true;
+            return Ok(ChildExitObservation::Retired);
+        }
+        let info = unsafe { info.assume_init() };
+        let pid = unsafe { info.si_pid() };
+        if pid == 0 {
+            return Ok(ChildExitObservation::PendingOwned);
+        }
+        if pid != owner.pid {
+            return Err(std::io::Error::other(format!(
+                "PTY child exit identity mismatch: expected={} observed={pid} code={}",
+                owner.pid, info.si_code
+            )));
+        }
+        // Darwin can report a stopped child even with WEXITED alone. A stop/continue is
+        // neither an exit nor permission to consume status or capture on an ordinary poll.
+        if matches!(
+            info.si_code,
+            libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED
+        ) {
+            return Ok(ChildExitObservation::PendingOwned);
+        }
+        if !matches!(
+            info.si_code,
+            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+        ) {
+            return Err(std::io::Error::other(format!(
+                "PTY child exit notification mismatch: pid={pid} code={}",
+                info.si_code
+            )));
+        }
+        if retained.captured.is_none() && owner.pid == owner.group && owner.pid == owner.session {
+            match workload_signal::FrozenGroup::capture(owner.group, owner) {
+                Ok(group) => retained.captured = Some(group),
+                Err(error) => {
+                    tracing::debug!("PTY pre-reap workload capture skipped: {error:#}");
+                }
+            }
+        }
+        Ok(ChildExitObservation::ExitedOwned)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (owner, retained);
+        Ok(ChildExitObservation::Retired)
+    }
+}
+
+#[cfg(unix)]
+fn try_wait_unix_child(
+    child: &mut ChildPtyBox,
+    owner: Option<workload_signal::Process>,
+    exit_workload: &Mutex<ExitWorkloadState>,
+) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+    let mut retained = exit_workload
+        .lock()
+        .map_err(|_| std::io::Error::other("PTY exit workload mutex poisoned"))?;
+    match observe_unix_child_exit(owner, &mut retained)? {
+        ChildExitObservation::PendingOwned | ChildExitObservation::Deferred => return Ok(None),
+        ChildExitObservation::ExitedOwned | ChildExitObservation::Retired => {}
+    }
+    let status = child.try_wait()?;
+    if status.is_some() {
+        retained.reaped = true;
+    }
+    Ok(status)
+}
+
 #[cfg(unix)]
 fn unix_writer_loop(
     writer: OwnedFd,
     cancel: OwnedFd,
-    input: std::sync::mpsc::Receiver<Vec<u8>>,
+    input: std::sync::mpsc::Receiver<InputMessage>,
     queue: input_queue::PtyInputQueueState,
 ) {
-    'messages: for bytes in &input {
+    'messages: for message in &input {
+        let bytes = &message.bytes;
         let len = bytes.len();
         let mut written = 0usize;
         while written < len {
+            if !message.permits_write() {
+                break;
+            }
             match wait_for_fd_or_cancel(writer.as_raw_fd(), libc::POLLOUT, cancel.as_raw_fd()) {
                 Ok(true) => {}
                 Ok(false) | Err(_) => {
                     queue.complete(len);
                     break 'messages;
                 }
+            }
+            if !message.permits_write() {
+                break;
             }
             let count = unsafe {
                 libc::write(
@@ -1374,14 +1583,12 @@ fn unix_writer_loop(
             queue.complete(len);
             break 'messages;
         }
-        if written == len {
-            queue.complete(len);
-        }
+        queue.complete(len);
     }
     // Cancellation happens only after the sole sender is dropped. Release any accepted messages
     // that the writer did not consume so post-kill pressure cannot retain stale accounting.
-    for bytes in input.try_iter() {
-        queue.complete(bytes.len());
+    for message in input.try_iter() {
+        queue.complete(message.bytes.len());
     }
     queue.close();
 }
@@ -1479,7 +1686,7 @@ struct PortablePtySession {
     /// 입력은 writer 전용 스레드가 쓴다 — worker가 blocking write에 매달리지 않는다.
     /// (출력 폭주로 child의 stdout이 막힌 상태에서 worker가 대량 paste를
     /// 동기 write하면 reader(backpressure)와 맞물려 full-duplex deadlock — codex P1)
-    input_tx: Option<SyncSender<Vec<u8>>>,
+    input_tx: Option<SyncSender<InputMessage>>,
     input_queue: input_queue::PtyInputQueueState,
     #[cfg(unix)]
     child: SharedChild,
@@ -1495,6 +1702,14 @@ struct PortablePtySession {
     writer_cancel: Option<OwnedFd>,
     #[cfg(unix)]
     process_group: Option<libc::pid_t>,
+    #[cfg(unix)]
+    owner_process: Option<workload_signal::Process>,
+    #[cfg(unix)]
+    exit_workload: ExitWorkload,
+    #[cfg(unix)]
+    query_fence: Option<query_fence::QueryFence>,
+    #[cfg(unix)]
+    frozen_groups: Mutex<Vec<workload_signal::FrozenGroup>>,
     /// 자식 자연 종료 — reader의 drain-후-종료 트리거 (`unix_reader_loop` 꼬리 참조).
     #[cfg(unix)]
     exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1530,6 +1745,153 @@ fn signal_failure_is_already_gone(errno: Option<i32>) -> bool {
 }
 
 impl PortablePtySession {
+    /// Pin the current shell/foreground executions while the original child and terminal still
+    /// exist. Once the master closes or the reaper consumes the shell, a cached PGID alone is
+    /// insufficient authority to signal a job-control foreground group.
+    #[cfg(unix)]
+    fn capture_owned_workloads(&self) -> Vec<workload_signal::FrozenGroup> {
+        let Ok(_child) = self.child.lock() else {
+            tracing::warn!("PTY child mutex poisoned during workload capture");
+            return Vec::new();
+        };
+        let owner = self.owner_process;
+        let Ok(mut retained) = self.exit_workload.lock() else {
+            tracing::warn!("PTY exit workload mutex poisoned during workload capture");
+            return Vec::new();
+        };
+        // A successful fresh waitid pins the original unreaped child even when Darwin hides
+        // its identity during exit. Keep the child mutex through every member snapshot.
+        let owner_pinned = match observe_unix_child_exit(owner, &mut retained) {
+            Ok(ChildExitObservation::PendingOwned | ChildExitObservation::ExitedOwned) => true,
+            Ok(ChildExitObservation::Retired | ChildExitObservation::Deferred) => false,
+            Err(error) => {
+                tracing::debug!("PTY teardown exit observation skipped: {error}");
+                false
+            }
+        };
+        let mut groups: Vec<_> = retained.captured.take().into_iter().collect();
+        drop(retained);
+        let Some(owner) = owner else {
+            return groups;
+        };
+        if !owner_pinned {
+            return groups; // Cached status or failed observation grants no new authority.
+        }
+        let Some(current) = workload_signal::inspect(owner.pid) else {
+            // portable-pty's owned Unix child starts a new session. Until it is reaped, its
+            // original PID/PGID/SID cannot be reused, including an exiting but not yet waitable
+            // Darwin child. This permits only the original shell group, never a fresh FG group.
+            if owner.pid == owner.group
+                && owner.pid == owner.session
+                && !groups.iter().any(|group| group.group() == owner.group)
+            {
+                match workload_signal::FrozenGroup::capture(owner.group, owner) {
+                    Ok(group) => groups.push(group),
+                    Err(error) => {
+                        tracing::debug!("PTY exiting shell workload capture skipped: {error:#}");
+                    }
+                }
+            }
+            return groups;
+        };
+        if !current.same_execution(owner) {
+            tracing::warn!("PTY owner identity changed during workload capture");
+            return groups;
+        }
+        let own_group = unsafe { libc::getpgrp() };
+        for group in [
+            Some(current.group),
+            self.foreground_process_group()
+                .and_then(|group| i32::try_from(group).ok())
+                .filter(|group| *group != current.group),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if signal_target(Some(group), own_group).is_none() {
+                continue;
+            }
+            match workload_signal::FrozenGroup::capture(group, owner) {
+                Ok(captured) => {
+                    if let Some(existing) =
+                        groups.iter_mut().find(|existing| existing.group() == group)
+                    {
+                        existing.merge_capture(captured);
+                    } else {
+                        groups.push(captured);
+                    }
+                }
+                Err(error) => {
+                    // Fail closed for this group; still cancel I/O, clean frozen groups and reap
+                    // the direct child. Short-lived shells can disappear during this snapshot.
+                    tracing::debug!(group, "PTY workload capture skipped: {error:#}");
+                }
+            }
+        }
+        groups
+    }
+
+    #[cfg(unix)]
+    fn terminate_captured_workloads(groups: &[workload_signal::FrozenGroup]) -> anyhow::Result<()> {
+        let mut first_error = None;
+        for (signal, grace) in [
+            (libc::SIGHUP, std::time::Duration::from_millis(20)),
+            (libc::SIGTERM, std::time::Duration::from_millis(200)),
+            (libc::SIGKILL, std::time::Duration::ZERO),
+        ] {
+            for group in groups {
+                if let Err(error) = group.signal_captured_members(signal) {
+                    first_error.get_or_insert(error);
+                }
+            }
+            let deadline = std::time::Instant::now() + grace;
+            while groups.iter().any(|group| group.captured_alive()) {
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if !groups.iter().any(|group| group.captured_alive()) {
+                break;
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Job-control foreground groups differ from the shell group. A stopped job cannot handle
+    /// HUP/TERM, so close its identity-checked group before the shell is reaped or PTY is closed.
+    #[cfg(unix)]
+    fn terminate_frozen_workloads(&self) -> anyhow::Result<()> {
+        let _child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+        let mut frozen = self
+            .frozen_groups
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY freeze mutex poisoned"))?;
+        let mut first_error = None;
+        for group in frozen.iter_mut().rev() {
+            if self
+                .owner_process
+                .is_some_and(|owner| owner.group == group.group())
+            {
+                continue; // The ordinary child kill/reap path still owns the initial shell.
+            }
+            if let Err(error) = group.signal(libc::SIGKILL) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        frozen.clear();
+        Ok(())
+    }
+
     /// Stop both workers without timers. The output queue cancellation covers a reader waiting for
     /// bounded capacity even when its receiver has been moved to the session crate; Unix self-pipes
     /// cover workers waiting in poll, and dropping the master closes the platform PTY itself.
@@ -1597,7 +1959,7 @@ impl PortablePtySession {
         join_worker(self.writer_thread.take(), "writer");
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
     fn signal_process_group(&self, signal: libc::c_int) {
         let own = unsafe { libc::getpgrp() };
         let Some(pgid) = signal_target(self.process_group, own) else {
@@ -1618,11 +1980,36 @@ impl PortablePtySession {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
     fn process_group_alive(&self) -> bool {
         self.process_group
             .is_some_and(|pgid| unsafe { libc::killpg(pgid, 0) } == 0)
     }
+}
+
+#[cfg(unix)]
+fn kill_unix_child_and_reap_bounded(
+    child: &mut ChildPtyBox,
+    exit_workload: &Mutex<ExitWorkloadState>,
+) -> anyhow::Result<()> {
+    // Capture has already taken the fixed members. Retire further exit-based authority before
+    // any raw teardown reap, including errors/timeouts, while the caller holds the child mutex.
+    exit_workload
+        .lock()
+        .map_err(|_| anyhow::anyhow!("PTY exit workload mutex poisoned"))?
+        .reaped = true;
+    // The reaper may already have cached the exit after HUP/TERM. Never kill the old PID after
+    // that cached status; holding the child mutex keeps try_wait and kill in one ownership scope.
+    let result = match child.try_wait() {
+        Ok(Some(_)) => Ok(()),
+        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => Ok(()),
+        _ => match child.kill() {
+            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+            other => other.context("프로세스 kill 실패"),
+        },
+    };
+    reap_child_bounded(child);
+    result
 }
 
 /// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
@@ -1727,18 +2114,27 @@ impl Drop for PortablePtySession {
 
         #[cfg(unix)]
         {
-            // Deterministic I/O cancellation comes first. In particular, this wakes a writer
+            let workloads = self.capture_owned_workloads();
+            if let Err(error) = self.terminate_frozen_workloads() {
+                tracing::warn!("frozen PTY workload teardown failed: {error:#}");
+            }
+            // Deterministic I/O cancellation wakes a writer
             // blocked on a full PTY even if an escaped descendant still owns the slave endpoint.
             self.stop_unix_worker_io();
-            // 터미널 종료 규약: foreground process group에 SIGHUP —
-            // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
+            if let Err(error) = Self::terminate_captured_workloads(&workloads) {
+                tracing::warn!("PTY workload teardown failed: {error:#}");
+            }
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             self.signal_process_group(libc::SIGHUP);
             // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
-            kill_and_reap_bounded(&mut self.child.lock().expect("PTY child mutex poisoned"));
-            // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
-            // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
-            // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
-            // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
+            if let Err(error) = kill_unix_child_and_reap_bounded(
+                &mut self.child.lock().expect("PTY child mutex poisoned"),
+                &self.exit_workload,
+            ) {
+                tracing::warn!("PTY child teardown failed: {error:#}");
+            }
+            // Keep the existing fallback on Unix platforms without birth/session inspection.
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             if let Some(pgid) = self.process_group
                 && self.process_group_alive()
             {
@@ -1804,6 +2200,34 @@ impl PtySession for PortablePtySession {
         }
     }
 
+    fn terminal_response_fence(&self) -> Option<query_fence::QueryFence> {
+        #[cfg(unix)]
+        {
+            self.query_fence.clone()
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn write_terminal_response(
+        &mut self,
+        bytes: &[u8],
+        after_boundary: bool,
+    ) -> anyhow::Result<PtyInputEnqueueResult> {
+        let Some(tx) = self.input_tx.as_ref() else {
+            return self.write_input(bytes);
+        };
+        let owner = self
+            .terminal_response_fence()
+            .map(|fence| (fence, after_boundary));
+        input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+            bytes,
+            response_owner: owner.clone(),
+        })
+    }
+
     fn input_queue_idle(&self) -> bool {
         self.input_queue.is_idle()
     }
@@ -1825,7 +2249,10 @@ impl PtySession for PortablePtySession {
                 },
             });
         };
-        input_queue::enqueue_input(tx, &self.input_queue, bytes)
+        input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+            bytes,
+            response_owner: None,
+        })
     }
 
     fn write_input_batch(&mut self, parts: &[&[u8]]) -> anyhow::Result<PtyInputEnqueueResult> {
@@ -1833,7 +2260,10 @@ impl PtySession for PortablePtySession {
             // This definitive rejection occurs before any part is attempted.
             return self.write_input(&[]);
         };
-        input_queue::enqueue_input_batch(tx, &self.input_queue, parts)
+        input_queue::enqueue_input_with(tx, &self.input_queue, parts, |bytes| InputMessage {
+            bytes,
+            response_owner: None,
+        })
     }
 
     fn resize(&mut self, cols: u16, rows: u16) -> anyhow::Result<()> {
@@ -1847,11 +2277,11 @@ impl PtySession for PortablePtySession {
 
     #[cfg(unix)]
     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>> {
-        let status = self
+        let mut child = self
             .child
             .lock()
-            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?
-            .try_wait()
+            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+        let status = try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)
             .context("exit status 조회 실패")?;
         if status.is_some() {
             // reaper가 25ms 안에 같은 신호를 내지만, 소비자 폴링이 먼저 발견했으면
@@ -1877,28 +2307,20 @@ impl PtySession for PortablePtySession {
     fn kill(&mut self) -> anyhow::Result<()> {
         #[cfg(unix)]
         {
-            // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
-            // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
+            let workloads = self.capture_owned_workloads();
+            let frozen_result = self.terminate_frozen_workloads();
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             self.signal_process_group(libc::SIGHUP);
             self.stop_unix_worker_io();
+            let workload_result = Self::terminate_captured_workloads(&workloads);
             let mut child = self
                 .child
                 .lock()
                 .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
-            // 바로 위 SIGHUP으로 자식이 죽으면 reaper가 25ms 안에 reap한다. 이미
-            // 회수된 자식의 pid로 kill(2)을 보낼 수는 없다 — ESRCH가 나거나,
-            // 최악에는 재사용된 남의 pid를 죽인다. 회수 여부를 먼저 보고, 그 사이의
-            // 좁은 경합으로 ESRCH가 나면 이미 죽은 것으로 간주한다.
-            let result = match child.try_wait() {
-                Ok(Some(_)) => Ok(()),
-                _ => match child.kill() {
-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
-                    other => other.context("프로세스 kill 실패"),
-                },
-            };
+            let result = kill_unix_child_and_reap_bounded(&mut child, &self.exit_workload);
             drop(child);
             self.join_unix_workers();
-            result
+            frozen_result.and(workload_result).and(result)
         }
 
         #[cfg(windows)]
@@ -1922,22 +2344,90 @@ impl PtySession for PortablePtySession {
 
     #[cfg(unix)]
     fn freeze(&self) -> anyhow::Result<()> {
-        // 프로세스 그룹 전체 정지 — grandchild job(예: next dev의 워커들)까지 멈춘다.
+        // Pin the child against the reaper while validating its session and workload groups.
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
         anyhow::ensure!(
-            self.process_group.is_some(),
-            "process group 없음 — 동결 불가"
+            try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)?.is_none(),
+            "PTY child exited"
         );
-        self.signal_process_group(libc::SIGSTOP);
-        Ok(())
+        let owner = self.owner_process.context("process identity unavailable")?;
+        let current = workload_signal::inspect(owner.pid).context("PTY owner exited")?;
+        anyhow::ensure!(current.same_execution(owner), "PTY owner identity changed");
+        let mut frozen = self
+            .frozen_groups
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY freeze mutex poisoned"))?;
+        if !frozen.is_empty() {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            for group in frozen.iter_mut() {
+                group.verify(true, deadline)?;
+            }
+            return Ok(());
+        }
+        let foreground = self
+            .foreground_process_group()
+            .context("foreground process group unavailable")? as i32;
+        let mut groups = vec![workload_signal::FrozenGroup::capture(current.group, owner)?];
+        if foreground != current.group {
+            groups.push(workload_signal::FrozenGroup::capture(foreground, owner)?);
+        }
+        let transition = (|| -> anyhow::Result<()> {
+            for group in &mut groups {
+                group.signal(libc::SIGSTOP)?;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+            for group in &mut groups {
+                group.verify(true, deadline)?;
+            }
+            Ok(())
+        })();
+        if transition.is_err() {
+            let mut rollback_failed = false;
+            for group in &mut groups {
+                if let Err(error) = group.rollback_stop() {
+                    tracing::warn!("PTY freeze rollback failed: {error:#}");
+                    rollback_failed = true;
+                }
+            }
+            if rollback_failed {
+                // Retain our groups for a retry or close rather than losing stopped work.
+                *frozen = groups;
+            }
+        } else {
+            *frozen = groups;
+        }
+        transition
     }
 
     #[cfg(unix)]
     fn resume(&self) -> anyhow::Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
         anyhow::ensure!(
-            self.process_group.is_some(),
-            "process group 없음 — 재개 불가"
+            try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)?.is_none(),
+            "PTY child exited"
         );
-        self.signal_process_group(libc::SIGCONT);
+        let mut frozen = self
+            .frozen_groups
+            .lock()
+            .map_err(|_| anyhow::anyhow!("PTY freeze mutex poisoned"))?;
+        if frozen.is_empty() {
+            return Ok(());
+        }
+        // Use only groups captured by freeze, never whichever job happens to be foreground now.
+        for group in frozen.iter_mut() {
+            group.signal(libc::SIGCONT)?;
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(100);
+        for group in frozen.iter_mut() {
+            group.verify(false, deadline)?;
+        }
+        frozen.clear();
         Ok(())
     }
 }
@@ -2940,7 +3430,7 @@ mod tests {
     ///   `pg_jobc == 0`이고 다른 세션 프로세스의 종료로 새로 고아가 되지 않는다.
     ///   XNU `orphanpg()` 경로라면 반드시 HUP 뒤 CONT가 기록돼야 한다.
     ///
-    /// 따라서 제품 `freeze()`는 블로킹 retry 없이 SIGSTOP 한 번만 보낸다. 테스트만
+    /// freeze의 유계 확인도 exec 전환을 정지 성공으로 오인하면 안 된다. 이 테스트는
     /// 임의 sleep이 아니라 자식 userland의 명시적 READY handshake를 기다린다.
     #[test]
     fn freeze는_프로세스를_정지시키고_resume이_되살린다() {
@@ -3029,6 +3519,206 @@ mod tests {
 
         session.kill().unwrap();
         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
+    }
+
+    #[test]
+    fn full_review_20261014_freeze_stops_foreground_job_not_only_shell() {
+        let mut session = spawn("/bin/zsh", &["-d", "-f", "-i"]);
+        let output = session.take_output().unwrap();
+        let initial_group = session.process_identity().process_group.unwrap();
+        assert!(
+            session
+                .write_input(
+                    b"/bin/sh -c 'printf \"DEPPY_FG_%s\\n\" READY; while :; do sleep 1; done'\r"
+                )
+                .unwrap()
+                .is_accepted()
+        );
+        let mut bytes = Vec::new();
+        assert!(
+            receive_until(
+                &output,
+                &mut bytes,
+                b"DEPPY_FG_READY",
+                Duration::from_secs(5)
+            ),
+            "foreground fixture must enter userland: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let foreground = session.foreground_process_group().unwrap();
+        struct KillFixtureGroup(u32);
+        impl Drop for KillFixtureGroup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::killpg(self.0 as i32, libc::SIGKILL);
+                }
+            }
+        }
+        let fixture_group = KillFixtureGroup(foreground);
+        assert_ne!(
+            foreground, initial_group,
+            "interactive shell must create a separate foreground job group"
+        );
+        session.freeze().unwrap();
+        let state = |pid: u32| {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut foreground_stopped = false;
+        while Instant::now() < deadline {
+            if state(foreground).starts_with('T') {
+                foreground_stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let initial_state = state(initial_group);
+        let foreground_state = state(foreground);
+        session.resume().unwrap();
+        // Only kills the foreground job created in this private PTY fixture.
+        drop(fixture_group);
+        drop(session);
+        assert!(
+            foreground_stopped,
+            "freeze returned Ok but only shell group stopped: shell={initial_group}:{initial_state}, foreground={foreground}:{foreground_state}"
+        );
+    }
+
+    #[test]
+    fn full_fix_lifecycle_freeze_rejects_an_unrelated_session_group() {
+        let mut owner = spawn("/bin/cat", &[]);
+        let mut unrelated = spawn("/bin/cat", &[]);
+        let owner_pid = owner.process_identity().pid.unwrap() as i32;
+        let unrelated_pid = unrelated.process_identity().pid.unwrap() as i32;
+        let owner_identity = workload_signal::inspect(owner_pid).unwrap();
+        let unrelated_identity = workload_signal::inspect(unrelated_pid).unwrap();
+        assert_ne!(owner_identity.session, unrelated_identity.session);
+        assert!(
+            workload_signal::FrozenGroup::capture(unrelated_identity.group, owner_identity)
+                .is_err()
+        );
+        assert!(
+            !workload_signal::inspect(unrelated_pid)
+                .unwrap()
+                .stopped_for_test()
+        );
+        owner.kill().unwrap();
+        unrelated.kill().unwrap();
+    }
+
+    #[test]
+    fn full_fix_lifecycle_freeze_handles_a_job_whose_group_leader_exited() {
+        let mut session = spawn("/bin/zsh", &["-d", "-f", "-i"]);
+        let output = session.take_output().unwrap();
+        assert!(
+            session
+                .write_input(
+                    b"/bin/sh -c 'printf \"DEPPY_PIPE_%s\\n\" READY >/dev/tty; exit' | /bin/sleep 30\r"
+                )
+                .unwrap()
+                .is_accepted()
+        );
+        let mut bytes = Vec::new();
+        assert!(
+            receive_until(
+                &output,
+                &mut bytes,
+                b"DEPPY_PIPE_READY",
+                Duration::from_secs(5)
+            ),
+            "{:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+        let foreground = session.foreground_process_group().unwrap() as i32;
+        struct KillFixtureGroup(i32);
+        impl Drop for KillFixtureGroup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::killpg(self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let fixture = KillFixtureGroup(foreground);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while workload_signal::inspect(foreground).is_some_and(|p| !p.zombie_for_test())
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let leader_exited =
+            workload_signal::inspect(foreground).is_none_or(|p| p.zombie_for_test());
+        let freeze = session.freeze();
+        let stopped = workload_signal::group_stopped_for_test(foreground);
+        let resume = session.resume();
+        drop(fixture);
+        drop(session);
+        assert!(leader_exited, "pipeline must lose its group leader");
+        assert!(freeze.is_ok(), "{freeze:?}");
+        assert!(stopped, "surviving foreground members must stop");
+        assert!(resume.is_ok(), "{resume:?}");
+    }
+
+    fn frozen_foreground_teardown_is_complete(use_kill: bool) {
+        let mut session = spawn("/bin/zsh", &["-d", "-f", "-i"]);
+        let output = session.take_output().unwrap();
+        assert!(session.write_input(b"/bin/sh -c 'trap \"\" HUP TERM; printf \"DEPPY_CLOSE_%s\\n\" READY; while :; do sleep 1; done'\r").unwrap().is_accepted());
+        let mut bytes = Vec::new();
+        assert!(receive_until(
+            &output,
+            &mut bytes,
+            b"DEPPY_CLOSE_READY",
+            Duration::from_secs(5)
+        ));
+        let foreground = session.foreground_process_group().unwrap() as i32;
+        struct FixtureGroup(Option<i32>);
+        impl Drop for FixtureGroup {
+            fn drop(&mut self) {
+                if let Some(group) = self.0 {
+                    unsafe {
+                        libc::killpg(group, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let mut fixture = FixtureGroup(Some(foreground));
+        session.freeze().unwrap();
+        if use_kill {
+            session.kill().unwrap();
+        }
+        drop(session);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while unsafe { libc::killpg(foreground, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let gone_without_rescue = unsafe { libc::killpg(foreground, 0) } != 0;
+        if gone_without_rescue {
+            fixture.0 = None;
+        } else {
+            // Fixture-only rescue, on the foreground group created by this test.
+            unsafe {
+                libc::killpg(foreground, libc::SIGCONT);
+                libc::killpg(foreground, libc::SIGKILL);
+            }
+        }
+        drop(fixture);
+        assert!(
+            gone_without_rescue,
+            "frozen foreground group {foreground} survived teardown use_kill={use_kill}"
+        );
+    }
+
+    #[test]
+    fn full_fix_lifecycle_frozen_foreground_is_reaped_by_kill() {
+        frozen_foreground_teardown_is_complete(true);
+    }
+
+    #[test]
+    fn full_fix_lifecycle_frozen_foreground_is_reaped_by_drop() {
+        frozen_foreground_teardown_is_complete(false);
     }
 
     /// 고립된 1바이트 echo 왕복(`unix_reader_loop`의 coalesce wait 포함)이 옛 2ms 대기

@@ -1,0 +1,104 @@
+--- a/crates/pty/src/lib.rs
++++ b/crates/pty/src/lib.rs
+@@ -1464,13 +1464,28 @@
+             if pid == 0 {
+                 return Ok(None);
+             }
+-            if pid != owner.pid
+-                || !matches!(
+-                    info.si_code,
+-                    libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
+-                )
+-            {
+-                return Err(std::io::Error::other("PTY child exit identity mismatch"));
++            if pid != owner.pid {
++                return Err(std::io::Error::other(format!(
++                    "PTY child exit identity mismatch: expected={} observed={pid} code={}",
++                    owner.pid, info.si_code
++                )));
++            }
++            // Darwin can report a stopped child even with WEXITED alone. A stop/continue is
++            // neither an exit nor permission to consume status or capture cached group IDs.
++            if matches!(
++                info.si_code,
++                libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED
++            ) {
++                return Ok(None);
++            }
++            if !matches!(
++                info.si_code,
++                libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
++            ) {
++                return Err(std::io::Error::other(format!(
++                    "PTY child exit notification mismatch: pid={pid} code={}",
++                    info.si_code
++                )));
+             }
+             if retained.captured.is_none() {
+                 match workload_signal::FrozenGroup::capture(owner.group, owner) {
+@@ -1709,10 +1724,25 @@
+     /// insufficient authority to signal a job-control foreground group.
+     #[cfg(unix)]
+     fn capture_owned_workloads(&self) -> Vec<workload_signal::FrozenGroup> {
+-        let Ok(_child) = self.child.lock() else {
++        let Ok(mut child) = self.child.lock() else {
+             tracing::warn!("PTY child mutex poisoned during workload capture");
+             return Vec::new();
+         };
++        // Teardown can beat the periodic reaper after Darwin has hidden an unreaped zombie.
++        // Publish its exact members before taking the snapshot or closing the terminal.
++        if let Err(error) = try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)
++        {
++            tracing::debug!("PTY teardown exit observation skipped: {error}");
++        }
++        let owner = self.owner_process;
++        let current = owner.and_then(|owner| workload_signal::inspect(owner.pid));
++        if owner.is_some() && current.is_none() {
++            // A live first peek can race the shell's exit before proc_pidinfo. Observe that
++            // transition before taking the snapshot; the child mutex still pins the owner PID.
++            if let Err(error) = try_wait_unix_child(&mut child, owner, &self.exit_workload) {
++                tracing::debug!("PTY teardown exit transition skipped: {error}");
++            }
++        }
+         let mut groups: Vec<_> = self
+             .exit_workload
+             .lock()
+@@ -1720,10 +1750,10 @@
+             .and_then(|mut retained| retained.captured.take())
+             .into_iter()
+             .collect();
+-        let Some(owner) = self.owner_process else {
++        let Some(owner) = owner else {
+             return groups;
+         };
+-        let Some(current) = workload_signal::inspect(owner.pid) else {
++        let Some(current) = current else {
+             return groups; // A reaped shell grants no new authority beyond the pinned members.
+         };
+         if !current.same_execution(owner) {
+@@ -1924,6 +1954,12 @@
+     child: &mut ChildPtyBox,
+     exit_workload: &Mutex<ExitWorkloadState>,
+ ) -> anyhow::Result<()> {
++    // Capture has already taken the fixed members. Retire further exit-based authority before
++    // any raw teardown reap, including errors/timeouts, while the caller holds the child mutex.
++    exit_workload
++        .lock()
++        .map_err(|_| anyhow::anyhow!("PTY exit workload mutex poisoned"))?
++        .reaped = true;
+     // The reaper may already have cached the exit after HUP/TERM. Never kill the old PID after
+     // that cached status; holding the child mutex keeps try_wait and kill in one ownership scope.
+     let result = match child.try_wait() {
+@@ -1934,12 +1970,6 @@
+         },
+     };
+     reap_child_bounded(child);
+-    if child.try_wait().is_ok_and(|status| status.is_some()) {
+-        let mut retained = exit_workload
+-            .lock()
+-            .map_err(|_| anyhow::anyhow!("PTY exit workload mutex poisoned"))?;
+-        retained.reaped = true;
+-    }
+     result
+ }
+ 

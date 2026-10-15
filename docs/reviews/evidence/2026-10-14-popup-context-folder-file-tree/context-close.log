@@ -1,0 +1,6 @@
+frame=0 popup_before=false popup_after=false memory_before=false memory_after=false terminal_accepts=true PTY_BYTES=[]
+frame=1 popup_before=false popup_after=false memory_before=false memory_after=false terminal_accepts=true PTY_BYTES=[]
+frame=2 popup_before=false popup_after=true memory_before=false memory_after=true terminal_accepts=false PTY_BYTES=[]
+frame=3 popup_before=false popup_after=true memory_before=true memory_after=true terminal_accepts=false PTY_BYTES=[]
+frame=4 popup_before=false popup_after=true memory_before=true memory_after=true terminal_accepts=false PTY_BYTES=[]
+frame=5 popup_before=false popup_after=true memory_before=true memory_after=false terminal_accepts=false PTY_BYTES=[]

@@ -22,6 +22,7 @@ struct Client {
     approved: bool,
 }
 struct Flow {
+    connection_id: String,
     client: String,
     redirect: String,
     resource: String,
@@ -36,11 +37,16 @@ struct Pending {
     denied: bool,
 }
 struct Access {
+    connection_id: String,
+    display_name: String,
+    issued_at: u64,
     input: bool,
     expires: u64,
     _lease: std::sync::Arc<secret::RedactionLease>,
 }
 struct Refresh {
+    connection_id: String,
+    display_name: String,
     client: String,
     resource: String,
     input: bool,
@@ -92,6 +98,38 @@ impl OAuth {
             .filter(|a| now < a.expires)
             .map(|a| a.input)
     }
+    pub fn principal_key(&self, key: &str, now: u64) -> Option<crate::Principal> {
+        let access = self.access.get(key).filter(|access| now < access.expires)?;
+        Some(crate::Principal {
+            id: access.connection_id.clone(),
+            name: access.display_name.clone(),
+            auth_kind: crate::AuthKind::OAuth,
+            input_scope: access.input,
+            authenticated_at: access.issued_at,
+            expires_at: access.expires,
+        })
+    }
+    pub fn connection_expiry(&self, id: &str) -> Option<u64> {
+        self.refresh
+            .values()
+            .filter(|refresh| refresh.connection_id == id)
+            .map(|refresh| refresh.expires)
+            .max()
+    }
+    pub fn live_principals(&self, now: u64) -> Vec<crate::Principal> {
+        self.access
+            .keys()
+            .filter_map(|key| self.principal_key(key, now))
+            .collect()
+    }
+    pub fn revoke_connection(&mut self, id: &str) {
+        self.access.retain(|_, access| access.connection_id != id);
+        self.refresh
+            .retain(|_, refresh| refresh.connection_id != id);
+        self.codes.retain(|_, flow| flow.connection_id != id);
+        self.pending
+            .retain(|_, pending| pending.flow.connection_id != id);
+    }
     pub fn approvals(&mut self, now: u64) -> Vec<Approval> {
         self.prune(now);
         self.pending
@@ -138,6 +176,7 @@ impl OAuth {
         let code = token();
         p.flow.expires = (now + 60).min(client.expires);
         let flow = Flow {
+            connection_id: p.flow.connection_id.clone(),
             client: p.flow.client.clone(),
             redirect: p.flow.redirect.clone(),
             resource: p.flow.resource.clone(),
@@ -332,6 +371,7 @@ impl OAuth {
                     id.clone(),
                     Pending {
                         flow: Flow {
+                            connection_id: uuid::Uuid::new_v4().to_string(),
                             client: q["client_id"].clone(),
                             redirect,
                             resource,
@@ -360,10 +400,16 @@ impl OAuth {
                 if !self.clients.contains_key(&client) || q.get("resource") != Some(&resource) {
                     return error(400, "invalid_grant");
                 }
-                let (input, refresh_input, expiry, code_key, refresh_key, replaced_access) = match q
-                    .get("grant_type")
-                    .map(String::as_str)
-                {
+                let (
+                    connection_id,
+                    display_name,
+                    input,
+                    refresh_input,
+                    expiry,
+                    code_key,
+                    refresh_key,
+                    replaced_access,
+                ) = match q.get("grant_type").map(String::as_str) {
                     Some("authorization_code") => {
                         let key = hash(q.get("code").map(String::as_str).unwrap_or(""));
                         let Some(f) = self.codes.get(&key) else {
@@ -385,7 +431,16 @@ impl OAuth {
                         if self.access.len() >= 32 || self.refresh.len() >= 32 {
                             return error(503, "token_capacity");
                         }
-                        (f.input, f.input, expires, Some(key), None, None)
+                        (
+                            f.connection_id.clone(),
+                            self.clients[&client].name.clone(),
+                            f.input,
+                            f.input,
+                            expires,
+                            Some(key),
+                            None,
+                            None,
+                        )
                     }
                     Some("refresh_token") => {
                         let key = hash(q.get("refresh_token").map(String::as_str).unwrap_or(""));
@@ -416,6 +471,8 @@ impl OAuth {
                             return error(503, "token_capacity");
                         }
                         (
+                            r.connection_id.clone(),
+                            r.display_name.clone(),
                             input,
                             r.input,
                             r.expires,
@@ -452,6 +509,9 @@ impl OAuth {
                 self.access.insert(
                     hash(&access),
                     Access {
+                        connection_id: connection_id.clone(),
+                        display_name: display_name.clone(),
+                        issued_at: now,
                         input,
                         expires: now + ttl,
                         _lease: lease.clone(),
@@ -460,6 +520,8 @@ impl OAuth {
                 self.refresh.insert(
                     hash(&refresh),
                     Refresh {
+                        connection_id,
+                        display_name,
                         client,
                         resource,
                         input: refresh_input,
@@ -596,6 +658,7 @@ mod tests {
         o.codes.insert(
             hash(id),
             Flow {
+                connection_id: uuid::Uuid::new_v4().to_string(),
                 client: client.into(),
                 redirect: "https://client.example/callback".into(),
                 resource: "https://deppy.example/mcp".into(),
@@ -625,6 +688,104 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned()
+    }
+    #[test]
+    fn cloud_management_oauth_names_follow_approved_clients_and_refresh() {
+        let mut oauth = OAuth::new(secret::RedactionService::new());
+        let mut grants = Vec::new();
+        for name in ["Review Bot", "Build Bot"] {
+            let registration =
+                json!({"client_name":name,"redirect_uris":["https://client.example/callback"]})
+                    .to_string();
+            let client = json_body(
+                route(
+                    &mut oauth,
+                    "POST",
+                    "/oauth/register",
+                    "",
+                    &registration,
+                    100,
+                )
+                .0,
+            )["client_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let verifier = "x".repeat(43);
+            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(&verifier));
+            let query = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("client_id", client.as_str()),
+                    ("redirect_uri", "https://client.example/callback"),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("response_type", "code"),
+                    ("code_challenge_method", "S256"),
+                    ("code_challenge", challenge.as_str()),
+                ])
+                .finish();
+            assert_eq!(
+                route(&mut oauth, "GET", "/oauth/authorize", &query, "", 101)
+                    .0
+                    .status,
+                200
+            );
+            let approval = oauth.approvals(101).pop().unwrap();
+            assert_eq!(approval.client_name, name);
+            assert!(oauth.approve(&approval.id, true, 102));
+            let (redirect, headers) = route(
+                &mut oauth,
+                "GET",
+                "/oauth/authorize",
+                &format!("request={}", approval.id),
+                "",
+                103,
+            );
+            assert_eq!(redirect.status, 303);
+            let location = &headers.iter().find(|(key, _)| key == "Location").unwrap().1;
+            let code = url::Url::parse(location)
+                .unwrap()
+                .query_pairs()
+                .find(|(key, _)| key == "code")
+                .unwrap()
+                .1
+                .into_owned();
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("grant_type", "authorization_code"),
+                    ("client_id", client.as_str()),
+                    ("redirect_uri", "https://client.example/callback"),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("code", code.as_str()),
+                    ("code_verifier", verifier.as_str()),
+                ])
+                .finish();
+            let tokens = json_body(route(&mut oauth, "POST", "/oauth/token", "", &body, 104).0);
+            let principal = oauth
+                .principal_key(&hash(tokens["access_token"].as_str().unwrap()), 104)
+                .unwrap();
+            grants.push((client, tokens, principal, name));
+        }
+        assert_ne!(grants[0].2.id, grants[1].2.id);
+        for (client, tokens, original, name) in grants {
+            assert_eq!(original.name, name, "approved label is display metadata");
+            let body = url::form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("grant_type", "refresh_token"),
+                    ("client_id", client.as_str()),
+                    ("resource", "https://deppy.example/mcp"),
+                    ("refresh_token", tokens["refresh_token"].as_str().unwrap()),
+                ])
+                .finish();
+            let refreshed = json_body(route(&mut oauth, "POST", "/oauth/token", "", &body, 105).0);
+            let principal = oauth
+                .principal_key(&hash(refreshed["access_token"].as_str().unwrap()), 105)
+                .unwrap();
+            assert_eq!(
+                principal.id, original.id,
+                "refresh preserves UUID authority"
+            );
+            assert_eq!(principal.name, name, "refresh preserves approved label");
+        }
     }
     #[test]
     fn redirect_bounds_reject_before_consent_and_allow_encoded_state() {
@@ -709,6 +870,10 @@ mod tests {
         let mut o = OAuth::new(secret::RedactionService::new());
         let client = registered(&mut o);
         let mut tokens = issue_scoped(&mut o, &client, "input-code", true);
+        let identity = o
+            .principal_key(&hash(tokens["access_token"].as_str().unwrap()), 102)
+            .unwrap()
+            .id;
         for (scope, time, input) in [
             (Some("deppy.input deppy.read"), 103, true),
             (Some("deppy.read"), 104, false),
@@ -732,6 +897,13 @@ mod tests {
                 Some(input)
             );
             assert_eq!(
+                o.principal_key(&hash(tokens["access_token"].as_str().unwrap()), time)
+                    .unwrap()
+                    .id,
+                identity,
+                "refresh must preserve the credential-issued connection"
+            );
+            assert_eq!(
                 tokens["scope"],
                 if input {
                     "deppy.read deppy.input"
@@ -740,6 +912,47 @@ mod tests {
                 }
             );
         }
+    }
+    #[test]
+    fn cloud_management_oauth_revoke_one_grant_keeps_other_grants_and_rejects_refresh() {
+        let mut oauth = OAuth::new(secret::RedactionService::new());
+        let client = registered(&mut oauth);
+        let a = issue_scoped(&mut oauth, &client, "grant-a", true);
+        let b = issue_scoped(&mut oauth, &client, "grant-b", true);
+        let principal_a = oauth
+            .principal_key(&hash(a["access_token"].as_str().unwrap()), 102)
+            .unwrap();
+        let principal_b = oauth
+            .principal_key(&hash(b["access_token"].as_str().unwrap()), 102)
+            .unwrap();
+        assert_ne!(
+            principal_a.id, principal_b.id,
+            "one client registration may authorize independent grants"
+        );
+        oauth.revoke_connection(&principal_a.id);
+        assert!(
+            oauth
+                .authenticate(a["access_token"].as_str().unwrap(), 103)
+                .is_none()
+        );
+        assert_eq!(
+            oauth.authenticate(b["access_token"].as_str().unwrap(), 103),
+            Some(true)
+        );
+        let body = url::form_urlencoded::Serializer::new(String::new())
+            .extend_pairs([
+                ("grant_type", "refresh_token"),
+                ("client_id", &client),
+                ("resource", "https://deppy.example/mcp"),
+                ("refresh_token", a["refresh_token"].as_str().unwrap()),
+            ])
+            .finish();
+        assert_eq!(
+            route(&mut oauth, "POST", "/oauth/token", "", &body, 103)
+                .0
+                .status,
+            400
+        );
     }
     #[test]
     fn refresh_scope_rejects_expansion_and_unknown_without_consuming_grant() {

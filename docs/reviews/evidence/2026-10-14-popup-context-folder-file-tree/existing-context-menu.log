@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.77s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 14 tests
+test app::tests::context_menu_audit_environment ... ignored, offscreen menu audit PNGs and measured geometry
+test ui::file_tree::tests::context_menu_audit_file_tree ... ignored, offscreen menu audit PNGs and measured geometry
+test ui::fleet::tests::context_menu_audit_fleet ... ignored, offscreen menu audit PNGs and measured geometry
+test ui::notes::tests::context_menu_audit_notes ... ignored, offscreen menu audit PNGs and measured geometry
+test ui::workspace::tests::context_menu_audit_workspace ... ignored, offscreen menu audit PNGs and measured geometry
+test ui::context_menu::tests::메뉴_모서리는_2pt로_둥글린다 ... ok
+test ui::file_tree::tests::live_session_row_context_menu_uses_the_multi_item_renderer ... ok
+test ui::file_tree::tests::compact_context_menu_short_session_row_is_narrow_and_scoped ... ok
+test ui::file_tree::tests::popup_review_closed_context_menu_does_not_cancel_inline_rename ... ok
+test ui::file_tree::tests::kittest_live_session_context_menu_keeps_all_items_on_one_line ... ok
+test ui::workspace::tests::compact_context_menu_folder_submenu_retains_session_identity ... ok
+test ui::workspace::tests::compact_context_menu_groups_splits_and_keeps_the_clicked_pane ... ok
+test ui::context_menu::tests::메뉴_폭은_가장_긴_항목에_맞추고_행_간격을_넓힌다 ... ok
+test ui::file_tree::tests::context_menu_header_right_click_keeps_primary_tabs ... ok
+
+test result: ok. 9 passed; 0 failed; 5 ignored; 0 measured; 3177 filtered out; finished in 0.11s

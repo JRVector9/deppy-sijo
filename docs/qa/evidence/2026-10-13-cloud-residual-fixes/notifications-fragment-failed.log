@@ -1,0 +1,279 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 29.28s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 10 tests
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery ... FAILED
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_known_corpus_masks_before_clipping ... FAILED
+test cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement ... ok
+test cloud_agent::integration_tests::notify_known_wrapped_secret_masks_claim_finish_notice_and_history ... ok
+test cloud_agent::integration_tests::notify_known_mixed_control_ansi_secret_masks_claim_finish_notice_and_history ... ok
+test cloud_agent::integration_tests::pr9_notify_own_answer_stays_original_after_switch_and_connection_stop ... ok
+test ui::notifications::cloud_answer_tests::late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy ... ok
+test cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement ... ok
+
+failures:
+
+---- ui::notifications::cloud_answer_tests::late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery stdout ----
+
+thread 'ui::notifications::cloud_answer_tests::late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery' (23398823) panicked at crates/app/src/ui/notifications.rs:1599:9:
+assertion `left == right` failed
+  left: 4
+ right: 2
+
+---- ui::notifications::cloud_answer_tests::late_secret_notify_notifications_known_corpus_masks_before_clipping stdout ----
+
+thread 'ui::notifications::cloud_answer_tests::late_secret_notify_notifications_known_corpus_masks_before_clipping' (23398822) panicked at crates/app/src/ui/notifications.rs:1495:9:
+assertion `left == right` failed
+  left: "[REDACTED]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED]"
+ right: "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- ui::notifications::cloud_answer_tests::late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target stdout ----
+
+thread 'ui::notifications::cloud_answer_tests::late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target' (23398821) panicked at crates/app/src/ui/notifications.rs:1554:28:
+No nodes found matching the query:
+By {
+    label: "[Cloud] ✅ Cloud answer: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED] — xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED]",
+}
+
+On node:
+Node {
+    id: NodeId(
+        TreeIndex(
+            0,
+        ),
+        #13826925289788388,
+    ),
+    role: Window,
+    focused: true,
+    hidden: false,
+    disabled: false,
+    children: [
+        Node {
+            id: NodeId(
+                TreeIndex(
+                    0,
+                ),
+                #18356943641707106210,
+            ),
+            role: GenericContainer,
+            focused: false,
+            hidden: false,
+            disabled: false,
+            children: [
+                Node {
+                    id: NodeId(
+                        TreeIndex(
+                            0,
+                        ),
+                        #17717534622495252412,
+                    ),
+                    role: GenericContainer,
+                    focused: false,
+                    hidden: false,
+                    disabled: false,
+                    children: [
+                        Node {
+                            id: NodeId(
+                                TreeIndex(
+                                    0,
+                                ),
+                                #15707054694645992835,
+                            ),
+                            role: GenericContainer,
+                            focused: false,
+                            hidden: false,
+                            disabled: false,
+                            children: [
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #17970341196664973444,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13043090184002317183,
+                                            ),
+                                            role: Label,
+                                            value: "Recent",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #17446720644000691953,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Recent",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #13732942197821760057,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5192736583954261710,
+                                            ),
+                                            role: Label,
+                                            value: "●",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #6342400749082746179,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "●",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #129168399402136103,
+                                            ),
+                                            role: Button,
+                                            label: "[Cloud] ✅ Cloud answer: [REDACTED]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED] — [REDACTED]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED]",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #16485001380289133131,
+                                    ),
+                                    role: Button,
+                                    label: "Clear all",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #17944503031798065734,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #1865401686768717881,
+                                            ),
+                                            role: Label,
+                                            value: "●",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #10204230436158237812,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "●",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #1930208432364558597,
+                                            ),
+                                            role: Button,
+                                            label: "[Cloud] ✅ Cloud answer: [REDACTED]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED] — [REDACTED]xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx[REDACTED]",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
+
+
+failures:
+    ui::notifications::cloud_answer_tests::late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target
+    ui::notifications::cloud_answer_tests::late_secret_notify_notifications_known_corpus_masks_before_clipping
+    ui::notifications::cloud_answer_tests::late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery
+
+test result: FAILED. 7 passed; 3 failed; 0 ignored; 0 measured; 3169 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 6 tests
+test app::tests::app_host_folder_picker_failure는_빈_completion으로_닫힌다 ... ok
+test app::tests::workspace_add_picker_click_survives_a_busy_host_action_slot ... ok
+test workspace_add::tests::non_utf8_picker_destination_is_rejected_before_clone_without_path_substitution ... ok
+test agent_model_catalog::tests::codex_catalog_keeps_listed_models_in_picker_order ... ok
+test ui::env_profiles::tests::production_source_has_no_storage_keyring_picker_or_render_io_edge ... ok
+test workspace_add::tests::add_dialog_selects_local_picker_only_after_a_click_and_exposes_git_fields ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 3185 filtered out; finished in 0.09s

@@ -1,0 +1,22 @@
+Current-source pure Recovery proof; no canonical source edits.
+Source HEAD: bf13eb48
+Compile command: rustc --edition=2024 --test /private/tmp/deppy-rereview-clock-baseline-20261013.rs --extern libc=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/liblibc-479c45172814a216.rlib -L dependency=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps -o /private/tmp/deppy-rereview-clock-baseline-20261013
+Compile exit: 0
+Test command: /private/tmp/deppy-rereview-clock-baseline-20261013 known_pre_suspend_baseline_survives_failed_sample --exact --nocapture
+Test exit: 101
+
+running 1 test
+
+thread 'known_pre_suspend_baseline_survives_failed_sample' (21934285) panicked at /private/tmp/deppy-rereview-clock-baseline-20261013.rs:15:5:
+a transient failed sample must not erase the last known baseline and hide 39 seconds of suspend
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test known_pre_suspend_baseline_survives_failed_sample ... FAILED
+
+failures:
+
+failures:
+    known_pre_suspend_baseline_survives_failed_sample
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+Boundary: synthetic native-clock values demonstrate exact current Recovery state transition; not actual OS suspend/App E2E.

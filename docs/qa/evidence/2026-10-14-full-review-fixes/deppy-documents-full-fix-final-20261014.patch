@@ -1,0 +1,2445 @@
+--- a/crates/app/src/document_io.rs
++++ b/crates/app/src/document_io.rs
+@@ -113,14 +113,19 @@
+ pub struct DocumentRevision {
+     modified: std::time::SystemTime,
+     len: u64,
+-    #[cfg(unix)]
++    #[cfg(any(unix, windows))]
+     device: u64,
+-    #[cfg(unix)]
++    #[cfg(any(unix, windows))]
+     inode: u64,
+ }
+ 
+ impl DocumentRevision {
+-    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, DocumentIoErrorCode> {
++    fn from_file_metadata(
++        file: &std::fs::File,
++        metadata: &std::fs::Metadata,
++    ) -> Result<Self, DocumentIoErrorCode> {
++        #[cfg(not(windows))]
++        let _ = file;
+         let modified = metadata
+             .modified()
+             .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
+@@ -134,7 +139,31 @@
+                 inode: metadata.ino(),
+             })
+         }
+-        #[cfg(not(unix))]
++        #[cfg(windows)]
++        {
++            use std::os::windows::io::AsRawHandle as _;
++            use windows_sys::Win32::Storage::FileSystem::{
++                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
++            };
++            let mut identity = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
++            // SAFETY: the open handle remains live and the API writes the whole
++            // information structure only on success; no uninitialized read occurs.
++            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), identity.as_mut_ptr()) }
++                == 0
++            {
++                return Err(DocumentIoErrorCode::MetadataFailed);
++            }
++            // SAFETY: the successful API call initialized every field.
++            let identity = unsafe { identity.assume_init() };
++            Ok(Self {
++                modified,
++                len: metadata.len(),
++                device: u64::from(identity.dwVolumeSerialNumber),
++                inode: (u64::from(identity.nFileIndexHigh) << 32)
++                    | u64::from(identity.nFileIndexLow),
++            })
++        }
++        #[cfg(not(any(unix, windows)))]
+         {
+             Ok(Self {
+                 modified,
+@@ -199,15 +228,37 @@
+     },
+ }
+ 
+-/// 상한까지만 읽는다. 상한을 넘는 파일은 본문을 아예 읽지 않고 크기만 돌려준다.
+-fn read_document_bounded(path: &Path) -> Result<RawRead, DocumentIoErrorCode> {
+-    let mut file = std::fs::File::open(path).map_err(|error| {
++/// Open before checking the handle's type, without waiting for a FIFO peer.
++/// Following ordinary symlinks is intentional; save resolves and revalidates
++/// the same regular target rather than replacing the link entry.
++fn open_document_file(path: &Path) -> Result<std::fs::File, DocumentIoErrorCode> {
++    let mut options = std::fs::OpenOptions::new();
++    options.read(true);
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::OpenOptionsExt as _;
++        options.custom_flags(libc::O_NONBLOCK);
++    }
++    let file = options.open(path).map_err(|error| {
+         if error.kind() == std::io::ErrorKind::NotFound {
+             DocumentIoErrorCode::NotFound
+         } else {
+             DocumentIoErrorCode::ReadFailed
+         }
+     })?;
++    if !file
++        .metadata()
++        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?
++        .is_file()
++    {
++        return Err(DocumentIoErrorCode::FileTypeInvalid);
++    }
++    Ok(file)
++}
++
++/// 상한까지만 읽는다. 상한을 넘는 파일은 본문을 아예 읽지 않고 크기만 돌려준다.
++fn read_document_bounded(path: &Path) -> Result<RawRead, DocumentIoErrorCode> {
++    let mut file = open_document_file(path)?;
+     let opened = file
+         .metadata()
+         .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
+@@ -235,11 +286,14 @@
+     let after = file
+         .metadata()
+         .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
+-    if after.len() != bytes.len() as u64 {
++    if after.len() != bytes.len() as u64
++        || DocumentRevision::from_file_metadata(&file, &opened)?
++            != DocumentRevision::from_file_metadata(&file, &after)?
++    {
+         return Err(DocumentIoErrorCode::Changed);
+     }
+ 
+-    let revision = DocumentRevision::from_metadata(&after)?;
++    let revision = DocumentRevision::from_file_metadata(&file, &after)?;
+     Ok(RawRead::Content { bytes, revision })
+ }
+ 
+@@ -277,17 +331,11 @@
+ 
+ /// 저장 직전 다시 읽는 현재 revision(내용은 읽지 않는다).
+ fn current_revision(path: &Path) -> Result<DocumentRevision, DocumentIoErrorCode> {
+-    let metadata = std::fs::metadata(path).map_err(|error| {
+-        if error.kind() == std::io::ErrorKind::NotFound {
+-            DocumentIoErrorCode::NotFound
+-        } else {
+-            DocumentIoErrorCode::MetadataFailed
+-        }
+-    })?;
+-    if !metadata.is_file() {
+-        return Err(DocumentIoErrorCode::FileTypeInvalid);
+-    }
+-    DocumentRevision::from_metadata(&metadata)
++    let file = open_document_file(path)?;
++    let metadata = file
++        .metadata()
++        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
++    DocumentRevision::from_file_metadata(&file, &metadata)
+ }
+ 
+ struct TempFileGuard(Option<PathBuf>);
+@@ -309,7 +357,22 @@
+ /// 같은 디렉터리에 임시 파일을 flush한 뒤 atomic replace한다. 실패 시 대상 파일은
+ /// 절대 건드리지 않는다 — rename은 한 번만, 임시 파일이 완전히 쓰이고 sync된 뒤에만
+ /// 호출한다.
+-fn atomic_write_document(path: &Path, contents: &[u8]) -> Result<(), DocumentIoErrorCode> {
++enum DocumentCommitError {
++    Conflict,
++    Io(DocumentIoErrorCode),
++}
++
++impl From<DocumentIoErrorCode> for DocumentCommitError {
++    fn from(code: DocumentIoErrorCode) -> Self {
++        Self::Io(code)
++    }
++}
++
++fn atomic_write_document(
++    path: &Path,
++    contents: &[u8],
++    validate_commit: impl FnOnce() -> bool,
++) -> Result<DocumentRevision, DocumentCommitError> {
+     let parent = path.parent().ok_or(DocumentIoErrorCode::ParentMissing)?;
+     let file_name = path
+         .file_name()
+@@ -337,8 +400,18 @@
+         .map_err(|_| DocumentIoErrorCode::TempWriteFailed)?;
+     file.sync_all()
+         .map_err(|_| DocumentIoErrorCode::TempSyncFailed)?;
++    let written_metadata = file
++        .metadata()
++        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
++    let written_revision = DocumentRevision::from_file_metadata(&file, &written_metadata)?;
+     drop(file);
+ 
++    // This checks after write+sync, when the expensive work is complete. Ordinary
++    // filesystem rename has no compare-and-swap against an unrelated writer:
++    // changes after this final check still require cooperation from that writer.
++    if !validate_commit() {
++        return Err(DocumentCommitError::Conflict);
++    }
+     atomic_replace(&temp, path).map_err(|_| DocumentIoErrorCode::ReplaceFailed)?;
+     guard.disarm();
+ 
+@@ -348,7 +421,7 @@
+     {
+         let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
+     }
+-    Ok(())
++    Ok(written_revision)
+ }
+ 
+ #[cfg(unix)]
+@@ -435,12 +508,32 @@
+         }
+     }
+ 
+-    let outcome = match atomic_write_document(&request.path, request.contents.as_bytes()) {
+-        Ok(()) => match current_revision(&request.path) {
+-            Ok(revision) => DocumentSaveOutcome::Saved { revision },
+-            Err(code) => DocumentSaveOutcome::Failed { code },
+-        },
+-        Err(code) => DocumentSaveOutcome::Failed { code },
++    // Resolve symlinks to the object loaded above. Revalidate both the alias and
++    // resolved path before commit, so a retargeted alias never redirects saving.
++    let target = match std::fs::canonicalize(&request.path) {
++        Ok(target) => target,
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
++            return DocumentSaveOutcome::Conflict;
++        }
++        Err(_) => {
++            return DocumentSaveOutcome::Failed {
++                code: DocumentIoErrorCode::MetadataFailed,
++            };
++        }
++    };
++    let expected = request.expected_revision;
++    let validate = || {
++        current_revision(&request.path) == Ok(expected) && current_revision(&target) == Ok(expected)
++    };
++    if !validate() {
++        return DocumentSaveOutcome::Conflict;
++    }
++    let outcome = match atomic_write_document(&target, request.contents.as_bytes(), validate) {
++        // The expected revision must describe our written object, not a later
++        // external edit observed after rename. That later edit conflicts next time.
++        Ok(revision) => DocumentSaveOutcome::Saved { revision },
++        Err(DocumentCommitError::Conflict) => DocumentSaveOutcome::Conflict,
++        Err(DocumentCommitError::Io(code)) => DocumentSaveOutcome::Failed { code },
+     };
+     if let DocumentSaveOutcome::Failed { code } = &outcome {
+         tracing::warn!(
+@@ -456,6 +549,176 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[cfg(unix)]
++    #[test]
++    fn full_fix_20261014_document_fifo_does_not_block_load_lane() {
++        use std::os::unix::fs::OpenOptionsExt as _;
++        use std::time::{Duration, Instant};
++        let dir = unique_dir("fifo-lane");
++        let fifo = dir.join("blocked.md");
++        let regular = write_file(&dir, "normal.md", b"normal document");
++        let native = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
++        // SAFETY: the private fixture path is a valid NUL-terminated string.
++        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
++        let mut worker = crate::lazy_worker::LazyBoundedWorker::new(
++            "document-fifo-regression",
++            Duration::from_secs(30),
++            || |request: DocumentLoadRequest| load_document(&request),
++            || {},
++        );
++        worker
++            .try_request(DocumentLoadRequest { path: fifo.clone() })
++            .unwrap();
++        let until = Instant::now() + Duration::from_millis(250);
++        let early = loop {
++            if let Some(result) = worker.try_recv() {
++                break Some(result.into_result().unwrap());
++            }
++            if Instant::now() >= until {
++                break None;
++            }
++            std::thread::sleep(Duration::from_millis(2));
++        };
++        if early.is_none() {
++            // Release the old blocking reader before asserting RED; never leave
++            // a lane or Drop::join waiting on this fixture.
++            let writer = std::fs::OpenOptions::new()
++                .write(true)
++                .custom_flags(libc::O_NONBLOCK)
++                .open(&fifo)
++                .unwrap();
++            let until = Instant::now() + Duration::from_secs(2);
++            loop {
++                if worker.try_recv().is_some() {
++                    break;
++                }
++                assert!(
++                    Instant::now() < until,
++                    "FIFO fixture reader did not release"
++                );
++                std::thread::sleep(Duration::from_millis(2));
++            }
++            drop(writer);
++        }
++        worker
++            .try_request(DocumentLoadRequest { path: regular })
++            .unwrap();
++        let until = Instant::now() + Duration::from_secs(2);
++        loop {
++            if let Some(result) = worker.try_recv() {
++                assert!(matches!(
++                    result.into_result().unwrap(),
++                    DocumentLoadOutcome::Loaded { .. }
++                ));
++                break;
++            }
++            assert!(Instant::now() < until, "normal load did not finish");
++            std::thread::sleep(Duration::from_millis(2));
++        }
++        drop(worker);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(
++            matches!(
++                early,
++                Some(DocumentLoadOutcome::Failed {
++                    code: DocumentIoErrorCode::FileTypeInvalid
++                })
++            ),
++            "FIFO must be rejected before opening a writer"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn full_fix_20261014_document_symlink_save_preserves_loaded_target() {
++        let dir = unique_dir("symlink-target");
++        let target = write_file(&dir, "target.md", b"old source");
++        let alias = dir.join("alias.md");
++        std::os::unix::fs::symlink("target.md", &alias).unwrap();
++        let DocumentLoadOutcome::Loaded { revision, .. } = load_document(&DocumentLoadRequest {
++            path: alias.clone(),
++        }) else {
++            panic!("load failed");
++        };
++        let outcome = save_document(DocumentSaveRequest {
++            path: alias.clone(),
++            contents: "new source".into(),
++            expected_revision: revision,
++        });
++        let link_preserved = std::fs::symlink_metadata(&alias)
++            .unwrap()
++            .file_type()
++            .is_symlink();
++        let target_bytes = std::fs::read(&target).unwrap();
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(matches!(outcome, DocumentSaveOutcome::Saved { .. }));
++        assert!(link_preserved, "saving must preserve an admitted symlink");
++        assert_eq!(target_bytes, b"new source");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_external_edit_during_temp_write_conflicts() {
++        use std::time::{Duration, Instant};
++        let dir = unique_dir("save-race");
++        let target = write_file(&dir, "doc.md", b"original");
++        let DocumentLoadOutcome::Loaded { revision, .. } = load_document(&DocumentLoadRequest {
++            path: target.clone(),
++        }) else {
++            panic!("load failed");
++        };
++        let observer_dir = dir.clone();
++        let observer_target = target.clone();
++        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
++        let observer = std::thread::spawn(move || {
++            ready_tx.send(()).unwrap();
++            let until = Instant::now() + Duration::from_secs(2);
++            loop {
++                let has_temp = || {
++                    std::fs::read_dir(&observer_dir)
++                        .unwrap()
++                        .filter_map(Result::ok)
++                        .any(|entry| {
++                            entry
++                                .file_name()
++                                .to_string_lossy()
++                                .contains("deppy-doc-tmp")
++                        })
++                };
++                if has_temp() {
++                    std::fs::write(
++                        &observer_target,
++                        b"external edit after initial revision check",
++                    )
++                    .unwrap();
++                    return has_temp();
++                }
++                assert!(
++                    Instant::now() < until,
++                    "temp-write race fixture was not reached"
++                );
++                std::thread::yield_now();
++            }
++        });
++        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
++        let outcome = save_document(DocumentSaveRequest {
++            path: target.clone(),
++            contents: "n".repeat(DOCUMENT_REFUSE_BYTES_MAX as usize),
++            expected_revision: revision,
++        });
++        let before_commit = observer.join().unwrap();
++        let bytes = std::fs::read(&target).unwrap();
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(
++            before_commit,
++            "external edit must finish before commit for this regression"
++        );
++        assert!(
++            matches!(outcome, DocumentSaveOutcome::Conflict),
++            "concurrent edit must return Conflict: {outcome:?}"
++        );
++        assert_eq!(bytes, b"external edit after initial revision check");
++    }
+ 
+     fn unique_dir(label: &str) -> PathBuf {
+         let dir = std::env::temp_dir().join(format!(
+--- a/crates/app/src/session_aux.rs
++++ b/crates/app/src/session_aux.rs
+@@ -2,7 +2,10 @@
+ use crate::ui;
+ use deppy_core::SessionId;
+ use runtime::MuxPaneId;
+-use std::{collections::HashMap, path::PathBuf};
++use std::{
++    collections::{HashMap, HashSet},
++    path::PathBuf,
++};
+ 
+ #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+ pub(crate) struct SessionAuxScope {
+@@ -70,6 +73,7 @@
+     pub owner: Option<SessionAuxScope>,
+     pub current: SessionAuxView,
+     parked: HashMap<SessionAuxScope, SessionAuxView>,
++    dead_document_owners: HashSet<SessionAuxScope>,
+ }
+ impl SessionAuxViews {
+     pub fn switch(&mut self, owner: SessionAuxScope) {
+@@ -88,6 +92,37 @@
+             view.close_document(id);
+         }
+     }
++    pub fn document_owners(&self) -> impl Iterator<Item = (&SessionAuxScope, &SessionAuxView)> {
++        self.owner
++            .as_ref()
++            .map(|owner| (owner, &self.current))
++            .into_iter()
++            .chain(self.parked.iter())
++    }
++    pub fn document_has_dead_owner(&self, id: ui::workspace::DocumentTabId) -> bool {
++        self.document_owners().any(|(scope, view)| {
++            self.dead_document_owners.contains(scope) && view.document_ids.contains(&id)
++        })
++    }
++    /// An explicit reopen transfers just this retained document. Merely switching
++    /// sessions never imports another owner's tabs, and live owners are excluded.
++    pub fn recover_document(&mut self, id: ui::workspace::DocumentTabId) -> bool {
++        let old = self.parked.iter().find_map(|(scope, view)| {
++            (self.dead_document_owners.contains(scope) && view.document_ids.contains(&id))
++                .then(|| scope.clone())
++        });
++        let Some(old) = old else {
++            return false;
++        };
++        self.parked.get_mut(&old).unwrap().close_document(id);
++        if !self.current.document_ids.contains(&id) {
++            self.current.document_ids.push(id);
++        }
++        self.current.active_document = Some(id);
++        self.current.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
++        self.current.aux_search.reset();
++        true
++    }
+     pub fn git_result_owner(&mut self, generation: u64) -> Option<&mut SessionAuxView> {
+         if self.current.owns_git_generation(generation) {
+             return Some(&mut self.current);
+@@ -105,7 +140,14 @@
+             .find(|view| view.transcript_generation == Some(generation))
+     }
+     pub fn retain_live(&mut self, mut live: impl FnMut(&SessionAuxScope) -> bool) {
+-        // Keep edited/open documents reachable until explicitly closed, under the global buffer cap.
++        self.dead_document_owners = self
++            .document_owners()
++            .filter_map(|(scope, view)| {
++                (!view.document_ids.is_empty() && !live(scope)).then(|| scope.clone())
++            })
++            .collect();
++        // Retain dead-owner buffers for explicit reopen; do not implicitly share
++        // them with a newly focused live session.
+         self.parked
+             .retain(|scope, view| !view.document_ids.is_empty() || live(scope));
+     }
+@@ -173,6 +215,34 @@
+         );
+         assert!(views.current.document_ids.is_empty());
+     }
++
++    #[test]
++    fn full_fix_20261014_document_explicit_recovery_excludes_live_owner() {
++        let mut views = SessionAuxViews::default();
++        let old = scope(1, 1);
++        let current = scope(1, 2);
++        let id = ui::workspace::DocumentTabId(7);
++        views.switch(old.clone());
++        views.current.document_ids = vec![id];
++        views.current.active_document = Some(id);
++        views.switch(current.clone());
++        views.retain_live(|_| true);
++        assert!(!views.document_has_dead_owner(id));
++        assert!(!views.recover_document(id));
++        assert!(
++            views.current.document_ids.is_empty(),
++            "live sessions must remain independent"
++        );
++        views.retain_live(|scope| scope == &current);
++        assert!(views.document_has_dead_owner(id));
++        assert!(views.recover_document(id));
++        assert_eq!(views.current.document_ids, [id]);
++        views.switch(old);
++        assert!(
++            views.current.document_ids.is_empty(),
++            "recovery moves one owner instead of sharing the buffer"
++        );
++    }
+     #[test]
+     fn git_results_drop_only_when_the_same_kind_is_reissued() {
+         let mut views = SessionAuxViews::default();
+--- a/crates/app/src/ui/document.rs
++++ b/crates/app/src/ui/document.rs
+@@ -265,7 +265,53 @@
+ /// 모드를 오갈 때마다 커서와 undo 기록이 따로 놀았다(2026-08-23 리뷰). 게다가 App이
+ /// 그 조합을 역산하는 취약한 공식을 들고 있어야 했다.
+ pub fn source_editor(ui: &mut egui::Ui, id: egui::Id, source: &mut String, editable: bool) -> bool {
+-    egui::ScrollArea::vertical()
++    source_editor_with_budget(
++        ui,
++        id,
++        source,
++        editable,
++        crate::document_io::DOCUMENT_REFUSE_BYTES_MAX as usize,
++    )
++    .0
++}
++
++/// App supplies the remaining global source+saved-source budget. A buffer adapter
++/// enforces UTF-8 bytes for paste, IME, ordinary input and undo/redo replacement.
++/// Overflow-only snapshots preserve selection and undo without cloning idle text.
++pub(crate) fn source_editor_with_budget(
++    ui: &mut egui::Ui,
++    id: egui::Id,
++    source: &mut String,
++    editable: bool,
++    max_bytes: usize,
++) -> (bool, bool) {
++    super::text_input::initialize_bounded_undo(ui.ctx(), id);
++    // TextEdit may acquire keyboard focus during this frame. The rare overflow
++    // event, rather than the previous frame's focus, controls rollback capture.
++    let needs_backup = editable && ui.input(|input| {
++        let incoming = input.events.iter().map(|event| match event {
++            egui::Event::Text(text) | egui::Event::Paste(text)
++            | egui::Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text)) => text.len(),
++            egui::Event::Key { key: egui::Key::Enter | egui::Key::Tab, pressed: true, .. } => 1,
++            _ => 0,
++        }).fold(0usize, usize::saturating_add);
++        let undo = input.events.iter().any(|event| matches!(event,
++            egui::Event::Key { key: egui::Key::Z | egui::Key::Y, pressed: true, modifiers, .. } if modifiers.command));
++        incoming > max_bytes.saturating_sub(source.len()) || undo
++    });
++    let backup = needs_backup.then(|| source.clone());
++    let state = needs_backup
++        .then(|| egui::TextEdit::load_state(ui.ctx(), id))
++        .flatten();
++    let undo_history = state.as_ref().map(|state| state.undoer());
++    let mut rejected = false;
++    let mut buffer = super::text_input::BoundedTextBuffer {
++        text: source,
++        max_bytes,
++        rejected: &mut rejected,
++        normalize_nfc: false,
++    };
++    let changed = egui::ScrollArea::vertical()
+         .auto_shrink([false, false])
+         .show(ui, |ui| {
+             // 원문은 **고정폭**이어야 한다 — `TextEdit`의 기본은 비례 폰트라 표·
+@@ -273,7 +319,7 @@
+             let font = egui::TextStyle::Monospace.resolve(ui.style());
+             let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
+             ui.add(
+-                egui::TextEdit::multiline(source)
++                egui::TextEdit::multiline(&mut buffer)
+                     .id(id)
+                     .interactive(editable)
+                     .font(font.clone())
+@@ -311,12 +357,231 @@
+             )
+         })
+         .inner
+-        .changed()
++        .changed();
++    if rejected {
++        if let Some(original) = backup {
++            *source = original;
++        }
++        if let Some(mut state) = state {
++            if let Some(history) = undo_history {
++                state.set_undoer(history);
++            }
++            state.store(ui.ctx(), id);
++        }
++        ui.ctx().request_repaint();
++    }
++    (changed && !rejected, rejected)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    fn run_budget_editor(
++        ctx: &egui::Context,
++        id: egui::Id,
++        source: &mut String,
++        max_bytes: usize,
++        events: Vec<egui::Event>,
++    ) -> (bool, bool) {
++        let mut result = (false, false);
++        let mut output = ctx.run_ui(
++            egui::RawInput {
++                screen_rect: Some(egui::Rect::from_min_size(
++                    egui::Pos2::ZERO,
++                    egui::vec2(900.0, 700.0),
++                )),
++                events,
++                ..Default::default()
++            },
++            |ui| {
++                result = source_editor_with_budget(ui, id, source, true, max_bytes);
++            },
++        );
++        output.textures_delta.clear();
++        result
++    }
++
++    fn select_editor_source(ctx: &egui::Context, id: egui::Id, source: &str) {
++        ctx.memory_mut(|memory| memory.request_focus(id));
++        let mut state = egui::TextEdit::load_state(ctx, id).unwrap();
++        state
++            .cursor
++            .set_char_range(Some(egui::text::CCursorRange::two(
++                egui::text::CCursor::new(0),
++                egui::text::CCursor::new(source.chars().count()),
++            )));
++        state.store(ctx, id);
++    }
++
++    #[test]
++    fn full_fix_20261014_document_editor_budget_measures_utf8_bytes() {
++        let ctx = egui::Context::default();
++        let id = egui::Id::new("utf8-budget");
++        let mut source = String::new();
++        run_budget_editor(&ctx, id, &mut source, 8, vec![]);
++        select_editor_source(&ctx, id, &source);
++        assert_eq!(
++            run_budget_editor(
++                &ctx,
++                id,
++                &mut source,
++                8,
++                vec![egui::Event::Paste("한글가".into())]
++            ),
++            (false, true)
++        );
++        assert!(
++            source.is_empty(),
++            "three Unicode characters exceed an eight-byte budget"
++        );
++        assert_eq!(
++            run_budget_editor(
++                &ctx,
++                id,
++                &mut source,
++                8,
++                vec![egui::Event::Text("한글".into())]
++            ),
++            (true, false)
++        );
++        assert_eq!(source, "한글");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_editor_allows_replacement_within_byte_budget() {
++        let ctx = egui::Context::default();
++        let id = egui::Id::new("selection-budget");
++        let mut source = "abc".to_owned();
++        run_budget_editor(&ctx, id, &mut source, 3, vec![]);
++        select_editor_source(&ctx, id, &source);
++        assert_eq!(
++            run_budget_editor(
++                &ctx,
++                id,
++                &mut source,
++                3,
++                vec![egui::Event::Paste("한".into())]
++            ),
++            (true, false)
++        );
++        assert_eq!(source, "한");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_editor_ime_rejection_preserves_preedit_selection() {
++        let ctx = egui::Context::default();
++        let id = egui::Id::new("ime-budget");
++        let mut source = "ab".to_owned();
++        run_budget_editor(&ctx, id, &mut source, 2, vec![]);
++        select_editor_source(&ctx, id, &source);
++        assert_eq!(
++            run_budget_editor(
++                &ctx,
++                id,
++                &mut source,
++                2,
++                vec![egui::Event::Ime(egui::ImeEvent::Preedit {
++                    text: "한".into(),
++                    active_range_chars: None
++                })]
++            ),
++            (false, true)
++        );
++        assert_eq!(source, "ab");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo() {
++        let ctx = egui::Context::default();
++        let id = egui::Id::new("undo-budget");
++        let mut source = "ok".to_owned();
++        run_budget_editor(&ctx, id, &mut source, 8, vec![]);
++        select_editor_source(&ctx, id, &source);
++        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
++        let cursor = state.cursor.char_range().unwrap();
++        let mut history = egui::util::undoer::Undoer::default();
++        history.feed_state(0.0, &(cursor, "original".to_owned()));
++        history.feed_state(1.0, &(cursor, "ok".to_owned()));
++        history.feed_state(2.0, &(cursor, "ok".to_owned()));
++        assert_eq!(
++            history.clone().undo(&(cursor, source.clone())).unwrap().1,
++            "original",
++            "the actual undo target must exceed the new byte budget"
++        );
++        state.set_undoer(history);
++        state.store(&ctx, id);
++        let result = run_budget_editor(
++            &ctx,
++            id,
++            &mut source,
++            2,
++            vec![egui::Event::Key {
++                key: egui::Key::Z,
++                physical_key: None,
++                pressed: true,
++                repeat: false,
++                modifiers: egui::Modifiers::COMMAND,
++            }],
++        );
++        assert_eq!(result, (false, true));
++        assert_eq!(
++            source, "ok",
++            "undo cannot exceed the remaining aggregate byte budget"
++        );
++        let state = egui::TextEdit::load_state(&ctx, id).unwrap();
++        assert_eq!(state.cursor.char_range(), Some(cursor));
++        assert_eq!(
++            state.undoer().undo(&(cursor, source.clone())).unwrap().1,
++            "original",
++            "a rejected undo preserves its original history for a later larger budget"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_document_oversized_paste_preserves_selection() {
++        let ctx = egui::Context::default();
++        let id = egui::Id::new("document-byte-budget-regression");
++        let mut source = "keep my selected text".to_owned();
++        let run = |source: &mut String, events| {
++            let mut output = ctx.run_ui(
++                egui::RawInput {
++                    screen_rect: Some(egui::Rect::from_min_size(
++                        egui::Pos2::ZERO,
++                        egui::vec2(900.0, 700.0),
++                    )),
++                    events,
++                    ..Default::default()
++                },
++                |ui| {
++                    source_editor(ui, id, source, true);
++                },
++            );
++            output.textures_delta.clear();
++        };
++        run(&mut source, vec![]);
++        ctx.memory_mut(|memory| memory.request_focus(id));
++        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
++        state
++            .cursor
++            .set_char_range(Some(egui::text::CCursorRange::two(
++                egui::text::CCursor::new(0),
++                egui::text::CCursor::new(source.chars().count()),
++            )));
++        state.store(&ctx, id);
++        let payload = "a\n".repeat(9 * 1024 * 1024 / 2);
++        let start = std::time::Instant::now();
++        run(&mut source, vec![egui::Event::Paste(payload)]);
++        eprintln!(
++            "oversized paste: retained={} elapsed={:?}",
++            source.len(),
++            start.elapsed()
++        );
++        assert_eq!(
++            source, "keep my selected text",
++            "rejected paste must preserve existing selection"
++        );
++    }
+ 
+     fn snapshot(
+         mode: DocumentViewMode,
+--- a/crates/app/src/ui/workspace.rs
++++ b/crates/app/src/ui/workspace.rs
+@@ -8968,6 +8968,15 @@
+         self.send(RuntimeCommand::ClosePane { pane });
+     }
+ 
++    pub(crate) fn submit_document_resolved_close(&mut self, command: RuntimeCommand) -> bool {
++        matches!(
++            command,
++            RuntimeCommand::ClosePane { .. }
++                | RuntimeCommand::CloseTab { .. }
++                | RuntimeCommand::KillSession { .. }
++        ) && self.send_keep_selection(command)
++    }
++
+     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
+     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
+     /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
+@@ -11212,6 +11221,34 @@
+     }
+ 
+     #[test]
++    fn full_fix_20261014_document_resolved_close_admission_retries_after_queue_full() {
++        let mut ui = WorkspaceUi::new();
++        for index in 0..WORKSPACE_PROTOCOL_CAP {
++            ui.queue_protocol_intent(RuntimeCommand::Scroll {
++                session: SessionId(index as u64 + 20),
++                delta: 1,
++            })
++            .unwrap();
++        }
++        let close = RuntimeCommand::ClosePane {
++            pane: runtime::MuxPaneId("document-owner".into()),
++        };
++        assert!(!ui.submit_document_resolved_close(close.clone()));
++        let queued = drain_protocol(&mut ui);
++        assert_eq!(queued.len(), WORKSPACE_PROTOCOL_CAP);
++        assert!(
++            !queued
++                .iter()
++                .any(|command| matches!(command, RuntimeCommand::ClosePane { .. }))
++        );
++        assert!(ui.submit_document_resolved_close(close));
++        assert!(
++            matches!(drain_protocol(&mut ui).as_slice(), [RuntimeCommand::ClosePane { pane }] if pane.0 == "document-owner")
++        );
++        assert!(drain_protocol(&mut ui).is_empty());
++    }
++
++    #[test]
+     fn popup_review_pending_session_close_blocks_global_keys_before_modal_render() {
+         let ctx = egui::Context::default();
+         let catalog = i18n::Catalog::load("en-US").unwrap();
+--- a/crates/app/src/folder_identity.rs
++++ b/crates/app/src/folder_identity.rs
+@@ -5,6 +5,25 @@
+ pub(crate) struct FolderIdentity {
+     pub anchor: storage::WorkspaceFolderAnchor,
+     pub volume: Option<uuid::Uuid>,
++}
++
++/// Directory validity is required on every platform; a Unix relocation anchor
++/// is only available where that identity format is supported.
++pub(crate) fn selected_folder(path: &Path) -> Result<Option<FolderIdentity>, ()> {
++    #[cfg(unix)]
++    {
++        probe(path).map(Some).ok_or(())
++    }
++    #[cfg(not(unix))]
++    {
++        unanchored_directory(path)
++    }
++}
++
++#[cfg(any(not(unix), test))]
++fn unanchored_directory(path: &Path) -> Result<Option<FolderIdentity>, ()> {
++    let metadata = std::fs::metadata(path).map_err(|_| ())?;
++    if metadata.is_dir() { Ok(None) } else { Err(()) }
+ }
+ 
+ #[cfg(unix)]
+@@ -99,6 +118,21 @@
+     use super::*;
+ 
+     #[test]
++    fn full_fix_20261014_document_portable_folder_validation_does_not_require_anchor() {
++        let root =
++            std::env::temp_dir().join(format!("deppy-portable-folder-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir(&root).unwrap();
++        std::fs::write(root.join("file"), "fixture").unwrap();
++        let directory = unanchored_directory(&root);
++        let file = unanchored_directory(&root.join("file"));
++        let missing = unanchored_directory(&root.join("missing"));
++        std::fs::remove_dir_all(&root).unwrap();
++        assert_eq!(directory, Ok(None));
++        assert_eq!(file, Err(()));
++        assert_eq!(missing, Err(()));
++    }
++
++    #[test]
+     fn popup_review_fifo_is_rejected_without_waiting_for_a_writer() {
+         use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+         let root = std::env::temp_dir().join(format!("deppy-volume-fifo-{}", uuid::Uuid::new_v4()));
+--- a/crates/app/src/app.rs
++++ b/crates/app/src/app.rs
+@@ -5378,10 +5378,8 @@
+                 let identity = if path_string.trim().is_empty() {
+                     None
+                 } else {
+-                    Some(
+-                        crate::folder_identity::probe(&path)
+-                            .ok_or(SettingsErrorCode::ProjectPath)?,
+-                    )
++                    crate::folder_identity::selected_folder(&path)
++                        .map_err(|_| SettingsErrorCode::ProjectPath)?
+                 };
+                 db.set_workspace_path_and_anchor_with_volume(
+                     &workspace_id,
+@@ -10551,6 +10549,7 @@
+     /// 탭 설계) App 전역 슬롯 하나가 아니라 집합이다 — 서로 다른 문서 둘을 동시에
+     /// "저장 후 닫기"해도 서로의 continuation을 덮어쓰지 않는다.
+     document_close_after_save: std::collections::HashSet<ui::workspace::DocumentTabId>,
++    document_pending_scope_close: Option<PendingDocumentScopeClose>,
+     /// Markdown caches are keyed by unique DocumentTabId.
+     document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
+     document_image_worker: crate::markdown_image_io::ImageWorker,
+@@ -12373,6 +12372,7 @@
+     /// 문서 렌더러에서 panic이 난 뒤 같은 내용을 매 프레임 다시 그리다 앱 전체를
+     /// 종료하지 않도록 해당 탭만 안전 안내 화면으로 전환한다.
+     render_failed: bool,
++    input_limit_rejected: bool,
+ }
+ 
+ impl OpenDocument {
+@@ -12534,6 +12534,7 @@
+         | document_io::DocumentLoadOutcome::Failed { .. } => {}
+     }
+     document.save_error = None;
++    document.input_limit_rejected = false;
+     document.saved_feedback_until = None;
+     document.source_revision = document.source_revision.wrapping_add(1);
+ }
+@@ -12607,6 +12608,253 @@
+     SaveConflict { id: ui::workspace::DocumentTabId },
+ }
+ 
++#[derive(Debug, Clone)]
++enum DocumentScopeCloseTarget {
++    Runtime {
++        workspace_id: String,
++        runtime_instance: u64,
++        command: runtime::RuntimeCommand,
++    },
++    Workspace {
++        workspace_id: String,
++        runtime_instance: u64,
++    },
++    AppExit,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum DocumentScopeClosePhase {
++    Confirming,
++    Submitted,
++    Canceled,
++}
++
++#[derive(Debug)]
++struct PendingDocumentScopeClose {
++    target: DocumentScopeCloseTarget,
++    owners: Vec<crate::session_aux::SessionAuxScope>,
++    documents: Vec<ui::workspace::DocumentTabId>,
++    phase: DocumentScopeClosePhase,
++}
++
++fn plan_document_scope_close(
++    documents: &[OpenDocument],
++    views: &crate::session_aux::SessionAuxViews,
++    target: DocumentScopeCloseTarget,
++    mux: Option<&runtime::MuxSnapshot>,
++) -> Option<PendingDocumentScopeClose> {
++    let mut owners = Vec::new();
++    let mut protected_documents = Vec::new();
++    for (scope, view) in views.document_owners() {
++        if !document_scope_matches_close(scope, &target, mux) {
++            continue;
++        }
++        if let DocumentScopeCloseTarget::Runtime {
++            workspace_id,
++            runtime_instance,
++            ..
++        } = &target
++            && !document_scope_owner_is_live(scope, workspace_id, *runtime_instance, mux)
++        {
++            continue;
++        }
++        let protected: Vec<_> = view
++            .document_ids
++            .iter()
++            .copied()
++            .filter(|id| {
++                documents
++                    .iter()
++                    .any(|document| document.id == *id && (document.dirty || document.saving))
++            })
++            .collect();
++        if !protected.is_empty() {
++            owners.push(scope.clone());
++            protected_documents.extend(protected);
++        }
++    }
++    (!protected_documents.is_empty()).then_some(PendingDocumentScopeClose {
++        target,
++        owners,
++        documents: protected_documents,
++        phase: DocumentScopeClosePhase::Confirming,
++    })
++}
++
++#[derive(Debug, PartialEq, Eq)]
++enum DocumentScopeCloseReadiness {
++    Canceled,
++    Waiting,
++    Ready,
++}
++
++fn document_scope_close_readiness(
++    pending: &PendingDocumentScopeClose,
++    documents: &[OpenDocument],
++    mut owner_valid: impl FnMut(&crate::session_aux::SessionAuxScope) -> bool,
++) -> DocumentScopeCloseReadiness {
++    if pending.phase == DocumentScopeClosePhase::Canceled {
++        return DocumentScopeCloseReadiness::Canceled;
++    }
++    if !matches!(pending.target, DocumentScopeCloseTarget::AppExit)
++        && !pending.owners.iter().all(&mut owner_valid)
++    {
++        return DocumentScopeCloseReadiness::Canceled;
++    }
++    if pending.documents.iter().any(|id| {
++        documents
++            .iter()
++            .any(|document| document.id == *id && (document.dirty || document.saving))
++    }) {
++        DocumentScopeCloseReadiness::Waiting
++    } else {
++        DocumentScopeCloseReadiness::Ready
++    }
++}
++
++fn cancel_document_scope_close_state(
++    pending: &mut Option<PendingDocumentScopeClose>,
++    confirms: &mut std::collections::VecDeque<DocumentPendingConfirm>,
++    close_after_save: &mut std::collections::HashSet<ui::workspace::DocumentTabId>,
++) {
++    if let Some(mut closing) = pending.take() {
++        confirms.retain(|confirm| {
++            !matches!(confirm,
++            DocumentPendingConfirm::CloseWithDirty { id } if closing.documents.contains(id))
++        });
++        for id in &closing.documents {
++            close_after_save.remove(id);
++        }
++        // A submitted command still owns an entry in the normal controller/protocol
++        // lane. Keep its fence as a tombstone until final delivery drops that entry.
++        if closing.phase != DocumentScopeClosePhase::Confirming {
++            closing.phase = DocumentScopeClosePhase::Canceled;
++            *pending = Some(closing);
++        }
++    }
++}
++
++#[derive(Clone, Copy)]
++enum DocumentScopeCloseHandoff<'a> {
++    Runtime {
++        runtime_instance: u64,
++        command: &'a runtime::RuntimeCommand,
++    },
++    Workspace(&'a str),
++}
++
++fn document_scope_close_handoff_matches(
++    pending: &PendingDocumentScopeClose,
++    handoff: DocumentScopeCloseHandoff<'_>,
++) -> bool {
++    match (&pending.target, handoff) {
++        (
++            DocumentScopeCloseTarget::Workspace { workspace_id, .. },
++            DocumentScopeCloseHandoff::Workspace(id),
++        ) => workspace_id == id,
++        (
++            DocumentScopeCloseTarget::Runtime {
++                runtime_instance,
++                command,
++                ..
++            },
++            DocumentScopeCloseHandoff::Runtime {
++                runtime_instance: instance,
++                command: submitted,
++            },
++        ) => {
++            *runtime_instance == instance
++                && match (command, submitted) {
++                    (
++                        runtime::RuntimeCommand::ClosePane { pane: a },
++                        runtime::RuntimeCommand::ClosePane { pane: b },
++                    ) => a == b,
++                    (
++                        runtime::RuntimeCommand::CloseTab { tab: a },
++                        runtime::RuntimeCommand::CloseTab { tab: b },
++                    ) => a == b,
++                    (
++                        runtime::RuntimeCommand::KillSession { session: a },
++                        runtime::RuntimeCommand::KillSession { session: b },
++                    ) => a == b,
++                    _ => false,
++                }
++        }
++        _ => false,
++    }
++}
++
++fn document_scope_close_handoff_is_stale(
++    pending: &mut Option<PendingDocumentScopeClose>,
++    handoff: DocumentScopeCloseHandoff<'_>,
++    owners_valid: bool,
++) -> bool {
++    if !pending.as_ref().is_some_and(|pending| {
++        pending.phase != DocumentScopeClosePhase::Confirming
++            && document_scope_close_handoff_matches(pending, handoff)
++    }) {
++        return false;
++    }
++    let pending = pending.take().unwrap();
++    pending.phase == DocumentScopeClosePhase::Canceled || !owners_valid
++}
++
++fn document_scope_matches_close(
++    scope: &crate::session_aux::SessionAuxScope,
++    target: &DocumentScopeCloseTarget,
++    mux: Option<&runtime::MuxSnapshot>,
++) -> bool {
++    match target {
++        DocumentScopeCloseTarget::AppExit => true,
++        DocumentScopeCloseTarget::Workspace {
++            workspace_id,
++            runtime_instance,
++        } => scope.workspace_id == *workspace_id && scope.runtime_instance == *runtime_instance,
++        DocumentScopeCloseTarget::Runtime {
++            workspace_id,
++            runtime_instance,
++            command,
++        } => {
++            if scope.workspace_id != *workspace_id || scope.runtime_instance != *runtime_instance {
++                return false;
++            }
++            match command {
++                runtime::RuntimeCommand::ClosePane { pane } => scope.pane.as_ref() == Some(pane),
++                runtime::RuntimeCommand::CloseTab { tab } => mux.is_some_and(|mux| {
++                    mux.tabs
++                        .iter()
++                        .filter(|item| item.id == *tab)
++                        .flat_map(|item| &item.panes)
++                        .any(|pane| {
++                            scope.pane.as_ref() == Some(&pane.id)
++                                && scope.session == pane.session_id
++                        })
++                }),
++                runtime::RuntimeCommand::KillSession { session } => scope.session == Some(*session),
++                _ => false,
++            }
++        }
++    }
++}
++
++fn document_scope_owner_is_live(
++    scope: &crate::session_aux::SessionAuxScope,
++    workspace_id: &str,
++    runtime_instance: u64,
++    mux: Option<&runtime::MuxSnapshot>,
++) -> bool {
++    scope.workspace_id == workspace_id
++        && scope.runtime_instance == runtime_instance
++        && scope.pane.as_ref().is_none_or(|id| {
++            mux.is_some_and(|mux| {
++                mux.tabs
++                    .iter()
++                    .flat_map(|tab| &tab.panes)
++                    .any(|pane| &pane.id == id && pane.session_id == scope.session)
++            })
++        })
++}
++
+ impl DocumentPendingConfirm {
+     /// 이 확인이 어느 문서에 대한 것인지 — 큐 중복 제거(`enqueue_document_pending_confirm`)와
+     /// 문서를 닫을 때 큐 정리(`close_document_entry`)가 공용으로 쓴다.
+@@ -12763,7 +13011,7 @@
+ /// 그 모드로 열린 적이 없으면 애초에 저장된 적이 없어 `remove`가 조용히 no-op이다.
+ fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
+     let editor_id = document_source_editor_id(document.id, &document.path);
+-    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(editor_id));
++    ui::text_input::forget_bounded_text_state(ctx, editor_id);
+ }
+ 
+ /// 문서가 닫힐 때 미리보기 쪽이 들고 있던 그 문서 몫의 상태도 지운다 — 가로 스크롤
+@@ -12809,10 +13057,43 @@
+         .map(|document| document.id)
+ }
+ 
++fn find_recoverable_document_by_path(
++    documents: &[OpenDocument],
++    views: &crate::session_aux::SessionAuxViews,
++    path: &Path,
++) -> Option<ui::workspace::DocumentTabId> {
++    find_open_document_by_path(
++        documents
++            .iter()
++            .filter(|document| views.document_has_dead_owner(document.id)),
++        path,
++    )
++}
++
+ fn retained_document_bytes(document: &OpenDocument) -> Option<u64> {
+     let source = u64::try_from(document.source.len()).ok()?;
+     let saved_source = u64::try_from(document.saved_source.len()).ok()?;
+     source.checked_add(saved_source)
++}
++
++fn document_source_byte_budget(
++    documents: &[OpenDocument],
++    id: ui::workspace::DocumentTabId,
++) -> usize {
++    let fixed = documents
++        .iter()
++        .try_fold(0u64, |total, document| {
++            let bytes = if document.id == id {
++                u64::try_from(document.saved_source.len()).ok()?
++            } else {
++                retained_document_bytes(document)?
++            };
++            total.checked_add(bytes)
++        })
++        .unwrap_or(u64::MAX);
++    DOCUMENT_TOTAL_RETAINED_BYTES_MAX
++        .saturating_sub(fixed)
++        .min(document_io::DOCUMENT_REFUSE_BYTES_MAX) as usize
+ }
+ 
+ #[derive(Debug, PartialEq, Eq)]
+@@ -17032,6 +17313,7 @@
+             document_save_worker,
+             document_pending_confirms: std::collections::VecDeque::new(),
+             document_close_after_save: std::collections::HashSet::new(),
++            document_pending_scope_close: None,
+             document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
+             document_image_worker: crate::markdown_image_io::new_worker(egui_ctx.clone()),
+             pending_document_open: None,
+@@ -20638,16 +20920,18 @@
+             std::iter::once(&self.active)
+                 .chain(self.warm.values())
+                 .any(|runtime| {
+-                    runtime.id == scope.workspace_id
+-                        && runtime.runtime_instance == scope.runtime_instance
+-                        && scope.pane.as_ref().is_none_or(|id| {
+-                            runtime.workspace_ui.mux().is_some_and(|mux| {
+-                                mux.tabs
+-                                    .iter()
+-                                    .flat_map(|t| &t.panes)
+-                                    .any(|p| &p.id == id && p.session_id == scope.session)
+-                            })
++                    let mux = runtime
++                        .pending_events
++                        .iter()
++                        .rev()
++                        .find_map(|event| match event {
++                            runtime::RuntimeEvent::MuxUpdated { snapshot } => {
++                                Some(snapshot.as_ref())
++                            }
++                            _ => None,
+                         })
++                        .or_else(|| runtime.workspace_ui.mux().map(|mux| mux.as_ref()));
++                    document_scope_owner_is_live(scope, &runtime.id, runtime.runtime_instance, mux)
+                 })
+         });
+     }
+@@ -21256,6 +21540,7 @@
+         let can_save = document.can_save();
+         let status_text = self.document_toolbar_status_text(id, text);
+         let load_state = document.load_state.clone();
++        let input_limit_rejected = document.input_limit_rejected;
+         let workspace_root = self.active_tree_root().unwrap_or_else(|| {
+             document
+                 .path
+@@ -21283,6 +21568,8 @@
+ 
+         let mut toolbar_action = None;
+         let mut editor_changed = false;
++        let source_byte_budget = document_source_byte_budget(&self.documents, id);
++        let mut editor_rejected = false;
+         let mut link_intent = None;
+         let mut split_width: Option<f32> = None;
+         let mut open_with_os_clicked = false;
+@@ -21308,6 +21595,13 @@
+                 // 헤더와 같은 면이고 본문은 다른 단이라, 선이 없어도 경계가 보인다.
+                 // 나란히 모드의 세로 분리선은 툴바 바로 아래(본문 시작)에서 시작한다.
+                 toolbar_separator_y = Some(ui.cursor().top());
++                if input_limit_rejected {
++                    ui::popup::notice(
++                        ui,
++                        &text.t("document.limit.input_rejected", &[]),
++                        ui::popup::NoticeTone::Error,
++                    );
++                }
+             }
+ 
+             match &load_state {
+@@ -21359,12 +21653,14 @@
+                     match mode {
+                         ui::document::DocumentViewMode::Source => {
+                             let editor_id = document_source_editor_id(document.id, &document.path);
+-                            editor_changed = ui::document::source_editor(
+-                                ui,
+-                                editor_id,
+-                                &mut document.source,
+-                                editable,
+-                            );
++                            (editor_changed, editor_rejected) =
++                                ui::document::source_editor_with_budget(
++                                    ui,
++                                    editor_id,
++                                    &mut document.source,
++                                    editable,
++                                    source_byte_budget,
++                                );
+                         }
+                         ui::document::DocumentViewMode::Preview => {
+                             link_intent = self.document_markdown_viewer.show(
+@@ -21402,12 +21698,14 @@
+                                 .find(|document| document.id == id)
+                                 .expect("checked above");
+                             let editor_id = document_source_editor_id(document.id, &document.path);
+-                            editor_changed = ui::document::source_editor(
+-                                &mut source_ui,
+-                                editor_id,
+-                                &mut document.source,
+-                                editable,
+-                            );
++                            (editor_changed, editor_rejected) =
++                                ui::document::source_editor_with_budget(
++                                    &mut source_ui,
++                                    editor_id,
++                                    &mut document.source,
++                                    editable,
++                                    source_byte_budget,
++                                );
+                             // Split은 같은 프레임에 source와 preview를 함께 그린다 —
+                             // `revision`(외부 스코프)이 다음 프레임에야 올라가면 방금 친
+                             // 글자가 이 프레임의 preview에는 반영되지 않는다(캐시 키가
+@@ -21512,6 +21810,11 @@
+         if editor_changed {
+             self.on_document_source_edited(id);
+         }
++        if editor_rejected {
++            if let Some(document) = self.documents.iter_mut().find(|document| document.id == id) {
++                document.input_limit_rejected = true;
++            }
++        }
+         if let Some(width) = split_width {
+             self.session_aux.current.document_tab_split_width = Some(width);
+         }
+@@ -21641,6 +21944,7 @@
+             return;
+         };
+         document.recompute_dirty();
++        document.input_limit_rejected = false;
+         document.save_error = None;
+         document.source_revision = document.source_revision.wrapping_add(1);
+     }
+@@ -21935,12 +22239,22 @@
+     /// 실행만 한다.
+     fn begin_document_open(&mut self, path: PathBuf) {
+         self.sync_session_aux_scope();
++        self.prune_session_aux_views();
+         if let Some(id) = find_open_document_by_path(
+             self.documents
+                 .iter()
+                 .filter(|d| self.session_aux.current.document_ids.contains(&d.id)),
+             &path,
+         ) {
++            self.activate_document_tab(id);
++            self.session_aux.current.document_cap_notice = false;
++            self.reveal_terminal_view_for_aux_tab();
++            return;
++        }
++        if let Some(id) =
++            find_recoverable_document_by_path(&self.documents, &self.session_aux, &path)
++            && self.session_aux.recover_document(id)
++        {
+             self.activate_document_tab(id);
+             self.session_aux.current.document_cap_notice = false;
+             self.reveal_terminal_view_for_aux_tab();
+@@ -21973,6 +22287,7 @@
+             view_only_byte_len: None,
+             source_revision: 0,
+             render_failed: false,
++            input_limit_rejected: false,
+         });
+         self.document_pending_loads.push_back((id, path));
+         self.session_aux.current.active_document = Some(id);
+@@ -22066,6 +22381,15 @@
+     /// 순수 함수 `resolve_document_confirm_choice`가 큐 맨 앞을 보고 정하고, 여기서는
+     /// 그 결정만 실행한다.
+     fn apply_document_confirm_choice(&mut self, choice: DocumentConfirmChoice) {
++        let canceled_scope = choice == DocumentConfirmChoice::Cancel
++            && self
++                .document_pending_confirms
++                .front()
++                .is_some_and(|confirm| {
++                    self.document_pending_scope_close
++                        .as_ref()
++                        .is_some_and(|pending| pending.documents.contains(&confirm.document_id()))
++                });
+         match resolve_document_confirm_choice(&mut self.document_pending_confirms, choice) {
+             Some(DocumentConfirmAction::Discard(id)) => self.close_document_entry(id),
+             Some(DocumentConfirmAction::SaveThenClose(id)) => {
+@@ -22074,15 +22398,219 @@
+             }
+             None => {}
+         }
++        if canceled_scope {
++            self.cancel_document_scope_close();
++        }
+     }
+ 
+     /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다 —
+     /// `apply_document_confirm_choice`와 같은 구조.
+     fn apply_document_conflict_choice(&mut self, reload: bool) {
++        if let Some(confirm) = self.document_pending_confirms.front() {
++            self.cancel_document_scope_close_for(confirm.document_id());
++        }
+         if let Some(id) =
+             resolve_document_conflict_choice(&mut self.document_pending_confirms, reload)
+         {
+             self.reload_document_from_disk(id);
++        }
++    }
++
++    fn request_document_scope_close(&mut self, target: DocumentScopeCloseTarget) -> bool {
++        let mux = match &target {
++            DocumentScopeCloseTarget::Runtime {
++                runtime_instance, ..
++            }
++            | DocumentScopeCloseTarget::Workspace {
++                runtime_instance, ..
++            } => self
++                .runtime_by_instance(*runtime_instance)
++                .and_then(|runtime| runtime.workspace_ui.mux().cloned()),
++            DocumentScopeCloseTarget::AppExit => None,
++        };
++        let Some(pending) =
++            plan_document_scope_close(&self.documents, &self.session_aux, target, mux.as_deref())
++        else {
++            return false;
++        };
++        // Modal requests are serial: a second close must not replace the original
++        // workspace/runtime/pane/session authorization while its prompt is open.
++        if self.document_pending_scope_close.is_none() {
++            for &id in &pending.documents {
++                enqueue_document_pending_confirm(
++                    &mut self.document_pending_confirms,
++                    DocumentPendingConfirm::CloseWithDirty { id },
++                );
++            }
++            self.document_pending_scope_close = Some(pending);
++        }
++        self.egui_ctx.request_repaint();
++        true
++    }
++
++    fn defer_document_runtime_close(
++        &mut self,
++        runtime_instance: u64,
++        command: &runtime::RuntimeCommand,
++    ) -> bool {
++        if !matches!(
++            command,
++            runtime::RuntimeCommand::ClosePane { .. }
++                | runtime::RuntimeCommand::CloseTab { .. }
++                | runtime::RuntimeCommand::KillSession { .. }
++        ) {
++            return false;
++        }
++        if self.document_scope_close_handoff_is_stale(DocumentScopeCloseHandoff::Runtime {
++            runtime_instance,
++            command,
++        }) {
++            return true;
++        }
++        let Some(workspace_id) = self
++            .runtime_by_instance(runtime_instance)
++            .map(|runtime| runtime.id.clone())
++        else {
++            return false;
++        };
++        self.request_document_scope_close(DocumentScopeCloseTarget::Runtime {
++            workspace_id,
++            runtime_instance,
++            command: command.clone(),
++        })
++    }
++
++    fn cancel_document_scope_close(&mut self) {
++        cancel_document_scope_close_state(
++            &mut self.document_pending_scope_close,
++            &mut self.document_pending_confirms,
++            &mut self.document_close_after_save,
++        );
++    }
++
++    fn cancel_document_scope_close_for(&mut self, id: ui::workspace::DocumentTabId) {
++        if self
++            .document_pending_scope_close
++            .as_ref()
++            .is_some_and(|pending| pending.documents.contains(&id))
++        {
++            self.cancel_document_scope_close();
++        }
++    }
++
++    fn document_scope_close_status(
++        &self,
++        pending: &PendingDocumentScopeClose,
++    ) -> DocumentScopeCloseReadiness {
++        document_scope_close_readiness(pending, &self.documents, |scope| {
++            self.runtime_by_instance(scope.runtime_instance)
++                .is_some_and(|runtime| match &pending.target {
++                    DocumentScopeCloseTarget::Workspace { workspace_id, .. } => {
++                        runtime.id == *workspace_id
++                    }
++                    _ => {
++                        document_scope_owner_is_live(
++                            scope,
++                            &runtime.id,
++                            runtime.runtime_instance,
++                            runtime.workspace_ui.mux().map(|mux| mux.as_ref()),
++                        ) && document_scope_matches_close(
++                            scope,
++                            &pending.target,
++                            runtime.workspace_ui.mux().map(|mux| mux.as_ref()),
++                        )
++                    }
++                })
++        })
++    }
++
++    fn document_scope_close_handoff_is_stale(
++        &mut self,
++        handoff: DocumentScopeCloseHandoff<'_>,
++    ) -> bool {
++        let owners_valid = self
++            .document_pending_scope_close
++            .as_ref()
++            .is_none_or(|pending| {
++                self.document_scope_close_status(pending) != DocumentScopeCloseReadiness::Canceled
++            });
++        document_scope_close_handoff_is_stale(
++            &mut self.document_pending_scope_close,
++            handoff,
++            owners_valid,
++        )
++    }
++
++    fn poll_document_scope_close(&mut self) {
++        let Some(pending) = self.document_pending_scope_close.as_ref() else {
++            return;
++        };
++        if pending.phase != DocumentScopeClosePhase::Confirming {
++            // A retired runtime also retires its entire WorkspaceUi protocol
++            // queue. Workspace controller entries still need their tombstone.
++            if let DocumentScopeCloseTarget::Runtime {
++                runtime_instance, ..
++            } = pending.target
++                && self.runtime_by_instance(runtime_instance).is_none()
++            {
++                self.cancel_document_scope_close();
++                self.document_pending_scope_close = None;
++            }
++            return;
++        }
++        match self.document_scope_close_status(pending) {
++            DocumentScopeCloseReadiness::Canceled => {
++                self.cancel_document_scope_close();
++                return;
++            }
++            DocumentScopeCloseReadiness::Waiting => return,
++            DocumentScopeCloseReadiness::Ready => {}
++        }
++        let target = self
++            .document_pending_scope_close
++            .as_ref()
++            .unwrap()
++            .target
++            .clone();
++        let admitted = match target {
++            DocumentScopeCloseTarget::Runtime {
++                runtime_instance,
++                command,
++                ..
++            } => {
++                self.runtime_by_instance_mut(runtime_instance)
++                    .is_some_and(|runtime| {
++                        // Return through the normal bounded Workspace protocol lane.
++                        // Re-admission also catches a new edit before host delivery.
++                        runtime.workspace_ui.submit_document_resolved_close(command)
++                    })
++            }
++            DocumentScopeCloseTarget::Workspace { workspace_id, .. } => self
++                .stage_workspace_controller_action(WorkspaceControllerAction::CloseWorkspace(
++                    workspace_id,
++                )),
++            DocumentScopeCloseTarget::AppExit => {
++                self.document_pending_scope_close = None;
++                self.egui_ctx
++                    .send_viewport_cmd(egui::ViewportCommand::Close);
++                return;
++            }
++        };
++        if admitted {
++            if let Some(pending) = self.document_pending_scope_close.as_mut() {
++                pending.phase = DocumentScopeClosePhase::Submitted;
++            }
++        } else {
++            self.egui_ctx
++                .request_repaint_after(std::time::Duration::from_millis(50));
++        }
++    }
++
++    fn protect_document_app_exit(&mut self, ctx: &egui::Context) {
++        if ctx.input(|input| input.viewport().close_requested())
++            && self.request_document_scope_close(DocumentScopeCloseTarget::AppExit)
++        {
++            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+         }
+     }
+ 
+@@ -22145,6 +22673,7 @@
+                             &mut self.document_close_after_save,
+                             id,
+                         );
++                        self.cancel_document_scope_close_for(id);
+                     }
+                 }
+             }
+@@ -22163,6 +22692,7 @@
+                         &mut self.document_close_after_save,
+                         id,
+                     );
++                    self.cancel_document_scope_close_for(id);
+                 }
+             }
+         }
+@@ -22223,6 +22753,7 @@
+             return;
+         };
+         if let Some(confirm) = apply_save_outcome_to_document(id, document, &outcome) {
++            self.cancel_document_scope_close_for(id);
+             self.document_close_after_save.remove(&id);
+             enqueue_document_pending_confirm(&mut self.document_pending_confirms, confirm);
+             return;
+@@ -22257,6 +22788,7 @@
+                 }
+             }
+             document_io::DocumentSaveOutcome::Failed { .. } => {
++                self.cancel_document_scope_close_for(id);
+                 self.document_close_after_save.remove(&id);
+             }
+             document_io::DocumentSaveOutcome::Conflict => {
+@@ -23592,6 +24124,9 @@
+                 }
+             }
+             WorkspaceControllerAction::Runtime(command) => {
++                if self.defer_document_runtime_close(self.active.runtime_instance, &command) {
++                    return;
++                }
+                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
+                     self.active.workspace_ui.clear_selection(*session);
+                 }
+@@ -23671,7 +24206,9 @@
+             }
+             WorkspaceControllerAction::CloseWorkspace(workspace_id) => {
+                 let was_active = workspace_id == self.active.id;
+-                self.close_workspace_sessions(&workspace_id);
++                if !self.close_workspace_sessions(&workspace_id) {
++                    return;
++                }
+                 if was_active
+                     && let Some(fallback) = self
+                         .workspaces
+@@ -23810,6 +24347,18 @@
+                 .then(|| intent.focus_pane().cloned())
+                 .flatten();
+             let command = intent.into_command();
++            if self.defer_document_runtime_close(runtime_instance, &command) {
++                if let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) {
++                    runtime.workspace_ui.complete_protocol(
++                        ui::workspace::WorkspaceProtocolCompletion {
++                            operation,
++                            generation,
++                            result: Err(ui::workspace::WorkspaceProtocolErrorCode::Busy),
++                        },
++                    );
++                }
++                continue;
++            }
+             if matches!(
+                 command,
+                 runtime::RuntimeCommand::ClosePane { .. }
+@@ -26618,7 +27167,23 @@
+ 
+     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
+     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
+-    fn close_workspace_sessions(&mut self, workspace_id: &str) {
++    fn close_workspace_sessions(&mut self, workspace_id: &str) -> bool {
++        if self.document_scope_close_handoff_is_stale(DocumentScopeCloseHandoff::Workspace(
++            workspace_id,
++        )) {
++            return false;
++        }
++        if let Some(runtime_instance) = std::iter::once(&self.active)
++            .chain(self.warm.values())
++            .find(|runtime| runtime.id == workspace_id)
++            .map(|runtime| runtime.runtime_instance)
++            && self.request_document_scope_close(DocumentScopeCloseTarget::Workspace {
++                workspace_id: workspace_id.to_owned(),
++                runtime_instance,
++            })
++        {
++            return false;
++        }
+         revoke_followup_authorizations(
+             &mut self.pty_followup,
+             &self.pending_prompt_deliveries,
+@@ -26779,6 +27344,7 @@
+         self.pending_resource_maintenance
+             .retain(|target| target.workspace_id != workspace_id);
+         self.invalidate_port_inventory_topology();
++        true
+     }
+ 
+     /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
+@@ -34144,6 +34710,7 @@
+     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
+     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
+     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
++        self.protect_document_app_exit(ctx);
+         self.pump_project_keys();
+         self.prune_session_aux_views();
+         self.pump_scrollback_policy(ctx);
+@@ -34372,6 +34939,7 @@
+         self.poll_pending_resume_agent();
+         self.poll_pending_document_open();
+         self.poll_document_io();
++        self.poll_document_scope_close();
+         let current_image_document = self.session_aux.current.active_document.and_then(|id| {
+             self.documents
+                 .iter()
+@@ -48902,6 +49470,7 @@
+             view_only_byte_len: None,
+             source_revision: 0,
+             render_failed: false,
++            input_limit_rejected: false,
+         }
+     }
+ 
+@@ -48942,6 +49511,542 @@
+             limit: document_io::DocumentLimitTier::Full,
+         };
+         document
++    }
++
++    #[test]
++    fn full_fix_20261014_document_dead_owner_same_path_is_recoverable() {
++        let scope = |session| crate::session_aux::SessionAuxScope {
++            workspace_id: "document-recovery-fixture".into(),
++            runtime_instance: 1,
++            pane: Some(runtime::MuxPaneId(format!("pane-{session}"))),
++            session: Some(runtime::SessionId(session)),
++        };
++        let mut views = crate::session_aux::SessionAuxViews::default();
++        let old = scope(1);
++        let current = scope(2);
++        let document = stub_open_document_id(
++            17,
++            "/fixture/recover.md",
++            "unsaved source",
++            "disk source",
++            true,
++        );
++        views.switch(old.clone());
++        views.current.document_ids.push(document.id);
++        views.current.active_document = Some(document.id);
++        views.current.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
++        views.switch(current.clone());
++        views.retain_live(|owner| owner == &current);
++        // This is begin_document_open's production lookup, backed by real
++        // SessionAuxViews rather than UI stubs. Static wiring is verified below.
++        let reopened = find_recoverable_document_by_path(
++            std::slice::from_ref(&document),
++            &views,
++            &document.path,
++        );
++        let production = include_str!("app.rs")
++            .split("#[cfg(test)]\nmod tests")
++            .next()
++            .unwrap();
++        let caller = production
++            .split_once("fn begin_document_open(&mut self, path: PathBuf)")
++            .unwrap()
++            .1
++            .split_once("fn open_document(&mut self")
++            .unwrap()
++            .0;
++        assert!(caller.contains("find_recoverable_document_by_path("));
++        assert_eq!(
++            reopened,
++            Some(document.id),
++            "explicit reopen must recover retained dead-owner source"
++        );
++        assert!(views.recover_document(document.id));
++        assert_eq!(views.current.document_ids, [document.id]);
++        assert_eq!(document.source, "unsaved source");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_guards_each_lifecycle_target() {
++        let mux = cross_workspace_test_mux("tab", "pane", runtime::SessionId(41));
++        let owner = crate::session_aux::SessionAuxScope {
++            workspace_id: "ws".into(),
++            runtime_instance: 7,
++            pane: Some(runtime::MuxPaneId("pane".into())),
++            session: Some(runtime::SessionId(41)),
++        };
++        let mut views = crate::session_aux::SessionAuxViews::default();
++        views.switch(owner);
++        let document = stub_open_document_id(5, "/fixture/close.md", "edited", "disk", true);
++        views.current.document_ids.push(document.id);
++        let commands = [
++            runtime::RuntimeCommand::ClosePane {
++                pane: runtime::MuxPaneId("pane".into()),
++            },
++            runtime::RuntimeCommand::CloseTab {
++                tab: runtime::MuxTabId("tab".into()),
++            },
++            runtime::RuntimeCommand::KillSession {
++                session: runtime::SessionId(41),
++            },
++        ];
++        for command in commands {
++            let target = DocumentScopeCloseTarget::Runtime {
++                workspace_id: "ws".into(),
++                runtime_instance: 7,
++                command,
++            };
++            let pending = plan_document_scope_close(
++                std::slice::from_ref(&document),
++                &views,
++                target,
++                Some(&mux),
++            )
++            .unwrap();
++            assert_eq!(pending.documents, [document.id]);
++            assert_eq!(
++                document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
++                DocumentScopeCloseReadiness::Waiting
++            );
++        }
++        for target in [
++            DocumentScopeCloseTarget::Workspace {
++                workspace_id: "ws".into(),
++                runtime_instance: 7,
++            },
++            DocumentScopeCloseTarget::AppExit,
++        ] {
++            assert!(
++                plan_document_scope_close(
++                    std::slice::from_ref(&document),
++                    &views,
++                    target,
++                    Some(&mux)
++                )
++                .is_some()
++            );
++        }
++        let other = DocumentScopeCloseTarget::Runtime {
++            workspace_id: "other".into(),
++            runtime_instance: 7,
++            command: runtime::RuntimeCommand::ClosePane {
++                pane: runtime::MuxPaneId("pane".into()),
++            },
++        };
++        assert!(
++            plan_document_scope_close(std::slice::from_ref(&document), &views, other, Some(&mux))
++                .is_none()
++        );
++    }
++
++    fn document_close_fixture() -> (OpenDocument, PendingDocumentScopeClose) {
++        let document = stub_loaded_document_id(17, "/fixture/close.md", "edited", "disk", true);
++        let owner = crate::session_aux::SessionAuxScope {
++            workspace_id: "ws".into(),
++            runtime_instance: 7,
++            pane: Some(runtime::MuxPaneId("pane".into())),
++            session: Some(runtime::SessionId(41)),
++        };
++        let pending = PendingDocumentScopeClose {
++            target: DocumentScopeCloseTarget::Runtime {
++                workspace_id: "ws".into(),
++                runtime_instance: 7,
++                command: runtime::RuntimeCommand::ClosePane {
++                    pane: runtime::MuxPaneId("pane".into()),
++                },
++            },
++            owners: vec![owner],
++            documents: vec![document.id],
++            phase: DocumentScopeClosePhase::Confirming,
++        };
++        (document, pending)
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_cancels_if_original_owner_is_gone_or_reused() {
++        let (document, pending) = document_close_fixture();
++        let reused = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
++                document_scope_owner_is_live(scope, "ws", 7, Some(&reused))
++            }),
++            DocumentScopeCloseReadiness::Canceled
++        );
++        assert_eq!(
++            document_scope_close_readiness(&pending, &[], |_| false),
++            DocumentScopeCloseReadiness::Canceled,
++            "a disappeared target must never become an authorized close of a replacement"
++        );
++        assert_eq!(document.source, "edited");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff() {
++        let (mut document, pending) = document_close_fixture();
++        document.saved_source = document.source.clone();
++        document.recompute_dirty();
++        let live = cross_workspace_test_mux("tab", "pane", runtime::SessionId(41));
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
++                document_scope_owner_is_live(scope, "ws", 7, Some(&live))
++            }),
++            DocumentScopeCloseReadiness::Ready,
++            "the close was authorized before entering the queued handoff"
++        );
++        let replacement = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
++                document_scope_owner_is_live(scope, "ws", 7, Some(&replacement))
++            }),
++            DocumentScopeCloseReadiness::Canceled,
++            "replacement after authorization still requires the original owner fence"
++        );
++        let production = include_str!("app.rs")
++            .split("#[cfg(test)]\nmod tests")
++            .next()
++            .unwrap();
++        let function = |name: &str| {
++            production
++                .split_once(name)
++                .unwrap()
++                .1
++                .split_once("\n    fn ")
++                .unwrap()
++                .0
++        };
++        assert!(
++            function("fn poll_document_scope_close(&mut self)")
++                .contains("pending.phase = DocumentScopeClosePhase::Submitted;"),
++            "queued close handoff must retain the original owner fence until final delivery"
++        );
++        for name in [
++            "fn defer_document_runtime_close(",
++            "fn close_workspace_sessions(",
++        ] {
++            assert!(
++                function(name).contains("document_scope_close_handoff_is_stale"),
++                "{name} must consume and validate the same queued handoff fence"
++            );
++        }
++    }
++
++    #[test]
++    fn full_fix_20261014_document_submitted_runtime_handoff_checks_same_owner_once() {
++        let (mut document, mut pending) = document_close_fixture();
++        document.saved_source = document.source.clone();
++        document.recompute_dirty();
++        pending.phase = DocumentScopeClosePhase::Submitted;
++        let command = runtime::RuntimeCommand::ClosePane {
++            pane: runtime::MuxPaneId("pane".into()),
++        };
++        let replacement = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
++        let valid =
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
++                document_scope_owner_is_live(scope, "ws", 7, Some(&replacement))
++            }) != DocumentScopeCloseReadiness::Canceled;
++        let mut pending = Some(pending);
++        assert!(!document_scope_close_handoff_is_stale(
++            &mut pending,
++            DocumentScopeCloseHandoff::Runtime {
++                runtime_instance: 8,
++                command: &command
++            },
++            valid,
++        ));
++        assert!(
++            pending.is_some(),
++            "an unrelated runtime cannot consume the fence"
++        );
++        assert!(document_scope_close_handoff_is_stale(
++            &mut pending,
++            DocumentScopeCloseHandoff::Runtime {
++                runtime_instance: 7,
++                command: &command
++            },
++            valid,
++        ));
++        assert!(
++            pending.is_none(),
++            "the stale queued close is consumed exactly once"
++        );
++        assert_eq!(document.source, "edited");
++        let (_, mut pending) = document_close_fixture();
++        pending.phase = DocumentScopeClosePhase::Submitted;
++        let mut pending = Some(pending);
++        assert!(!document_scope_close_handoff_is_stale(
++            &mut pending,
++            DocumentScopeCloseHandoff::Runtime {
++                runtime_instance: 7,
++                command: &command
++            },
++            true,
++        ));
++        assert!(
++            pending.is_none(),
++            "a valid exact owner transfers the close once"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_document_submitted_workspace_handoff_rejects_replacement_runtime() {
++        let (document, mut pending) = document_close_fixture();
++        pending.target = DocumentScopeCloseTarget::Workspace {
++            workspace_id: "ws".into(),
++            runtime_instance: 7,
++        };
++        pending.phase = DocumentScopeClosePhase::Submitted;
++        let owners_valid = pending.owners.iter().all(|scope| {
++            workspace_runtime_identity_matches("ws", 8, &scope.workspace_id, scope.runtime_instance)
++        });
++        assert!(!owners_valid);
++        let mut pending = Some(pending);
++        assert!(document_scope_close_handoff_is_stale(
++            &mut pending,
++            DocumentScopeCloseHandoff::Workspace("ws"),
++            owners_valid,
++        ));
++        assert!(pending.is_none());
++        assert_eq!(document.source, "edited");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_submitted_close_cancel_conflict_failure_leave_tombstone() {
++        for outcome in [
++            None,
++            Some(document_io::DocumentSaveOutcome::Conflict),
++            Some(document_io::DocumentSaveOutcome::Failed {
++                code: document_io::DocumentIoErrorCode::TempWriteFailed,
++            }),
++        ] {
++            let (mut document, mut pending) = document_close_fixture();
++            pending.phase = DocumentScopeClosePhase::Submitted;
++            let id = document.id;
++            let mut confirms = [DocumentPendingConfirm::CloseWithDirty { id }]
++                .into_iter()
++                .collect();
++            let conflict = outcome
++                .as_ref()
++                .and_then(|outcome| apply_save_outcome_to_document(id, &mut document, outcome));
++            if let Some(conflict) = conflict {
++                enqueue_document_pending_confirm(&mut confirms, conflict);
++            }
++            let mut after_save = [id].into_iter().collect();
++            let mut pending = Some(pending);
++            cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
++            assert_eq!(
++                pending.as_ref().unwrap().phase,
++                DocumentScopeClosePhase::Canceled
++            );
++            assert!(after_save.is_empty());
++            assert_eq!(
++                confirms.into_iter().collect::<Vec<_>>(),
++                conflict.into_iter().collect::<Vec<_>>()
++            );
++            let command = runtime::RuntimeCommand::ClosePane {
++                pane: runtime::MuxPaneId("pane".into()),
++            };
++            assert!(document_scope_close_handoff_is_stale(
++                &mut pending,
++                DocumentScopeCloseHandoff::Runtime {
++                    runtime_instance: 7,
++                    command: &command
++                },
++                true,
++            ));
++            assert!(
++                pending.is_none(),
++                "the canceled queued command must be discarded"
++            );
++            assert_eq!(document.source, "edited");
++        }
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_cancel_preserves_unrelated_confirmations() {
++        let (document, pending) = document_close_fixture();
++        let other = ui::workspace::DocumentTabId(20);
++        let mut pending = Some(pending);
++        let mut confirms = [
++            DocumentPendingConfirm::CloseWithDirty { id: document.id },
++            DocumentPendingConfirm::CloseWithDirty { id: other },
++        ]
++        .into_iter()
++        .collect();
++        let mut after_save = [document.id, other].into_iter().collect();
++        assert_eq!(
++            resolve_document_confirm_choice(&mut confirms, DocumentConfirmChoice::Cancel),
++            None
++        );
++        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
++        assert!(pending.is_none());
++        assert_eq!(
++            confirms.into_iter().collect::<Vec<_>>(),
++            vec![DocumentPendingConfirm::CloseWithDirty { id: other }]
++        );
++        assert_eq!(after_save, [other].into_iter().collect());
++        assert_eq!(document.source, "edited");
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_conflict_keeps_source_and_conflict_prompt() {
++        let (mut document, pending) = document_close_fixture();
++        document.saving = true;
++        document.saving_source = Some(document.source.clone());
++        let conflict = apply_save_outcome_to_document(
++            document.id,
++            &mut document,
++            &document_io::DocumentSaveOutcome::Conflict,
++        )
++        .unwrap();
++        let mut pending = Some(pending);
++        let mut confirms = [
++            DocumentPendingConfirm::CloseWithDirty { id: document.id },
++            conflict,
++        ]
++        .into_iter()
++        .collect();
++        let mut after_save = [document.id].into_iter().collect();
++        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
++        assert_eq!(confirms.into_iter().collect::<Vec<_>>(), vec![conflict]);
++        assert!(pending.is_none() && after_save.is_empty());
++        assert_eq!(document.source, "edited");
++        assert!(document.dirty && !document.saving);
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_save_failure_preserves_buffer() {
++        let (mut document, pending) = document_close_fixture();
++        document.saving = true;
++        let failure = document_io::DocumentSaveOutcome::Failed {
++            code: document_io::DocumentIoErrorCode::TempWriteFailed,
++        };
++        assert!(apply_save_outcome_to_document(document.id, &mut document, &failure).is_none());
++        let mut pending = Some(pending);
++        let mut confirms = std::collections::VecDeque::new();
++        let mut after_save = [document.id].into_iter().collect();
++        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
++        assert!(pending.is_none() && after_save.is_empty());
++        assert_eq!(document.source, "edited");
++        assert!(document.dirty && document.save_error.is_some());
++    }
++
++    #[test]
++    fn full_fix_20261014_document_worker_panic_cancels_close_before_later_manual_save() {
++        use std::time::{Duration, Instant};
++        let (mut document, pending) = document_close_fixture();
++        document.saving = true;
++        document.saving_source = Some(document.source.clone());
++        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
++            panic!("loaded fixture");
++        };
++        let id = document.id;
++        let unrelated = ui::workspace::DocumentTabId(99);
++        let mut worker = crate::lazy_worker::LazyBoundedWorker::<
++            ui::workspace::DocumentTabId,
++            (
++                ui::workspace::DocumentTabId,
++                document_io::DocumentSaveOutcome,
++            ),
++        >::new(
++            "document-save-panic-fixture",
++            Duration::from_secs(1),
++            || |_| panic!("synthetic save executor failure"),
++            || {},
++        );
++        worker.try_request(id).unwrap();
++        let until = Instant::now() + Duration::from_secs(2);
++        let outcome = loop {
++            if let Some(outcome) = worker.try_recv() {
++                break outcome;
++            }
++            assert!(Instant::now() < until, "panic outcome must be published");
++            std::thread::sleep(Duration::from_millis(1));
++        };
++        assert_eq!(
++            outcome.error_code(),
++            Some(crate::lazy_worker::LazyWorkerErrorCode::WorkerPanicked)
++        );
++        let mut documents = vec![document];
++        let mut pending = Some(pending);
++        let mut confirms = [
++            DocumentPendingConfirm::CloseWithDirty { id },
++            DocumentPendingConfirm::CloseWithDirty { id: unrelated },
++        ]
++        .into_iter()
++        .collect();
++        let mut after_save = [id].into_iter().collect();
++        // These are poll_document_io's real failure-state functions. The separate
++        // caller regression verifies both infrastructure branches connect them.
++        apply_document_save_infrastructure_failure(&mut documents, &mut after_save, id);
++        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
++        assert!(pending.is_none() && after_save.is_empty());
++        assert_eq!(documents[0].source, "edited");
++        assert!(documents[0].dirty && !documents[0].saving);
++        assert_eq!(
++            confirms.into_iter().collect::<Vec<_>>(),
++            vec![DocumentPendingConfirm::CloseWithDirty { id: unrelated }]
++        );
++        documents[0].saving = true;
++        documents[0].saving_source = Some(documents[0].source.clone());
++        apply_save_outcome_to_document(
++            id,
++            &mut documents[0],
++            &document_io::DocumentSaveOutcome::Saved { revision },
++        );
++        assert!(!documents[0].dirty);
++        assert!(
++            pending.is_none(),
++            "a later manual save cannot resume the old close"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_document_scope_close_waits_for_edits_made_during_save() {
++        let (mut document, pending) = document_close_fixture();
++        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
++            panic!("loaded fixture");
++        };
++        document.saving = true;
++        document.saving_source = Some("edited".into());
++        document.source = "edited while saving".into();
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
++            DocumentScopeCloseReadiness::Waiting
++        );
++        apply_save_outcome_to_document(
++            document.id,
++            &mut document,
++            &document_io::DocumentSaveOutcome::Saved { revision },
++        );
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
++            DocumentScopeCloseReadiness::Waiting
++        );
++        assert_eq!(document.source, "edited while saving");
++        document.saved_source = document.source.clone();
++        document.recompute_dirty();
++        assert_eq!(
++            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
++            DocumentScopeCloseReadiness::Ready
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_document_aggregate_editor_budget_counts_saved_copies() {
++        let half = "a".repeat(6 * 1024 * 1024);
++        let documents = vec![
++            stub_open_document_id(1, "/a.md", "", "", false),
++            stub_open_document_id(2, "/b.md", &half, &half, false),
++            stub_open_document_id(3, "/c.md", &half, &half, false),
++        ];
++        assert_eq!(
++            document_source_byte_budget(&documents, ui::workspace::DocumentTabId(1)),
++            0
++        );
++        assert_eq!(
++            document_source_byte_budget(&documents[..2], ui::workspace::DocumentTabId(1)),
++            8 * 1024 * 1024
++        );
+     }
+ 
+     #[test]
+@@ -50038,7 +51143,7 @@
+     }
+ 
+     #[test]
+-    fn document_poll의_두_save_worker_인프라_실패는_같은_정리_helper를_쓴다() {
++    fn full_fix_20261014_document_poll_infrastructure_failures_cancel_scope_close() {
+         let source = include_str!("app.rs");
+         let function_body = source
+             .split_once("fn poll_document_io(&mut self) {")
+@@ -50053,6 +51158,13 @@
+                 .count(),
+             2,
+             "worker outcome Err와 admission Unavailable 모두 snapshot/continuation을 정리해야 한다"
++        );
++        assert_eq!(
++            function_body
++                .matches("self.cancel_document_scope_close_for(id);")
++                .count(),
++            2,
++            "worker outcome Err와 admission Unavailable 모두 이전 lifecycle close 요청을 취소해야 한다"
+         );
+     }
+ 
+@@ -59739,6 +60851,37 @@
+         assert_eq!(stored_volume, identity.volume.map(|id| id.to_string()));
+     }
+ 
++    #[cfg(not(unix))]
++    #[test]
++    fn full_fix_20261014_document_nonunix_project_folder_accepts_valid_directory() {
++        let db_path = temp_db_path("nonunix-project-folder");
++        let base = unique_temp_dir("nonunix-project-folder");
++        let mut db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("portable folder fixture").unwrap();
++        let outcome = execute_settings_job(
++            &mut db,
++            &db_path,
++            &secret::RedactionService::new(),
++            SettingsJob {
++                generation: 1,
++                revision: 1,
++                workspace_id: workspace_id.clone(),
++                project_root: None,
++                action: SettingsJobAction::SetProjectPath { path: base.clone() },
++            },
++        );
++        let success = matches!(outcome.kind, SettingsOutcomeKind::ProjectPathSet(Ok(_)));
++        let stored_path = db.workspace_path(&workspace_id).unwrap();
++        drop(db);
++        remove_sqlite_files(&db_path);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            success,
++            "directory selection must not require a Unix anchor"
++        );
++        assert_eq!(stored_path.as_deref(), base.to_str());
++    }
++
+     #[cfg(target_os = "macos")]
+     #[test]
+     fn popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths() {
+--- a/crates/i18n/locales/ko-KR/messages.txt
++++ b/crates/i18n/locales/ko-KR/messages.txt
+@@ -439,6 +439,7 @@
+ document.dirty = 저장되지 않음
+ document.loading = 불러오는 중…
+ document.limit.save_too_large = 편집 내용은 보존됩니다 — 8 MiB를 초과하면 저장할 수 없습니다. 내용을 줄이면 다시 저장할 수 있습니다.
++document.limit.input_rejected = 입력이 문서 8 MiB 또는 전체 문서 24 MiB 한도를 넘어 거절되었습니다. 기존 내용은 유지됩니다.
+ document.limit.grew_past_full = 현재 {bytes}바이트 — 편집 권장 한도(1 MiB)를 넘었습니다. 입력이 느려질 수 있습니다
+ document.limit.view_only = 읽기 전용 — {bytes} 바이트(1 MiB 초과)
+ document.limit.refused = 이 문서는 8 MiB보다 커서 열 수 없습니다({bytes} 바이트). OS 기본 앱으로 열어보세요.
+--- a/crates/i18n/locales/en-US/messages.txt
++++ b/crates/i18n/locales/en-US/messages.txt
+@@ -439,6 +439,7 @@
+ document.dirty = Unsaved
+ document.loading = Loading…
+ document.limit.save_too_large = Buffer preserved — can't save above 8 MiB. Reduce the document below the limit to save again.
++document.limit.input_rejected = Input exceeds the 8 MiB document or 24 MiB total document limit. Existing content is preserved.
+ document.limit.grew_past_full = Now {bytes} bytes — past the 1 MiB editing budget; typing may lag
+ document.limit.view_only = Read-only — {bytes} bytes (over 1 MiB)
+ document.limit.refused = This document is larger than 8 MiB ({bytes} bytes) and can't be opened here. Try opening it with the OS default app.
+--- a/crates/i18n/locales/ja-JP/messages.txt
++++ b/crates/i18n/locales/ja-JP/messages.txt
+@@ -439,6 +439,7 @@
+ document.dirty = 未保存
+ document.loading = 読み込み中…
+ document.limit.save_too_large = 編集内容は保持されています — 8 MiBを超えると保存できません。内容を減らすと再び保存できます。
++document.limit.input_rejected = 入力が文書の8 MiBまたは文書全体の24 MiBの上限を超えたため拒否されました。元の内容は保持されます。
+ document.limit.grew_past_full = 現在{bytes}バイト — 編集の推奨上限(1 MiB)を超えました。入力が遅くなることがあります
+ document.limit.view_only = 読み取り専用 — {bytes} バイト(1 MiB超)
+ document.limit.refused = このドキュメントは8 MiBを超えているため開けません({bytes} バイト)。OS標準アプリで開いてください。
+--- a/crates/i18n/locales/zh-Hans/messages.txt
++++ b/crates/i18n/locales/zh-Hans/messages.txt
+@@ -439,6 +439,7 @@
+ document.dirty = 未保存
+ document.loading = 加载中…
+ document.limit.save_too_large = 编辑内容已保留 — 超过 8 MiB 时无法保存。减小内容后即可再次保存。
++document.limit.input_rejected = 输入超过单个文档8 MiB或全部文档24 MiB的上限，已被拒绝。原有内容已保留。
+ document.limit.grew_past_full = 当前 {bytes} 字节 — 已超过 1 MiB 编辑上限，输入可能变慢
+ document.limit.view_only = 只读 — {bytes} 字节(超过 1 MiB)
+ document.limit.refused = 该文档超过 8 MiB({bytes} 字节),无法打开。请尝试用系统默认应用打开。
+--- a/crates/i18n/locales/zh-Hant/messages.txt
++++ b/crates/i18n/locales/zh-Hant/messages.txt
+@@ -439,6 +439,7 @@
+ document.dirty = 未儲存
+ document.loading = 載入中…
+ document.limit.save_too_large = 編輯內容已保留 — 超過 8 MiB 時無法儲存。縮減內容後即可再次儲存。
++document.limit.input_rejected = 輸入超過單一文件8 MiB或全部文件24 MiB的上限，已被拒絕。原有內容已保留。
+ document.limit.grew_past_full = 目前 {bytes} 位元組 — 已超過 1 MiB 編輯上限，輸入可能變慢
+ document.limit.view_only = 唯讀 — {bytes} 位元組(超過 1 MiB)
+ document.limit.refused = 這份文件超過 8 MiB({bytes} 位元組),無法開啟。請嘗試用系統預設應用程式開啟。

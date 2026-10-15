@@ -55,6 +55,11 @@ pub struct HistoryView {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMsg {
+    /// Operator controls enqueue App intents; they never contain terminal input.
+    CloudControl {
+        request: u32,
+        intent: crate::cloud::CloudControlIntent,
+    },
     /// 첫 프레임 — 페어링 토큰 인증. `v`는 선택(구클라 호환).
     Auth {
         token: String,
@@ -269,6 +274,18 @@ pub struct LineView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    CloudSnapshot {
+        snapshot: crate::cloud::CloudSnapshot,
+        can_control: bool,
+        can_approve: bool,
+    },
+    /// Receipt is mailbox admission, not successful execution or cancellation.
+    CloudControlResult { request: u32, status: &'static str },
+    /// App-observed final activation result, sent only to the requesting socket.
+    CloudNavigationResult {
+        request: u32,
+        status: crate::cloud::CloudNavigationOutcome,
+    },
     /// 인증 성공 직후 1회.
     Welcome { v: u32 },
     /// 워크스페이스별 세션 목록 + 리소스 스냅샷. 활성 워크스페이스의 상태는 런타임

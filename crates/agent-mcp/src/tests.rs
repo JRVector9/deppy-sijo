@@ -254,7 +254,7 @@ fn actual_http_auth_origin_initialize_and_answer_tool_discovery() {
         serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
     );
     let result: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 6);
+    assert_eq!(result["result"]["tools"].as_array().unwrap().len(), 14);
     assert!(
         result["result"]["tools"]
             .as_array()
@@ -272,6 +272,586 @@ fn actual_http_auth_origin_initialize_and_answer_tool_discovery() {
         )
         .0,
         401
+    );
+}
+
+#[test]
+fn cloud_management_tools_are_additive_and_run_linkage_is_optional() {
+    let discovery = tools();
+    let tools = discovery["tools"].as_array().unwrap();
+    for name in [
+        "start_run",
+        "update_run",
+        "get_run",
+        "list_runs",
+        "read_history",
+        "get_operation",
+        "acquire_control",
+        "release_control",
+    ] {
+        assert!(
+            tools.iter().any(|tool| tool["name"] == name),
+            "missing {name}"
+        );
+    }
+    for name in ["send_text", "paste_text", "send_ctrl_c", "notify"] {
+        let schema = &tools.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert_eq!(schema["properties"]["run_id"]["type"], "string");
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item == "run_id")
+        );
+    }
+}
+
+#[test]
+fn cloud_management_wire_auth_kind_and_history_schema_are_canonical() {
+    assert_eq!(serde_json::to_value(AuthKind::OAuth).unwrap(), "oauth");
+    assert_eq!(
+        serde_json::from_value::<AuthKind>(json!("oauth")).unwrap(),
+        AuthKind::OAuth
+    );
+    assert!(serde_json::from_value::<AuthKind>(json!("o_auth")).is_err());
+    assert_eq!(
+        serde_json::to_value(AuthKind::ManualBearer).unwrap(),
+        "manual_bearer"
+    );
+    let discovery = tools();
+    let tools = discovery["tools"].as_array().unwrap();
+    let history = tools
+        .iter()
+        .find(|tool| tool["name"] == "read_history")
+        .unwrap();
+    assert_eq!(
+        history["inputSchema"]["properties"]["max_bytes"]["minimum"],
+        1024
+    );
+    assert_eq!(
+        history["inputSchema"]["properties"]["max_bytes"]["maximum"],
+        65536
+    );
+    let acquire = tools
+        .iter()
+        .find(|tool| tool["name"] == "acquire_control")
+        .unwrap();
+    assert_eq!(
+        acquire["inputSchema"]["properties"]["ttl_seconds"]["maximum"],
+        120
+    );
+    for name in ["get_run", "get_operation", "read_history", "list_runs"] {
+        assert_eq!(
+            tools.iter().find(|tool| tool["name"] == name).unwrap()["annotations"]["readOnlyHint"],
+            true
+        );
+    }
+}
+
+#[test]
+fn cloud_management_fixed_management_errors_reach_live_http_without_authority_changes() {
+    let server = Server::start(0, "", || {}).unwrap();
+    for (tool, code, retryable, effect) in [
+        ("start_run", "invalid_run", false, "none"),
+        ("update_run", "invalid_run_progress", false, "none"),
+        ("get_run", "run_not_owned_or_session_changed", false, "none"),
+        ("get_operation", "history_reply_mismatch", false, "unknown"),
+        (
+            "read_history",
+            "history_query_timeout_no_effect",
+            true,
+            "none",
+        ),
+        ("update_run", "run_update_busy_no_effect", true, "none"),
+        (
+            "update_run",
+            "run_save_unknown_query_before_retry",
+            false,
+            "unknown",
+        ),
+        ("update_run", "run_save_failed", false, "unknown"),
+        ("update_run", "run_recovery_failed", false, "unknown"),
+        (
+            "start_run",
+            "token_redaction_capacity_no_connection",
+            false,
+            "none",
+        ),
+        ("get_run", "cloud_snapshot_unavailable", false, "none"),
+        ("start_run", "invalid_run_private_secret", false, "unknown"),
+    ] {
+        let addr = server.addr;
+        let token = server.auth.token_for_user();
+        let args = match tool {
+            "start_run" => {
+                json!({"session_id":"original","generation":"g","run_id":if code == "invalid_run" { "\0" } else { "run-a" },"title":"Analyze"})
+            }
+            "update_run" => {
+                json!({"session_id":"original","generation":"g","run_id":"run-a","state":"running","progress":if code == "invalid_run_progress" { 101 } else { 50 }})
+            }
+            "get_run" => json!({"session_id":"original","generation":"g","run_id":"run-a"}),
+            "get_operation" => {
+                json!({"session_id":"original","generation":"g","operation_id":"op-a"})
+            }
+            "read_history" => {
+                json!({"session_id":"original","generation":"g","cursor":0,"max_bytes":65536})
+            }
+            _ => unreachable!(),
+        };
+        let expected_args = args.clone();
+        let caller = std::thread::spawn(move || {
+            http_call_addr(
+                addr,
+                &token,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            )
+        });
+        let request = server
+            .requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(request.principal.id, LEGACY_CONNECTION_ID);
+        assert_eq!(request.tool, tool);
+        assert_eq!(request.args, expected_args);
+        request.reply.send(Err(code.into())).unwrap();
+        let (status, response) = caller.join().unwrap();
+        assert_eq!(status, 200);
+        let envelope: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(envelope["result"]["isError"], true);
+        let payload: Value =
+            serde_json::from_str(envelope["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(
+            payload["code"],
+            if code == "invalid_run_private_secret" {
+                "internal_error_outcome_unknown"
+            } else {
+                code
+            }
+        );
+        assert_eq!(payload["retryable"], retryable, "{code}");
+        assert_eq!(payload["effect_state"], effect, "{code}");
+        if retryable {
+            assert_eq!(payload["retry_after_ms"], 1000);
+        }
+    }
+}
+
+#[test]
+fn cloud_management_optional_public_port_preserves_exact_host_and_oauth_resource() {
+    use std::io::{Read, Write};
+    for host in ["mac.example.ts.net", "mac.example.ts.net:8443"] {
+        assert!(valid_public_host(host));
+        let server = Server::start(0, host, || {}).unwrap();
+        let get = |supplied_host: &str| {
+            let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+                .unwrap();
+            write!(stream, "GET /.well-known/oauth-protected-resource/mcp HTTP/1.1\r\nHost: {supplied_host}\r\n\r\n").unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        };
+        let response = get(host);
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let body: Value = serde_json::from_str(response.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(body["resource"], format!("https://{host}/mcp"));
+        if host.contains(':') {
+            assert!(get("mac.example.ts.net").starts_with("HTTP/1.1 403"));
+        }
+    }
+    assert!(valid_public_host(""));
+    for host in [
+        "https://mac.example.ts.net",
+        "mac.example.ts.net:0",
+        "mac.example.ts.net:65536",
+        "mac.example.ts.net:8443/mcp",
+        "mac.example.ts.net:8443:8444",
+        "mac.example.ts.net\n",
+    ] {
+        assert!(!valid_public_host(host));
+        assert!(Server::start(0, host, || {}).is_err());
+    }
+}
+
+#[test]
+fn cloud_management_live_http_old_and_new_tool_dispatch_remains_additive() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let (status, response) = http_call(
+        &server,
+        &token,
+        "MCP-Protocol-Version: 2025-03-26\r\n",
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26"}}),
+    );
+    assert_eq!(status, 200);
+    let init: Value = serde_json::from_str(&response).unwrap();
+    assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
+    let (status, response) = http_call(
+        &server,
+        &token,
+        "MCP-Protocol-Version: 2025-03-26\r\n",
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    );
+    assert_eq!(status, 200);
+    let discovery: Value = serde_json::from_str(&response).unwrap();
+    let discovered = discovery["result"]["tools"].as_array().unwrap();
+    assert_eq!(discovered.len(), 14);
+    for name in ["send_text", "paste_text", "send_ctrl_c", "notify"] {
+        let schema = &discovered.iter().find(|tool| tool["name"] == name).unwrap()["inputSchema"];
+        assert!(schema["properties"].get("run_id").is_some());
+        assert!(schema["properties"].get("connection_id").is_none());
+        assert!(
+            !schema["required"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("run_id"))
+        );
+    }
+    assert_eq!(
+        discovered
+            .iter()
+            .find(|tool| tool["name"] == "read_history")
+            .unwrap()["inputSchema"]["properties"]["max_bytes"]["minimum"],
+        1024
+    );
+    for (tool, args) in [
+        (
+            "send_text",
+            json!({"session_id":"original","generation":"g","operation_id":"legacy-op","text":"hello","submit":false}),
+        ),
+        (
+            "start_run",
+            json!({"session_id":"original","generation":"g","run_id":"new-run","title":"Analyze"}),
+        ),
+    ] {
+        let addr = server.addr;
+        let token = server.auth.token_for_user();
+        let expected = args.clone();
+        let caller = std::thread::spawn(move || {
+            http_call_addr(
+                addr,
+                &token,
+                json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":args}}),
+            )
+        });
+        let request = server
+            .requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(request.tool, tool);
+        assert_eq!(request.args, expected);
+        assert_eq!(request.principal.id, LEGACY_CONNECTION_ID);
+        request.reply.send(Ok(json!({"status":"stored"}))).unwrap();
+        let (status, body) = caller.join().unwrap();
+        assert_eq!(status, 200);
+        let result: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(result["result"]["isError"], false);
+    }
+}
+
+#[test]
+fn cloud_management_unknown_input_error_has_safe_retry_and_effect_fields() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let addr = server.addr;
+    let token = server.auth.token_for_user();
+    let caller = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &token,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_text","arguments":{}}}),
+        )
+    });
+    let request = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    request
+        .reply
+        .send(Err("outcome_unknown_do_not_retry_input".into()))
+        .unwrap();
+    let (status, body) = caller.join().unwrap();
+    assert_eq!(status, 200);
+    let envelope: Value = serde_json::from_str(&body).unwrap();
+    let payload: Value =
+        serde_json::from_str(envelope["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["retryable"], false);
+    assert_eq!(payload["effect_state"], "unknown");
+    assert_eq!(payload["error"], "outcome_unknown_do_not_retry_input");
+}
+
+#[test]
+fn cloud_management_manual_identity_revocation_is_per_connection() {
+    let time = now();
+    let auth = Auth::new_at(time);
+    let legacy = auth
+        .authenticate_principal(&format!("Bearer {}", auth.token_for_user().as_str()), time)
+        .unwrap();
+    assert_eq!(legacy.id, LEGACY_CONNECTION_ID);
+    let (a, token_a) = auth
+        .mint_manual_connection("Connection A", true, time)
+        .unwrap();
+    let (b, token_b) = auth
+        .mint_manual_connection("Connection B", false, time)
+        .unwrap();
+    assert_ne!(a.id, b.id);
+    assert_ne!(a.id, legacy.id);
+    assert_eq!(
+        auth.authenticate_principal(&format!("Bearer {}", token_a.as_str()), time)
+            .unwrap()
+            .id,
+        a.id
+    );
+    assert!(
+        !auth
+            .authenticate_principal(&format!("Bearer {}", token_b.as_str()), time)
+            .unwrap()
+            .input_scope
+    );
+    assert!(auth.rename_connection(&a.id, "Owner label"));
+    assert_eq!(
+        auth.authenticate_principal(&format!("Bearer {}", token_a.as_str()), time)
+            .unwrap()
+            .name,
+        "Owner label"
+    );
+    assert!(!auth.rename_connection(&a.id, "spoof\nowner"));
+    let epoch = auth
+        .authenticate(&format!("Bearer {}", token_a.as_str()), time)
+        .unwrap();
+    let access_key = crate::oauth::hash(&token_a);
+    assert!(auth.revoke_connection(&a.id));
+    assert!(
+        auth.authenticate_principal(&format!("Bearer {}", token_a.as_str()), time)
+            .is_none()
+    );
+    assert!(
+        auth.authenticate_principal(&format!("Bearer {}", token_b.as_str()), time)
+            .is_some()
+    );
+    assert!(
+        auth.authenticate_principal(&format!("Bearer {}", auth.token_for_user().as_str()), time)
+            .is_some()
+    );
+    assert!(!auth.current_access(epoch, Some(&access_key), time));
+    auth.admit_current_access(epoch, Some(&access_key), &mut || {
+        panic!("revoked actor admitted queued effect")
+    });
+    let revoked = auth
+        .connections_at(time)
+        .into_iter()
+        .find(|info| info.principal.id == a.id)
+        .unwrap();
+    assert_eq!(revoked.state, ConnectionState::Revoked);
+    assert!(auth.revoke_connection(LEGACY_CONNECTION_ID));
+    assert!(!auth.current_access(epoch, None, time));
+    assert!(
+        auth.authenticate_principal(&format!("Bearer {}", token_b.as_str()), time)
+            .is_some()
+    );
+    let snapshot = serde_json::to_string(&auth.connections_at(time)).unwrap();
+    assert!(!snapshot.contains(token_b.as_str()));
+    assert_eq!(
+        auth.connections_at(time + TOKEN_TTL)
+            .into_iter()
+            .find(|info| info.principal.id == b.id)
+            .unwrap()
+            .state,
+        ConnectionState::Expired
+    );
+}
+
+#[test]
+fn cloud_management_poll_contention_does_not_block_another_connection() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let time = now();
+    let (_, token_a) = server
+        .auth
+        .mint_manual_connection("A", false, time)
+        .unwrap();
+    let (_, token_b) = server
+        .auth
+        .mint_manual_connection("B", false, time)
+        .unwrap();
+    let addr = server.addr;
+    let a_copy = token_a.to_string();
+    let a = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &a_copy,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_runs","arguments":{}}}),
+        )
+    });
+    let pending_a = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    let (_, rejected) = http_call_addr(
+        addr,
+        &token_a,
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"get_run","arguments":{}}}),
+    );
+    let envelope: Value = serde_json::from_str(&rejected).unwrap();
+    let payload: Value =
+        serde_json::from_str(envelope["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["error"], "poll_budget_no_effect");
+    assert_eq!(payload["retryable"], true);
+    assert_eq!(payload["effect_state"], "none");
+    assert!(server.requests.try_recv().is_err());
+    let b = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &token_b,
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}),
+        )
+    });
+    let pending_b = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_ne!(pending_a.principal.id, pending_b.principal.id);
+    pending_b.reply.send(Ok(json!({"sessions":[]}))).unwrap();
+    assert_eq!(b.join().unwrap().0, 200);
+    pending_a.reply.send(Ok(json!({"runs":[]}))).unwrap();
+    assert_eq!(a.join().unwrap().0, 200);
+}
+
+#[test]
+fn cloud_management_private_diagnostics_do_not_leave_as_tool_errors() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let addr = server.addr;
+    let token = server.auth.token_for_user();
+    let caller = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &token,
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}),
+        )
+    });
+    let request = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    request
+        .reply
+        .send(Err("secret=private-access-token /private/files".into()))
+        .unwrap();
+    let (_, response) = caller.join().unwrap();
+    assert!(!response.contains("private-access-token"));
+    assert!(!response.contains("/private/files"));
+    assert!(response.contains("internal_error_outcome_unknown"));
+    assert!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .all(|info| info.last_tool_success_at.is_none())
+    );
+}
+
+#[test]
+fn cloud_management_revoked_manual_credentials_do_not_exhaust_registry() {
+    let time = now();
+    let auth = Auth::new_at(time);
+    for _ in 0..100 {
+        let (principal, _) = auth
+            .mint_manual_connection("Revocable connection", false, time)
+            .expect("retired connections must leave room for new credentials");
+        assert!(auth.revoke_connection(&principal.id));
+        assert!(auth.connections_at(time).len() <= 65);
+    }
+}
+
+#[test]
+fn cloud_management_code_like_private_errors_and_structured_errors_are_safe() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let cases = [
+        Err("c0ffee0123456789".into()),
+        Ok(
+            json!({"status":"unknown","error":"secret=/private/answer","retryable":true,"effect_state":"none"}),
+        ),
+    ];
+    for reply in cases {
+        let addr = server.addr;
+        let token = server.auth.token_for_user();
+        let caller = std::thread::spawn(move || {
+            http_call_addr(
+                addr,
+                &token,
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}),
+            )
+        });
+        let request = server
+            .requests
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        request.reply.send(reply).unwrap();
+        let (_, response) = caller.join().unwrap();
+        assert!(!response.contains("c0ffee0123456789"));
+        assert!(!response.contains("/private/answer"));
+        let envelope: Value = serde_json::from_str(&response).unwrap();
+        let payload: Value =
+            serde_json::from_str(envelope["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(payload["retryable"], false);
+        assert_eq!(payload["effect_state"], "unknown");
+    }
+}
+
+#[test]
+fn cloud_management_http_activity_uses_credential_identity_only() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    assert!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .all(|info| info.last_authenticated_at.is_none())
+    );
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","clientInfo":{"name":"Owner impersonation","connection_id":"forged"}}});
+    assert_eq!(http_call(&server, "invalid", "", init.clone()).0, 401);
+    assert!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .all(|info| info.last_authenticated_at.is_none())
+    );
+    assert_eq!(http_call(&server, &token, "", init).0, 200);
+    let info = server
+        .auth
+        .connections()
+        .into_iter()
+        .find(|info| info.principal.id == LEGACY_CONNECTION_ID)
+        .unwrap();
+    assert_ne!(info.principal.name, "Owner impersonation");
+    assert!(info.last_authenticated_at.is_some());
+    assert!(info.last_initialize_at.is_some());
+    assert!(info.last_tool_success_at.is_none());
+    let addr = server.addr;
+    let caller = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &token,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_sessions","arguments":{}}}),
+        )
+    });
+    let request = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(request.principal.id, LEGACY_CONNECTION_ID);
+    request.reply.send(Ok(json!({"sessions":[]}))).unwrap();
+    assert_eq!(caller.join().unwrap().0, 200);
+    assert!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .any(|info| info.last_tool_success_at.is_some())
     );
 }
 
@@ -311,7 +891,7 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         "POST",
         "/oauth/register",
         "application/json",
-        r#"{"redirect_uris":["https://client.example/callback"]}"#,
+        r#"{"client_name":"Queue Bot","redirect_uris":["https://client.example/callback"]}"#,
         None,
     );
     let client = body(&r)["client_id"].as_str().unwrap().to_owned();
@@ -334,6 +914,7 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         200
     );
     let approval = server.auth.approvals().pop().unwrap();
+    assert_eq!(approval.client_name, "Queue Bot");
     assert!(server.auth.approve(&approval.id, true));
     let (_, r) = wire(
         addr,
@@ -384,6 +965,13 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
         .unwrap();
     assert!(pending.live(&server.auth));
     assert!(pending.input_scope);
+    let connection_id = pending.principal.id.clone();
+    assert_eq!(pending.principal.name, "Queue Bot");
+    assert!(
+        server
+            .auth
+            .rename_connection(&connection_id, "Owner queue label")
+    );
     let access_expiry = now() + 3600;
     assert!(server.auth.current(pending.epoch, access_expiry));
     assert!(!server.auth.current_access(
@@ -400,18 +988,37 @@ fn queued_oauth_request_is_invalid_after_access_refresh() {
             ("scope", "deppy.read"),
         ])
         .finish();
-    assert_eq!(
-        wire(
-            addr,
-            "POST",
-            "/oauth/token",
-            "application/x-www-form-urlencoded",
-            &f,
-            None
-        )
-        .0,
-        200
+    let refreshed = wire(
+        addr,
+        "POST",
+        "/oauth/token",
+        "application/x-www-form-urlencoded",
+        &f,
+        None,
     );
+    assert_eq!(refreshed.0, 200);
+    let refreshed_access = body(&refreshed.1)["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let refreshed_principal = server
+        .auth
+        .authenticate_principal(&format!("Bearer {refreshed_access}"), now())
+        .unwrap();
+    assert_eq!(refreshed_principal.id, connection_id);
+    assert_eq!(refreshed_principal.name, "Owner queue label");
+    assert_eq!(
+        server
+            .auth
+            .connections()
+            .iter()
+            .find(|info| info.principal.id == connection_id)
+            .unwrap()
+            .principal
+            .name,
+        "Owner queue label"
+    );
+    assert!(!refreshed_principal.input_scope);
     assert!(
         server
             .auth

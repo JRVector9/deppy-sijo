@@ -57,7 +57,7 @@ pub struct SessionResourceUsage {
     /// 세션 자손 프로세스들의 메모리 합. macOS는 pid별 phys_footprint 합 —
     /// ps RSS 합산은 공유 페이지(dyld 캐시·런타임)를 자손 수만큼 중복 가산해
     /// 수천 프로세스에서 수백 GiB 허수를 만든다(2026-07-23 실증). 조회 실패한
-    /// pid와 그 외 플랫폼은 ps RSS로 폴백한다(상한 근사치).
+    /// pid와 그 외 플랫폼은 ps RSS로 폴백한다. 두 지표의 대소 관계는 보장하지 않는다.
     pub rss_bytes: u64,
     pub cpu_percent: Option<f32>,
     pub high_cpu: bool,
@@ -822,8 +822,8 @@ fn phys_footprint_for_pid(pid: u32) -> Option<u64> {
 }
 
 /// 자손 프로세스 한 행의 메모리. macOS는 phys_footprint를 조회해 ps RSS의 공유
-/// 페이지 중복 합산을 제거하고, 실패한 행만 ps RSS로 폴백한다 — 절대 0으로
-/// 떨어뜨리지 않는다. 캐시는 같은 샘플 주기 안에서 pid당 syscall 1회 바운드용.
+/// 페이지 중복 합산을 줄이고, 실패한 행만 ps RSS로 폴백한다. 성공한 값은 RSS와의
+/// 대소 관계나 0 여부에 따라 보정하지 않는다. 캐시는 같은 샘플 안에서 pid당 조회 1회용.
 #[cfg(target_os = "macos")]
 fn descendant_rss_bytes(
     row: &ProcessRow,
@@ -980,40 +980,201 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn macos_자식_다수의_footprint_합은_ps_rss_합보다_작다() {
-        let mut children: Vec<std::process::Child> = (0..5)
-            .map(|_| {
+    #[ignore = "diagnostic: compare distinct native metrics over repeated child samples"]
+    fn all_review_20261014_macos_footprint_rss_repeat_probe() {
+        struct Children(Vec<std::process::Child>);
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut footprint_less_than_ps = 0;
+        let mut footprint_equal_to_ps = 0;
+        let mut footprint_greater_than_ps = 0;
+        for round in 0..20 {
+            let mut children = Children(Vec::new());
+            for _ in 0..5 {
+                children.0.push(
+                    std::process::Command::new("/bin/sleep")
+                        .arg("10")
+                        .spawn()
+                        .expect("sleep spawn"),
+                );
+            }
+            let mut footprint_sum = 0u64;
+            let mut ps_rss_sum = 0u64;
+            let mut native_footprint_sum = 0u64;
+            let mut native_resident_sum = 0u64;
+            for child in &children.0 {
+                let pid = child.id();
+                // Match the existing failing fixture's production helper then ps order.
+                footprint_sum += phys_footprint_for_pid(pid).expect("footprint");
+                let output = std::process::Command::new("/bin/ps")
+                    .args(["-o", "rss=", "-p", &pid.to_string()])
+                    .output()
+                    .expect("ps");
+                assert!(output.status.success());
+                let kib: u64 = String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .parse()
+                    .expect("rss parse");
+                ps_rss_sum += kib * 1024;
+
+                // A single native call also returns the two distinct metrics together.
+                let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+                let rc = unsafe {
+                    libc::proc_pid_rusage(
+                        pid as libc::c_int,
+                        libc::RUSAGE_INFO_V4,
+                        info.as_mut_ptr().cast(),
+                    )
+                };
+                assert_eq!(rc, 0, "native rusage query");
+                // SAFETY: the successful query initialized the requested structure.
+                let info = unsafe { info.assume_init() };
+                native_footprint_sum += info.ri_phys_footprint;
+                native_resident_sum += info.ri_resident_size;
+            }
+            match footprint_sum.cmp(&ps_rss_sum) {
+                std::cmp::Ordering::Less => footprint_less_than_ps += 1,
+                std::cmp::Ordering::Equal => footprint_equal_to_ps += 1,
+                std::cmp::Ordering::Greater => footprint_greater_than_ps += 1,
+            }
+            eprintln!(
+                "round={round} footprint_sum={footprint_sum} ps_rss_sum={ps_rss_sum} native_footprint_sum={native_footprint_sum} native_resident_sum={native_resident_sum}"
+            );
+            assert!(footprint_sum > 0 && ps_rss_sum > 0);
+            assert!(native_footprint_sum > 0 && native_resident_sum > 0);
+        }
+        eprintln!(
+            "rounds=20 footprint_lt_ps={footprint_less_than_ps} footprint_eq_ps={footprint_equal_to_ps} footprint_gt_ps={footprint_greater_than_ps}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_cached_footprint_is_used_without_rss_ordering_or_zero_clamping() {
+        let row = ProcessRow {
+            pid: u32::MAX,
+            ppid: None,
+            pgid: None,
+            rss_bytes: 1234,
+            cpu_percent: None,
+        };
+        let mut cache = std::collections::HashMap::from([(row.pid, Some(8192))]);
+        assert_eq!(descendant_rss_bytes(&row, &mut cache), 8192);
+        cache.insert(row.pid, Some(0));
+        assert_eq!(descendant_rss_bytes(&row, &mut cache), 0);
+        cache.insert(row.pid, None);
+        assert_eq!(descendant_rss_bytes(&row, &mut cache), 1234);
+        assert_eq!(cache.get(&row.pid), Some(&None));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_live_descendants_sum_native_memory_and_reuse_only_the_same_sample_cache() {
+        struct Children(Vec<std::process::Child>);
+        impl Children {
+            fn reap(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    child.wait().expect("child reap");
+                }
+            }
+        }
+        impl Drop for Children {
+            fn drop(&mut self) {
+                for child in &mut self.0 {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+            }
+        }
+
+        let mut children = Children(Vec::new());
+        for _ in 0..5 {
+            children.0.push(
                 std::process::Command::new("/bin/sleep")
                     .arg("10")
                     .spawn()
-                    .expect("sleep spawn")
+                    .expect("sleep spawn"),
+            );
+        }
+        let rows: Vec<_> = children
+            .0
+            .iter()
+            .map(|child| ProcessRow {
+                pid: child.id(),
+                ppid: Some(std::process::id()),
+                pgid: Some(77),
+                rss_bytes: 1234,
+                cpu_percent: None,
             })
             .collect();
-        let mut footprint_sum = 0u64;
-        let mut ps_rss_sum = 0u64;
-        for child in &children {
-            let pid = child.id();
-            footprint_sum += phys_footprint_for_pid(pid).expect("footprint");
-            let output = std::process::Command::new("ps")
-                .args(["-o", "rss=", "-p", &pid.to_string()])
-                .output()
-                .expect("ps");
-            let kib: u64 = String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse()
-                .expect("rss parse");
-            ps_rss_sum += kib * 1024;
-        }
-        for child in &mut children {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        // dyld 공유 캐시가 자식마다 ps RSS에 중복 가산되므로 footprint 합이
-        // 항상 작아야 한다 — 공유 페이지 중복 제거의 회귀 가드.
-        assert!(
-            footprint_sum < ps_rss_sum,
-            "footprint_sum={footprint_sum} ps_rss_sum={ps_rss_sum}"
+        let mut cache = std::collections::HashMap::new();
+        let expected_sum: u64 = rows
+            .iter()
+            .map(|row| {
+                let value = descendant_rss_bytes(row, &mut cache);
+                assert!(cache.get(&row.pid).is_some_and(|value| value.is_some()));
+                value
+            })
+            .sum();
+        assert!(expected_sum > 0);
+        let cached = cache.clone();
+        let table = ProcessTable::new(&rows);
+        let target = SessionResourceTarget {
+            session: SessionId(1),
+            identity: ProcessIdentity {
+                pid: Some(rows[0].pid),
+                process_group: Some(77),
+                source: ProcessIdentitySource::PlatformFallback,
+            },
+        };
+        let usage = aggregate_session_usage_with_table(
+            target,
+            &table,
+            123,
+            100.0,
+            expected_sum,
+            &mut |row| descendant_rss_bytes(row, &mut cache),
         );
+        assert_eq!(usage.process_count, rows.len());
+        assert_eq!(usage.rss_bytes, expected_sum);
+        assert!(usage.high_rss);
+        assert_eq!(cache, cached);
+
+        children.reap();
+        // A successful query stays memoized until this sample ends, even if the pid exits.
+        let same_sample = aggregate_session_usage_with_table(
+            target,
+            &table,
+            124,
+            100.0,
+            expected_sum,
+            &mut |row| descendant_rss_bytes(row, &mut cache),
+        );
+        assert_eq!(same_sample.rss_bytes, expected_sum);
+        assert_eq!(cache, cached);
+
+        // A fresh sample tries each pid again and falls back only for failed native queries.
+        let mut next_sample_cache = std::collections::HashMap::new();
+        let next_sample = aggregate_session_usage_with_table(
+            target,
+            &table,
+            125,
+            100.0,
+            1234 * rows.len() as u64 + 1,
+            &mut |row| descendant_rss_bytes(row, &mut next_sample_cache),
+        );
+        assert_eq!(next_sample.rss_bytes, 1234 * rows.len() as u64);
+        assert!(!next_sample.high_rss);
+        assert_eq!(next_sample_cache.len(), rows.len());
+        assert!(next_sample_cache.values().all(Option::is_none));
     }
 
     #[test]

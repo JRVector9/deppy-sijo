@@ -1,0 +1,40 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/core)
+   Compiling secret v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/secret)
+   Compiling mux v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/mux)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/terminal)
+   Compiling persist v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/persist)
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/pty)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/audit)
+   Compiling mcp-store v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/mcp-store)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage-core)
+   Compiling storage v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/session)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 17.74s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-46a3bba02c89b9c4)
+
+running 1 test
+test resource_monitor::tests::all_review_20261014_macos_footprint_rss_repeat_probe ... round=0 footprint_sum=6440112 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=1 footprint_sum=5522512 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=2 footprint_sum=5522512 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=3 footprint_sum=5669968 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=4 footprint_sum=6194280 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=5 footprint_sum=5588048 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=6 footprint_sum=5588048 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=7 footprint_sum=5686352 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=8 footprint_sum=5866576 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=9 footprint_sum=5522512 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=10 footprint_sum=5866576 ps_rss_sum=6373376 native_footprint_sum=6456496 native_resident_sum=6373376
+round=11 footprint_sum=5899344 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=12 footprint_sum=5555280 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=13 footprint_sum=5997672 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=14 footprint_sum=6128744 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=15 footprint_sum=5637200 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=16 footprint_sum=6194280 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=17 footprint_sum=5948520 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=18 footprint_sum=5719120 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+round=19 footprint_sum=5850192 ps_rss_sum=6389760 native_footprint_sum=6472880 native_resident_sum=6389760
+rounds=20 footprint_lt_ps=19 footprint_eq_ps=0 footprint_gt_ps=1
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 396 filtered out; finished in 0.15s

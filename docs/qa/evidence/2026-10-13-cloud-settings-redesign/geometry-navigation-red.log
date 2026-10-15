@@ -1,0 +1,34 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.80s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 5 tests
+test cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons ... FAILED
+test cloud_agent::ui::redesign_tests::redesign_initial_screen_explains_connecting_without_showing_credential_forms ... ok
+test cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab ... FAILED
+test cloud_agent::ui::redesign_tests::redesign_tabs_show_only_the_selected_task_and_keep_actions_reachable ... ok
+test cloud_agent::ui::redesign_tests::redesign_native_geometry_and_reference_images ... ok
+
+failures:
+
+---- cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons stdout ----
+
+thread 'cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons' (27567331) panicked at crates/app/src/cloud_agent/ui/redesign_tests.rs:69:5:
+search input differs from approved control height: [[289.8 155.9] - [609.8 176.1]]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab stdout ----
+
+thread 'cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab' (27567328) panicked at crates/app/src/cloud_agent/ui/redesign_tests.rs:98:5:
+assertion `left == right` failed
+  left: Connections
+ right: Advanced
+
+
+failures:
+    cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab
+    cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 3179 filtered out; finished in 9.93s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -1,3 +1,510 @@
+# Main 통합 보안 gate 후속 — 진행 중, 2026-10-15
+
+- 현재 실제 branch `integrate/reviewed-main-clean-20261015`, HEAD51ae03da, PR231. 원래 PR230은 SHA256 오탐 표현을 정리한 대체 PR로 인해 closed; 원본 branch/commit1192cfcb 보존, force push 없음.
+- 제품057048ac에 대한 실제 전체검사5733PASS/0FAIL/65ignored, Clippy/fmt/경계/deps 모두0. release 선행 컴파일 exit0/2m22s, CLI `Deppy Sijo 0.12.2`. 아직 main merge와 최종 bundle 없음, 앱 launch/restart 없음.
+- PR231 GitGuardian/라이선스/Linux/형식·경계 PASS. macOS Clippy PASS, 상태 회귀 실행 중. RustSec는 실제4개 새 advisory(2026-10-14)로 FAIL: rustls0.23.45. 이를 무시하지 않고 root 최소버전/lock만0.23.46으로 갱신한다. GUI/Actions 일괄 업그레이드는 제외 유지.
+- root가 Cargo sole executor. 현재 패치 업데이트→연결 영향 검사→Clippy/CI 전체→release 재컴파일·main merge·최종 package/version 검증이 남았다. 현재 0.12.2는 미배포라 추가 version bump 불필요.
+- 다음 추가 사용자 작업은 아래 대기 목록(한글 IME 초성 문제 GitHub 비교 수정+cloud 완료 알림)이며, 이 통합/빌드 최종 확인 뒤 GPT-6.1-Sol/xhigh 병렬로 시작한다. 아직 착수하지 않았다. IME 발생 위치 질문은 async 대기, 무응답은 선택으로 간주하지 않는다.
+
+# Main 통합 검토·재빌드 — 진행 중, 2026-10-15 (Codex)
+
+## 현재 목표
+
+사용자 요청: main 미반영 커밋/미커밋 수정/열린 PR/다른 worktree 잔여물을 각각 검토하고 필요한 변경만 안전하게 main으로 통합한 뒤 재빌드. 재실행은 요청되지 않았으며 앱 stop/launch 금지.
+
+## 작업 상태와 설계
+
+- 원본 `/Users/jr/Desktop/projects/deppy-sijo-performance` dirty 보존. 별도 `/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015`, branch `integrate/reviewed-main-20261015`에서 통합.
+- 시작 HEAD d8826f0b, 원격 main d5f88b35. main이 HEAD의 조상이며 main 이후 커밋23개. 원본 tracked45개+untracked361개를 SHA 대조해 복사했다.
+- 과거 Draft7건·의존성4건 및 다른 worktree의 잔여물을 각각 대조해 포함/제외 근거를 `docs/qa/2026-10-15-main-integration.md`에 기록한다. 오래된 가지를 일괄 merge하지 않는다.
+- ship/review 스킬 본문은 읽었지만 필수 gstack review/checklist.md가 로컬 skill/프로젝트 어디에도 없어 해당 자동 workflow는 중단. 저장소 검증과 직접 코드 리뷰로 사용자 작업을 계속하며 그 스킬 완료를 주장하지 않는다.
+- 변경된 로컬 배포 artifact는 최신 shipped version보다 높은 버전, 바이너리 --version 및 bundle 두 version필드 검증 후 완료. 테스트 결과를 이전 실행으로 대체하지 않는다.
+
+## 완료/변경/검증
+
+- origin fetch 완료. 통합 worktree 생성과 원본 수정 byte 복사 검증 완료. 제품 commit057048ac 완료. push/merge/build는 대기.
+- 수정 파일: 이 handoff와 복사된 기존 수정. 이전 QA/evidence는 역사 기록으로 유지.
+
+## 이번 단계 진행과 실제 검사
+
+- PR11건을 각각 검토해 기존 기능/대체 UX와 겹치는 Draft4개, 미채택 실험3개, 이미 적용된 base641개, 제품 안정화에 불필요한 dependency/action 업그레이드3개를 이번 merge에서 제외하기로 했다. 원본 가지는 삭제하지 않는다.
+- Claude resolvedModel label 누락은 기존 parser 회귀로 실제 RED0PASS/1FAIL exit101. launch alias 값은 동일하고 label만 달라져 실패했다. 해당 작은 수정만 agent-wait-audit에서 선별 반영했다.
+- source version0.12.1→0.12.2, workspace inherited package27개 lock을 같은 버전으로 갱신. 기존 shipped bundle 최고0.11.0, 모든 branch source 최고0.12.1 확인.
+- 0.12.2 전체 workspace 실제 exit0: 78 Cargo harness의 마지막 결과 합계5733PASS/0FAIL/65ignored. nested subprocess 결과 중복 제외. workspace-result.json에 집계. `cargo fmt --all -- --check` 실제 exit0. 엄격한 Clippy/경계/의존성 검사 모두 실제 exit0 (final-gates.json).
+- Node relay16PASS/0FAIL exit0; Chromium readability114 assertions exit0; history89 assertions exit0; cloud-results-mobile77 assertions exit0 (native app 실행 없음).
+- 역사 raw patch/log의 context 공백·테스트 출력은 SHA 증거 보존을 위해 재작성하지 않는다. 전체 cached diff 경고는 이 raw evidence에만 한정됨을 파일별 집계로 확인했다. 제품 cached diff와 evidence 제외 문서 cached diff는 각각 exit0.
+- staging 뒤 diff 검사에서 새 CHANGELOG의 끝 빈줄1개를 찾아 제거했고 cached diff 검사를 재실행해 exit0. 제품/test 변경 없음.
+- 보고서 생성 첫 Python 명령은 문자열 newline 구문 오류로 파일 쓰기 전 실패했다. apply_patch로 문서를 작성하고 commit 목록을 append해 교정. 제품 동작 실패와 별개다.
+- 문서: docs/qa/2026-10-15-main-integration.md, CHANGELOG.md, plan 및 evidence의 branch/worktree/PR inventory. 원본 작업 folder dirty patch는 중복 배포를 피하려고 통합본에 넣지 않고 SHA만 남겼다.
+
+## 사용자 추가 요청 — 통합·빌드 최종 확인 뒤 순차 착수
+
+- 현재 main 통합/재빌드/최종 확인을 먼저 완료한다.
+- 이후 GPT-6.1-Sol/xhigh 서브에이전트 병렬: GitHub 유사 터미널 프로젝트의 한글 IME 처리와 비교해 초성만 입력되는 문제를 재현·원인 확인·수정한다.
+- 클라우드 연결에서 로컬 작업 완료 시 원래 클라우드 에이전트에 자동 알림을 보내는 기능을 기존 연결/권한/작업 상관관계 계약에 맞춰 구현한다.
+- 현재 단계가 끝나기 전에 후속 구현을 섞지 않는다. 새 작업도 앱 재실행 승인을 뜻하지 않는다.
+
+## 남은 작업과 다음 명령
+
+1. 23개 커밋/dirty/Draft7개/dependency4개/다른 worktree 대조 완료.
+2. 필요한 Claude label 잔여 통합, 버전0.12.2/changelog/통합보고서 작성 완료.
+3. 최종 workspace/lint/경계/JS 검사 완료 → docs commit·push·PR·main merge → 그 commit의 release build/package/version검증.
+4. GitHub 체크가 실제 실행 안 된 경우에만 별도 workflow의 로컬 대체 게이트를 확인. 실패/미실행은 PASS로 세지 않는다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015
+cat AGENTS.md
+head -n 65 docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+git log --oneline origin/main..HEAD
+```
+
+---
+
+# 병목·클라우드 재리뷰 결함 병렬 수정 — 완료, 2026-10-15 (Codex)
+
+## 목표와 완료 상태
+
+- 현재 사용자 요청: 발견 R01–R06/P01을 서브에이전트 병렬 수정. 7항목의 소스 구현·통합·교차 리뷰·실제 회귀·workspace/lint·최종 기록을 완료했다.
+- Canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, HEAD `d8826f0bdb8d89255f3448b5b61b6eee83faa87a`, source/test0.12.1와 이전 dirty 보존. nominal checkout과 실제 사용자 앱/세션/DB/키/clipboard/provider 계정은 변경하지 않았다.
+- GPT-6.1-Sol/xhigh workers3명: management R01/R05, PTY R02, transport R04/R06. Root는 R03/P01·공유 secret revision, canonical 통합과 sole Cargo2jobs 담당. 별도 exact-dirty worktree의 baseline-relative patch만 통합했다. 관리→transport, PTY→관리, transport→Root 교차 리뷰 완료. worker/Cargo 잔여 작업 없음.
+- release/package/restart/commit/push 없음. 현재 task는 source/test 수정이다. 다음 사용자용 배포는 last-shipped보다 높은 patch version과 binary/macOS bundle version 검증이 필요하며 새 재실행 요청 없이 앱을 stop/launch하지 않는다.
+
+## 설계 결정과 수정 파일
+
+- R01: shutdown 입구에서 신규 관리 접수를 영구 봉인. 이미 접수한 queued job과 유한 Get/Lookup→Save durable continuation은 유지하고 오류 재접수는 금지.
+- R05: bootstrap_initialized/in_flight 분리, 실패는 job을 보존하지 않는 단일250ms retry deadline. empty cache도 repaint, active에서만 재시도하며 stopping에서 timer/job 생성 없음.
+- R02: master close 전 실제 foreground/shell PID/birth/PGID/SID를 고정. 자연 종료는 child mutex 아래 matching waitid WNOWAIT 결과로 unreaped owner를 확인한 뒤 shell-group 멤버를 보존한다. 정상 poll은 scalar 조회만 하며 그룹 스캔은 종료 시에만 한다. HUP20ms→TERM200ms→KILL은 각 멤버 신원을 재확인한다. frozen·자기/외부 그룹 제외·I/O cancel/join·유계 reap·runtime authorization deferral을 유지한다. 미래/escaped 자식 전체 정리로 계약을 확장하지 않는다.
+- R03/P01: coherent RedactionSnapshot mutex+단조revision을 모든 표시필드에 사용. 등록/lease 변경·retirement/prune/fail-closed에서 revision 증가. list_sessions title/workspace_name 마스킹 후512UTF8 cap, routing opaque identity 보존. safe projection은 원본 Arc identity+corpus revision으로1개 cache; raw source는 늦은 키 마스킹에 유지. corpus/source 변경 때 동기 재계산.
+- R04: TcpStream 단독 소유 AuthDeadlineStream, raw Read/Write/flush 및 auth parse 완료를 남은 전체 시한/stop으로 제한. 성공 때 원 read/write timeout 복원, 실패 reply/close에도 같은 guard 유지. 정상 partial frames/Pong 동작 보존.
+- R06: active && (live || 기존 read grant)일 때 read revoke UI 활성. 종료 후 재승인/input 비활성, actor/다른 session consent 유지.
+- 기존 변경10: app/cloud_agent.rs, cloud_agent/bridge_tests.rs, management.rs, ui/management_tests.rs, ui/permissions.rs; pty/lib.rs와 workload_signal.rs; secret/lib.rs와 redaction.rs; web-remote/ws_api.rs. 신규 pty/foreground_teardown_tests.rs. 시작422→최종423 source, 무관412 byte-identical. Cargo.toml/lock task-start와 동일.
+- 보고서 `docs/qa/2026-10-15-resource-cloud-fixes.md`, evidence `docs/qa/evidence/2026-10-15-resource-cloud-fixes/`, plan, 원본 review 후속 링크, 이 handoff. `root-final-task-changes.patch`가 최종 dirty-baseline 증분이며 worker 중간패치를 재적용하지 않는다.
+
+## 실제 실행과 결과
+
+- 새 safe Arc RED: compile 성공0PASS1FAIL101. 새 PTY production6fixtures RED: compile 성공2controlsPASS4protectionFAIL101, exactidentity rescue 완료. 나머지 cloud 5경로는 원본 리뷰 actual RED를 production 회귀로 이식했다.
+- affected GREEN 실제: secret80PASS, 초기pty64PASS/1ignored→최종pty68PASS/1ignored; Appcloud175PASS/3ignored; Web unit392+integration20=412PASS/13ignored. 각exit0. 앞선 실행을 workspace 총계에 더하지 않는다.
+- 최종 `CARGO_BUILD_JOBS=2 cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1`: exit0, **5732PASS/0FAIL/65ignored**, 78Cargo harness 최신 마지막 결과. nested subprocess3개 중복 제외. Appunit3228PASS/39ignored 포함.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `cargo run --offline --locked -p xtask -- check-boundary`, `... check-deps`: 모두 실제exit0.
+- Root독립 productionPTY: 새 canonical rlib를 새 binary로 재링크 compile0/run0. normal/HUP무시 Drop/kill/frozen4조건 전경잔존false 및 cleanupPASS. 기존 리뷰 binary 재사용 없음. source/rlib/binary SHA와 compile/run command·rlib mtime evidence에 보관.
+- optimized exactproduction component 같은100x16KiB/key32 fixture10sample: 이전평균110.782ms/14,902alloc/37,102,106누적bytes→warm <0.001ms/0alloc/0bytes. 실제late-registration/wrappedsecret/routing/Arc reuse PASS. cold동일조건114.108ms, key128387.129ms. GUIframe/RSS/release/retainedheap 측정 아님. 첫 rebuild는 corpus mutex를 보유해 등록이 기다릴 수 있다.
+- 최종 artifact decoded/storedSHA, source423SHA, baseline412보존, local links, gitdiffcheck 및 taskpatch reversecheck는 evidence verification-result.json으로 확인한다. 실제provider/publictunnel/mobile/OSsleep/WindowsLinuxruntime은 검증범위밖, RelayBLOCKED해소주장없음.
+
+## 실패 접근과 교정
+
+- 첫 App GREEN은 새UItest NodeT import누락2 E0599 compile101, 행동RED 아님. trait import 보완.
+- 두번째 App 실제174PASS/1FAIL/3ignored: accepted-stale fixture가 bootstrap미완료상태에서2작업접수뒤1completion을기대. 223ms에이미받은2작업배출·잠금해제전종료. empty bootstrap완료와초기3wakecallback barrier로 자격을보완, exact-one assertion유지, 제품변경없음. 이후 Appcloud/fullApp/workspace 모두 통과.
+- 첫 workspace 실제exit101: 자연 종료 뒤 same-group 자식 정리 누락으로 기존 runtime 승인 handshake 실패. Root가 private fixture 신원·경로·command를 고정해 개별 TERM으로 정리했다. 초기 shell-exit Drop/kill 2회귀 RED0PASS2FAIL(당시 inspectNone은 실제 reap 증거가 아니었음); 첫 zombie-query 보완도PTY64PASS2FAIL1ignored였다. Root native probe에서 Darwin proc_pidinfo/getsid가 exited-unreaped child에ESRCH임을 확인하고 matching waitid WNOWAIT로 교정했다. 기존 승인 assertion을 유지한 채 PTY전체·해당runtime검사·최종workspace 통과. 모든 실패 원로그 보존.
+- 첫 WNOWAIT보완도61PASS5FAIL1ignored: Darwin WEXITED가CLD_STOPPED를반환하는실제OS동작, teardown-before-reaper간격을추가교정. reaper를미리stop/join한실제Drop/kill회귀와진짜ECHILDreap증거로테스트자격도강화했다. 정상 상태 poll에서 STOP/CONT는 상태 소비나 그룹 capture 없이 보류한다.
+- 독립 production probe의 첫 선택은 예전 fixed rlib가 수정 source보다 오래되어 실행 전 freshness assertion이 거절했다. 제품 테스트 실행/실패로 세지 않는다. 최신 canonical cohort의 deps.d·mtime·source SHA를 확인한 새링크로 compile0/run0을 검증했다.
+- evidence 검증의 첫 실행은 결과 파일을 생성하기 전에 README의 자기 결과 링크 존재를 검사해 실패했다. 자기 결과 링크만 생성 뒤 검사하도록 순서를 교정하고 전체 SHA/links/delta 검증을 재실행했다. 제품·테스트 소스 변경 없음.
+- transport 초기 read-only wrapper는 source review에서 tungstenite automaticPong/Close write/flush까지 보강한뒤 최종 통합. 과거gstack필수checklist누락 workflow는완료라고세지않고직접요청된 sourcepeerreview를수행했다.
+- canonical로전환한뒤모든crateentry+xtaskmtime를한번갱신해sharedtarget stalescratchartifact를방지했다. 이후 Cargo는canonical단일실행. bytes변경없이mtime만갱신했다.
+
+## 남은 작업과 다음 정확 명령
+
+요청된 구현·검증 잔여 없음. 새로운 사용자 지시를 기다린다. source/test version0.12.1을 사용자용 변경 release로 배포하지 않는다. 재실행은 현재 task에 승인되지 않았다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-performance
+cat AGENTS.md
+head -n 90 docs/CODEX_HANDOFF.md
+git status --short
+git diff
+cat docs/qa/2026-10-15-resource-cloud-fixes.md
+cat docs/qa/evidence/2026-10-15-resource-cloud-fixes/README.md
+cat docs/qa/evidence/2026-10-15-resource-cloud-fixes/verification-result.json
+git diff --check
+```
+
+---
+
+# 병목·리소스·클라우드 기능 재리뷰 — 완료, 2026-10-15 (Codex)
+
+## 현재 목표와 결과
+
+- 사용자 요청: 현재 수정 소스의 병목/리소스 누수/오동작 및 클라우드 에이전트 기능 정상성을 다시 코드 리뷰. 호출 경로·기존 보호 코드·실제 재현을 대조하고 새 결함6건(high3/medium3)+실측 병목P01(medium1)을 보고했다. 아래 번호는 직전 전체 수정 R01–R12와 별개다. 리뷰 완료이며 새 결함은 제품 미수정이다.
+- Canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, HEAD `d8826f0bdb8d89255f3448b5b61b6eee83faa87a`, source/test0.12.1와 기존 dirty 보존. nominal checkout/실앱/세션/userDB/keys/clipboard 변경·release/package/restart/commit/push 없음.
+- GPT-6.1-Sol/xhigh read-only 성능·리소스/클라우드 로직/인증·보안/오류 처리 관점. Root는 실제 caller·source invariant·재현 자격을 확인하고 sole Cargo 실행.4agent 동시slot 때문에 4번째 관점은 슬롯 반환 후 진행. codex-reviewer+systematic-debugging 적용; gstack review 필수 checklist 누락으로 그 workflow 미완료. 보안worker 마지막turn contentfilter 중단은 Root source/safe private loopback 회귀로 보완. 별도CLI review300초 timeout124/최종결과없음은 clean review로 세지 않는다. 현재 모든 workers/Cargo/subprocess 완료.
+
+## 발견과 설계 권고
+
+- R01high: cloud_agent.rs705 shutdown drain→completion→poll_management가 실패한 stale GetRun/SaveRun을 재접수, 지속DB오류에서 drain끝나지 않음. 종료 신규bootstrap/stale admission을 먼저 봉인하고 이미받은 durable작업과 유한continuation만배출.
+- R02high: pty/lib.rs1836/2023 cached shellPGID를 정리하지만 일반unfrozen jobcontrol foreground별도PGID가HUP무시하면 Drop/kill이TERM/KILL을전달하지않음. masterclose전에birth/PGID/SID/ownedSession 고정하고 기존workload_signal 신원보호로현재fg정리.
+- R03high: cloud_agent.rs1358 list_sessions title/workspace_name raw출력. knowncredential을표시필드만현재corpus로redact, originalroutingUUID/gen유지.
+- R04medium: web-remote/ws_api.rs196 directWS authenticate 전체5초검사가ws.read전뿐. individual300msread정상fragment를통해6.363초후valid auth수락. transportremainingdeadline+완료시간검사. 기존relayTLS시한fix와별도.
+- R05medium: management.rs557 bootstrap_started를접수시true로고정, 최초ListRunsErr후재시도없어복구DB의savedrun도UIcache누락. successinitialized/inflight분리+유계backoff, R01종료봉인아래설계.
+- R06medium: ui/permissions.rs198 active&&live로readcheckbox disable, backendretainedread에대해종료target세션별해제UI없음. 기존consent해제는허용, inputlive정책유지.
+- P01medium: cloud_agent.rs306 cloud_answers 전체clone/redaction/VecArc매UIupdate(app.rs35371), stoppedhidden경로도반복. optimizedactualmethod/redaction 합성100x16KiB/key32 Root10회평균110.782ms/14,902alloc/37,102,106누적bytes. sourcehistoryrevision+단조corpusgeneration cache, credential추가/교체/lease변경즉시무효화. GUIframe/RSS/retainedheap누수측정아님.
+- 권장PR1R01+R05, PR2R02, PR3R03, PR4R04, PR5R06, PR6P01. 실제provideraccounts는privatefixtures와구분하며live호환성검증완료라표현하지않음.
+
+## 실제 실행한 검사와 증거
+
+- canonical `CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-sijo --bin deppy-sijo cloud_agent:: -- --test-threads=1` exit0/161PASS3ignored; cloud_history_worker:: exit0/6PASS. `cargo test --offline --locked -p agent-mcp -p web-remote --no-fail-fast -- --test-threads=1` exit0/MCP67PASS1ignored+webunit388PASS1ignored+integrations20PASS12ignored. 합계642PASS/0FAIL/17ignored, nestedMCP1PASS제외. 이전5702PASS재사용아님, 이번전체workspace실행아님.
+- detachedexact-source scratch `/private/tmp/deppy-cloud-review-worktree-20261015`에tests-onlypatch만적용. Root기존공유target/Cargo단독. metadata/ended-consent/bootstrap/qualifiedWS각compile성공0PASS1FAIL(exit101); shutdowncontrol1PASS/protection1FAIL101. shutdownlock700ms동안6completion→release후717ms/control2ms. bootstrapactualcache0expected1이고sameworker독립query1로DB복구자격확인. namedreadactorfakeknownkeytitleleak및actualeguiendedcheckbox승인true확인. WSqualifiedactual5s/300mstimeout6.363sacceptedtrue.
+- actualproductionPTYrlib/macOSnative격리bashforeground하네스Root독립rerunexit101(Drop/kill HUP무시sameidentity잔존), normal/frozencontrolsPASS;15초hardlifetime+identityscopedcleanup전부완료. loopbacksocketsdrop/writerjoin,SQLiterollback/join완료. optimizedbenchmarkexit0/late-redactionwrappedsecret+routingidentity/equivalencecontractPASS. cumulativealloc은traffic이지retainedheap아님.
+- 최종실제검증: archived45artifactstoredSHA(rawCLI gzip decodedSHA포함), source422SHA,HEAD및trackedproductdiff 시작bytes동일; newreport/READMElocal43link(소스line suffix제외),finding6+P1sections, 실제로그의normaltest21이름, whitespace/Newline,combinedtests-onlypatchgitapplycheck0,gitdiffcheck0. evidence/verification-result.json. 현재제품소스422개변화0, baseline코드dirty그대로.
+
+## 수정 파일·실패 접근·남은 일
+
+- 새report `docs/reviews/2026-10-15-resource-cloud-code-review.md`, evidence `docs/reviews/evidence/2026-10-15-resource-cloud-code-review/`(원본45artifact+manifest/README/normal-test-reference-check/verification-result), 이handoff만permanent신규/변경. 이전source/docsdirty는보존. 원시private /private/tmp/deppy-cloud-review-root-20261015 및perf/logic/quality에유지; source-start/products-start와finalcombinedtests-onlypatch원본SHA보관.
+- 실패/교정: 첫WSfixture에type:auth가없어wholedeadline5.871sovershoot만확인, validAuthacceptance근거제외. parsequalification후qualified6.363sacceptedtrue로재검사. docname검증처음workspace_nameDTOfield를test로오분류한scriptassertion은testname범위를21개로교정해PASS;제품실패로세지않음. CLItimeout/contentfilter/checklistmissing은workflow제약으로기록, 통과승인/최종자동리뷰로표현하지않음.
+- 리뷰정리잔여없음. 발견6결함/P01은아직미수정; 구현요청시reportPR단위로진행하고 syntheticRED를production회귀로이동. 실제dot/MetaMuse/GrokBot계정/publictunnel/realbrowser/mobiledevice/OSsleep/WindowsLinuxruntime미검증, 기존RelayBLOCKED해소주장없음.17ignored를PASS로세지않음.
+- 현재공유target에는scratchtests-onlyApp/webtestbinary가있고사용자releaseartifact아님. canonicalCargo재실행필요시모든crates src/lib.rs/src/main.rs 및xtask entry touch후soleCargo실행(staleworktreeartifact재사용방지);mtime만변하고bytes유지. 추가코드수정없이기존검사반복불필요.
+- 다음정확명령(canonicalcwd): `cat AGENTS.md`; `head -n 55 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/reviews/2026-10-15-resource-cloud-code-review.md`; `cat docs/reviews/evidence/2026-10-15-resource-cloud-code-review/README.md`; `cat docs/reviews/evidence/2026-10-15-resource-cloud-code-review/verification-result.json`. 사용자새restart요청없이dev-run.sh/실앱종료/launch금지. 사용자용배포시lastshipped보다높은version+builtbinary/bundle검증필수.
+
+---
+
+# 전체 리뷰 결함·개선 후보 병렬 수정 — 완료, 2026-10-15 (Codex)
+
+## 현재 목표와 결과
+
+- 사용자 요청: R01–R12와 개선 P01을 서브에이전트 병렬로 수정하고 C01/C02는 실측·지원 조건을 확인한 뒤 필요한 경우 진행. 요청된 소스 수정·통합·교차 리뷰·검증·보고서 정리를 완료했다.
+- Canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, HEAD `d8826f0bdb8d89255f3448b5b61b6eee83faa87a`, source/test0.12.1. nominal `/Users/jr/Desktop/projects/deppy-sijo`의 오래된 dirty checkout은 변경하지 않았다.
+- 사용자 앱/세션/DB/키/clipboard는 변경하지 않았다. commit/push/build-package/release/restart 없음. 테스트 binary만 사용했다. 다음 사용자용 배포는 last-shipped보다 높은 version 증가와 binary/bundle version 검증이 필요하다. 이 작업에는 재실행 승인이 없다.
+- GPT-6.1-Sol/xhigh 3명 별도 worktree 병렬: lifecycle R01/R09/R10, documents R02doc/R03/R04/R08/R11/C01, data R05/R06/R07/R12coordinator/C02. Root는 R02usage/R12App/P01 및 공통 연결·통합·Cargo·QA. worker는 canonical/common docs/Cargo를 수정하지 않았다. lifecycle↔data, documents→Root, data→최종 document handoff와 Root storage 보정의 read-only 교차 리뷰 및 후속 수정 완료. 현재 worker 작업과 Cargo 실행 없음.
+
+## 변경과 설계
+
+- R01: 취소/전체5초 시한을 관측하는 nonblocking RPC write, child terminate/reap 후 worker/readers join. partial failure는 연결을 폐기한다.
+- R02: 문서/usage 동일 handle의 nonblocking regular-file bounded read. Claude usage는 App-owned bounded worker/cache, 원 timestamp+elapsed로 freshness 유지, worker pending 동안 CLI probe 보류 및 실패 completion부터2초 TTL. frame 파일 I/O 없음.
+- R03/R08: temp 작성/sync 뒤 alias+target revision 재검사, 읽었던 canonical target에 저장해 symlink 보존. conflict는 source/external content 보존. 최종 검사→rename은 OS compare-and-swap이 아니므로 비협조적 writer의 모든 경쟁을 막는다고 주장하지 않는다.
+- R04: 공통 dirty-document popup 사례26 재사용, dead-owner same-path 명시적 복구. 단일 Confirming/Submitted/Canceled plan의 원래 runtime/pane/session owner fence를 Runtime/Workspace 최종 dispatch까지 유지. 취소/실패/panic은 queued close tombstone, queue Full은 재시도하며 새 dirty는 재확인한다.
+- R05/R06: migration IMMEDIATE lock 내 SQLite online backup으로 WAL 포함 snapshot 완성 후 게시. exclusive UUID temp/동일 handle/mode/sync/자기 cleanup. Root backup destination NOFOLLOW 추가 후 정상 부모 symlink만 canonicalize하고 basename/최종 backup entry는 따라가지 않는다.
+- R07: 동일 persistent UUID의 queued/inflight write를 flush 뒤 direct upsert, 새 UUID는 불필요 flush 생략.
+- R09: 실제 foreground/shell 그룹 birth+PGID+SID 검증 동결/재개, 실패 rollback 및 frozen kill/Drop 처리.
+- R10: reader marker·query ownership tags·안전한 bounded sentinel로 이전 agent 응답을 fallback shell과 분리. status 소비 전에 owner retire, 등록 시 stamp 삭제 없음. 사용자 입력과 새 legitimate query 보존. wrapper stamp 실패는 marker+원 exitcode로 종료하고 fallback 없음.
+- R11: TextEdit 삽입 전 UTF8 개별8MiB/전체 retained24MiB budget, paste/IME/replacement/undo 선택 보존. 기존1MiB view-only 정책 유지, locale5 안내key 추가.
+- R12: enqueue 성공 후 pending owner 소비, 거부한 exact owned payload를 App1-slot lane에 보존·50ms repaint·retry. canceled/stale 폐기, 한 번만 전달. heap복제/API확장 없이 좁은 lint allowance 이유 명시.
+- C01: 정상 directory 검증과 optional Unix anchor 분리. host portable helper 통과. Windows offline cross-check는 미캐시 의존성으로 compile전 중단했다.
+- C02: TCP 아래 TLS/WS wholedeadline+50ms stop slice, partial 정상 fragment 재개. WebPKI 및 production Relay BLOCKED 유지. connect 중 취소는 기존 전체10초 시한 범위다.
+- P01: snapshot당 process children adjacency 한 번 구축·재사용. 동일 optimized production-body 합성10회 평균 32/2048=1.313→0.163ms,128/8192=18.015→0.622ms,256/16384=70.400→1.249ms; found 동일. GUI frame 측정 아님.
+- resource_monitor는 제품 metric 변경 없이 잘못된 footprint<RSS 테스트/주석만 교정. native20×5 childprobe에서 <19/=0/>1, 동일 native footprint>resident20/20; Apple primary source URL/SHA 보관.
+
+## 변경 파일과 보존
+
+- 시작 snapshot412개 `/private/tmp/deppy-full-fix-baseline-20261014/`, source-baseline.json 및 products-before.patch. 누락0, 기존 변경25. source/mode/소유 영역은 HEAD가 아니라 이 dirty snapshot 기준으로 통합했다.
+- 주요 파일: App app.rs/agent_detect.rs/codex_app_server.rs/document_io.rs/folder_identity.rs/main.rs/session_aux.rs/ui/document.rs/ui/workspace.rs 및 신규 claude_usage_snapshot.rs; coordinator.rs; core/fs.rs; pty/lib.rs/input_queue.rs 및 신규 query_fence.rs/workload_signal.rs; runtime/agent_wrapper.rs/in_process.rs/persistence.rs/resource_monitor.rs; session/session.rs/status.rs; storage-core manifest/lib.rs; web-remote manifest/relay_client tls.rs/worker.rs; Cargo.lock, locale5, synthetic DER2.
+- 정확한33text파일+2fixture와 최종422개 SHA는 `docs/qa/evidence/2026-10-14-full-review-fixes/final-source-snapshot.json`, 최종 증분은 final-task-changes.patch. 원 worker patches는 Root 최종 overlays 이전이므로 재적용하지 않는다. 최종 reverse patch check exit0.
+- 기존 dirty6파일 App file_tree/file_delete, connector-ui lib/draft_text_edit/oauth_secret_tests, terminal alacritty_backend는 시작 bytes와 동일. 기존 shared App/runtime/workspace dirty 수정도 baseline 증분으로 보존했다. locale는 새 input_rejected key를 제거하면 각 HEAD bytes와 동일.
+- 문서: QA `docs/qa/2026-10-14-full-review-fixes.md`, evidence README/manifest/로그·patch·SHA, plan `docs/superpowers/plans/2026-10-14-full-review-fixes.md`, 기존 review 후속 링크, popup design/HTML 사례26, 이 handoff. 다른 기존 문서 dirty 유지.
+
+## 실제 검사 결과
+
+- `CARGO_BUILD_JOBS=2 cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1`: exit101,5679PASS/22FAIL/65ignored. App1은 이력 source-string 과대범위, storage/core21은 Root NOFOLLOW가 /var 부모 링크를 거부한 같은 원인. 두 원인 교정 후 다음 전체 affected 재검사 수행.
+- `CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-sijo -p storage -p storage-core --no-fail-fast -- --test-threads=1`: exit0,3747PASS/0FAIL/42ignored; Appunit3214/39ignored, storage479, storage-core7(새 parent-link 회귀 포함).
+- 78harness target별 최신 결과 합계5702PASS/0FAIL/65ignored. nested subprocess3개 중복 제외. 전체 단일명령 exit0라고 표현하지 않는다. 집계 JSON과 최초/affected 로그는 evidence에 보관했다.
+- `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` exit0, `cargo fmt --all -- --check` exit0, xtask check-boundary exit0, check-deps exit0(27crate), popup inlineJS node syntax1script exit0.
+- 최종 lint 정리 후 App full_fix_20261014 32PASS, session_aux::4PASS, 이력경계1PASS, connector-service전체83PASS/2ignored 각 exit0. 이전5702에 중복 합산하지 않는다.
+- Windows `cargo check --offline --locked --target x86_64-pc-windows-msvc -p deppy-sijo --tests` exit101: curve25519-dalek-derive0.1.1 미캐시로 compile전 중단. Windows compile/runtime PASS로 세지 않는다.
+- 최종 증거 검사 실제 exit0: manifest74개 저장 SHA(압축 원본 SHA 포함), source422개 SHA, 기존 dirty6개 보존, 문서/로그72개 whitespace·newline, local link30개, git diff-check 및 task patch reverse-check 모두 통과. manifest는 자기 hash를 담지 않으며 native 근거 manifest는 별도 고유 이름이다.
+- actual baseline 보호 RED→GREEN 상세는 QA/evidence. Plain receive baseline40ms→252ms/worker shutdown3.108s RED, 수정 후 Plain41ms/TLS40ms/TLSstop20ms/workerstop0ms와5회귀PASS. TLS baseline RED는 미실행.
+
+## 실패 접근과 남은 범위
+
+- Undo seeded cursor와 자연 backpressure/slow usage fixture의 최초 PASS는 qualification이 부족해 수정했고 실제 기대 실패로 재확인했다. compile/cache 오류는 행동 RED가 아니다.
+- shared target worktree 전환 시 App entry touch만으로 stale PTY artifact가 재사용됐다. 전환 시 모든 crate entry touch로 교정했고 Root 단일 Cargo를 유지했다.
+- wrapper post-write 검사는 status 소비자의 정상 stamp 삭제와 경쟁하는 실제 새 실패를 만들었다. postcheck만 제거하고 안전한 precheck/marker/exitcode 계약 유지. Root 등록 check→delete 경쟁도 삭제 없는 등록으로 교정했다.
+- SQLite NOFOLLOW의 정상 부모 링크 회귀는 explicit symlink-parent actualRED를 추가하고 parent-only canonicalize로 보완했다. 이력 test scope1줄과 test-only editor cfg는 별도 실제 재검사 통과.
+- Clippy 초기2실행은 inline owner enum/Result와 스타일 lint로 실패했다. 이유가 있는 좁은 item allowance 및 동등한 let-chain/filter+map으로 해결했고 최종 strictPASS. 전역lint완화/민감 payload복제 없음.
+- locale 증거 검사의 파일 끝 추가 가정만 실패했다. 실제는 관련 key 옆 삽입이며 새 key 제거 후 원 bytes와 동일함을 확인했다. 제품 코드를 바꾸지 않았다. native 근거 manifest의 basename 충돌도 최종 SHA 검사가 발견해 고유 이름/원본 SHA로 교정했다.
+- 요청된 소스 작업 잔여 없음. 실제 사용자 GUI/PWA/provider/OS sleep 및 Windows/Linux 전체 실행은 fixture 검증 범위 밖이다. R03 finalcheck→rename gap 및 C02 connect10초 범위는 QA에 명시했다. 실제 release는 수행하지 않았다.
+
+## 다음 agent의 정확한 명령
+
+canonical cwd에서 아래를 읽고 현재 dirty를 유지한다. 이번 작업 완료 후 새 사용자 지시를 기다린다. 새 현재 restart 요청 없이 dev-run.sh/실앱 stop/launch 금지.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-performance
+cat AGENTS.md
+head -n 80 docs/CODEX_HANDOFF.md
+git status --short
+git diff
+cat docs/qa/2026-10-14-full-review-fixes.md
+cat docs/qa/evidence/2026-10-14-full-review-fixes/README.md
+git diff --check
+```
+
+---
+
+# 전체 코드·병목·오동작 병렬 리뷰 — 완료, 2026-10-14 (Codex)
+
+- 목표/완료: 현재 canonical 전체 제품 경로를 위험 중심으로 병렬 재검토했다. 활성 기능 결함 R01–R12 12건, 조건부 C01(non-Unix)/C02(현재 Relay BLOCKED)2건, 측정한 P01 최적화 후보1건을 정리했다. 현재 요청은 리뷰이므로 제품 수정/build/release/restart/commit/push는 수행하지 않았다.
+- 기준/보존: `/Users/jr/Desktop/projects/deppy-sijo-performance`, HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a, source/test0.12.1 및 직전 wide-cursor/popup dirty수정 포함. nominal deppy-sijo 오래된 dirty checkout·기존 모든 dirty/untracked 보존. 412개 source/manifests SHA changed/missing0, 제품diff는 시작 snapshot과 byte 동일 확인. Cargo.toml/lock/제품/기존test 변경0.
+- 병렬: gpt-6.1-sol/xhigh/forknone3명 runtime_state(runtime/PTY/session/persist/core/agentstate), ui_files(UI/FS/문서/Git/이력/credential), remote_data(원격/PWA/Relay/MCP/auth/secret/storage). Root는 mainApp frame/worker/queue/종료 연결·실제 재현·중복 제거를 맡았다. CargoRoot 단일 slot. inventory와 위험 호출 경로 검토이며 모든 행/OS/provider/GUI 완전 검증을 주장하지 않는다.
+- 발견: R01 Codex blocking stdin→shutdown join, R02 documentFIFO lane+Claudeusage directUIFIFO, R03 초기revision 검사 후 외부write 손실, R04 owner닫힌dirty문서 복구 불가, R05 checkpointbusy 무시→WAL누락backup, R06 fixedtemp 링크추적/저장객체교체, R07 oldqueuedexit→respawnDBexited, R08 documentalias rename으로 원target 미저장, R09 shellPGIDfreeze의 foreground 누락, R10 agent종료후query응답 fallback수신, R11 documentpaste 개별/전체budget 미적용, R12 importFull에서pendingowner 소비→retryStale. C01 non-Unix probeNone+필수identity 조건; C02 message read budget이 idle만 제한, 현재 endpointBLOCKED. P01 repeated adjacency의 합성 최적화 측정.
+- 실제 기존검사: Root `CARGO_BUILD_JOBS=2 cargo test --offline --locked --workspace --exclude deppy-sijo --exclude connector-ui --exclude terminal --no-fail-fast -- --test-threads=1` exit0, 나머지24package2238PASS/18기존ignored. subprocess1PASS/67filtered 중복제외. 직전 App3181PASS/39ignored+connector35+terminal138/4ignored=3354PASS/43ignored는 기존 QA의 실제 결과이며 소스 동일; 이번 재실행 주장없음. 이번 runtime395PASS(이전 footprint flake도 이번 통과), webunit383PASS/1ignored 등 포함.
+- 실제 추가검증: Root scratch Codex1FAIL(compile0/74sec,실행0.83s; ownchildrescue), respawn1FAIL(actualDBexited), freeze1FAIL(shellTs/foregroundS+), latequery최종1FAIL(actualfallbackCPRhex), connectorimport1FAIL(full8→Backpressure/pendingfalse→retryStale/import0). standalone documentFIFO/symlink/saveRace, usageFIFO(HOME변경없음), dirtyauxcomponent, editor9MiB, actualatomichelper2FAIL, actualstoragecorebackup2live/1backup 모두 compile성공→exit101. Root actualRelayworker Plainloopback3108ms vs1000sliceRED; agentreceive40msbudget252msRED(publicTLS/auth 미검증). Root optimized synthetic descendant10passes32/2048=1.340ms128/8192=18.448ms256/16384=71.492ms; 실제GUIframe 측정 아님. editor4.7Mlines headless/debug5.270s, release/generaltext 지연으로 일반화하지 않음.
+- 실행/수정 경계: `/private/tmp/deppy-full-review-worktree-20261014` detached에 currentdirty9제품files 복사 후 새 assertions는 cfg(test)5files만. canonicaltarget cache공유 시 scratch entry만touch. 실제 사용자 app/session/DB/키/clipboard 변경없음, fixtureprocess/PTY/SQLite/temp/loopback만 사용. canonical에는 docs/evidence만 작성.
+- 실패 접근: reviewSKILL 필수 gstackchecklist 미설치로 해당 자동workflow STOP, 직접parallel+systematic-debugging 대체. scratchcopy 상대cwd 오류→absolute canonical 교정. latequery 최초PASS는 macOSod double-space 비교 오류; actualoutput 진단→token비교 후 최종RED. diagnostic patch의 rustfmt 줄바꿈 매칭 ValueError→정확pattern+set-e로 교정, 그 미삽입 PASS는 제품보장으로 세지 않음. reviewer2명 final텍스트 서비스filter오류→기존증거/coverage 재회수·Root 실제 재현, 실패응답을 완료근거로 쓰지 않음. stub/API compile실패는 행동RED로 세지 않음.
+- 수정 문서: `docs/reviews/2026-10-14-full-code-review.md`, `docs/reviews/evidence/2026-10-14-full-code-review/`(31source/log/snapshot/patch+README/manifest), 이 handoff만. 보고서에12확정+2조건+1최적화, caller/results/limits 및 권장10PR묶음. 로그는 행끝공백/EOF빈줄만 정리하고 original/stored SHA를 manifest에 기록했다. 기존QA/docs 보존.
+- 최종 문서검증: `git diff --check` exit0;31개evidence storedSHA 검증, 상대링크/행끝공백 검사 PASS. `final-verification.json`에 source412 unchanged/productdiff동일/2238PASS·18ignored 집계 저장. 새report/evidence/handoff 외 제품변경없음 확인.
+- 남은/제한: 리뷰 목표 완료. 발견12건 수정은 미실행이며 다음 구현 요청 시 보고서 PR1–8 순서 권장. 조건2건은 지원/활성화 전, 성능은 별도PR. browserignored/실제 OSsleep/providerGUI/WindowsLinuxGhostty/publicTLS는 미검증이며 모든 버그가 없음을 보증하지 않는다. source/test0.12.1 유지(조사/test만, 배포없음). 다음 사용자용 release는 lastshipped보다 큰 version 및 binary/bundle검증 필수, 현재restart승인없음.
+- 다음 정확명령: canonicalcwd에서 `cat AGENTS.md`; `head -n 18 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/reviews/2026-10-14-full-code-review.md`; `cat docs/reviews/evidence/2026-10-14-full-code-review/README.md`. 추가재현은 기존scratch에서 README의 Cargo순서(1slot) 사용. canonical에 재현patch 자동적용 금지. 현재 요청없이 dev-run.sh/실앱종료·launch 금지.
+
+---
+
+# 팝업·우클릭·폴더·파일트리 10건 병렬 수정 — 완료, 2026-10-14 (Codex)
+
+- 목표/완료: 사용자 병렬 결함 수정 요청의 직전 리뷰 R1–R10 전부 소스 수정·통합·교차검토·실행 검증 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a. 명목 deppy-sijo dirty checkout·기존 widecursor source2/문서·unrelated active-work HTML 보존. 현재 task restart/release/commit/push 요청/수행 없음.
+- 병렬: gpt-6.1-sol/xhigh3명, 별도 detached `/private/tmp/deppy-popup-fix-{delete,input,secret}-20261014`. delete R1/R7/R10; input R2/R4/R5/R6; secret R3; Root R8/R9·canonical integration·Cargo 단일 슬롯·최종 검증/문서. worker canonical/Cargo/앱 mutation 없음. canonical 통합 후 input이R1/R8/R9, delete가R2/R3/R4/R5/R6 read-only 교차 대조: 추가확정결함 없음.
+- 설계: UI FS I/O 금지 유지. 실패 nativeTrash에서 root/parent/target pinned FD·dev/inode/type proof→UI 승인→worker mutation 직전 검증. atomic quarantine move 후 원래 객체 재검증, replacement no-replace복원/충돌 시 보존. unreadable normalTrash 유지하되 permanent authority 없음. bounded cancellation/item/byte/depth 및 no-follow directory삭제. manual denied retry만 허용, 실패 IO도 affected dir reconcile. tree stable path/generationID+raw/native/IME closing fence·Primary drag·terminal explicit focus회복. OAuth masked input+draft Drop shared undo/state/focus 정리. physical watch registration→logical snapshot mapping(삭제된 .env 포함), picker probe실패는DB변경 전 거부.
+- 수정 파일: app.rs/ui/file_tree.rs/ui/workspace.rs/new file_delete.rs; connector-ui lib.rs/new draft_text_edit.rs/oauth_secret_tests.rs; popup-components.md/HTML case13·25; plan/new QA/evidence/원래 review closure/이 handoff. runtime/terminal 기존 source2는 원래 copiedbaseline과 final byte/SHA 동일. Cargo.toml/lock 변화 없음.
+- 실제 RED: deletecontrol1PASS/8FAIL+boundary0/2FAIL, input0/8FAIL, corrected OAuth0/9FAIL, Rootwatch/picker0/4FAIL. 모두 컴파일 성공 후 실제 기대 동작 실패. initial OAuth undo 전제·private API E0433 compile 실패는 제품 RED로 세지 않음. Root0 selected/stale-target cache도PASS로 인정하지 않고 source touch→actual4RED 실행.
+- 실제 최종 검사: full App3181PASS/0FAIL/39기존ignored(exit0,102.16s); connector35PASS/doc0; terminal138PASS/4기존ignored/doc0. 고유3354PASS/43ignored. 3crate all-targets strictClippy-Dwarnings exit0(16.82s), UI boundary exit0. Full App 이후 동작동일 lint 정리(stage이름·iflet병합·0o0)에 대해 Apppopup/input/audit87PASS/10기존ignored+기존 동일목록회귀1PASS 재실행(exit0). narrow/child-process PASS 중복합산 없음. fmt/HTMLJSsyntax/diff 최종 모두exit0, evidence/static-final.log 저장완료 및 source/evidenceSHA 검증통과.
+- 실패/보완: delete patch check는 input후 helper인접hunk 충돌로 미적용→명시적3way Appclean/FileTree양쪽helper유지 해결. 최초새audit20PASS/1fixturefail은 macOSPATH_MAX 때문에 segment만 nested→n, 깊이130·보존assertion 그대로. 첫fullApp3180/1FAIL/39ignored: R7 unconditionalrebuild로 동일목록watch/path reuse회귀→deniednode expanded/children실제변경 때만 rebuild. 첫보정script가pub fn을 찾아실패하며 미수정재검사 시작→정확fixture프로세스만 중단/privatefn기준수정, 중단실행 집계제외. 최초strict enum/nestedif/permission6lint→allow없이동일동작정리→strict+영향regressions재통과. generic review skill필수 gstackchecklist없음은직접root/crossreview로대체, 그workflow완료 주장없음.
+- 문서/근거: `docs/qa/2026-10-14-popup-context-folder-fixes.md`; `docs/qa/evidence/2026-10-14-popup-context-folder-fixes/` rawlogs(행끝공백만제거)·원본/저장SHAmanifest·sourceSHA/workerpatchSHA. 원래REDevidence보존. planTasks1–5 완료체크. popupgeometry변경없음, 보호규칙문서/HTMLstatus일치.
+- 잔여/범위: 제품 소스 수정·실행 검증 잔여 없음. 최종 static/doc manifest consistency 저장·상대링크·source/evidenceSHA 확인완료. source/test0.12.1, 미커밋. 사용자용 artifactbuild/package/deploy/launch없음; 실제userDB/실키/clipboard/agent sessionmutation없음. macOSnative/격리SQLiteFS/productionegui만검증, GUIE2E/providerauth/LinuxWindows실행PASS주장없음. 다음 사용자용 release는 last-shipped보다큰 version+builtbinary/bundle검증필수, 현재restart승인없음.
+- 다음 정확명령: canonicalcwd에서 `cat AGENTS.md`; `head -n 15 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/qa/2026-10-14-popup-context-folder-fixes.md`. 추가 source변경 없으면 이미 통과한 gate 반복 불필요. 새변경 시 QA영향명령 실행, 다른worktree공유target실행직후canonicalentrytouch로0selected미인정. 현재요청없이dev-run.sh/실앱종료·launch금지. 다음기능은 사용자 새지시 기준.
+
+---
+
+# 팝업·우클릭·폴더·파일트리 병렬 코드 리뷰 — 완료, 2026-10-14 (Codex)
+
+- 목표: 사용자 요청대로 전체 popup/right-click/folder picker/file tree 오동작을 병렬 코드 리뷰. canonical performance, HEAD d8826f0b와 이전 미커밋 R1 fix 포함 현 working tree를 검토. 기존 source/docs/evidence dirty와 unrelated active-work HTML·nominal checkout dirty 보존.
+- 병렬 분담: gpt-6.1-sol/xhigh review_popups_20261014=모달/팝업 수명·focus·keyboard·stale target; review_menus_tree_ui_20261014=공통 우클릭/all call sites/file-tree UI; review_folders_files_20261014=폴더·파일picker/workspace/path validation/FS workers. Root=통합 handlers·중복제거·실제 검사·최종 근거 재검토. 모두 제품/테스트/공통 문서 readonly, Cargo는 Root 단일 실행.
+- 완료: 3 reviewers 모두 종료, Root가 호출부·실제 로그·대상/키보드 소유권을 대조. 확정 10건(high 2 / medium 7 / low 1): 영구삭제 stale root/inode(2재현을 1원인으로 합침), Rename 종료키 PTY 전달, OAuth 취소 키 undo 복원, tree focus 회수, Rename 불안정 ID, secondary drag 자동스크롤, 권한복구 retry 불가, symlink watch 경로 불일치, 사라진 picker 경로 anchor 제거, watcher 장애 조건의 부분복사 실패 갱신 누락.
+- 실제 기존 검사: App popup 58/10ignored, context_menu 9/5ignored, file_tree 195/3ignored, workspace 578/4ignored, picker 6/0ignored; connector-ui 전체 26/doc0. 모두 exit0. 필터·이전 targeted connector 결과 중복 제거한 고유 838 PASS / 15 기존 ignored. 전체 App suite 통과 주장 없음.
+- 실제 재현: detached scratch `/private/tmp/deppy-popup-review-worktree-20261014`에 현 제품 소스+tests-only patch 적용. `popup_audit_20261014_` compile 성공/행동 0PASS·6FAIL exit101: 삭제 새 inode/부모 symlink 이탈, 실제 native watch 이벤트 누락, 실제 권한 복구·부분 복사, 실제 settings worker/격리 SQLite. egui/source-derived 메뉴 4개+production ConnectorUi OAuth 1개 독립 probe compile0/행동101; Root가 5개 binary 재실행해 동일101 확인. 공통 context menu Escape control은 compile0/행동0이며 후보 제외. 다른 OAuth/trust focus 후보는 production 도달 경로 미입증으로 제외.
+- 제품 보존: review 시작/종료 `git diff --binary -- crates` patch `cmp` 실제 exit0. 기존 R1 source2파일만 그대로 dirty. 앱/사용자 DB/실제 키/clipboard 수정·restart·release·commit/push 없음. source/test 0.12.1 유지, 사용자용 artifact 없음.
+- 실패 접근: 첫 scratch patch 생성의 여분 closing brace를 컴파일 전 발견하여 교정, rustfmt parse/git apply check 후 사용. 첫 egui probe texture delta cleanup 및 control popup 상태 검사 오류 교정. connector fingerprint cohort 일시 누락은 새 cohort로 컴파일 성공 후 행동 RED만 집계. 이들 harness 문제를 제품 결함/행동 RED로 세지 않음. review SKILL 필수 gstack checklist 누락으로 그 workflow는 중단, 직접 병렬 소스 리뷰로 대체.
+- 완료 문서/변경: 이 handoff, `docs/reviews/2026-10-14-popup-context-folder-file-tree-review.md`, `docs/reviews/evidence/2026-10-14-popup-context-folder-file-tree/` 30파일(근거 로그·재현소스·tests-only patches·original/source/evidence SHA manifest·README). 제품 파일은 이 리뷰에서 변경하지 않음. 근거 SHA/JSON6실행 exit/문서 상대링크/whitespace/10finding sections 검사 exit0, `git diff --check` 실제 exit0. 최종 제품 diff `cmp`도 exit0.
+- 남은/결정: 요청된 병렬 코드 리뷰·Root 검증·보고서 잔여 없음. 확정 10건은 아직 미수정이며 보고서에 PR 묶음/회귀 권고를 기록. 전체 App GUI E2E/실제 provider·user secret 검증은 미실행. 검토 요청에 따라 앱 상태와 제품 코드 유지, 원본 dirty도 보존.
+- 다음 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 18 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/reviews/2026-10-14-popup-context-folder-file-tree-review.md`; `cat docs/reviews/evidence/2026-10-14-popup-context-folder-file-tree/README.md`. 향후 구현 요청 시 R1 영구삭제 원본 identity/root 보호부터 진행하고 근거 RED를 production composite 회귀로 옮긴다. 기존 source/docs dirty를 버리지 말 것. 현재 restart 요청 없이 실제 앱 종료/launch 금지.
+
+---
+
+# R1 wide 커서 입력 회귀 수정 — 소스 수정 완료, 2026-10-14 (Codex)
+
+- 목표: 사용자 “코드 변경해”에 따라 직전 리뷰 R1만 수정. canonical performance, 기준 d8826f0b. 기존 리뷰 문서/evidence와 unrelated active-work HTML 및 원래 checkout dirty 보존. 현재 restart/release/push 요청 없음.
+- 원인/설계: native grid cursor가 WIDE_CHAR_SPACER에 있을 때 반환 좌표만 owner 열로 보정. 실제 grid cursor/vi navigation/scroll/cache/damage는 이동하지 않는다. 입력 권한·현재 초안·자동 전송 보호 정책 유지.
+- 실행 결과: terminal 새 회귀 실제 RED 0 통과/1 실패(col3 vs2), runtime owned PTY 새 회귀 실제 RED 1 통과/1 실패(ExplicitPrompt가 AdmissionDenied). compile 오류가 아닌 예상한 행동 실패. 로그 `/private/tmp/deppy-wide-cursor-red-{terminal,runtime}-20261014.log`.
+- 구현/실행 결과: local cursor만 WIDE_CHAR_SPACER owner로 보정(제품 5줄). terminal input_snapshot 2 통과, runtime composer_ 8 통과(新2+기존6). 실제 owned PTY에서 bottom/5줄/최상단 한글 multiline 전달 및 viewport 보존, 현재 한글 초안/진입한 dim hint/자동 입력 거절 모두 확인. GREEN 로그 `/private/tmp/deppy-wide-cursor-green-{terminal,runtime}-20261014.log`.
+- 최종 실제 검사: terminal 전체 138 통과/기존 수동4 ignored, Session 전체 81 통과/doc0, exit0(`/private/tmp/deppy-wide-cursor-terminal-session-20261014.log`); App composer 97 통과 exit0(`/private/tmp/deppy-wide-cursor-app-composer-20261014.log`)。고유 관련 검사324 통과, 전체 runtime 재실행 주장 없음. 4crate all-targets strict clippy-Dwarnings exit0(`/private/tmp/deppy-wide-cursor-clippy-20261014.log`)、fmt/boundary/diff exit0(boundary 로그同접두사)。Root 제품diff/회귀/호출부/vendor 직접 대조 완료, 추가 결함 없음.
+- 수정 파일: terminal/alacritty_backend.rs(제품 보정+한글/CJK/emoji·primary/alternate·scroll/native cursor 불변 회귀), runtime/in_process.rs(실제 PTY 전달/viewport 보존+초안/자동 보호 회귀), 이 handoff, 新QA `docs/qa/2026-10-14-wide-cursor-input.md`, 이전 QA/review의 후속 결과 링크.
+- 실패 접근: 현재 없음. 리뷰의 dependency-cohort probe 실패는 이전 섹션에 기록.
+- 잔여/릴리스: 요청된 R1 소스 수정 및 검증 잔여 없음. 소스/문서 미커밋, HEAD d8826f0b. source/test0.12.1 유지, 사용자용 artifact build/package/deploy/launch 없음. 실제 외부provider/GUI E2E·실험 Ghostty 범위는 검사하지 않음. 다음 사용자용 release는 last-shipped보다 높은 version+built artifact 검증 필수; 현재 task에는 restart 승인 없음.
+- 다음 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 16 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/qa/2026-10-14-wide-cursor-input.md`; `tail -n 5 /private/tmp/deppy-wide-cursor-clippy-20261014.log`. 추가 재검사가 필요할 때 QA의 GREEN 명령 사용. 사용자의 새 현재 restart 요청 없이 dev-run.sh/실앱 종료·launch 금지.
+
+---
+
+# 스크롤백 입력 수정 후 코드 리뷰 — 완료, 추가 수정 1건, 2026-10-14 (Codex)
+
+- 현재 목표/상태: 사용자 “코드리뷰해”, 고정 d8826f0b vs6a06d319 리뷰 완료. canonical performance/기존 branch 유지. 제품 source/test/app/user DB 변경·restart/release/commit/push 없음, 기존 active-work HTML 보존. 직접 전체diff/호출부/관련vendor·runtime/백엔드 대조.
+- 발견 R1 medium/P2 confidence10: alacritty_backend.rs:805 grid native cursor 직접 복사로 RenderableCursor의 WIDE_CHAR_SPACER→owner 보정 누락. dim 한글 안내문 뒷칸 커서 col3이 viewport의 col2 대신 입력 guard에 전달돼 Placeholder→Draft, 실제 ExplicitPrompt 거절. 현재 일반스크롤fix는 유지하되 입력용 좌표보정 및 wide regression 필요.
+- 실제 검사: runtime composer_6PASS/0FAIL exit0(`/private/tmp/deppy-composer-review-runtime-20261014.log`). terminal+actual prompt_row probe 컴파일0/행동101(col2Placeholder vscol3Draft); 제품 input_admission.rs 직접 path모듈+별도 실제catPTY guard probe 최종 compile0/행동101(ascii allowedtrue/wide false). 첫 guard compile은 dependency cohort 타입 불일치→Session fingerprint dep hash로 교정, 제품 결함으로 세지 않음. 전체707 재실행 주장 없음.
+- 스킬: review SKILL 전체 읽었으나 필수 checklist/gstack 설치 누락으로 해당workflow 중단(원문 Step2 STOP 규칙), 이후 직접 검토로 사용자 요청 완료. 독립agent/CLIreview 없음. 실제 외부provider/GUI/Ghostty는 검사하지 않음. Ghostty scroll중거절은 기존QA 명시한지원제한으로 별도신규결함 합산안함.
+- 수정 문서: docs/reviews/2026-10-14-composer-scroll-input-review.md, evidence10개(manifest/provenance/실제probe·compile/result/기존6검사로그), QA 후속링크 및 이 handoff. `git diff --exit-code d8826f0b -- crates` 실제exit0. 문서는 미커밋, 제품기준 d8826f0b/source version0.12.1.
+- 남음/권고: R1 미수정. 다음 구현 요청 시 native 실제cursor 선택 유지하며 반환col만wide owner보정, bottom/scrolled dim한글hint/진짜초안 회귀RED→GREEN, 기존composer6/terminal/session 및strict/fmt/boundary 검증. 사용자의 새 재실행 요청 없이는 앱 launch금지, 제품artifact배포는versionbump+검증필수.
+- 다음 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 14 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `cat docs/reviews/2026-10-14-composer-scroll-input-review.md`; `cat docs/reviews/evidence/2026-10-14-composer-scroll-input/guard-result-matched.log`. 문서dirty보존, R1수정은 현재리뷰에서 미실행.
+
+---
+
+# 스크롤백 열람 중 하단 컴포저 입력 거절 — 소스 수정 완료, 2026-10-14 (Codex)
+
+- 현재 목표: 사용자 새 요청(스크롤이 맨 아래가 아닐 때 하단 입력이 안 됨)의 원인을 재현·수정·검증. canonical performance, baseline6a06d319, 기존 untracked active-work HTML/원래 checkout dirty 보존. 현재 재실행/배포/push 요청 없음.
+- 확인 원인: Session::input_guard_snapshot이 backend.viewport_snapshot을 읽어 역사 화면과 viewport 커서를 AgentInputGuard에 전달. prompt_row는 scroll_offset!=0을 Unknown으로 판정하고 choice_dialog는 화면 밖 커서의 잘못된 범위를 현재 선택창으로 취급. 실제 10월14일 로그03:33:52~55Z의 Codex ExplicitPrompt 거절7건 모두 current_choice_dialog. 사용자 내용/DB/PTY 입력은 읽거나 변경하지 않음.
+- 구현: TerminalBackend::input_snapshot 계약 및 Alacritty native grid/실제 cursor 직접 읽기. Session guard만 새 입력용 경로 사용, live 근거 미지원은 명시적 live_screen_unavailable 거절. viewport cache/dirty/scroll을 이동·소비하지 않고 native 전체 geometry·style·grapheme 유지. 앱 전송/저장/재시도/identity/권한 정책 유지.
+- 회귀: 별도 /bin/cat PTY의 Claude/Codex·짧은/깊은 스크롤·과거 선택창·긴 한글 실제전달 및 현재 초안/선택창 보호. Session에 live screen/스타일·500x132큰 grid·scroll/cache/damage 보존; terminal vi cursor 및 alt screen 추가. 기존 history query 테스트의 viewport용 input_guard 읽기를 올바른 native snapshot+dirty 복구로 교정, 최종 live guard offset0/native offset3·query dirty 보존 확인.
+- 실제 결과: runtime RED0PASS/2FAIL→GREEN2PASS; session RED0PASS/1FAIL(offset200 vs0). 첫 fullruntime391PASS/2FAIL(위 계약변경 test+수정없는macOS footprint비교); test용 viewport 소비자 교정 후 runtime392PASS/1FAIL(footprint만). footprint 단독0PASS/1FAIL, baseline6a06d319 대비 해당 파일 diff없음. terminal137PASS/4existingignored、session81PASS/doc0、App composer97PASS = 고유707PASS/1FAIL. 마지막 500x132 fixture 보정 후 session81 재통과. fullruntime가 통과했다고 주장하지 않음. 4crate alltargets strictclippy-Dwarnings/fmt/boundary/diff 실제exit0. Root 전체diff/호출부대조 완료, 추가 확정결함 없음.
+- 결정: 입력 근거는 현재 native screen이어야 하며 사용자의 scroll 위치를 이동시키거나 pending render damage를 소비하지 않는다. 프롬프트/전송 내용 검증이나 자동 재전송 정책은 변경하지 않는다.
+- 수정 파일: terminal/backend.rs、alacritty_backend.rs；session/session.rs；runtime/input_admission.rs、in_process.rs；QA `docs/qa/2026-10-14-composer-scroll-input.md` 및 이 handoff. full/RED/isolated/App/clippy/boundary 실제로그 `/private/tmp/deppy-composer-scroll-*.log`. QA에 명령·결과·실패·검증 제한 기록.
+- 실패 접근/남은 범위: 최초 fullruntime의 기존 history test가 viewport와 live 입력 helper를 혼용해 1FAIL → 테스트의 viewport 근거를 native snapshot으로 교정. macOS footprint<RSS 가정 실패는 그대로 보고하며 관련 제품 코드 미변경. 승인된 기본backend 버그 수정 잔여 없음. 실험 Ghostty 등 live cell read를 제공하지 않는 backend의 scrolled admission은 허용을 보장하지 않음. 실제 사용자 CLI E2E/release/push/restart 없음. source/test0.12.1 유지; 다음 사용자용 artifact 배포는 last-shipped보다 높은 버전 및 binary/bundle 검증 필수.
+- 다음 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 16 docs/CODEX_HANDOFF.md`; `git status --short`; `git log -2 --oneline`; `cat docs/qa/2026-10-14-composer-scroll-input.md`. 재검사가 필요하면 QA의 실제 명령 사용. scripts/dev-run.sh/앱 종료·launch는 현재 별도 명시 요청 없이 금지.
+
+---
+
+# 에이전트 연결 설정 시안 적용 — 완료, 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자 승인 HTML 시안대로 에이전트 연결 설정 native UI 구현·코드 리뷰·실제 렌더 대조 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, 기존 branch 유지, baseline70380aea. 소스51b23890 및2fd73a5b(권한80px열/34px hitarea·중앙 정렬). 원래 dirty checkout 및 untracked active-work HTML 보존. push/restart/release 요청 없음.
+- 완료: 연결/접근권한/작업답변/고급설정 4tab,80/43/35px 고정shell·본문scroll, list/detail 및 narrowstack. 34px control/68px 최소rows/26pxpad/8pxgap/15-14-13type·HTML dark/light palette. auth/public/tool 관측·actor별read/input/lease·cancel/navigation·profile·legacy 기능 유지. 18actualnativePNG(1090/710,dark/light,empty/verifying/failure/expired/expiredpermissions/real loopbackOAuthapproval), QA HTML/Markdown·evidence·plan 완료. 브라우저/native 글꼴 pixel100% 동일성을 주장하지않음.
+- 수정 파일: cloud_agent ui.rs, ui/{settings,runs,management_tests}; ui/settings.rs metrics exposure/hostscroll; 신규 ui/{layout,connections,permissions,advanced,history,redesign_tests};5locale. 승인HTML·plan·QA/gallery/evidence/images·handoff. app/runtime/authcontroller/backend source변경 없음.
+- 실제 최종검사: fullCloudAgent161PASS/3existingignored (`/private/tmp/deppy-cloud-settings-final-geometry-verified.log`), commonsettings37PASS, i18n8PASS/doc0 =206PASS. 이후 testfixture 서비스coordinates 보정 후 affectedUI44PASS. 마지막 권한헤더정렬 UI44 최종PASS(`/private/tmp/deppy-cloud-settings-ui-final-aligned.log`). strictApp+i18nalltargets-Dwarnings 실제exit0;fmtcheck/boundary/diff0. docgalleryJS node--check0. HTMLproto기존JS syntax0.
+- 독립review: gpt-6.1-sol/xhigh CLIreview--uncommitted session55150 실제exit0, 최종“no remaining actionable defects”; reviewerUI44/i18n8/fmt/diff실행. full로그 `/private/tmp/deppy-cloud-settings-redesign-review.log`, 결론evidence보존. 이후 권한치수·헤더정렬만Root추가코드대조/전체Cloud및UI44·hitarea34x34·strict재검증.
+- 실제RED→수정: 탭/초기연결0/2→GREEN2; TextEdit34·arrowfocus3/2→GREEN5; review3문제RED5/3(긴detail버튼clip,알림다음frame소실,latentactorconsent)→UI40GREEN; answerconnection-name검색0/1→finalGREEN; narrowdescriptionclip0/1→finalGREEN. 새manual sorted-lastlegacy선택0/1→전후ID差로수정. 기존 late-secret/footer/hover/nav/cancel 회귀보존.
+- 실패접근: TextEdit.min_size.y egui0.36.1에서무시→add_sized; custom/nativearrow중복→consume+move_focusNone; RTLbarelayout높이소모→horizontalwrapper; 상세420pxchildclip→부모viewportYclip; 초기testhelper삭제→HEAD복원. WidgetInfo API/NodeTimport/temporaryborrow compile실패는behaviorRED로세지않고수정후gate재실행. 첫strictcollapsible-if1건→동등let-chain수정후GREEN. 문서staged diffcheck는 증거로그EOF빈줄로exit2→EOF빈줄만정리하고전체문서diff재검사후커밋교정(검사결과내용불변).
+- 제한/릴리스: source/test0.12.1, 사용자용 appartifact를 build/package/deploy/launch하지않았으므로versionbump없음. 실제외부provider로그인/publictunnel/userDB/userclipboard/실앱interaction은미실행. Native검증은productionegui·loopbackauth·SQLite/history/realqueuedPTYharness. 다음사용자release는lastshipped보다높은버전+bundle검증필수, 현재restart미승인.
+- 남은: 승인된 구현/검토 잔여 없음. 소스·QA/evidence/gallery/handoff 확정, 사용자 최종보고. 원래 HTMLserver8794session15836 유지. gallery `docs/qa/cloud-settings-redesign-2026-10-13.html`, 검증MD `docs/qa/2026-10-13-cloud-settings-redesign.md`. 새 사용자용 release/restart는 별도 현재 요청 필요.
+- 다음agent정확명령: `cat AGENTS.md`; `head -n 14 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff`; `tail -n 7 /private/tmp/deppy-cloud-settings-ui-final-aligned.log`; `git log -4 --oneline`; `git diff --exit-code -- crates web`; `cat docs/qa/2026-10-13-cloud-settings-redesign.md`. 필요할 때 evidence README의 검증명령을 사용. 명시적현재restart요청없이는dev-run.sh/app종료·launch금지.
+
+---
+
+# 2차 리뷰 잔여 3건 수정 — 완료, 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자 “코드 수정해”에 따른 N1/N2/N3 수정·영속 회귀·독립 교차 리뷰·소스 커밋 완료. 기준 bf13eb48, canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`. 원래 dirty deppy-sijo 및 기존 untracked `docs/mockups/active-work-visibility-2026-10-12.html` 보존. 재실행/push/release 없음.
+- 병렬 소유권: 기존 gpt-6.1-sol/xhigh 작업자 N1 management/pwa/native UI/notifications, N2 common cloud_agent/continuity/bridge, N3 shared/mobile/browser. Root App/transport/authority 및 통합. Cargo는 Root 단일 슬롯. 소유 파일 동시편집 없이 마지막 source freeze·교차 리뷰 완료, 추가 확정 결함 없음.
+- 완료 N1: late/replacement credential 이후 owned 작업/답변 view를 현재 wrapped corpus로 표시·복사·공유. notify 수신 wrapped→ANSI/controls 정리→wrapped. raw routing 참조는 유지하고 안전한 optional run_label을 native/PWA에 표시; legacy raw ID fallback 없음. footer/hover와 선택된 answer 이름·제목 fallback 보호. URI exact-safe 또는 제외. bounded complete notification source→현재 callback mask→120/240char preview→native delivery 재검증.
+- 완료 N2: None clock sample에서도 마지막 정상 baseline 보존. 지원 OS에서 unknown frame이면 input grant/lease/queued permits 즉시 회수; 실제 suspend만 tunnel revalidate. 정상 idle/unsupported fallback 동작 유지. fresh legacy/named 및 실제 queued PTY 회귀 포함.
+- 완료 N3: queued 접수와 App observed completion 구분. bounded final enum을 original socket-local16 queue에 nonblocking 전달하고 원래 origin/core/권한/epoch/만료 재검증. 닫힘·rejected·30초 native/40초 final timeout·superseded/late reply/연결 변경 처리. 실패 안내는 snapshot에도 유지, 새 제어 요청은 이전 실패 안내만 해제. 현재 view-only relay를 control로 확장하지 않음.
+- 핵심 경계: notifications leaf는 secret/MCP crate를 직접 참조하지 않는다. App이 같은 RedactionService를 소유한 순수 Arc<Fn(&str)->String>을 주입. UI의 source/queue/payload budgets 및 target IDs 불변. App answer projection은 branch당 한 번 생성하고 active/warm Arc 공유. authority 검사에는 cheap raw metadata helper 사용.
+- 실제 최종 검사: App cloud155PASS/3ignored, answer2PASS, notifications28PASS, completion1PASS; web403PASS/13ignored/doc0; actual production Chrome77checks PASS. Rust 합계589PASS/16ignored. 5crate strict alltargets-Dwarnings/fmt/boundary/diff 모두exit0. boundary 수리 후 affected App/notifications/strict/fmt/boundary/diff 재실행; 변경없는 web/browser/answer/completion은 앞선 실제 실행 결과 유지. 소스 커밋 후 `git diff --exit-code -- crates web` exit0.
+- 실제 RED: late_secret1PASS/4FAIL; unavailable9PASS/4FAIL; notify0PASS/4FAIL, ingress+notifications5PASS/5FAIL; run_label0/3, footer/hover0/2, legacy label0/1, answer fallback0/1. N3 valid Navigate callback/WS 각각0/1, browser queued-before-final/실패 배너/새 요청 안내 RED 후 수정. isolated 최초 리뷰 증거와 최신 QA 로그 모두 보존.
+- 실패 접근: clipped fragment 정책은 일반 문장 시작까지 가려7PASS/3FAIL→bounded complete source로 변경. iterator API 오류는 fixture만 수정 후 행동 RED 재실행. 추가 길이 fixture one-byte SecretTooShort 및 adjacent marker merge 기대 오류로 두 번154PASS/1FAIL→유효126byte separated ID/198byte 표시 회귀 통과. boundary2violations는 allowlist 변경 없이 callback 주입으로 수정. 실제 유효128byte ID의 >512 확대는 주장하지 않음.
+- 수정 파일: app.rs; cloud_agent.rs 및 bridge_tests/continuity/management/navigation/pwa/ui/ui-management_tests/ui-runs; ui/cloud_answer/notifications; web-remote cloud/dashboard/lib/protocol/ws_api/relay adapter/assets app.js/browser fixture; shared/cloud-results.js. QA·리뷰 resolution·증거·이 handoff. 상세 변경은 세 소스 커밋 참조.
+- 소스 커밋: N2 `5fff2264`; N1 `8c5e0db4`; N3 `7e02a46d`. 공통 파일을 hunk로 나눠 각 원인의 생산자·소비자를 함께 커밋했다. QA `docs/qa/2026-10-13-cloud-residual-fixes.md`, 실제20logs+manifest `docs/qa/evidence/2026-10-13-cloud-residual-fixes/`. 최초2차 리뷰와9증거도 역사적 기록으로 보존하고 해결 링크 추가.
+- 제한/남은 작업: 승인된 코드 수정 잔여 없음. 실제 provider 계정/public tunnel/OS sleep/Windows 전체 runtime/사용자 App→PWA E2E/OS notification delivery는 미실행. 합성 DB/PTY와 egui OutputCommand만 사용. source/test version0.12.1, 사용자용 artifact를 만들거나 배포하지 않았으므로 version bump 없음. 다음 사용자용 release는 last-shipped보다 높은 버전 및 artifact 검증 필수; 현재 재시작 승인 없음.
+- 다음 agent 정확한 명령: canonical cwd에서 `cat AGENTS.md`; `head -n 22 docs/CODEX_HANDOFF.md`; `git status --short`; `git log -4 --oneline`; `git diff --exit-code 7e02a46d -- crates web`; `cat docs/qa/2026-10-13-cloud-residual-fixes.md`. 재검사가 필요할 때 위 evidence README의 실제 명령 사용. 명시적 현재 요청 없이 scripts/dev-run.sh/앱 종료·launch 금지.
+
+---
+
+# 7건 수정 후 2차 독립 코드 리뷰 — 완료, 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자 '한번 더 코드리뷰해' 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, 고정 source fcf237f7..a3843d99, HEAD bf13eb48. 읽기 전용 source 검토·격리 proof·보고서 작성. 제품 source/test 변경·앱 재실행·push·release 없음.
+- 리뷰 담당: 새 gpt-6.1-sol/xhigh/forknone 3명. rereview_redaction_oauth R1/R6, rereview_continuity_control R2/R5, rereview_status_dom_navigation R3/R4/R7. Root producer/consumer/cross-workspace/authority·proof 대조/중복 제거와 최종 기록. 모든 담당 완료; Cargo slot 해제.
+- 완료 결과: **3건 미수정 발견**. N1 high late credential registration 이후 캐시/native 및 wrapped PWA 노출. N2 medium None clock sample이 pre-suspend baseline 삭제, 이후 새 요청이 old approval로 통과 가능. N3 medium PWA 원본 이동 실패/만료 안내 누락(기존 baseline 동일, 신규 회귀 아님). R3/R4/R5/R6/native R7 추가 확정 신규 회귀 없음.
+- 실제 검증: production browser 기존 fixture50PASS(exit0). N1 isolated detached bf13eb48 + App 기존 SQLite/setup/bootstrap/cache/DTO 새 검사만 추가→compile1m49s, test0.02s **0PASS/1FAIL exit101**, native_cache/snapshot title/message/result 모두 masked=false. N2 current continuity.rs include rustc compile0→**0PASS/1FAIL exit101**, pre(100,50)→None→post(140,51)39초 suspend 누락; Root 동일 검사 재실행 exit101. N3 current/baseline production Chrome 각exit0 **결함 행동 재현 성공**, 닫힘/31초 Date.now 만료 failureShown=false, errors0. 보호 GREEN이라고 주장하지 않음.
+- 변경 파일: 이 handoff, 기존 QA에 후속3건 링크 추가, 새 `docs/reviews/2026-10-13-cloud-management-fixes-rereview.md` 및 `docs/reviews/evidence/2026-10-13-cloud-fixes-rereview/`9개. canonical 제품 범위 `git diff --exit-code bf13eb48 -- crates web` exit0. 기존 untracked HTML/원래 dirty checkout 보존. 보고서·증거는 미커밋.
+- 핵심 결정/수정 권고: 캐시 삽입 시만 masking하지 말고 현재 corpus로 표시/공유 보호 또는 corpus-change invalidation. failed clock에서는 last-known baseline 보존/unknown-input 정책 필요. PWA는 queued 접수와 App observed 결과 구분하여 request별 failure 표시; notification deep link의 silent discard 정책을 그대로 공유하지 말 것. source fix 자동 수행하지 않음.
+- 실패·제외: 잘못된 assets 경로 web/pwa/app.js read 실패→rg로 crates/web-remote/assets/app.js 확인, 소스 수정 없음. 임의 check→write instruction 사이 sleep 후보는 실제 blocking 근거 부족해 제외. review skill는 full-branch prelanding auto-fix/external triage 방식이라 고정commit read-only 검토에 적용 안 함. 이전 PASS는 이전 실행으로만 구분. docs/log evidence 끝의 빈줄만 정리.
+- 남은 작업: 사용자에게3건 보고; 추후 수정 승인 시 각 permanent regression RED→fix GREEN 및 영향검사. 실 OS sleep/실제 provider/사용자 앱UI/App-wire E2E 미실행. source/test0.12.1, 배포 artifact 없음. 임시 detached proof worktree `/private/tmp/deppy-cloud-rereview-late-secret-20261013`와 proof fixtures 보존; 여기는 격리 test만 있고 제품 수정 없음.
+- 다음 agent 명령: canonical에서 `cat AGENTS.md`; `head -n 14 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff --exit-code bf13eb48 -- crates web`; `cat docs/reviews/2026-10-13-cloud-management-fixes-rereview.md`. N1 재현은 isolated worktree cwd에서 `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-performance/target CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo rereview_late_secret_registration -- --nocapture`. N2 정확한 rustc/실행명령은 evidence clock-baseline.log. N3 `node /private/tmp/deppy-cloud-navigation-rereview-20261013.mjs current` / `fcf237f7`. 수정 승인 뒤 canonical source regression 추가·검사. 명시적 현재 재실행 요청 없이 앱 종료/launch 금지.
+
+---
+
+# 클라우드 리뷰 7건 병렬 수정 — 완료, 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자 요청한 리뷰 결함 R1–R7 전부 수정·독립 교차 리뷰·실제 검증·소스 커밋 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, 기준 `fcf237f7`. 원래 dirty deppy-sijo 및 기존 untracked active-work HTML 보존.
+- 병렬 소유권: 모두 gpt-6.1-sol/xhigh/forknone. fix_secret_oauth R1 관리 마스킹/R6 이름; fix_cloud_control R2 native clock/input admission/R5 ACL; fix_pwa_status R3 상태/native 설정/R4 DOM. Root 공통 App status producer/R7 navigation/5 locale 통합, 실제 최종 검사와 문서. 동일 파일 동시 편집 없음. 마지막 source 교차 리뷰 추가 확정 결함 없음.
+- 완료: 원문/ANSI 정규화 양쪽 wrapped secret 보호 및 legacy run/receipt 읽기 보호; 정상 UI idle 승인 유지/실제 suspend clock evidence 및 App frame 이전 queued PTY 차단; active/warm 로컬 상태와 agent identity 분리/시각없는 관측 명시; keyed DOM focus/selection/최신 권한 보존; rotation named ACL 정리/legacy consent 보존; 승인한 OAuth client name/refresh/owner rename 보존; 원본 이동 correlated success/failure/superseded/30초 timeout.
+- 핵심 결정: InputAdmission에서 auth lock 전/쓰기 직전 native clock 재검증. 권한은 UUID/epoch/generation 그대로. Done 관측 시각은 revision이 아닌 current generation confirmed idle Unix seconds만 사용. PWA navigation은 권한을 재검증한 같은 frame에서 적용; latest pending MuxUpdated로 완료를 관측한 뒤 destination aux scope sync+terminal reveal. 실패는 결과 유지하며 old focus intent를 exact identity로 취소. URI는 exact safe URI 그대로 또는 제외.
+- 수정 파일: agent-mcp oauth/tests 2; App app.rs/cloud_agent.rs/bridge_tests/continuity/control/management/pwa/navigation/native management_tests/runs/settings 11; web-remote DTO/browser fixture 2; shared JS 1; i18n locales 5; handoff/review resolution/QA 및 evidence. 각 소스 파일 목록은 커밋을 참조.
+- 실제 최종 검사: App `cloud_agent::` **135PASS/0FAIL/3ignored**; App completion1, 세션이동1, SessionAux3 PASS. agent-mcp67PASS/1ignored, web-remote400PASS/13ignored, i18n8PASS, doc0. production cloud-results Chrome **50PASS**. 5대상 all-targets strict clippy-Dwarnings exit0; fmt/boundary/diff exit0. 실제 PTY 및 격리 SQLite/HTTP/OAuth/UI/browser 포함. ignored/실사용 앱/provider 계정/OS sleep는 통과로 주장하지 않음.
+- 실패 접근: 초기 App114PASS/8FAIL 기대 위반 RED; mixed BEL+ANSI 및 legacy wrapped 회귀 추가 발견→durable RED→수정. 초기 Job Debug/SaveRun state fixture 오류 수정 후 행동 RED 재실행. 중간 UI 모호한 duplicate Label query는 get_all로 두 곳 확인. Done hook revision-as-time 접근 폐기. R7 교차 리뷰의 무권한 2단 queue/old mux/aux scope 보완. 광범위 materialized 치환이 unrelated 함수에 닿은 것을 diff에서 즉시 발견/복원; 최종 unrelated 변화 없음.
+- 소스 커밋: R1 `cd614286`; R6 `18491c2e`; 컴파일 가능한 R2/R3/R4/R5/R7 교차 계약 통합 **`a3843d99`**. QA `docs/qa/2026-10-13-cloud-management-review-fixes.md`, 증거 `docs/qa/evidence/2026-10-13-cloud-management-review-fixes/`. 최초 리뷰/evidence도 보존하고 resolution link 추가.
+- 최종 기록 검사: staged diff 검사에서 Cargo transcript의 파일 끝 빈줄 8개를 지적(exit2)→로그 본문·결과 유지하며 마지막 빈줄만 정리 후 재검사. source 검사는 모두 앞서 통과했으며 이 문서 정리는 제품 변경이 아니다.
+- 남은 승인 수정: 없음. 실제 provider 계정/공개 터널/OS sleep/Windows 전체 앱/실앱 원본 이동 E2E는 미실행(정확한 범위 QA 명시). 기존 ESC 파괴 저장 문자열을 임의 복원·삭제하는 migration 없음. source/test version0.12.1, 사용자용 artifact 배포 없음. push/앱 재실행 없음. 다음 제품 release는 shipped보다 큰 version bump와 binary/bundle version 검증 필수.
+- 다음 agent 정확한 명령(canonical cwd): `cat AGENTS.md`; `head -n 16 docs/CODEX_HANDOFF.md`; `git status --short`; `git log -5 --oneline`; `cat docs/qa/2026-10-13-cloud-management-review-fixes.md`. 새로운 변경이 있을 때 영향 검사 `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::`; `CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mcp -p web-remote -p i18n`; `node crates/web-remote/tests/fixtures/run-cloud-results-mobile.mjs`; strict/fmt/boundary. 사용자 현재 작업의 재실행 요청 없이 dev-run.sh/실앱 종료/launch 금지.
+
+---
+
+# 클라우드 리뷰 7건 병렬 수정 — 단계별 기록, 2026-10-13 (Codex)
+
+- 현재 목표: 사용자 승인 7건 전부 병렬 수정·실제 회귀 RED→GREEN·root 통합 리뷰. 기준 HEAD fcf237f7, canonical deppy-sijo-performance. 원래 dirty deppy-sijo와 기존 untracked HTML 보존. 현재 앱 재실행/배포 요청 없음.
+- 소유권: gpt-6.1-sol/xhigh/fork none 작업자 3개. fix_secret_oauth R1 management.rs + R6 oauth/tests; fix_cloud_control R2 continuity + R5 control/cloud_agent.rs/bridge_tests; fix_pwa_status R3 pwa/native settings/status 계약 + R4 shared JS/browser fixture. Root R7 app/native runs navigation, App status producer 통합, locale, docs/최종 검사. 공통 Target/CloudAgent 정의는 control 작업자 단일 소유, 다른 담당은 계약을 메시지로 요청. Cargo는 Root 단일 슬롯; 글로벌 fmt는 소유 편집 종료 후 Root만.
+- 시작 확인: AGENTS/handoff/status/diff 실제 읽음. source 변경 없음, 이전 review docs/evidence/handoff 미커밋 상태. systematic-debugging/TDD 적용, 리뷰에서 확인한 원인을 바탕으로 영속 회귀 먼저 작성·실행. Root 정확한 테스트 결과/실패 접근/남은 작업 계속 기록.
+- 다음: 작업자 RED 준비/contract 응답 확인, 원본 navigation 결과 모델/회귀 추가; 순차 Cargo RED 후 각 owner 최소 수정; 전체 영향검사/독립 코드리뷰·문서 갱신. 제품 릴리스/버전 bump/앱 실행은 이번 수정 검증 범위에 포함하지 않는다.
+- 실제 RED/진행: App `cloud_agent::` 114 PASS/8 FAIL/3ignored(exit101) — R1 ANSI/wrapped/mixed3, R2 idle bridge/continuity2, R5 rotation1, R3 identity1, R7 native notice1이 기대 동작 실패. 첫 R1 compile은 fixture Job Debug unwrap 오류로 blocked→fixture만 수정 후 행동 RED 실행. OAuth 이름/refresh 두 focused명령 각0PASS/1FAIL, DTO status 형식0PASS/1FAIL. browser R4 실제 RED→keyed DOM GREEN38, R3 identity/labels 및 duplicate key 후속 RED→GREEN50(작업자실행). Root 제품 통합: 원본 navigation request token/callback, exact identity·runtime·관측된 focus·최대30초 polling, 실패 시 결과 유지; active/warm session_entries 상태 분리, timestamp는 실제 Done hook만 보존. native settings owner가 exclusive Cargo RED중, root전체GREEN 아직 미실행.
+- 후속 검사/리뷰: native settings 실제 RED0/1→GREEN1/0; R2 resume-before-App 실제 queued PTY legacy/named RED0/2→admission clock gate 양쪽PASS, 작업자 전체Cloud 131PASS/1FAIL/3ignored(남은 실패는 새 모델정보 Label 두 곳의 query 모호성→root get_all로 수정). independent cross-review에서 R1 BEL+ANSI 혼합 누락 발견→실제 durable RED0/1→기존 complete ANSI stripper 재사용으로 개선(C peer component GREEN1). 기존 wrapped run/receipt read scrub 회귀를 owner가 격리 SQLite RED→GREEN 중. R7 old-focus supersession/PWA 즉시 settings-close 지적 수용: 이전 exact focus취소, PWA도 동일 queue/observed completion, 이전 UI notice는 superseded 오류. R3 첫 timestamp 접근은 hook attention_revision을 seconds로 오인해 폐기; 이제 confirmed global_idle_since의 Unix seconds+current generation만 Done 상태에 사용, 그 밖은 시각없음으로 표시.
+- 현 소스: App status/navigation, cloud_agent Target/continuity/admission/rotation, 관리 mask/OAuth name, shared PWA/DTO/nativeUI 및5locale 수정. 작업자 소유 외 편집 없음; root 전체Cargo/strict/fmt/boundary는 legacy read 회귀 종료 후 실행한다. 원본 리뷰와 부가 logs는 보존하며 현재미커밋.
+- 통합 검증 진행: legacy wrapped SQLite run bootstrap/Get/cache/snapshot·receipt lookup 실제 RED0/2→GREEN2; owner3개 소스 편집 종료. Root `cloud_agent::` **135PASS/0FAIL/3ignored**, production browser **50PASS** exit0. R7 교차 리뷰 후 PWA는 권한 재검증된 동일 frame에서 효과 적용(2차 무권한 queue 없음), latest pending MuxUpdated 관측, 성공 뒤 destination aux scope sync+terminal reveal, 실패는 결과 유지. focused completion1PASS, 영향 agent-mcp/web/i18n 검사 및 strict/fmt/boundary 최종 실행 중. broad materialized 치환이 기존 unrelated focus 함수에 적용된 것을 diff에서 확인→즉시 복원하고 cloud navigation 구간만 수정, 관련 source 외 변경 없음.
+
+---
+
+# 클라우드 PR 1–6 독립 병렬 코드 리뷰 — 완료, 2026-10-13 (Codex)
+
+- 현재 요청: 구현한 PR 전체를 서브에이전트 병렬로 코드 리뷰. source 고정 범위 `3ac1f61f..fcf237f7`; canonical deppy-sijo-performance. 제품 수정/재실행/푸시/릴리스는 이번 리뷰에서 수행하지 않는다.
+- 리뷰 모델/소유권: 모두 명시적 gpt-6.1-sol/xhigh/forknone. review_auth_access(PR1/2 인증·권한·runtime), review_runs_history(PR3/4 영속 작업·receipt·출력·Secret), review_ui_pwa(PR5/6 native/PWA·복구·관리 권한). Root는 경계/문서 대조, finding 재검증·중복 제거·필요 focused proof와 최종 보고. 담당은 읽기 전용, 소스 편집 금지; Cargo는 Root 단일 슬롯.
+- 시작 확인: AGENTS/handoff/status/diff/log actual 읽음. tracked clean, 기존 미추적 active-work HTML만 있음. 기존 구현 테스트는 이전 실행 증거이며 이번 리뷰에서 다시 실행한 결과로 주장하지 않음.
+- 완료: 독립 리뷰 3개 모두 종료, Root 실제 근거/호출 경로 대조·중복 제거·격리 재현. **7건 미수정**: R1 high management_text ANSI/줄바꿈 등록 비밀 마스킹 누락; R2 medium 정상 idle frame gap의 input revoke; R3 medium local_status에 agent identity 사용; R4 medium PWA snapshot 전체 DOM 교체로 focus/selection 소실; R5 medium rotation stale named ACL capacity; R6 medium OAuth 승인 이름 소실; R7 medium missing original pane 이동 결과 누락. 상세 `docs/reviews/2026-10-13-cloud-agent-management-parallel-review.md`.
+- 수정 파일: 이 handoff, 새 리뷰 보고서, `docs/reviews/evidence/2026-10-13-cloud-management-review/{redaction-order,rotation-acl,pwa-focus}.log`만. 제품 source는 HEAD `fcf237f7d14f2c9548d653b98c1fc9e5b1aa20d8`와 동일. source/test 0.12.1 유지, build/release artifact 미배포.
+- 실제 검사: 현재 Secret compiled component와 동일 management filter Rust compile0→0 PASS/2 FAIL(exit101), 현재 control.rs 포함 ACL rotation wrapper compile0→0 PASS/1 FAIL(exit101), production HTML/JS/CSS isolated Chrome timestamp-only snapshot focus/selection proof exit1. 모두 보호 기대 위반을 재현한 FAIL이며 수정 후 PASS 아님. PWA 명령 `node /private/tmp/deppy-cloud-review-focus-20261013.mjs`; Rust 원본 `/private/tmp/deppy-cloud-review-{redaction-order,rotation-acl}-20261013.rs`. 실제 실행 로그 위 evidence에 보존. `git diff --exit-code fcf237f7 -- crates web` exit0. 이전 Cargo/QA PASS는 이전 실행으로만 기록, 이번 Cargo 실행 없음.
+- 검증 한계/실패 접근: R1/R5는 component proof + App persistence/rotation 정적 trace, 전체 App/SQLite/Auth E2E 아님. R2/R3/R6/R7 정적 확인, 실제 OS sleep/제공자 계정/native closed pane E2E 미실행. page byte-cursor 후보는 explicit truncated/lossless:false 계약 대조 후 제외, expired-auth retry/legacy revoke 정책은 불확실해 확정 finding으로 올리지 않음. 단독 control.rs wrapper compile에는 unused method 경고가 있었으며 전체 strictclippy로 주장하지 않음.
+- 핵심 결정/남음: 이번 요청은 리뷰만; 7건 product fix를 자동 시작하거나 커밋/푸시/재실행하지 않는다. 추후 수정 요청 시 R1 먼저, R2/R5/R3 다음, R4/R7/R6 순서. actual crate/browser 영속 회귀를 추가해 current RED→fix GREEN을 실행해야 한다. original dirty deppy-sijo/기존 untracked HTML 보존.
+- 최종 저장 확인: evidence 로그 3개 복사 완료. `git diff --check` exit0; 제품 범위 diff exit0; `git status --short`는 이 handoff·새 리뷰 보고서/evidence와 기존 미추적 HTML만 표시. 이번 리뷰 문서는 미커밋 상태다.
+- 다음 agent 정확한 명령(canonical cwd): `cat AGENTS.md`; `head -n 23 docs/CODEX_HANDOFF.md`; `git status --short`; `git diff --exit-code fcf237f7 -- crates web`; `cat docs/reviews/2026-10-13-cloud-agent-management-parallel-review.md`; `git diff 3ac1f61f..fcf237f7 --stat`. 수정 승인 후 `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::`, 영향 crate 검사·browser fixture·strict/fmt/boundary. 명시적 재실행 요청 없이 dev-run.sh/실앱 종료·launch 금지.
+
+---
+
+# 클라우드 에이전트 관리 PR 1–6 완료 — 2026-10-13 (Codex)
+
+- 현재 목표/상태: 사용자가 승인한 1–6 병렬 구현, GPT-6.1-Sol xhigh 담당 작업, root 오케스트레이션·코드 리뷰·결함 수정·커밋 완료. canonical `/Users/jr/Desktop/projects/deppy-sijo-performance`, branch `feat/audit-nine-pr-v0.6.0-20261004`, baseline `3ac1f61f`. 원래 dirty `/Users/jr/Desktop/projects/deppy-sijo`와 기존 미추적 active-work HTML 보존.
+- 완료: 준비/실제 인증/도구 성공 구분; 독립 인증 주체·읽기/입력 권한·한 세션 한 writer·실제 PTY 대기 입력 회수; 영속 CloudRun/heartbeat/unknown/취소 요청·ACK; bounded history/freshness/접수 조회; 비밀 없는 프로필/명시적 bounded reconnect/절전 간격 재검증; native/PWA 동일 원본 작업·검색·결과·링크·관리 UI.
+- 수정 파일: agent-mcp 8개(인증/스키마/원장/새 principal·protocol·management); App 18개(bridge/controller/worker/config/native UI/원본 이동); i18n 5개; web-remote 후속 6개; secret redaction/runtime command; 가이드 2개 및 plan/QA/handoff/실제 native PNG. 초기 PR1/웹 커밋 파일은 git log를 참조. 수정 경계/계약은 실행 계획에 기록했다.
+- 핵심 결정: App만 터미널 effect 적용, worker만 SQLite; 연결별 scoped 내부 ID와 기존 legacy tombstone 호환; 큐 접수≠실행/완료; DB commit 후 로컬 truth 유지/외부 불확실 응답은 조회; 취소 요청≠Ctrl+C/권한 회수. 원래 workspace/session/generation/actor에 결과 귀속. 프로필은 비밀·승인·입력 보존 안 함. PWA 관리 envelope는 origin·전체 16바이트 epoch·정확한 권한·5초 deadline·생존/만료를 접수 및 App 적용 직전 재검증. Secret fragment redaction은 페이지 경계 재구성을 막고 Unicode scalar를 보존하며 KMP로 corpus-linear.
+- 실제 최종 검사: `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::` 112 PASS/0 FAIL/3 ignored(7.48s, UI25 포함); `cloud_history_worker::`6, `config::tests`45, `ui::cloud_answer::`1, i18n8 PASS. agent-mcp66 PASS/1ignored/doc0; Secret79 PASS/doc0; web399 PASS/13ignored/doc0; runtime tracked_input_4 PASS(실제 PTY). 5 대상 crate all-targets strict clippy-Dwarnings PASS(25.33s), fmt/boundary/diff PASS. 전체 workspace suite를 실행했다고 주장하지 않는다.
+- UI 검증: 실제 Chrome6/모바일 production fixture31/RelayNode16 PASS(당시 도구 출력); native720 actual screenshot과 geometry PASS, root 시각 대조 완료. PNG `docs/qa/assets/cloud-agent-management-2026-10-13/native-720.png`. 상세 검증/로그/ignored 범위는 `docs/qa/2026-10-13-cloud-agent-management.md`.
+- 리뷰: root 실제 diff 대조 + gpt-6.1-sol/xhigh read-only CLI foundation/App/PWA 리뷰; 각 지적을 실제 회귀 RED→GREEN으로 반영. 최종 origin 좁은 리뷰 추가 구체 결함 없음. root가 마지막 5개 행동 수정 및 narrow lint/Box worker representation diff를 재대조하고 영향 검사를 재실행했다.
+- 실패 접근: 새 계약 컴파일 오류(타입/epoch16), fixture 시간·trailing blank row·AccessKit link 역할 오인, runtime 내부@ID 거절, 실제 ACL/URI/recency/reconnect/scoped widget/PWA queue 결함을 각각 분리해 수정했다. 최종 첫 strict는 신규 App lint exit101→동일 동작의 좁은 정리 후 모든 App 검사/strict 재통과. 중간 실패를 최종 PASS로 숨기지 않았으며 단계별 로그는 아래 기록/QA에 있다.
+- 커밋: 계획 `19fa8df3`; PR1 `35e8a264`; PR6 웹 `1878a449`; secret `2fdf4a4d`; runtime `1dd6d16d`; 최종 제품 통합 source **`9d0ed76b`**. Request/Principal/worker/operator 교차 crate 계약은 컴파일 가능한 원자적 통합 커밋으로 묶음. 이 완료 기록/수용 문서는 docs-only 후속 커밋.
+- 남은 승인 구현: 없음. 실제 dot/Muse/Grok Bot 계정 인증과 공개 터널/실제 OS sleep E2E는 수행하지 않아 호환성을 보증하지 않음. 격리 DB/HTTP/OAuth/PTY/UI fixture만 실행; 실 사용자 DB/토큰/클립보드/터미널 수정 없음. source/test version0.12.1 유지, 사용자용 변경 artifact 미배포. push/release/app restart 요청 없고 수행하지 않음. 추후 release는 최신 shipped보다 큰 버전 bump 및 binary/bundle 검증 필수.
+- 다음 agent 정확한 명령(canonical cwd): `cat AGENTS.md`; `head -n 22 docs/CODEX_HANDOFF.md`; `git status --short`; `git log -8 --oneline`; `cat docs/qa/2026-10-13-cloud-agent-management.md`. 새 코드 변경이 생기면 `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::`, 해당 crate 검사 및 strict/fmt/boundary를 변경 영향에 맞게 실행. 명시적 재실행 요청 없이 dev-run.sh/실앱 종료·launch 금지.
+
+---
+
+# 클라우드 관리 PR 1–6 단계별 진행 기록 — 2026-10-13 (Codex)
+
+- 목표: 사용자가 보고서의 PR 1–6 구현·서브에이전트 병렬 작업·오케스트레이터 리뷰 후 커밋을 승인. 기준 `3ac1f61f`/0.12.1, 이 worktree에서 작업. 앱 재실행·푸시·제품 릴리스는 요청 없음.
+- 계획: `docs/superpowers/plans/2026-10-13-cloud-agent-management.md`. 모델은 세 작업자 모두 명시적 `gpt-6.1-sol`, effort `xhigh`, fork none. 소유권: `/root/cloud_auth` server/oauth/lib/tests; `/root/cloud_domain` management/history/history_worker; `/root/cloud_settings` cloud UI/locales/guides/new mockup; root App bridge/control/config/app integration 및 리뷰/커밋. 다른 소유 파일 수정 금지, Cargo는 root가 슬롯 직렬화.
+- 계약: `Principal {id,name,auth_kind,input_scope,authenticated_at,expires_at}`, `LEGACY_CONNECTION_ID="manual-legacy"`; OAuth/신규 bearer는 별도 인증 연결 ID, refresh 중 유지. 새 작업 영속 키는 연결별 scope, 기존 legacy operation tombstone 유지. `OperationContext {connection_id,operation_id,run_id:Option<String>,generation}`; run/cancel/status와 async history worker에 추가 변형. 제어 lease TTL 1–120초, App가 revoke한 epoch의 runtime permit을 실제 큐 입장까지 회수.
+- 완료/검증: 승인 보고서·실행 계획 기록, 분리 작업자 3개 실행. auth 소유자가 `CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mcp cloud_management_` RED 실행 exit101: start_run 미존재·retryable/effect 정보 미존재·domain migration table count0vs2의 3개 실제 행동 실패. root 순수 control 상태는 타입 부재 RED 확인 후 `/private/tmp/deppy-cloud-control-harness-20261013.rs`를 rustc test로 컴파일, 4 PASS(다른 봇 권한 분리/generation fence, 동일 세션 단일 제어권/다른 세션 독립, lease 만료/회수 후 epoch 재사용 불가, 같은 봇의 다른 run 인계·read-only 차단). 아직 Cargo App 통합/최종 green 완료 아님.
+- 실패한 접근: control.rs를 직접 rustc crate root로 컴파일하면 pub(super) 경계 오류. 경로 모듈 wrapper로 테스트해 수정; standalone test에는 아직 App에서 쓸 API dead-code 경고가 있으며 최종 workspace clippy까지 완료했다고 주장하지 않음.
+- 현재 변경: 보고서/계획/handoff, 신규 cloud_agent/control.rs; 소유자 변경은 git status로 확인. 기존 `docs/mockups/active-work-visibility-2026-10-12.html` 보존. 테스트는 실 사용자 DB/터미널/토큰에 접근하지 않음.
+- 남음: auth/domain 계약 구현 완료 후 root App Request 필드·ACL/lease/run/receipt/output integration; UI PR1 red/green과 커밋; 프로필·복구, PWA 결과/명시적 관리 intents; local HTTP/PTY/browser harness 및 모델 지정 CLI 코드 리뷰; PR별 커밋·일지. 실제 제공자 계정 인증 완료와 local fixtures를 혼동하지 않음.
+- 다음 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`; `cat AGENTS.md`; `head -n 30 docs/CODEX_HANDOFF.md`; `git status --short`; `cat docs/superpowers/plans/2026-10-13-cloud-agent-management.md`; live agents 상태/메시지 확인. Cargo 작업 슬롯은 root와 협의하고 workspace fmt를 병렬 수행하지 말 것.
+
+- 단계 갱신(09:30 KST): auth 최종 `CARGO_BUILD_JOBS=2 cargo test --locked -p agent-mcp` 실제 57 PASS/1 ignored. domain focused history 11 PASS/1 ignored, management 7 PASS; exact GetRun beyond100 RED→GREEN. UI PR1 `setup_state_` 실제 compile 성공 뒤 0 PASS/4 FAIL(표시 3개 및 copied instruction paste_text 누락), GREEN 작업 중. PWA 작업자 gpt-6.1-sol/xhigh 추가, web-remote/shared frontend/relay shell 소유; generation String 계약. domain는 신규 App management.rs async run/receipt helper로 재배정, root controller/control/output/config/app 독점 유지. Cargo UI→PWA 순서, root 독립 auth/domain CLI 소스 리뷰 실행 중(최종 결과 아직 없음). mockup 실제 Chrome 1440/900/390 검사 overflow/JS error 없음, 실 계정 검증은 아님.
+
+- PR1 완료: UI 실제 RED 0/4 → GREEN11 PASS(추가 manual-local URL 숨김 회귀 RED0/1→GREEN 포함), i18n8 PASS. HTML Chrome 1440/900/390 overflow/JS 오류 없음. Root 실제 source diff 대조 + `codex exec -m gpt-6.1-sol -c model_reasoning_effort=xhigh --sandbox read-only` 독립 PR1 리뷰 완료, concrete defects 없음(`/private/tmp/deppy-cloud-pr1-review-20261013.txt`). 첫 기능 커밋은 PR1 소유 파일만, Record additive fixture4필드는 index에서 제외. 연결관리/run/profile UI 후속은 동일 소유자에게 재배정. PWA 실제 Rust RED40 missing API → GREEN5 PASS, 모바일22→24 checks와 Relay Node16 PASS. History targeted receipt 실제RED1 FAIL(다른 pane 권한으로 원본receipt조회) 후 production수정대기. App management RED 첫 compile는 새 Effect::History test match2누락으로blocked, root수정후재실행중; 행동RED로 주장하지 않음.
+
+
+- 통합 단계 갱신: root는 connection ACL/단일 writer lease/actual runtime InputPermit 회수, scope별 operation key·receipt, async CloudRun·취소/heartbeat, bounded terminal history cursor, nonsecret profile/reconnect/wake revalidation, PWA snapshot/operator intent를 연결했다. 새 수동 credential 발급은 actor별 auth/일회성 clipboard용 반환·redaction lease만 보관하며 기본 Target 권한은 denied. App/output/control/continuity/access/pwa/config/bridge_tests는 root 소유, async management helper는 domain에게 추가 위임했다. 실제 App GREEN은 아직 완료 아님.
+- 실제 검증 추가: PWA normal suite391 PASS/13ignored, 실제 Chrome 선택6 PASS, 모바일 production fixture26 checks/RelayNode16 PASS, web-remote strictclippy0, isolatedrelay-shell build/digest PASS. domain 독립 CLI 리뷰 2건(최대 크기 run 복원 metadata 증가·큰 escaped 답변 page workerbudget)을 회귀RED4FAIL→GREEN4PASS로 수정; history14PASS/1ignored. UI 연결관리 actualRED10PASS7FAIL 후 구현, run UI3새회귀는 아직 행동RED 미실행. Root bridge4회귀는 작성 후 컴파일 수리 중이며 테스트 통과로 주장하지 않음.
+- 실패/검토: App helper initial 행동RED3FAIL(즉시ACK/cache·revoke-before-save·pendingbound) 이후 구현; 후속 compile은 UI age u64/i64, E0716 temporary와 root fixture auth hash 형식 오류로 blocked→소유자 수정. PWA 독립 CLI 리뷰1 medium: pending original-session navigation이 후속 사용자 선택을 덮음; 아직 수정 전. 독립리뷰 출력 /private/tmp/deppy-cloud-{foundation,pwa,pr1}-review-20261013.txt. Auth 후속 fixed-code/schema tests는 의도된RED 상태, production mapping 수정 전.
+- 다음: Cargo exclusive slot domain App helper/worker gate→auth RED/GREEN/full agent-mcp→UI run/issuer RED/GREEN→root full cloud_agent/worker/config/answer gates. 모든 root/App source는 domain compile 동안 freeze. PWA navigation 회귀/수정·App 소스 독립 CLI review·strictlint/fmt/boundary·남은 PR단위 커밋/Obsidian journal/plan checklist. PR1 commit35e8a264, docs19fa8df3. No push/release/restart. 미추적 기존 active-work HTML 보존.
+
+- PR6 웹 계층 리뷰 완료: 독립소스 리뷰 medium1(PWA 대기 원본세션 이동)이 실제 Chrome production fixture RED1FAIL→GREEN31checks로 수정. 최신 명시 선택·새 이동 요청·늦은 ACK·다른 workspace·socketdisconnect 모두 이전 이동을 취소/격리. JS syntax/RelayNode16PASS 재확인. Rust391PASS/13ignored·Chrome6PASS·strictwebclippy0는 소유자 최종소스에서 실행했으며 후속 JS 수정 뒤 fixture31을 재실행. 웹 모델/frontend는 별도 의미 단위로 먼저커밋, native PR6 snapshot/intent통합은 App 최종gate 후커밋.
+
+- Phase gate: domain completed/frozen helper10PASS·worker6PASS·history14PASS/1ignored·management9PASS·review4PASS. UI fresh compiled RED2 actual16PASS6FAIL (3runpanel, independent issuance, 720pxgeometry, manual-vsOAuthreauthcopy); production followup ongoing. Auth actual followup RED13PASS2FAIL(schema min1 vs1024/fixed invalid_run error)→fullagent-mcp66PASS1ignored; exact3newlocalcodes audit followup pending.
+- Root added new independently authenticated credential queued-PTY revoke/leaseexpiry and simulated sleep-gap regressions to the existing real-PTY admission harness; bridge tests add two intentional regressions for durable page truncation disclosure and transient listener retry scheduling. Not executed yet, no PASS claim. Source review found Stage::Save fence can report no-effect after DBcommit and retained Running cache can permit fresh run lease after terminal commit; narrow domain followup delegated with regression-before-fix. Cargo schedule auth final→domainsave-fenceRED/GREEN→UIproductionGREEN→root bridgeRED/fixes/fullintegration. RootAppcontrollers frozen duringAppcompile.
+- Commits so far: docs19fa8df3,PR1setup35e8a264,PR6web1878a449. No source release/restart/push. User DB/terminal/provideraccount untouched.
+- 통합 독립 App CLI 리뷰 완료: `/private/tmp/deppy-cloud-app-review-20261013.txt`의 9건을 담당별 회귀로 보완 중. Secret `redact_wrapped_text` 실제64자/20열 줄바꿈 재구성 노출 RED0/1→GREEN; full `CARGO_BUILD_JOBS=2 cargo test --locked -p secret` 72PASS/0FAIL/doc0, source frozen. Root control lease 축소는 standalone5PASS; 실제 PTY12case는 미실행. Domain terminal Save 후 cachetruth/unknownresponse 실제 helperRED9PASS2FAIL 이후 수정했으나 GREEN 미실행. 출력 cursor방향/페이지 truncation/줄바꿈 redaction은 domain 추가3회귀. Root는 nonlive readACL, 실제수신 timestamp, list_runs max_bytes, Rotate issuancecapacity, transientlistener retry, durablehistory truncation 및 wrapped snapshot 회귀를 추가했으며 helpers 일부 의도된 stub 상태.
+- 현재 Cargo 단독 슬롯: domain `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::` composite RED. Root/App/UI/Secret source freeze. 완료 후 Root/controller fixes +domain/output fixes +UI/nav button을 서로 다른 파일에 적용, full GREEN→strictlint/fmt/boundary→최종 독립 소스 리뷰→PR별커밋/일지. UI native 원본세션 navigation 신규회귀는 아직 실행 전; 실제720px PNG도 미실행. read_history512 schema 지적은 현재min1024/66PASS에서 이미 해결됨.
+- Composite RED 실제 종료: 88PASS/15FAIL/3ignored(compile35.12s/test6.92s). Domain savehelper11GREEN, 출력3·Root7·native navigation1 행동RED 확인. 추가 기존 fixture3(ClaimScoped compatibility, HTTP bool, queue25ms) 및 UIartifactLink1 실패는 원인 검토 중. Root7fix 및 raw≤1MiB/failclosed→wrappedredaction→public64KiBcap 적용; cached workspace fallback도 pre-redaction truncation 제거. ClaimScoped fixture와 queue expiry fixture가 DBclaim 전에25ms만에 만료될 수 있어1s→admission후1100ms로 보정했으며 아직 finalGREEN 아님. Secret/agent-mcp strict clippy alltargets-Dwarnings 실제exit0; semantically identical loopcleanup만 수행. Source window는 OPEN, domain 출력/UI navigation 작업 중; Root가 추가 발견한 CR/LF-only corpus compactempty panic은 auth에게 실제회귀/수정 후 foundationgate 위임.
+- 추가 root 리뷰: newline-only 의심은 실제회귀1PASS였고 기존find(empty)=None 때문에 panic 재현 없음; 방어guard만 추가, 결함으로 주장하지 않음. 반면 synthetic64자토큰40/24 두 페이지를 따로 가리면 재구성 가능함을 실제probe로 확인해 auth가 별도 conservative `redact_wrapped_fragment` API와 회귀를 보완 중(complete-snapshot/stream 기존동작 보존). Root redact_screen은 신규fragment API 사용. Domain 출력 cursor/bytecrop3productionfix 및 UI navigation4locale키/버튼 완료/frozen. UIartifactLink 실패는 실제egui Hyperlink가AccessKitLabel로 나타난 fixture문제: 실제click→OpenUrl 정확주소 검사로 교체. Root 실제720PNG 확인 가로overflow없음; nav 포함최종이미지는 다음gate에서 재생성. ArtifactURI가 redaction 뒤 다른유효주소가 되는 문제는 domain 신규회귀 작성 중, 다음 Appgate에서 RED→최소수정 필요. HTTP첫send_text isError=true 원인은 새assert payload로 다음gate에서 확인하며 retryable발표는 잘못된추정이라 제외.
+- Foundation 최종 fragment RED0PASS3FAIL→full Secret76PASS/0FAIL/doc0, strict secret+agent-mcp alltargets-Dwarnings exit0(29.53s), ownedfmt/diffPASS/frozen. KMP prefix/suffix tables로 corpus-linear 경계매칭, tiny부분·중간페이지·Unicode/ANSI·wholepattern 회귀 포함; complete/stream 기존동작 유지. Root 실제 App 독립 후속 CLI 리뷰 session69392(`/private/tmp/deppy-cloud-app-final-review-20261013.txt`), Foundation후속 CLI session76224(`/private/tmp/deppy-cloud-foundation-final-review-20261013.txt`) 진행 중, 모델gpt-6.1-sol/xhigh read-only/noCargo. Root full App `cloud_agent::` diagnostic2 session2921/log`/private/tmp/deppy-cloud-app-diagnostic2-20261013.log` 진행 중; App/UI/domain sourcefreeze. Domain artifact2회귀는 production미수정이므로 실제RED후 좁은guard적용예정. HTTP/queue 새payload 확인 후 finalGREEN 필요.
+- Diagnostic2 실제100PASS/5FAIL/3ignored(exit101,8.02s tests): artifact2 실제RED→domain immutableURI guard적용; output raw>64KiB test는 마지막CRLF로빈row가 생긴fixture였으므로 finalrow fill +rawbytes전제 보완(production재변경 없음). HTTPfirstinput runtime_error와queue client_revoke earlyrejection은 Runtime operation_id validator가 scoped `@` 내부ID를 거부하는 실제Root통합결함. Root runtime/command.rs의 공통tracked-ID validator가 leading@ 내부namespace를 안전한ASCII/128byte범위로 추가허용(외부MCP IDs는 계속@금지), 실제 `CARGO_BUILD_JOBS=2 cargo test --locked -p runtime tracked_input_`4PASS/0FAIL(실제PTYadmission2+wireidentity2). Queue25ms보정만으로 해결되었다고 주장하지 않음. Root 신규 namedconnection-only consent가legacybearer까지암묵공유되는경계회귀 추가(production미수정,다음Appgate에서RED확인). App diagnostic3 `/private/tmp/deppy-cloud-app-diagnostic3-20261013.log` 시작, Root/App/UI/domain/runtime 모두freeze; 성공한Auth76/strictgate는 그대로보존.
+
+---
+
+- Diagnostic3 actual `CARGO_BUILD_JOBS=2 cargo test --locked -p deppy-sijo --bin deppy-sijo cloud_agent::` exit101:105PASS/1intentional named-consent FAIL/3ignored(7.25s); all23UI,13management,3output and actualOAuthHTTP/queuedPTY GREEN. Root fixed named-only consent leaking legacy compatibility read by explicitly denying legacy only when a named grant first opens the global session ceiling; explicit original legacy consent remains supported. GREEN pending. Native nav-inclusive720PNG inspected by root+UI, fits. Foundation final source CLI actual exit0 found compact newline-pattern singleline leak and worstcase overlapping quadratic scan under corpus mutex; auth owner has Secret-exclusive followup/Cargo RED→GREEN, no App compile concurrently. App final source CLI still running69392. Domain/UI frozen/complete. Runtime tracked4PASS remains actual. Final lint/tests/review/commits pending; no release/restart/push.
+- Final App source CLI exit0 found6concrete followups(`/private/tmp/deppy-cloud-app-final-review-20261013.txt`): named-input grant lifts legacy ceiling; queued PWA control loses operator auth fence; reconnectoptout keeps recovery enabled; history selects externalnot scopedID; invalidartifact projection drops parentrun; activity usespresence notmaxrecency. Auth actual SecretreviewRED0PASS2FAIL→full78PASS0FAIL(doc0) with KMP comparison budget and compactnewline support, strict foundation running. Root added input/parentrun/activity regressions(productionunfixed); UI added realcheckbox/2actor duplicate-IDregressions(productionunfixed). PWA ownerwebqueue typed origin/envelope+actualdrain revalidationcontract approved; source/Cargo order Secretstrict→PWAwebRED/GREEN→AppnewRED→Root/UIfixes→finalgates. RootApp ownsrelayfield/callback/drain; PWAownswebcore/API, UIownssettings/historytests, AuthSecretonly. No owners overlap. Final QA draft `docs/qa/2026-10-13-cloud-agent-management.md` explicitly pendingfinalgates.
+- Secret exact78PASS/strictfoundation0 final. Narrow Secret CLI47406 exit0 foundmedium malformedANSI→UTF-8 span split (`zzzzé`, fragment ESC+é) and otherwise confirmedcompact/KMP/boundary fixes; Auth inspect-only untilwebCargo completes, then root grants Secret regression+span expansion. PWA actual missingAPIRED was35compileerrors, not behavioralclaim; acceptedtypedAPI thenactual `cargo test --locked -p web-remote cloud_control_ --lib` RED0PASS5FAIL forrevoke/drop/deadline/relayexpiry/directserverstop. RootApp sourceusesCloudControlRequest sink/queue, coreauthorizeatdrain, relayorigin policy callback rereads originaldevice identity/epoch/issuedat/expiry/exactperms andall4deactivatepaths dropguard. Web guards actualfence production fix ongoing. Cargoorder now PWA focused/fullGREEN→SecretUTF RED/GREEN→AppnewRED→Root/UIfixes→finalrootgate. Rootfinalgatescript prepared `/private/tmp/deppy-cloud-final-gate-20261013.py` (appcloud,worker,config,answer,i18n,strict5crates,fmt,boundary,diff). No finalcompletion/PASS claim yet.
+- PWA authority final behavioral `CARGO_BUILD_JOBS=2 cargo test --locked -p web-remote cloud_control_ --lib` RED0PASS7FAIL→GREEN7PASS. Full `cargo test --locked -p web-remote` actual399PASS/13ignored/doc0 (lib379PASS1ignored+integration20PASS12ignored), source frozen/Cargo released. Stale `static_srv.rs` markers from already-browser-tested pendingnavigation lifecycle were corrected after actual full379-library gate1testfail, JS unchanged. Root reviewed typed non-serde/singleuse5sec requests and pre/postcallback core/guard/expiry/epoch/exactpermissions checks. Root now grants Auth SecretUTF regression/linear scalar span fix→full/strict; RootAppRED queued next. All6AppCLI knownfixes still require final GREEN, so completion notclaimed.
+- Secret final UTF actualRED0PASS1FAIL→full79PASS0FAIL/doc0, strict secret+agent-mcp exit0(40.44s), scalarspan rootsource review PASS. App newRED firstcompile blocked2E0308: relayauthorization_epoch is &[u8;16], notu64. RootApp compares fulloriginalepoch already; PWA Policy nowretains[16] bytesexactly (no truncation/hash), directwebsentinel[1;16]; RootApp initializerderefsfull16, queuefixture[1;16]. PWA postcontractfocused7PASS and fullweb rerun pending/release. This compile failure is not behavioralRED. Root final origin scopedCLI1017 exit0, noadditional concrete security/correctness/liveness issues (`/private/tmp/deppy-cloud-origin-final-review-20261013.txt`). AppUI/rootbehaviorRED stillnextoncePWA release; allsourcefullGREEN/strict/commits remainpending.
+
+- App followup RED2 actual107PASS/5FAIL/3ignored(10.11s): named-input/legacy consent, unsupported artifact dropping parentrun, latest activity, reconnect optout, scoped native history collision all reproducibly failed. Typed epoch16 corrected web full399PASS/13ignored/doc0. Root now preserves prior effective legacy ACL before widening global ceilings; filters unsupported artifact independently and discloses truncation; uses maximum activity observation; adds set_reconnect plus apply_action optout guard. UI owner applies checkbox/scoped widget fixes in disjoint files. Final GREEN/gates stillpending; no Cargo owner overlaps.
+
+- Root final cloud GREEN actual112PASS/0FAIL/3ignored(7.66s), all5followup regressionsGREEN. Historyworker6/config45/answerUI1/i18n8PASS; strict5crates/fmt/boundary/diff stillrunning. UI scopedID/checkbox diffsrootreviewed, sourcefrozen. Latest720native test PNG copied to docs/qa/assets/cloud-agent-management-2026-10-13/native-720.png for durable QA evidence.
+
+- Final strict first actualexit101(99.16s): App screen_text/test-only legacyjobs deadcode, or_insert_withDefault, nestedif, GetRun336byteenum, outputtests beforeproduction. Root narrow lint repair: cfgtestscreen, targetedexpect legacycompatvariant fixtures, Defaultentry, same letchain, Box<CloudRun>workerresponse unboxed immediatelybycontroller, tests movedend. Firstfailedlog preserved /private/tmp/deppy-cloud-final-strict-first-20261013.log. Entirefinalgate rerun22447 because internalworkerrepresentation changed; sourcefrozen. No productrelease/version/restart/push.
+
+- Final complete gate actualexit0: cloud112PASS/0FAIL/3ignored(7.48s); worker6/config45/answer1/i18n8PASS; strict5cratesalltargets-Dwarnings0(25.33s), fmt0, boundary0, diff0. Root exact lintdiffreviewed: responseBox only affects retention size, controller immediatelyunboxes; repeated App/worker testsGREEN. Latestnative720PNG durably recopied afterfinalrun. Foundation actualtooloutputs preserved from ownerrunJSONL in captured-stdout logs, webepoch16captured full399PASS/13ignored. Source implementation/review complete; remaining logical commits/plan&QAfinalization/Obsidianjournal only.
+
+---
+
+# 0.12.1 재실행 — 2026-10-13 (Claude Code)
+
+- 버전: 0.12.0 → 0.12.1(patch, `3ac1f61f`). 변경 요약: 우클릭 메뉴 폭을 가장 긴 항목에 맞추고 행 간격 3→7pt, 모서리 2pt, Git 패널 파일 행 메뉴도 공용 스타일 사용(`5cdafd3f`).
+- 재실행(사용자 명시 요청): `cargo build -p deppy-sijo -p mcp-proxy --release` → 기존 PID 48518(0.12.0, 번들 없는 `target/release/deppy-sijo`)에 `NSRunningApplication.terminate`(quit Apple event) → 2초 내 정상 종료, force kill 없음 → `scripts/dev-run.sh --release` → PID 865, `--version` `Deppy Sijo 0.12.1`, codesign identifier `app.vector9.deppy-sijo`/Team ZDTU5LS35K, 10초 이상 유지. 번들은 만들지 않아 `CFBundleShortVersionString` 검증 대상 없음.
+- 「이어서 실행」 확인 준비: 종료 전후 `agent_sessions`(pane·kind·session 앞 8자리만 읽음) 변화 없음. `Design` pane `7b5da262`→codex `01a128ab`, `nomorevibe` pane `722c86d1`→codex `01a128ca`, 둘 다 pane 하나에만 묶임(공유 binding 아님). 시작 시 에이전트를 자동으로 띄우지 않으므로 실제로 Codex로 잇는지는 사용자가 버튼을 눌러야 확인된다.
+- 핸드오프의 Codex 2026-10-13 항목(미커밋)은 건드리지 않음.
+
+# 클라우드 에이전트 연결 기능 검토 보고서 — 2026-10-13 (Codex)
+
+- 현재 목표: dot·Meta Muse·Grok Bot 등 클라우드 에이전트 연결의 부족한 점, 우선 개선 사항, 다음 단계 업데이트를 보고. 이번 요청은 조사·보고이며 제품 구현·재실행 요청이 아니다.
+- 완료: 현재 사용 기준인 이 트리 `6bf56f53`/0.12.0의 MCP·OAuth·공유 권한·입력·화면 조회·history worker·답변 UI·PWA 경로를 검토하고 공식 제품/MCP/Cloudflare 문서와 대조. `docs/reviews/2026-10-13-cloud-agent-product-gap-review.md`에 우선순위 9항목, 이미 구현된 기반, 제공자별 미검증 범위, PR 1–6 계획과 완료 시나리오, 차기 기능을 기록.
+- 관찰: PID 48518은 127.0.0.1:8737/8739 수신. 2026-10-13 05:24 KST 읽기 전용 SQLite 집계에서 `send_text` 3건 모두 `queued`, `notify` 0건. 입력·대화·화면·토큰·fingerprint 원문은 읽지 않음. `queued`는 실행/완료 증거가 아니며 notify 부재도 작업 실패 증거가 아님. 현재 저장 모델로는 제공자별 책임과 외부 작업 완료를 알 수 없음.
+- 핵심 판단: 기존 UUID/generation fencing, 입력 권한 회수, PKCE/refresh, durable operation_id, multiline paste, 자동 터널 준비 검사, 비동기 이력 저장은 유지. 부족한 것은 연결별 주체/권한/입력 제어권, 클라우드 작업 생명주기, 과거 출력과 freshness, 접수 조회, 연결 연속성, 실제 연결 성공 표시, 작업별 결과/PWA, 제공자별 E2E 증거. `MCP 연결됨`은 실제 봇 인증 성공까지 확인하지 않음. 재시작 후 승인 해제는 의도된 정책이며 장기 사용 개선 시 묵시적으로 전체 복원하면 안 됨.
+- 수정 파일: 위 보고서와 이 handoff만. 기존 미추적 `docs/mockups/active-work-visibility-2026-10-12.html`은 건드리지 않음. 원래 `/Users/jr/Desktop/projects/deppy-sijo` 체크아웃도 변경하지 않음.
+- 검증: 소스/공식 자료 대조와 read-only runtime 메타데이터 집계 실행. `git diff --check` exit 0, 보고서 159줄·명시적 소스 앵커 10개 존재/줄 번호 검증·후행 공백 없음 확인. Cargo 테스트·제공자 계정별 E2E·입력 충돌/절전 재현·재빌드·재실행 미수행. `cargo nextest --version`은 nextest 미설치로 exit 101; 제품 테스트 실패 아님.
+- 실패/제한: 원래 worktree는 현재 실행 DB/소스와 달라 검토 기준으로 쓰지 않음. 일부 광범위 rg/read 출력이 잘려 필요한 소스 구간을 좁혀 재조회. history worker 테스트의 숫자 100을 실제 목록 한도로 해석하지 않음; 실제 이력 조회 SQL은 최근 일반 작업 500건과 보존 답변 100건. dot/Muse의 임의 MCP 등록 방식은 공식 제품 소개만으로 확인되지 않아 호환성 확정하지 않음.
+- 남은 작업: 사용자에게 보고. 이후 구현 요청 시 보고서의 PR 범위를 선택해 진행하며, 인증된 연결/권한 계약부터 고정. 실제 제공자 연결 검증과 불명확한 입력 자동 재실행 방지 시나리오가 필요. 이번 조사로 코드 수정·커밋·푸시·앱 재실행을 승인받은 것으로 간주하지 않음.
+- 다음 에이전트 명령: `cd /Users/jr/Desktop/projects/deppy-sijo-performance`, `cat AGENTS.md`, `head -n 35 docs/CODEX_HANDOFF.md`, `git status --short`, `git diff -- docs/CODEX_HANDOFF.md`, `cat docs/reviews/2026-10-13-cloud-agent-product-gap-review.md`. 구현 테스트의 통과 여부는 해당 시점에 실제 명령을 실행한 결과로 기록.
+
+---
+
+# 0.12.0 재실행·「이어서 실행」 첫 에이전트 재개 조사 — 2026-10-12 (Claude Code)
+
+- 사용자 「재빌드하고 재실행해」. 원래 체크아웃(`feat/fleet-one-list-and-relay-wip`, 마이그레이션 38)은 실제 DB(`user_version` 50)를 forward-only 가드로 거부해 실행 불가 — DB는 건드리지 않음. 사용자 선택으로 이 트리에서 실행.
+- 버전 0.11.0 → 0.12.0(08:05 0.11.0 번들 이후 feat 포함 커밋 `07060046`·`5f19379d`·`93b96622` 등이 들어와 minor). `Cargo.lock`은 워크스페이스 27줄만. 소스 `d5f88b35` + 버전 변경.
+- 실행: `scripts/dev-run.sh --release`(Developer ID, identifier `app.vector9.deppy-sijo`), `--version` 0.12.0, PID 48518. `package-macos.sh`의 로컬 개발 플래그는 자동 권한 검사가 거부해 이번엔 번들을 만들지 않았다(`target/release/deppy-sijo` 직접 실행).
+- 「이어서 실행이 종료 직전 대화가 아니라 처음 에이전트 대화로 뜬다」 조사: Claude로 띄운 `Design`·`nomorevibe` pane에서 사용자가 Codex로 바꿔 쓰다(`01a128ab` 14:28, `01a128ca` 13:51 마지막 기록) 재시작했더니 Claude(`240ec284`·`113b810f`)가 떴다. 재시작 시점의 binding은 이전 빌드가 남긴 것 — 08:22 백업에서 `nomorevibe` pane은 Codex가 그 폴더에서 10-11 11:39부터 돌았는데도 Claude binding(10-11 09:56) 그대로였고, `Design`은 Claude pane 두 개(`622d9033`·`7b5da262`)가 같은 Codex ID에 묶여 있었다(공유 binding → `archived_resume_target`이 전환을 막고 Claude `-c`로 떨어짐). 0.12.0은 두 pane 모두 Codex binding을 pane 하나씩에 기록 중(14:44:38, 14:51:21) — 다음 재시작에서 Codex로 잇는지 확인 필요(재시작은 새 명시 요청 필요).
+- 기각한 가설: `hook_binding_matches_command`의 Codex `resume X` 고정은 원인이 아니다 — `detect_cached`가 Codex hook엔 이 대조를 적용하지 않고(`b.kind == Codex ||`), TUI 안 `/new` 전환 수용은 `independent_current_execution_hook_replaces_codex_resume_cache`가 고정한다.
+
+---
+
 # 남은 상태 문제 3건 — 완료 판정·그 밖의 에이전트·pane 에이전트 전환 — 2026-10-12 (Claude Code)
 
 - 사용자 「남은 문제 해결해」. 한 PR에 커밋 3개.
@@ -1026,3 +1533,7 @@ Historical completed-task records and original commands are preserved in [the pr
 - FullWebinitialactualexit101347PASS2FAIL1ignored /private/tmp/deppy-pwa-pr4-web-full-initial-20261009.log, integration/browsernotreached. ExpectedlegacyWSRuntimeScroll assertion obsolete; rootauthorizes testmigration preserveswatch/±100000 andaddsno-nativeScroll. Otherfailure static_srv.rs exactoldprefsliteral excludesreadableWrap field; rootauthorizes removeONEobsoleteexactmarker, no newformula-mirroringliteral, default/restorationcoveredactualChrome281/read180. Backendtest-onlylib/static_srv edits aftergateexit, allocator/productunchanged. FinalWebGREEN+fullApponce/vendor/7Chromewrappers/strictterminal-session-runtime-Web-AppClippy/fmt/boundaryplanned, no resultsclaimedyet.
 - FullWebGREEN actualexit0 /private/tmp/deppy-pwa-pr4-web-full-green-20261009.log349unitPASS1ignored+20defaultintegrationPASS; browserignorednotexecutedyet. Rootmanuallegacytesttarget/cap/no-native andone-markerremovaldiffreviewclean. FinalallocatorCLI38485 completedexit0 CONCLUSION:OK /private/tmp/deppy-pwa-pr4-web-final-review-20261009.txt, source/correlation/exhaustioninspected, testsnotrerun. No rootCLIactive.
 - Finalaffectedgate initialexit101 vendor -p selectionexcludedrequiresdevdeps, NO testsran /private/tmp/deppy-pwa-pr4-final-affected-gate-20261009.log. Manifest-pathcontinuationvendor actual155unit+45ref+2doc=202PASS1docignored /private/tmp/deppy-pwa-pr4-final-affected-continuation-20261009.log, thenAppcompileE0004 workspace.rs5377 newHistoryResultmissingexhaustivematch, noApp/browser/lintcommandsran. Rootauthorizednecessaryone-arm nativequeryreplynoop underEnvironmentApplied/InputAdmitted, no broaderAppflow. OwnRustrefrozen /private/tmp/deppy-pwa-pr4-final-affected-continuation-2-20261009.log nowfullAppbin+7Chrome+strict5cratealltargetsClippy/fmt/boundary; no vendorrepeat. Runtime377/terminal130/session76 unchangedpreviousGREEN remainsvalid. App/query-noop exactdiff manuallyreviewedroot; resultsremainingpending.
+
+## GitGuardian 기록 오탐 처리
+
+PR230의 GitGuardian은 과거 manifest의 `worker_patches.secret` SHA256을 generic secret으로 판정했다. 실제 `/private/tmp/deppy-popup-fix-secret-20261014.patch` 파일 SHA256과 정확히 일치함을 검증했다. 작업자명과 `sha256` 필드를 분리해 메타데이터 표현만 정규화했다. 실제 credential이나 제품 변경은 없다. 기존 PR/commit을 보존하고 force push 없이 깨끗한 대체 integration branch/PR로 검사한다. 원본 manifest와 3개 digest 값은 보존된다.

@@ -1,0 +1,5 @@
+ascii_placeholder_allowed=true wide_placeholder_allowed=false
+
+thread 'main' (37786497) panicked at /private/tmp/deppy-composer-review-20261014/guard_probe.rs:22:5:
+current empty native hint must remain admissible at its wide cursor owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,13 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 6 tests
+test cloud_history_worker::tests::cloud_management_actor_rejects_oversized_context_run_and_query_before_admission ... ok
+test cloud_history_worker::tests::cloud_management_actor_scopes_receipts_and_persists_runs_without_effects ... ok
+test cloud_history_worker::tests::history_page_snapshot_keeps_valid_newlines_and_reports_retained_memory_truncation ... ok
+test cloud_history_worker::tests::pr7_actor_drop_drains_admitted_finish_without_any_input_callback ... ok
+test cloud_history_worker::tests::pr7_actor_is_inert_then_opens_on_worker_and_wakes_after_publication ... ok
+test cloud_history_worker::tests::pr7_actor_reserves_snapshot_bytes_until_completion_consumed_and_bounds_job_count ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 3247 filtered out; finished in 0.07s
+

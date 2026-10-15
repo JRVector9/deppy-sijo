@@ -1,0 +1,15 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 8 tests
+test ui::file_tree::tests::popup_input_secondary_workspace_drag_does_not_autoscroll ... ok
+test ui::workspace::tests::popup_input_file_rename_enter_consumes_raw_and_native_batch ... ok
+test ui::workspace::tests::popup_input_file_rename_escape_consumes_raw_and_native_batch ... ok
+test ui::workspace::tests::popup_input_file_rename_ime_enter_keeps_composition_owned ... ok
+test ui::workspace::tests::popup_input_file_rename_listing_insert_keeps_focus_and_target ... ok
+test ui::workspace::tests::popup_input_tree_click_keeps_keyboard_for_next_frame_delete ... ok
+test ui::workspace::tests::popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste ... ok
+test ui::workspace::tests::popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 3212 filtered out; finished in 0.18s
+

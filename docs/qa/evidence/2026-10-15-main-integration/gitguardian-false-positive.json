@@ -1,0 +1,12 @@
+{
+  "check_run_id": 116266099942,
+  "old_pr": 230,
+  "old_commit": "1192cfcbf7e4197582422232ba508983a91165c6",
+  "classification": "artifact SHA256, not a credential",
+  "artifact": "/private/tmp/deppy-popup-fix-secret-20261014.patch",
+  "sha256": "19b01b9e655bb0d37d2fbbb14e9a450002ac39a5a2715511fb0b1fe4aa3e9b04",
+  "exact_artifact_digest_verified": true,
+  "metadata_before_sha256": "a53db37f1668803361a952c298b94e2c16a52b0220e3a38a6a5655e4751a8487",
+  "metadata_representation": "worker name and explicit sha256 fields; all three original digest values unchanged",
+  "original_preserved_in": "original performance worktree and original integration branch"
+}

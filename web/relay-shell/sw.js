@@ -24,6 +24,8 @@ const STATIC = [
   "./relay-crypto.js",
   "./relay-shell.css",
   "./mobile-theme.css",
+  "./cloud-results.js",
+  "./cloud-results.css",
   "./manifest.webmanifest",
 ];
 

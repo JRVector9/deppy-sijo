@@ -1,0 +1,12 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 14.58s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 5 tests
+test cloud_agent::ui::redesign_tests::redesign_search_input_keeps_the_same_height_as_buttons ... ok
+test cloud_agent::ui::redesign_tests::redesign_initial_screen_explains_connecting_without_showing_credential_forms ... ok
+test cloud_agent::ui::redesign_tests::redesign_tabs_show_only_the_selected_task_and_keep_actions_reachable ... ok
+test cloud_agent::ui::redesign_tests::redesign_arrow_navigation_moves_focus_with_the_selected_tab ... ok
+test cloud_agent::ui::redesign_tests::redesign_native_geometry_and_reference_images ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 3179 filtered out; finished in 1.14s

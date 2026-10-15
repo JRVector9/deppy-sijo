@@ -1,0 +1,18 @@
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling mux v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling terminal v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling persist v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 25.15s
+     Running unittests src/lib.rs (target/debug/deps/runtime-46a3bba02c89b9c4)
+
+running 1 test
+test in_process::tests::pr13_exit_teardown_releases_authorization_before_revocation_handshake ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 405 filtered out; finished in 0.05s
+

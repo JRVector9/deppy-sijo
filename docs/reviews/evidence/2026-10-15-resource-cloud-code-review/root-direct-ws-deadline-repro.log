@@ -1,0 +1,33 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/core)
+   Compiling alacritty_terminal v0.26.0 (/private/tmp/deppy-cloud-review-worktree-20261015/third_party/alacritty_terminal-0.26.0)
+   Compiling mux v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/mux)
+   Compiling secret v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/secret)
+   Compiling persist v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/persist)
+   Compiling audit v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/audit)
+   Compiling pty v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/pty)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/terminal)
+   Compiling mcp-store v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/mcp-store)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/storage-core)
+   Compiling storage v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/storage)
+   Compiling session v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/session)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/runtime)
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.95s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/web_remote-e87460d57d8c6d0a)
+
+running 1 test
+test ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline ... auth whole deadline=5s; elapsed=5.871264417s; late valid message accepted=false
+
+thread 'ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline' (51642234) panicked at crates/web-remote/src/ws_api.rs:772:9:
+auth whole deadline exceeded: 5.871264417s
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 5.87s
+
+error: test failed, to rerun pass `-p web-remote --lib`

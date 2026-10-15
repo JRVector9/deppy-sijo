@@ -1,0 +1,25 @@
+
+running 2 tests
+test full_review_atomic_write_parallel_saves_have_distinct_temporary_objects ... actual concurrent production saves: failed=90/120 final_payload_valid=true
+
+thread 'full_review_atomic_write_parallel_saves_have_distinct_temporary_objects' (47938321) panicked at /private/tmp/deppy-atomic-write-audit-20261014.rs:50:5:
+assertion `left == right` failed: unrelated successful writers share one temporary name and fail rename
+  left: 90
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test full_review_atomic_write_preserves_preexisting_temp_symlink_target ... production helper result: victim="new config", published_config_is_symlink=true
+
+thread 'full_review_atomic_write_preserves_preexisting_temp_symlink_target' (47938327) panicked at /private/tmp/deppy-atomic-write-audit-20261014.rs:21:5:
+assertion `left == right` failed: atomic save truncated a different existing user file through its fixed temp symlink
+  left: [110, 101, 119, 32, 99, 111, 110, 102, 105, 103]
+ right: [109, 117, 115, 116, 32, 112, 114, 101, 115, 101, 114, 118, 101]
+FAILED
+
+failures:
+
+failures:
+    full_review_atomic_write_parallel_saves_have_distinct_temporary_objects
+    full_review_atomic_write_preserves_preexisting_temp_symlink_target
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.02s

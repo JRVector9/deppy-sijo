@@ -123,6 +123,62 @@ fn claude_response(text: &str) -> Option<serde_json::Value> {
         })
 }
 
+/// Claude가 별칭에 버전을 생략해도 초기화 응답의 실제 해석 모델로 표시한다.
+/// 버전을 알 수 없는 응답은 CLI가 준 이름을 그대로 사용한다.
+fn claude_versioned_label(label: &str, resolved_model: Option<&str>) -> String {
+    let Some(slug) = resolved_model.and_then(|value| value.strip_prefix("claude-")) else {
+        return label.to_owned();
+    };
+    let slug = slug.split('[').next().unwrap_or(slug);
+    let parts: Vec<_> = slug.split('-').collect();
+    let Some(major_index) = parts
+        .iter()
+        .position(|part| {
+            !part.is_empty() && part.len() <= 2 && part.bytes().all(|b| b.is_ascii_digit())
+        })
+        .filter(|index| *index > 0)
+    else {
+        return label.to_owned();
+    };
+    let family = parts[..major_index].join(" ");
+    let major = parts[major_index];
+    let version = match parts.get(major_index + 1) {
+        Some(minor)
+            if !minor.is_empty()
+                && minor.len() <= 2
+                && minor.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            format!("{major}.{minor}")
+        }
+        _ => major.to_owned(),
+    };
+    if label
+        .get(..family.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&family))
+    {
+        let rest = &label[family.len()..];
+        if rest
+            .trim_start()
+            .starts_with(|ch: char| ch.is_ascii_digit())
+        {
+            return label.to_owned();
+        }
+        return format!("{} {version}{rest}", &label[..family.len()]);
+    }
+    let family = family
+        .split_whitespace()
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_ascii_uppercase().to_string() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{label} · {family} {version}")
+}
+
 fn parse_claude(text: &str) -> Result<Vec<ModelChoice>, ()> {
     if text.len() > OUTPUT_MAX {
         return Err(());
@@ -149,6 +205,8 @@ fn parse_claude(text: &str) -> Result<Vec<ModelChoice>, ()> {
             .get("displayName")
             .and_then(|v| v.as_str())
             .unwrap_or(id);
+        let label =
+            claude_versioned_label(label, value.get("resolvedModel").and_then(|v| v.as_str()));
         let efforts = if value.get("supportsEffort").and_then(|v| v.as_bool()) == Some(true) {
             value
                 .get("supportedEffortLevels")
@@ -166,7 +224,7 @@ fn parse_claude(text: &str) -> Result<Vec<ModelChoice>, ()> {
         } else {
             Vec::new()
         };
-        if let Some(choice) = ModelChoice::new(id, label, efforts, None)
+        if let Some(choice) = ModelChoice::new(id, &label, efforts, None)
             && seen.insert(choice.value().to_owned())
         {
             models.push(choice);
@@ -474,6 +532,28 @@ mod tests {
         );
         assert!(models[1].efforts().is_empty());
         assert!(parse_claude(&text.replace(REQUEST_ID, "another-request")).is_err());
+    }
+
+    #[test]
+    fn model_probe_claude_displays_resolved_versions_without_changing_launch_values() {
+        let text = r#"{"type":"control_response","response":{"subtype":"success","request_id":"deppy-model-catalog","response":{"models":[{"value":"default","displayName":"Default (recommended)","resolvedModel":"claude-opus-5-5[1m]"},{"value":"opus[1m]","displayName":"Opus (1M context)","resolvedModel":"claude-opus-5-5[1m]"},{"value":"claude-fable-5-1[1m]","displayName":"Fable","resolvedModel":"claude-fable-5-1"},{"value":"sonnet","displayName":"Sonnet","resolvedModel":"claude-sonnet-5"},{"value":"haiku","displayName":"Haiku","resolvedModel":"claude-haiku-4-5-20251001"},{"value":"other","displayName":"Other"},{"value":"already","displayName":"Opus 5.5","resolvedModel":"claude-opus-5-5"}]}}}"#;
+        let models = parse_claude(text).unwrap();
+        let shown: Vec<_> = models
+            .iter()
+            .map(|model| (model.value(), model.label()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("default", "Default (recommended) · Opus 5.5"),
+                ("opus[1m]", "Opus 5.5 (1M context)"),
+                ("claude-fable-5-1[1m]", "Fable 5.1"),
+                ("sonnet", "Sonnet 5"),
+                ("haiku", "Haiku 4.5"),
+                ("other", "Other"),
+                ("already", "Opus 5.5"),
+            ]
+        );
     }
 
     #[test]

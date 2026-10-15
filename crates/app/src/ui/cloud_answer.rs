@@ -3,6 +3,9 @@
 pub struct Answer {
     pub id: String,
     pub session: String,
+    pub connection: String,
+    pub run: Option<String>,
+    pub run_label: Option<String>,
     pub created: i64,
     pub message: String,
 }
@@ -35,8 +38,13 @@ pub fn contents(
             for (index, r) in answers.iter().enumerate() {
                 let reveal = selected_id.as_deref() == Some(r.id.as_str());
                 let response = egui::CollapsingHeader::new(format!(
-                    "{} · {}",
+                    "{} · {}{} · {}",
                     catalog.t("cloud.history_answer", &[]),
+                    r.connection,
+                    r.run_label
+                        .as_deref()
+                        .map(|run| format!(" · {run}"))
+                        .unwrap_or_default(),
                     crate::ui::notifications::relative_time_label(
                         catalog,
                         deppy_core::time::unix_secs_i64() - r.created
@@ -65,11 +73,43 @@ mod tests {
     use super::*;
     use egui_kittest::kittest::Queryable as _;
     #[test]
+    fn late_secret_run_reference_legacy_answer_omits_unavailable_run_label() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let run_id = "opaque-original-run-reference";
+        let records = vec![Answer {
+            id: "answer".into(),
+            session: "original".into(),
+            connection: "Grok".into(),
+            run: Some(run_id.into()),
+            run_label: None,
+            created: deppy_core::time::unix_secs_i64(),
+            message: "Grok final answer".into(),
+        }];
+        let expected_header = format!(
+            "{} · Grok · {}",
+            catalog.t("cloud.history_answer", &[]),
+            crate::ui::notifications::relative_time_label(&catalog, 0),
+        );
+        let mut selected = None;
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(700.0, 500.0))
+            .build_ui(move |ui| {
+                contents(ui, &records, "original", &mut selected, &catalog);
+            });
+        harness.get_by_label(&expected_header);
+        assert!(harness.query_by_label_contains(run_id).is_none());
+        harness.get_by_label("Grok final answer");
+    }
+
+    #[test]
     fn answers_display_only_in_the_original_session_and_copy_without_input() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
         let records = vec![Answer {
             id: "answer".into(),
             session: "original".into(),
+            connection: "Grok".into(),
+            run: Some("run-original".into()),
+            run_label: Some("run-original".into()),
             created: deppy_core::time::unix_secs_i64(),
             message: "Grok final answer".into(),
         }];

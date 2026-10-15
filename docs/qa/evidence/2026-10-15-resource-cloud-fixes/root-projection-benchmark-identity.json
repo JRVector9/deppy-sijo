@@ -1,0 +1,23 @@
+{
+  "command": [
+    "rustc",
+    "--edition=2024",
+    "-O",
+    "-A",
+    "dead_code",
+    "/private/tmp/deppy-cloud-fix-root-20261015/cloud_answers_optimized.rs",
+    "-L",
+    "dependency=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps",
+    "--extern",
+    "serde_json=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libserde_json-470d943c96af7edd.rlib",
+    "-o",
+    "/private/tmp/deppy-cloud-fix-root-20261015/cloud_answers_optimized"
+  ],
+  "compile_exit": 0,
+  "method_sha256": "4b4394c4badd8e768192342b0a184a5e01a6c65f75fe365d990aaffbe051af2d",
+  "cache_type_sha256": "0f86470e2171ddeb425356cb7fa7cf236d90f267e012f034d9dc87f673a0ad17",
+  "redaction_source_sha256": "ab70fa75543e404b14ee97dff214030eae8333f130fe223c39cc8eff9e7d29ec",
+  "harness_sha256": "17592bf2b1f3f35b93aa822dcdd6d65aa74df5b298cc7bf50ae74a4c40d79b57",
+  "scope": "optimized exact modified component, same synthetic fixtures and timed steady calls as baseline; cold build shown separately; not GUI/release app/RSS",
+  "run_exit": 0
+}

@@ -1,0 +1,19 @@
+{
+  "reviewed_commit": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "source_unchanged_command": "git diff --exit-code d8826f0b -- crates",
+  "source_unchanged_exit": 0,
+  "runtime_composer_passed": 6,
+  "probe_compile_exit": 0,
+  "probe_behavior_exit": 101,
+  "files": {
+    "guard_probe.rs": "7ff8aecbff89687b0e25e4bdbafe24b2dcf0290bd59884548e4dc0f07bda144a",
+    "wide-cursor-result.log": "383179a96fb545e7e7d2f88b5c546dea132c65ff81d119fadead76bc00bbb9cc",
+    "wide-cursor-compile.log": "e38de84537fecb6f6c575dd5735e81d0880f886abd6298adf6d8357ba6c68acb",
+    "guard-compile.log": "7cde35357b0bd10207ecacd497b96b03da1a50021fc52df3856b4cbf372ec5d5",
+    "runtime-composer.log": "92c04d5d175dbeb87e5d9f3002bcba9728b9d6c86e392ab8d12ee1c37b2f4399",
+    "wide_cursor_probe.rs": "d441583ee5f2cbc648384a92b437ea2a1aa95bfbff0a554e28a1ca2f9cdd86f6",
+    "guard-result-matched.log": "049d2f8671329e161f4de9b2aa8d9d9f3d04548135931980ac7406ee1c891611",
+    "guard-provenance.json": "b8e2ca60ea7688bbe9f01001c9524ddc9ead4f9e5881cbf876854704f444269e",
+    "guard-compile-matched.log": "dd9e271cd5d453771bcf4176f3c3cb66ac976d32ae48184a99e78f45e75e10d8"
+  }
+}

@@ -1,0 +1,61 @@
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling rusqlite v0.40.2
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling mux v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling persist v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling mcp-store v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling storage-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling i18n v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+   Compiling connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 54.30s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 23 tests
+test app::tests::full_fix_20261014_document_aggregate_editor_budget_counts_saved_copies ... ok
+test app::tests::full_fix_20261014_document_dead_owner_same_path_is_recoverable ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancel_preserves_unrelated_confirmations ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancels_if_original_owner_is_gone_or_reused ... ok
+test app::tests::full_fix_20261014_document_scope_close_conflict_keeps_source_and_conflict_prompt ... ok
+test app::tests::full_fix_20261014_document_scope_close_guards_each_lifecycle_target ... ok
+test app::tests::full_fix_20261014_document_scope_close_save_failure_preserves_buffer ... ok
+test app::tests::full_fix_20261014_document_scope_close_waits_for_edits_made_during_save ... ok
+test app::tests::full_fix_20261014_host_completion_cancelled_owner_discards_payload ... ok
+test app::tests::full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_pending_worker_never_waits_on_frame ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_regular_bounded_file ... ok
+test document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts ... ok
+test document_io::tests::full_fix_20261014_document_fifo_does_not_block_load_lane ... ok
+test document_io::tests::full_fix_20261014_document_symlink_save_preserves_loaded_target ... ok
+test folder_identity::tests::full_fix_20261014_document_portable_folder_validation_does_not_require_anchor ... ok
+test session_aux::tests::full_fix_20261014_document_explicit_recovery_excludes_live_owner ... ok
+test ui::document::tests::full_fix_20261014_document_editor_allows_replacement_within_byte_budget ... ok
+test ui::document::tests::full_fix_20261014_document_editor_budget_measures_utf8_bytes ... ok
+test ui::document::tests::full_fix_20261014_document_editor_ime_rejection_preserves_preedit_selection ... ok
+test ui::document::tests::full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo ...
+thread 'ui::document::tests::full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo' (48816768) panicked at crates/app/src/ui/document.rs:522:9:
+assertion `left == right` failed
+  left: (true, false)
+ right: (false, true)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test ui::document::tests::full_fix_20261014_document_oversized_paste_preserves_selection ... oversized paste: retained=21 elapsed=972.166µs
+ok
+
+failures:
+
+failures:
+    ui::document::tests::full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo
+
+test result: FAILED. 22 passed; 1 failed; 0 ignored; 0 measured; 3222 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

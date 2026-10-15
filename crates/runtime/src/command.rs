@@ -53,6 +53,17 @@ fn admission_error(code: &'static str) -> RuntimeAdmissionError {
     RuntimeAdmissionError(code)
 }
 
+fn valid_tracked_operation_id(id: &str) -> bool {
+    // A leading @ reserves an internal producer namespace while public IDs
+    // keep their existing alphabet. The runtime treats both as opaque receipt IDs.
+    let body = id.strip_prefix('@').unwrap_or(id);
+    !body.is_empty()
+        && id.len() <= 128
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':'))
+}
+
 /// Stable, payload-free failure returned by the public command-retention preflight.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeCommandPreparationErrorCode {
@@ -879,13 +890,7 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             bytes,
             ..
         } => {
-            if operation_id.is_empty()
-                || operation_id.len() > 128
-                || !operation_id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
-                || bytes.len() > WRITE_INPUT_BYTES_MAX
-            {
+            if !valid_tracked_operation_id(operation_id) || bytes.len() > WRITE_INPUT_BYTES_MAX {
                 return Err(admission_error("runtime_command_input_invalid"));
             }
         }
@@ -894,11 +899,7 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
             parts,
             ..
         } => {
-            if operation_id.is_empty()
-                || operation_id.len() > 128
-                || !operation_id
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+            if !valid_tracked_operation_id(operation_id)
                 || parts.is_empty()
                 || parts.len() > 32
                 || parts
@@ -1964,6 +1965,51 @@ mod tests {
         assert!(!format!("{command:?}").contains("pwd"));
         for id in ["", "bad\nidentifier", "bad identifier", &"x".repeat(129)] {
             assert!(validate_host_command(&make(id)).is_err());
+        }
+    }
+
+    #[test]
+    fn tracked_input_accepts_internal_namespaces_without_loosening_public_identity_bytes() {
+        let scoped = format!("@scoped:{}", "a1".repeat(32));
+        for command in [
+            RuntimeCommand::WriteInputTracked {
+                session: SessionId(7),
+                operation_id: scoped.clone(),
+                bytes: b"pwd\r".to_vec(),
+            },
+            RuntimeCommand::WriteInputBatchTracked {
+                session: SessionId(7),
+                operation_id: scoped.clone(),
+                parts: vec![b"line one\nline two".to_vec(), b"\r".to_vec()],
+            },
+        ] {
+            let mut command = command;
+            assert!(prepare_runtime_command_for_retention_internal(&mut command).is_ok());
+            let wire = postcard::to_allocvec(&command).unwrap();
+            let decoded: RuntimeCommand = postcard::from_bytes(&wire).unwrap();
+            assert!(validate_host_command(&decoded).is_ok());
+            match decoded {
+                RuntimeCommand::WriteInputTracked { operation_id, .. }
+                | RuntimeCommand::WriteInputBatchTracked { operation_id, .. } => {
+                    assert_eq!(operation_id, scoped)
+                }
+                _ => panic!("tracked identity changed on the wire"),
+            }
+        }
+        for invalid in [
+            "@",
+            "@@scoped:id",
+            "@scoped:bad id",
+            "@scoped:bad\n",
+            "@scoped:../id",
+            "@scoped:한글",
+        ] {
+            let command = RuntimeCommand::WriteInputTracked {
+                session: SessionId(7),
+                operation_id: invalid.into(),
+                bytes: vec![1],
+            };
+            assert!(validate_host_command(&command).is_err());
         }
     }
 

@@ -94,6 +94,11 @@ impl RelayMessageAdapter {
     /// 이 명령에 필요한 권한. `None`이면 이 전송에 올 수 없는 메시지다.
     const fn required(message: &ClientMsg) -> Option<RelayAction> {
         match message {
+            ClientMsg::CloudControl { intent, .. } => Some(match intent {
+                crate::cloud::CloudControlIntent::ApproveConnection { .. } => RelayAction::Approval,
+                crate::cloud::CloudControlIntent::Navigate { .. } => RelayAction::Switch,
+                _ => RelayAction::Input,
+            }),
             // protocol-v3 페어링 토큰은 loopback 전송의 것이다. Relay 채널에서 이 메시지를
             // 받아 주면 두 인증 체계가 서로를 대체할 수 있게 된다.
             ClientMsg::Auth { .. } | ClientMsg::ResizeControl { .. } | ClientMsg::Resize { .. } => {
@@ -141,11 +146,19 @@ impl RelayMessageAdapter {
     ///
     /// 승인 목록은 별도 권한이다. 첫 릴리스의 view-only 기기는 접속 시점 스냅샷이든 이후
     /// 갱신이든 승인 정보를 **한 번도** 받지 않는다.
-    pub const fn may_emit(&self, message: &ServerMsg) -> bool {
+    pub fn may_emit(&self, message: &ServerMsg) -> bool {
         if self.revoked {
             return false;
         }
         match message {
+            ServerMsg::CloudSnapshot { snapshot, .. } => {
+                self.permissions.allows(RelayAction::View)
+                    && (snapshot.approvals.is_empty()
+                        || self.permissions.allows(RelayAction::Approval))
+            }
+            ServerMsg::CloudControlResult { .. } | ServerMsg::CloudNavigationResult { .. } => {
+                self.permissions.allows(RelayAction::View)
+            }
             ServerMsg::TerminalControl { .. } | ServerMsg::HistoryError { .. } => false,
             ServerMsg::Approvals { .. } => self.permissions.allows(RelayAction::Approval),
             ServerMsg::Welcome { .. }
@@ -170,6 +183,37 @@ impl RelayMessageAdapter {
 mod tests {
     use super::*;
     use crate::protocol::{CursorView, ResourceView};
+
+    #[test]
+    fn read_only_cloud_controls_never_cross_device_gate() {
+        let mut adapter = view_only();
+        for intent in [
+            crate::cloud::CloudControlIntent::RevokeConnection {
+                connection_id: "actor-a".into(),
+            },
+            crate::cloud::CloudControlIntent::CancelRun {
+                connection_id: "actor-a".into(),
+                run_id: "run-a".into(),
+            },
+            crate::cloud::CloudControlIntent::TakeControl {
+                session_id: "original".into(),
+                generation: "generation".into(),
+            },
+            crate::cloud::CloudControlIntent::Navigate {
+                workspace_id: "workspace".into(),
+                session_id: "original".into(),
+            },
+            crate::cloud::CloudControlIntent::ApproveConnection {
+                approval_id: "approval".into(),
+                allow: true,
+            },
+        ] {
+            assert!(matches!(
+                adapter.admit(ClientMsg::CloudControl { request: 1, intent }),
+                RelayAdmission::Denied(_)
+            ));
+        }
+    }
 
     fn view_only() -> RelayMessageAdapter {
         RelayMessageAdapter::new(RelayPermissions::default())

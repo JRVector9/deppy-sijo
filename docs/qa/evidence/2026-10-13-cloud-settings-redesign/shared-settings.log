@@ -1,0 +1,43 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 37 tests
+test ui::settings::tests::모양_화면_타이포그래피는_참조_font_map을_고정한다 ... ok
+test ui::settings::tests::모양_화면_컴포넌트_치수는_참조값을_고정한다 ... ok
+test ui::settings::tests::qr_이미지는_quiet_zone을_포함한_정방형 ... ok
+test ui::settings::tests::설정_검색은_label과_alias를_모두_본다 ... ok
+test ui::settings::tests::kittest_소수_최소_변경도_저장_신호를_보낸다 ... ok
+test ui::settings::tests::설정_검색_대상_행은_긴_페이지에서_스크롤되어_보인다 ... ok
+test ui::settings::tests::kittest_소수_숫자영역도_직접입력을_받는다 ... ok
+test ui::settings::tests::kittest_직접입력중_escape는_취소하고_plus는_기존_step을_유지한다 ... ok
+test ui::settings::tests::kittest_숫자영역은_직접입력을_받고_다른_stepper와_섞이지_않는다 ... ok
+test ui::settings::tests::설정_네비의_관리그룹은_연결_환경_에이전트_셋뿐이다 ... ok
+test ui::settings::tests::소수_표시는_step_격자에_가까운_직접입력도_숨기지_않는다 ... ok
+test ui::settings::tests::숫자_직접입력은_범위안_값을_그대로_쓰고_범위밖은_고정한다 ... ok
+test ui::settings::tests::relay_토글은_모바일_웹_동작을_방출하지_않는다 ... ok
+test ui::settings::tests::relay_준비_전에는_페어링_시작이_비활성이다 ... ok
+test ui::settings::tests::kittest_카테고리_전환은_현재_숫자입력을_확정한_뒤_페이지를_바꾼다 ... ok
+test ui::settings::tests::접속_url_마스킹은_토큰만_가린다 ... ok
+test ui::settings::tests::지문_길면_앞부분만_말줄임 ... ok
+test ui::settings::tests::지문_짧으면_그대로 ... ok
+test ui::settings::tests::기기_취소는_살아_있는_기기의_id만_방출한다 ... ok
+test ui::settings::tests::카운트다운_숫자는_접근성_트리에_없고_안내만_있다 ... ok
+test ui::settings::tests::확인_단계의_초기_초점은_승인이_아니라_거부에_있다 ... ok
+test ui::settings::tests::kittest_행간_직접입력은_step_격자로_반올림하지_않고_그대로_표시한다 ... ok
+test ui::settings::tests::kittest_ui배율_직접입력은_step_격자로_반올림하지_않고_그대로_표시한다 ... ok
+test ui::settings::tests::승인과_거부는_확인_단계에서만_방출된다 ... ok
+test ui::settings::tests::kittest_터미널_스크롤백은_100줄을_직접_입력한다 ... ok
+test ui::settings::tests::kittest_캐시_모드_전환은_수동_직접입력과_증감을_보존한다 ... ok
+test ui::settings::tests::설정_검색은_실제_서브_페이지와_고정_단축키를_가리킨다 ... ok
+test ui::settings::tests::설정_검색은_열려있지_않은_확인창_문구를_결과로_내지_않는다 ... ok
+test ui::settings::tests::설정_검색은_프로젝트_키_관리의_제목과_설명도_찾는다 ... ok
+test ui::settings::tests::스크롤백_설정페이지는_완료안내를_숨기고_실패만_재시도_의도를_반환한다 ... ok
+test ui::settings::tests::설정_검색은_설명_선택지_단축키와_관리_화면까지_찾는다 ... ok
+test ui::settings::tests::relay_페이지는_다섯_로케일_모두에서_키를_노출하지_않는다 ... ok
+test ui::settings::tests::설정_검색_선택지는_소속_설정_행으로_이동하도록_요청한다 ... ok
+test ui::settings::tests::설정_검색은_카테고리_밖의_행_제목과_설명도_찾는다 ... ok
+test ui::settings::tests::전역_검색_단축키_결과는_페이지의_이전_필터를_해제한다 ... ok
+test ui::settings::tests::kittest_설정_인라인_페이지에_widget_id_충돌이_없다 ... ok
+test ui::settings::tests::설정_검색은_프로젝트_키와_기존_고급_화면을_정확히_선택한다 ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 3153 filtered out; finished in 0.93s

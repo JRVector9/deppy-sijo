@@ -1,0 +1,18 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "pty",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 101,
+    "seconds": 15.788077116012573,
+    "log": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-green.log"
+  }
+]

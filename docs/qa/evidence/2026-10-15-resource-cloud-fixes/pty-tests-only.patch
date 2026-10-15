@@ -1,0 +1,204 @@
+--- a/crates/pty/src/lib.rs
++++ b/crates/pty/src/lib.rs
+@@ -2,6 +2,8 @@
+ //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
+ 
+ mod input_queue;
++#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
++mod foreground_teardown_tests;
+ mod process_identity;
+ pub mod query_fence;
+ #[cfg(unix)]
+--- /dev/null
++++ b/crates/pty/src/foreground_teardown_tests.rs
+@@ -0,0 +1,190 @@
++//! Real job-control foreground regressions. Every signal is scoped to an owned PTY or a
++//! birth/group/session-checked fixture PID; the Python child also has a hard lifetime.
++
++use super::*;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++const WORKLOAD: &str = r#"import os, signal, sys, time
++signal.alarm(15)
++if sys.argv[2] != "normal":
++    signal.signal(signal.SIGHUP, signal.SIG_IGN)
++if sys.argv[2] == "ignore-hup-term":
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++with open(sys.argv[1], "x") as output:
++    output.write(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}\n")
++while True:
++    time.sleep(0.01)
++"#;
++
++struct Fixture {
++    session: Option<Box<dyn PtySession>>,
++    output: Option<PtyOutputReceiver>,
++    process: Option<workload_signal::Process>,
++    directory: PathBuf,
++}
++
++impl Fixture {
++    fn spawn(mode: &str) -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        let directory = std::env::temp_dir().join(format!(
++            "deppy-pty-foreground-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let pid_path = directory.join("identity");
++        let spec = CommandSpec {
++            program: "/bin/bash".into(),
++            args: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
++            env: vec![
++                ("HISTFILE".into(), "/dev/null".into()),
++                ("BASH_ENV".into(), "/dev/null".into()),
++                ("ENV".into(), "/dev/null".into()),
++                ("PS1".into(), "FIXTURE> ".into()),
++                (
++                    "DEPPY_FIXTURE_PID".into(),
++                    pid_path.to_str().unwrap().to_owned(),
++                ),
++                ("DEPPY_FIXTURE_MODE".into(), mode.into()),
++            ],
++            cwd: Some(directory.clone()),
++        };
++        let mut fixture = Self {
++            session: Some(PortablePtyBackend.spawn(&spec, 80, 24).unwrap()),
++            output: None,
++            process: None,
++            directory,
++        };
++        let session = fixture.session.as_mut().unwrap();
++        fixture.output = session.take_output();
++        // WORKLOAD contains no single quotes. Paths/modes are environment values, never shell code.
++        let command =
++            format!("python3 -c '{WORKLOAD}' \"$DEPPY_FIXTURE_PID\" \"$DEPPY_FIXTURE_MODE\"\n");
++        assert!(
++            session
++                .write_input(command.as_bytes())
++                .unwrap()
++                .is_accepted()
++        );
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let fields = loop {
++            if let Ok(text) = std::fs::read_to_string(fixture.directory.join("identity")) {
++                let fields: Vec<i32> = text
++                    .split_whitespace()
++                    .filter_map(|field| field.parse().ok())
++                    .collect();
++                if fields.len() == 3 {
++                    break fields;
++                }
++            }
++            while fixture.output.as_ref().unwrap().try_recv().is_ok() {}
++            assert!(Instant::now() < deadline, "foreground fixture not ready");
++            std::thread::sleep(Duration::from_millis(5));
++        };
++        let process = workload_signal::inspect(fields[0]).unwrap();
++        fixture.process = Some(process);
++        assert_eq!(process.group, fields[1]);
++        assert_eq!(process.session, fields[2]);
++        assert!(!process.zombie_for_test());
++        assert_eq!(
++            session.foreground_process_group(),
++            Some(process.group as u32)
++        );
++        assert_ne!(
++            session.process_identity().process_group,
++            Some(process.group as u32),
++            "fixture must run in a real job-control group separate from its shell"
++        );
++        fixture
++    }
++
++    fn same_process_alive(&self) -> bool {
++        self.process.is_some_and(|process| {
++            workload_signal::inspect(process.pid).is_some_and(|current| {
++                current.same_execution(process) && !current.zombie_for_test()
++            })
++        })
++    }
++
++    fn wait_for_exit(&self, timeout: Duration) -> bool {
++        let deadline = Instant::now() + timeout;
++        while self.same_process_alive() && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        !self.same_process_alive()
++    }
++}
++
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        // Rescue only this captured execution, even if the assertion or product teardown failed.
++        if self.same_process_alive() {
++            unsafe {
++                libc::kill(self.process.unwrap().pid, libc::SIGKILL);
++            }
++        }
++        drop(self.session.take());
++        drop(self.output.take());
++        let _ = self.wait_for_exit(Duration::from_secs(2));
++        let _ = std::fs::remove_dir_all(&self.directory);
++    }
++}
++
++fn foreground_teardown(mode: &str, use_kill: bool, frozen: bool) {
++    let mut fixture = Fixture::spawn(mode);
++    if frozen {
++        fixture.session.as_ref().unwrap().freeze().unwrap();
++    }
++    let started = Instant::now();
++    if use_kill {
++        // Check kill itself; Drop must not supply the missing foreground escalation.
++        fixture.session.as_mut().unwrap().kill().unwrap();
++    } else {
++        drop(fixture.session.take());
++    }
++    let elapsed = started.elapsed();
++    let gone_without_rescue = fixture.wait_for_exit(Duration::from_millis(500));
++    let process = fixture.process.unwrap();
++    // Complete identity-checked rescue before reporting the protective assertion.
++    drop(fixture);
++    assert!(
++        gone_without_rescue,
++        "same foreground execution survived: mode={mode} kill={use_kill} frozen={frozen} identity={process:?} teardown={elapsed:?}"
++    );
++    assert!(
++        elapsed < Duration::from_secs(4),
++        "unbounded teardown: {elapsed:?}"
++    );
++}
++
++#[test]
++fn normal_foreground_hup_control_exits_on_drop() {
++    foreground_teardown("normal", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_drop() {
++    foreground_teardown("ignore-hup", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_kill() {
++    foreground_teardown("ignore-hup", true, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop() {
++    foreground_teardown("ignore-hup-term", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill() {
++    foreground_teardown("ignore-hup-term", true, false);
++}
++
++#[test]
++fn frozen_foreground_control_exits_on_drop() {
++    foreground_teardown("ignore-hup-term", false, true);
++}

@@ -1,0 +1,514 @@
+worktree /Users/jr/Desktop/projects/deppy-sijo
+HEAD 331b78b3f8b80543a7f078a78da0be3060dfb9e7
+branch refs/heads/feat/fleet-one-list-and-relay-wip
+
+worktree /private/tmp/deppy-audit-pr1-20261004
+HEAD 957ae3b5c56c220f6dee109980c5907bde54d1e8
+branch refs/heads/fix/audit-pr1-prompt-delivery-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr10-20261004
+HEAD 1a1bdd4bb732e74dbb9300a92345f6ee95db32cd
+branch refs/heads/fix/audit-pr10-direct-input-latency-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr10-wavefinal-followups-20261004
+HEAD e428df3ccac7a95bb379ca512b7159d4f3dcebd6
+branch refs/heads/fix/audit-pr10-direct-input-latency-wavefinal-followups-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr11-20261004
+HEAD 1a1bdd4bb732e74dbb9300a92345f6ee95db32cd
+branch refs/heads/fix/audit-pr11-tree-multiselect-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr11-wavefinal-followups-20261004
+HEAD 350d8d4c5beea108af6fa39396764a246bda9784
+branch refs/heads/fix/audit-pr11-tree-multiselect-wavefinal-followups-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr12-20261004
+HEAD a3a8517b5b6d56f5ac218638794eef101daa0db9
+branch refs/heads/fix/audit-pr12-combined-code-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr13-20261004
+HEAD 87e205811ed41032b943bbbcaf768043f032a3a6
+branch refs/heads/fix/audit-pr13-guard-output-freshness-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr13-base-probe-20261004
+HEAD f64d8d9c1b9fac10a0e02756b97dacbb3abcb8ac
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr14-20261004
+HEAD 89359378e921a7ffa6a107511f3934823d472ef4
+branch refs/heads/fix/audit-pr14-followup-revoke-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr15-20261004
+HEAD ba3f47bb4544c48c99cb192b9f15cc560e31db8a
+branch refs/heads/fix/audit-pr15-prompt-id-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr16-20261004
+HEAD 5327957f80b325f006a24470f0824961d2516950
+branch refs/heads/fix/audit-pr16-corrected-core-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr17-20261004
+HEAD f875919b3d0fe9355f51126bba30b29cf6681eda
+branch refs/heads/fix/audit-pr17-followup-code-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr18-20261004
+HEAD 0f8c85a934a942156b8b34d0020be1fb24f981b2
+branch refs/heads/fix/audit-pr18-runtime-test-secrets-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr19-20261004
+HEAD 8d0168f10fc404013d2193ed057f3a89da7e27bd
+branch refs/heads/fix/audit-pr19-final-corrective-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr2-20261004
+HEAD 63e3cbece98168a827d4670f5bcbb31e893893b6
+branch refs/heads/fix/audit-pr2-ai-eligibility-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr2-wave2-coherent-20261004
+HEAD 502bac403a056799e75f00e331d534da7919f4ca
+branch refs/heads/fix/audit-pr2-ai-eligibility-wave2-coherent-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr20-20261004
+HEAD 6a796b5b30a5ce24458c2faf32d80864921691bb
+branch refs/heads/fix/audit-pr20-move-layout-volume-fixtures-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr21-20261004
+HEAD d1818e3355e9604998e6581285bad8e7edd88ffb
+branch refs/heads/fix/audit-pr21-final-layout-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr3-20261004
+HEAD f0b22dd92e361e5053deb03d118905519e7eb083
+branch refs/heads/fix/audit-pr3-library-recovery-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr4-20261004
+HEAD 63e3cbece98168a827d4670f5bcbb31e893893b6
+branch refs/heads/fix/audit-pr4-palette-cache-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr4-wave2-coherent-20261004
+HEAD 314ecf376ede58961d910d6e600153261f8b4ffc
+branch refs/heads/fix/audit-pr4-palette-cache-wave2-coherent-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr4r-20261004
+HEAD 809bda2f8842e2840f2d4d65f2adc29354801219
+branch refs/heads/fix/audit-pr4r-fleet-review-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr5-20261004
+HEAD 78371a7f0b51531160810ae5bc71dc93ee277f81
+branch refs/heads/fix/audit-pr5-session-drafts-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr6-20261004
+HEAD 1234ed9c550adedbcdbc88aa220bc0f96cd9f795
+branch refs/heads/fix/audit-pr6-image-budgets-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr7-20261004
+HEAD 63e3cbece98168a827d4670f5bcbb31e893893b6
+branch refs/heads/fix/audit-pr7-cloud-history-worker-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr7-wave2-coherent-20261004
+HEAD b889969101ebdd637c7c59b06c922ebe837adf81
+branch refs/heads/fix/audit-pr7-cloud-history-worker-wave2-coherent-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr8-20261004
+HEAD 6aba90515e64a5cbca71d45f96562d0520732fe5
+branch refs/heads/fix/audit-pr8-batch-wake-logs-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr8r-20261004
+HEAD 3cfe880c88e0a781a3d173458792d9361c518876
+branch refs/heads/fix/audit-pr8r-log-error-cap-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr9-20261004
+HEAD e2cd2c8243372e806a0357f257fb1ddbf83740e4
+branch refs/heads/fix/audit-pr9-remote-paste-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-audit-pr9r-20261004
+HEAD 0f7d45dd572b389d2ed599ac205a9e529bb4f6a7
+branch refs/heads/fix/audit-pr9r-grant-revoke-20261004
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-blank-tab-new-shell-20260924
+HEAD cdf0b0a796daa5ae3f7eb889cd1025b69206409e
+branch refs/heads/feat/blank-tab-new-shell
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-cjk-cell-fallback-main-20260908
+HEAD 1c0630580634b844efc9aa0a0c45e93911d85aa1
+branch refs/heads/fix/cjk-cell-fallback-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-cloud-fix-management-20261015
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-cloud-fix-pty-20261015
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-cloud-fix-transport-20261015
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-cloud-rereview-late-secret-20261013
+HEAD bf13eb48fe005366739c765063763ba8492eeffe
+detached
+
+worktree /private/tmp/deppy-cloud-review-worktree-20261015
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-credential-env-20260909
+HEAD ee5288347f69fe75151a53471f36a41bbfe653f2
+branch refs/heads/feat/workspace-credential-env
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-deps-151-20260907
+HEAD 57a554bdd65c70d0580221a35fe416580cd65cfe
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-deps-152-20260907
+HEAD e45c32c963012b6585a0a470b1591c9e94b7a285
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-dotenv-shell-spawn-main-20260908
+HEAD 8ad906d2a99ff5336088133cb7e66358f32a0225
+branch refs/heads/perf/dotenv-shell-spawn-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-egui-036-20260907
+HEAD c7e1c9cef0854bdafee84f41bbd0ad8d9384fea9
+branch refs/heads/fix/gui-stack-036-20260907
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-env-application-20260909
+HEAD 502f71c34da175760f620264280f1ff04e1f675c
+branch refs/heads/feat/environment-application-status
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-env-files-20260909
+HEAD 49ad36fb433b5f9bc996e898399533121be8be77
+branch refs/heads/fix/environment-file-consistency
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-env-main-20260909
+HEAD d66d0d7cea31c1793e6c9609e99c91afb71a59fb
+branch refs/heads/feat/cursor-usage-status
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-env-sources-20260909
+HEAD 4a5409a99172acc58c1a01b1c78dfe981e3f2336
+branch refs/heads/feat/workspace-env-sources
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-env-state-20260909
+HEAD 44076d69ff2f8378c9454b3677bbe678d52ebe67
+branch refs/heads/fix/environment-snapshot-state
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-file-tree-clean-20260908
+HEAD 1e761c54abd5c34d9fc0a36a3dd024515c5aa84d
+branch refs/heads/feat/file-tree-multiselect-order-clean
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-file-tree-create-modal-20260924
+HEAD 1a44ccea0a753ec87ba8e0105824e5da53326349
+branch refs/heads/feat/file-tree-create-modal
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-file-tree-finder-clipboard-20260926
+HEAD 60b6bda860dfbe39d17eda1e6e6576bd21d42de9
+branch refs/heads/feat/file-tree-finder-clipboard
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-file-tree-search-20260924
+HEAD fcdea53b21bc44cc69b662b9ecb0f5d6bfca8822
+branch refs/heads/feat/file-tree-search
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-file-tree-typeahead-20260924
+HEAD c8821b3b40f729c5ff41147905543a3787de6b71
+branch refs/heads/feat/file-tree-typeahead
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-fleet-one-list-main-20260908
+HEAD 72d0d9bbac3ca9bdd4b5d22c6ebb69e9ad576b50
+branch refs/heads/feat/fleet-one-list-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-fleet-user-review-20261001
+HEAD 166f8daeb1054cf09a07194fa83bf0a4a19d93ce
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-full-fix-data-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-full-fix-documents-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-full-fix-lifecycle-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-full-review-worktree-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-grok-session-main-20260908
+HEAD 3278d74d7bb05cb3d75fd685e603784fc7823e75
+branch refs/heads/feat/grok-session-detection-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-keychain-noninteractive-main-20260908
+HEAD a6b7b4349c9462341174a1dc728f7365e86b5232
+branch refs/heads/fix/keychain-noninteractive-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-keychain-startup-lazy-20260908
+HEAD 9d2934930c8cd796af291183bba9fa1fed4592c9
+branch refs/heads/fix/keychain-startup-lazy
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-macos-notarization-main-20260908
+HEAD 2cefb2542737ee1d7f81c9b788e684caff4e79b7
+branch refs/heads/build/macos-notarization-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-main-b698-test-20260911
+HEAD 9432d33d65290046db517fb49a0c3a48a6305434
+branch refs/heads/main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-main-final-20260909
+HEAD ea587b65981b415e2db9c403c28c75dcdff97c60
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-md-drop-isolation-20260908
+HEAD 4f3bf5d78d1a3e47402217925f1acd5616d46e2c
+branch refs/heads/fix/md-drop-render-isolation
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-merge-order-audit-20260909
+HEAD 4313b70d244359589b319615cd9a228d091781b5
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-popup-behavior-review-20261002
+HEAD 166f8daeb1054cf09a07194fa83bf0a4a19d93ce
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-popup-check-review-20261003
+HEAD 166f8daeb1054cf09a07194fa83bf0a4a19d93ce
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-popup-fix-delete-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-popup-fix-input-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-popup-fix-secret-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-popup-review-worktree-20261014
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+detached
+
+worktree /private/tmp/deppy-pr13-teardown-review-20261004
+HEAD 137a531d3fc88bcda68ecca9b48562768979fa5f
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-preserve-layout-main-20260908
+HEAD 99346a515eaa75d73ac173a2e338918f556c1319
+branch refs/heads/fix/preserve-terminal-layout-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-ready-prs-integration-20260909
+HEAD cd9c97f29b91d9bf1557c9fc5251cb037e0504b3
+branch refs/heads/integrate/ready-prs-20260909
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-relay-app-adapter-clean-20260908
+HEAD e89d3e9f1299f245238158a605db04c41212450f
+branch refs/heads/feat/relay-app-adapter-main-clean
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-relay-app-adapter-main-20260908
+HEAD eee3ed1326c5d169363e55e2d150db61f898634f
+branch refs/heads/feat/relay-app-adapter-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-relay-core-main-20260908
+HEAD 65d807e6e7c3299b02788b283641987a710b4098
+branch refs/heads/feat/relay-shell-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-relay-local-runner-main-20260908
+HEAD 1b3169eb68ea9b501272ec346b8d8ff17e3ff957
+branch refs/heads/dev/relay-local-runner-main
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-relay-shell-clean-20260908
+HEAD 850b7a8747bd71d74d7858a5d95f6c257a076857
+branch refs/heads/feat/relay-shell-main-clean
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-resize-applied-generation-20260908
+HEAD e66952db282f7f1fb3075d7e1f9bd0e0ff43dd9f
+branch refs/heads/fix/resize-applied-generation
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-scrollback-live-20260908
+HEAD 9af1b807e89202a4c45626259af3687a7e229a7a
+branch refs/heads/feat/scrollback-live-policy
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-scrollback-policy-20260908
+HEAD d0d1e6655ed1ec38cdbbe889f698c9c740944354
+branch refs/heads/feat/scrollback-policy-contract
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-session-agent-isolation-20260924
+HEAD c4f4d8078ce1465803ee9f19dd9bbf4e6918b97b
+branch refs/heads/fix/session-agent-isolation
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-session-agent-isolation-clean-20260924
+HEAD 315b9a1b38818a2168f6dd4e2e072e37541b9959
+branch refs/heads/fix/session-agent-isolation-clean
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-session-intent-20260908
+HEAD d6ac7f013c0e7796a27ec7eb8d65e68339df5836
+branch refs/heads/fix/workspace-open-intent
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-settings-session-background-20260909
+HEAD ea587b65981b415e2db9c403c28c75dcdff97c60
+branch refs/heads/fix/settings-copy-session-background
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-sijo-review-149/repro
+HEAD 320d9067bfffa19134dc468b4f7cbbf2c6508167
+detached
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-ssh-screen-visible-20260924
+HEAD 33116e7bf4d60b71bc6318ab2ac37b5943dd84d4
+branch refs/heads/fix/ssh-screen-stays-visible
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-streaming-reflow-20260908
+HEAD 18a06f1a15df555ddbd22569d2d4cf7042db2b21
+branch refs/heads/perf/terminal-streaming-reflow
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-toolbar-icons-20260909
+HEAD 78e72ee2e98515108e4d97b0d60a67ca0b0f0419
+branch refs/heads/fix/terminal-toolbar-icon-size
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-ureq3-20260907
+HEAD bfecc7f485f6ca3e435d25ee9edc3c79990688c2
+branch refs/heads/build/ureq3-migration-20260907
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-warp-relay-preview-20260907
+HEAD dbac54e7cecd392c491f1596a4031f6cbfbd78eb
+branch refs/heads/preview/warp-relay-20260907
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-warp-terminal-20260907
+HEAD aca3ffbaf5be9c908085ca939ff6ff5cd3488ae3
+branch refs/heads/fix/warp-terminal-resize
+prunable gitdir file points to non-existent location
+
+worktree /private/tmp/deppy-workspace-md-drop-20260908
+HEAD 4fb675d063ecf3429ca3187f9947fe5354316925
+branch refs/heads/fix/workspace-session-menu-md-drop
+prunable gitdir file points to non-existent location
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit
+HEAD 2a1583d170ee54111b46b7c6ce76117ae832ef1e
+branch refs/heads/fix/environment-api-context-integration
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp
+HEAD 78f054b9808851456ef687dbcbc72ba1a6cd823a
+branch refs/heads/feat/cloud-agent-mcp
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-env-api-preview
+HEAD 3606ffc18b74b0858611bfa1adc86e754e920b24
+branch refs/heads/design/environment-api-preview
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-layout-20260906
+HEAD 320d9067bfffa19134dc468b4f7cbbf2c6508167
+branch refs/heads/fix/preserve-terminal-layout
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+branch refs/heads/integrate/reviewed-main-20261015
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-perf-baseline
+HEAD 78f054b9808851456ef687dbcbc72ba1a6cd823a
+detached
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-perf-model
+HEAD ffaa80932f96a00ef20d7c0485a3ef769c3dae9a
+branch refs/heads/perf/seven-snapshot-model
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-perf-render
+HEAD 99d48bbb02320708b163854c9353974ef4542f9b
+branch refs/heads/perf/seven-render-ime
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-perf-storage
+HEAD 32a4abea376d594582cf036375aabe6643df2688
+branch refs/heads/perf/seven-visible-rows
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-performance
+HEAD d8826f0bdb8d89255f3448b5b61b6eee83faa87a
+branch refs/heads/feat/audit-nine-pr-v0.6.0-20261004
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-project-keys
+HEAD 1d17a0297e6ab0586ce30e4ac35e186fb86b7e20
+branch refs/heads/feat/project-key-management-20261012
+
+worktree /Users/jr/Desktop/projects/deppy-sijo-pwa-reading-20261008
+HEAD 2718608664c56fa9dea8b346272c09ac06bea93a
+branch refs/heads/feat/pwa-reading-pr4-20261008
+

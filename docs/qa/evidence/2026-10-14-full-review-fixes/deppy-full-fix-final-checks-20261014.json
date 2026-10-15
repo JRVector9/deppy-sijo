@@ -1,0 +1,76 @@
+[
+  {
+    "check": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-full-fix-final-clippy-20261014.log"
+  },
+  {
+    "check": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-full-fix-final-fmt-20261014.log"
+  },
+  {
+    "check": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-full-fix-final-boundary-20261014.log"
+  },
+  {
+    "check": "deps",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-deps"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-full-fix-final-deps-20261014.log"
+  },
+  {
+    "check": "windows",
+    "command": [
+      "cargo",
+      "check",
+      "--offline",
+      "--locked",
+      "--target",
+      "x86_64-pc-windows-msvc",
+      "-p",
+      "deppy-sijo",
+      "--tests"
+    ],
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-full-fix-final-windows-20261014.log"
+  }
+]

@@ -1,0 +1,38 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.13s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 4 tests
+test app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor ... missing-picked-folder: reported_success=true, before=WorkspaceFolderAnchor { dev: 16777232, ino: 577392781 }, after=None
+
+thread 'app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor' (46858111) panicked at crates/app/src/app.rs:59498:9:
+a folder that disappeared before worker admission must fail instead of committing an unanchored path
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test app::tests::popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach ...
+thread 'app::tests::popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach' (46858118) panicked at crates/app/src/app.rs:59626:9:
+a selected regular file must not replace a folder binding
+FAILED
+test app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events ... symlink-watch raw=["/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-42605-7ccf1e85-e809-49db-b34a-ebba42b53942/physical/new.txt"], physical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-42605-7ccf1e85-e809-49db-b34a-ebba42b53942/physical", logical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-42605-7ccf1e85-e809-49db-b34a-ebba42b53942/alias", refresh_queued=false
+
+thread 'app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events' (46858120) panicked at crates/app/src/app.rs:59441:9:
+native changes beneath a selected symlink root must reach the file tree in its logical path namespace
+FAILED
+test app::tests::popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths ...
+thread 'app::tests::popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths' (46858301) panicked at crates/app/src/app.rs:59565:9:
+assertion `left == right` failed: physical events must map before env/ignore filtering even after a file disappears
+  left: []
+ right: ["/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-watch-path-filter-42605-05773e7f-b51d-4f84-8e69-23c72bed5389/alias/.env"]
+FAILED
+
+failures:
+
+failures:
+    app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor
+    app::tests::popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach
+    app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events
+    app::tests::popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 3191 filtered out; finished in 5.68s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

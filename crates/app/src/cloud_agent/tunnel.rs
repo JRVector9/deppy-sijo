@@ -31,6 +31,7 @@ pub struct Tunnel {
     cancel: Arc<AtomicBool>,
     signal: SyncSender<()>,
     address_published: Arc<AtomicBool>,
+    revalidate: Arc<AtomicBool>,
     updates: Updates,
     observed: u64,
     worker: Option<JoinHandle<()>>,
@@ -79,6 +80,8 @@ impl Tunnel {
         let worker_signal = signal.clone();
         let address_published = Arc::new(AtomicBool::new(false));
         let published = address_published.clone();
+        let revalidate = Arc::new(AtomicBool::new(false));
+        let worker_revalidate = revalidate.clone();
         let updates = Arc::new(Mutex::new((0, None)));
         let pid = Arc::new(AtomicU32::new(0));
         #[cfg(test)]
@@ -104,7 +107,7 @@ impl Tunnel {
                     child_pid,
                     &publish,
                     &probe,
-                    (worker_signal, notified, published),
+                    (worker_signal, notified, published, worker_revalidate),
                     #[cfg(test)]
                     count,
                 );
@@ -114,6 +117,7 @@ impl Tunnel {
             cancel,
             signal,
             address_published,
+            revalidate,
             updates,
             observed: 0,
             worker: Some(worker),
@@ -139,6 +143,10 @@ impl Tunnel {
             let _ = self.signal.try_send(());
         }
         matches
+    }
+    pub fn revalidate(&self) {
+        self.revalidate.store(true, Ordering::Release);
+        let _ = self.signal.try_send(());
     }
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Release);
@@ -203,7 +211,12 @@ fn run(
     pid: Arc<AtomicU32>,
     publish: &impl Fn(Event),
     probe: &impl Fn(&str) -> bool,
-    signals: (SyncSender<()>, Receiver<()>, Arc<AtomicBool>),
+    signals: (
+        SyncSender<()>,
+        Receiver<()>,
+        Arc<AtomicBool>,
+        Arc<AtomicBool>,
+    ),
     #[cfg(test)] loop_count: Arc<AtomicU32>,
 ) -> Event {
     let config = match ConfigFile::create() {
@@ -252,7 +265,7 @@ fn run(
     // public endpoint, and continuing health is still determined by HTTPS.
     let registered_once = Arc::new(AtomicBool::new(false));
     let registration = registered_once.clone();
-    let (signal, notified, address_published) = signals;
+    let (signal, notified, address_published, revalidate) = signals;
     #[cfg(test)]
     let child_started = Instant::now();
     let reader = match std::thread::Builder::new()
@@ -284,7 +297,7 @@ fn run(
         Ok(reader) => reader,
         Err(_) => return Event::Failed("tunnel_reader_failed"),
     };
-    let mut discovered = None;
+    let mut discovered: Option<String> = None;
     let mut ready = false;
     let mut deadline = Instant::now() + timeout;
     let mut next_probe = Instant::now();
@@ -294,6 +307,14 @@ fn run(
         loop_count.fetch_add(1, Ordering::Relaxed);
         if stop.load(Ordering::Acquire) {
             break Event::Stopped;
+        }
+        if revalidate.swap(false, Ordering::AcqRel) {
+            ready = false;
+            deadline = Instant::now() + timeout;
+            next_probe = Instant::now();
+            if let Some(host) = &discovered {
+                publish(Event::Address(host.clone()));
+            }
         }
         match child.0.try_wait() {
             Ok(Some(_)) => break Event::Failed("tunnel_exited"),

@@ -1,0 +1,5 @@
+production editor retained=9437184 bytes; paste/render elapsed=5.269876792s; refuse_limit=8388608 bytes
+
+thread 'main' (47925568) panicked at /private/tmp/deppy-ui-editor-review-20261014.rs:71:5:
+editable document exceeded absolute save/load byte limit
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -7,8 +7,16 @@ const INDEX: &str = include_str!("../assets/index.html");
 const CORE_JS: &str = include_str!("../../../web/shared/viewer-core.js");
 const CORE_CSS: &str = include_str!("../../../web/shared/viewer-core.css");
 const THEME_CSS: &str = include_str!("../../../web/shared/mobile-theme.css");
-const APP_JS: &str = include_str!("../assets/app.js");
-const APP_CSS: &str = include_str!("../assets/app.css");
+const APP_JS: &str = concat!(
+    include_str!("../../../web/shared/cloud-results.js"),
+    "\n",
+    include_str!("../assets/app.js")
+);
+const APP_CSS: &str = concat!(
+    include_str!("../../../web/shared/cloud-results.css"),
+    "\n",
+    include_str!("../assets/app.css")
+);
 
 #[test]
 #[ignore = "requires a locally installed Chromium-family browser"]

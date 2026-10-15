@@ -1,0 +1,789 @@
+{
+  "harnesses": [
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/agent_mcp-c161d9a67e2a3333)",
+      "result": {
+        "status": "ok",
+        "passed": 67,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/audit-7fe6da85bf89e433)",
+      "result": {
+        "status": "ok",
+        "passed": 65,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/auth-d4d15e1d5f5966b6)",
+      "result": {
+        "status": "ok",
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/connector_contract-98a74f89a8763ee7)",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/connector_service-9439df7f306d9a25)",
+      "result": {
+        "status": "ok",
+        "passed": 83,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/connector_ui-6519285bde5fbdca)",
+      "result": {
+        "status": "ok",
+        "passed": 35,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/deppy_core-5d981b71a1723f8c)",
+      "result": {
+        "status": "ok",
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/deppy_sijo-ac927001ad603cc0)",
+      "result": {
+        "status": "FAILED",
+        "passed": 3213,
+        "failed": 1,
+        "ignored": 39
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-d75620d0de7e3401)",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-672fbd32e036cc07)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-fa5a2d89522ce8c9)",
+      "result": {
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-7a09ee7b6b62cc45)",
+      "result": {
+        "status": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/logging_policy.rs (target/debug/deps/logging_policy-e5854fa2692a612b)",
+      "result": {
+        "status": "ok",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-8983d809b15907ed)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/http_client-cb41408703e8b5c9)",
+      "result": {
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/i18n-4a8a6cc432bfc364)",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/mcp-6e18f1bb6f899dc9)",
+      "result": {
+        "status": "ok",
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/deppy_mcp_proxy-a7f277c4fe7f3bb3)",
+      "result": {
+        "status": "ok",
+        "passed": 108,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/hook_task_prompt.rs (target/debug/deps/hook_task_prompt-2a24647c41f45143)",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/mcp_store-656c8cb0927b9162)",
+      "result": {
+        "status": "ok",
+        "passed": 42,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/mux-b283456cd98e478b)",
+      "result": {
+        "status": "ok",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/persist-e55dfe93c8316113)",
+      "result": {
+        "status": "ok",
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/platform-a2fd1cb9034388dc)",
+      "result": {
+        "status": "ok",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/pty-d4371ef00324c7c9)",
+      "result": {
+        "status": "ok",
+        "passed": 57,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/relay_protocol-279920e2e7f0aab3)",
+      "result": {
+        "status": "ok",
+        "passed": 13,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_wire_vectors.rs (target/debug/deps/relay_wire_vectors-bc722a6c9962ab7c)",
+      "result": {
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/relay_server-d668971ec9c2fd7d)",
+      "result": {
+        "status": "ok",
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/relay_server-646a749d36babb49)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/deploy_manifests.rs (target/debug/deps/deploy_manifests-24bb3cbeae64fe8f)",
+      "result": {
+        "status": "ok",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/shutdown.rs (target/debug/deps/shutdown-a2613ab098e44b91)",
+      "result": {
+        "status": "ok",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/transport_contract.rs (target/debug/deps/transport_contract-efb6dc87aaced6cd)",
+      "result": {
+        "status": "ok",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/runtime-8d6508024d170e05)",
+      "result": {
+        "status": "ok",
+        "passed": 405,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/secret-997ef4bbf501a594)",
+      "result": {
+        "status": "ok",
+        "passed": 79,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/session-7450ee6e26b22c3d)",
+      "result": {
+        "status": "ok",
+        "passed": 81,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/storage-861cc9432f613e92)",
+      "result": {
+        "status": "FAILED",
+        "passed": 460,
+        "failed": 19,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/background_agent_lifecycle.rs (target/debug/deps/background_agent_lifecycle-f2471608fce4bfc6)",
+      "result": {
+        "status": "ok",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/storage_core-581bf50ddf8b62a1)",
+      "result": {
+        "status": "FAILED",
+        "passed": 4,
+        "failed": 2,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/terminal-c2f9f8c95667e6e4)",
+      "result": {
+        "status": "ok",
+        "passed": 138,
+        "failed": 0,
+        "ignored": 4
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (target/debug/deps/web_remote-7a12ceb355404a6f)",
+      "result": {
+        "status": "ok",
+        "passed": 388,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-f6a333ef05d59061)",
+      "result": {
+        "status": "ok",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-5f346973402511b9)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-0253c58d9f29b50d)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-2b8a707b67da24b0)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-179d180251f01da5)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-b6b73ccb8ca1354f)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-d6e79c521cbf33cd)",
+      "result": {
+        "status": "ok",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-dc8d587f578e15d7)",
+      "result": {
+        "status": "ok",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/transport_independence.rs (target/debug/deps/transport_independence-0784a3dee8a43875)",
+      "result": {
+        "status": "ok",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-080b051e2438ab9f)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-5198e8ec1e4d12fe)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-ab928292edb82ebd)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-4eeb9d65366bfd28)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-74623d61d9a3cc2d)",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (target/debug/deps/xtask-34834a7296fa9074)",
+      "result": {
+        "status": "ok",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests agent_mcp",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests audit",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests auth",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_contract",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_service",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_ui",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests deppy_core",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests http_client",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests i18n",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mcp",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mcp_store",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mux",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests persist",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests platform",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests pty",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests relay_protocol",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests relay_server",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests runtime",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests secret",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests session",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests storage",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests storage_core",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests terminal",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests web_remote",
+      "result": {
+        "status": "ok",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    }
+  ],
+  "totals": {
+    "passed": 5679,
+    "failed": 22,
+    "ignored": 65
+  }
+}

@@ -1,0 +1,520 @@
+[
+  {
+    "source": "canonical final evidence artifact",
+    "stored": "README.md",
+    "original_sha256": "f5a0624f2cef8c141d04980c69c6c061d05bdb28abd20f835df1e88c41eb594d",
+    "stored_sha256": "f5a0624f2cef8c141d04980c69c6c061d05bdb28abd20f835df1e88c41eb594d",
+    "format": "original bytes"
+  },
+  {
+    "source": "/private/tmp/deppy-detect-descendants-after-bench-20261014.rs",
+    "stored": "deppy-detect-descendants-after-bench-20261014.rs",
+    "original_sha256": "7c8340f91bbc02e03031c54eb76caee8e7e8eb0c6d62fe6cc93198e4f3d9984b",
+    "stored_sha256": "7c8340f91bbc02e03031c54eb76caee8e7e8eb0c6d62fe6cc93198e4f3d9984b",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-detect-descendants-bench-20261014.rs",
+    "stored": "deppy-detect-descendants-bench-20261014.rs",
+    "original_sha256": "b9f396aa01edca0827adbce87c35d1208edcbcfcccdbdf387abc4d18591797c7",
+    "stored_sha256": "b9f396aa01edca0827adbce87c35d1208edcbcfcccdbdf387abc4d18591797c7",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-documents-full-fix-final-20261014-files.json",
+    "stored": "deppy-documents-full-fix-final-20261014-files.json",
+    "original_sha256": "b70fa809c58c8516b3c592e7fa658eeb7406b0358be8c5ae6d518cfec4201a05",
+    "stored_sha256": "b70fa809c58c8516b3c592e7fa658eeb7406b0358be8c5ae6d518cfec4201a05",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-documents-full-fix-final-20261014.patch",
+    "stored": "deppy-documents-full-fix-final-20261014.patch",
+    "original_sha256": "618870c78824757145cdcd8a3e636e2c96ca7ed21af14386a813230dfb49672f",
+    "stored_sha256": "618870c78824757145cdcd8a3e636e2c96ca7ed21af14386a813230dfb49672f",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-condition-third-deppy-sijo-documents-20261014.log",
+    "stored": "deppy-full-fix-condition-third-deppy-sijo-documents-20261014.log",
+    "original_sha256": "f65b267205988e33f81897c7ce4a86363fe36cd3fe075479f3d9e0591e2d0918",
+    "stored_sha256": "d93f07d09e11408e7e53f8da9214435d7ad0f0daad0fcc9cf52d9809e471e57c",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-condition-third-runtime-data-20261014.log",
+    "stored": "deppy-full-fix-condition-third-runtime-data-20261014.log",
+    "original_sha256": "35621bd9d09fce53cb84d3ecacce61608836ae5326b7a53f45f5ee01ed124860",
+    "stored_sha256": "35621bd9d09fce53cb84d3ecacce61608836ae5326b7a53f45f5ee01ed124860",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-condition-third-runtime-lifecycle-20261014.log",
+    "stored": "deppy-full-fix-condition-third-runtime-lifecycle-20261014.log",
+    "original_sha256": "62a9b7df707c71caad5a27b88e731bcbfd39164bb36e5a1bc8a5b863328c2e72",
+    "stored_sha256": "6540b66c683841a007d896f3838f9d96141f7f88accd5ded76b693d526398876",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-data-final-20261014-files.json",
+    "stored": "deppy-full-fix-data-final-20261014-files.json",
+    "original_sha256": "c4c00ac44863fe0eecbee3222128d817f7898ed50c867cae1ebb20b907d644e9",
+    "stored_sha256": "c4c00ac44863fe0eecbee3222128d817f7898ed50c867cae1ebb20b907d644e9",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-data-final-20261014.patch",
+    "stored": "deppy-full-fix-data-final-20261014.patch",
+    "original_sha256": "78884b3810c4ed32da12496ec8534f6cc2defd2dee3aa2e77b4341ab9ccbf36d",
+    "stored_sha256": "78884b3810c4ed32da12496ec8534f6cc2defd2dee3aa2e77b4341ab9ccbf36d",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-affected-app-storage-20261014.log",
+    "stored": "deppy-full-fix-final-affected-app-storage-20261014.log",
+    "original_sha256": "53285f448762fc7ea8b3c1ed30eb3b3bfdebbe49086882db2541291621ca4d5c",
+    "stored_sha256": "71000f229983c532647aa389aa11e450e07d180f4663b95edb9c2527248af8e9",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-boundary-20261014.log",
+    "stored": "deppy-full-fix-final-boundary-20261014.log",
+    "original_sha256": "699f2881b43bb59fc9cca40bad65191d10e923e0d80782fa24595eda8ea09f53",
+    "stored_sha256": "699f2881b43bb59fc9cca40bad65191d10e923e0d80782fa24595eda8ea09f53",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-checks-20261014.json",
+    "stored": "deppy-full-fix-final-checks-20261014.json",
+    "original_sha256": "c714096240290c922c4748323d49e81baaaa73f0a9698014c5db4690db632826",
+    "stored_sha256": "c714096240290c922c4748323d49e81baaaa73f0a9698014c5db4690db632826",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-clippy-20261014.log",
+    "stored": "deppy-full-fix-final-clippy-20261014.log",
+    "original_sha256": "8b8b1e53a7387b9d517a28b17f196a245f82843cbd99a2079ef4aa9a2a12411b",
+    "stored_sha256": "8b8b1e53a7387b9d517a28b17f196a245f82843cbd99a2079ef4aa9a2a12411b",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-deps-20261014.log",
+    "stored": "deppy-full-fix-final-deps-20261014.log",
+    "original_sha256": "7d5197f8ab1ab7a38dbd6e2986205aad3facb65596bc43b65c8f39e1beb9e180",
+    "stored_sha256": "7d5197f8ab1ab7a38dbd6e2986205aad3facb65596bc43b65c8f39e1beb9e180",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-evidence-check-20261014.log",
+    "stored": "deppy-full-fix-final-evidence-check-20261014.log",
+    "original_sha256": "438eb98936373e91b8be608ff264effe403105d38b08ff31000ae74429294a90",
+    "stored_sha256": "438eb98936373e91b8be608ff264effe403105d38b08ff31000ae74429294a90",
+    "format": "original bytes"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-fmt-20261014.log",
+    "stored": "deppy-full-fix-final-fmt-20261014.log",
+    "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-source-check-20261014.log",
+    "stored": "deppy-full-fix-final-source-check-20261014.log",
+    "original_sha256": "6d04d7e3342357fd7a063a70928841fa39acc4bf6b334edb49494c86d2abcad5",
+    "stored_sha256": "6d04d7e3342357fd7a063a70928841fa39acc4bf6b334edb49494c86d2abcad5",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-test-counts-20261014.json",
+    "stored": "deppy-full-fix-final-test-counts-20261014.json",
+    "original_sha256": "1b6c56b8d08e74767b8a211d4b63f8828279e5e07f51599a75f6322d0ebe17b6",
+    "stored_sha256": "1b6c56b8d08e74767b8a211d4b63f8828279e5e07f51599a75f6322d0ebe17b6",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-windows-20261014.log",
+    "stored": "deppy-full-fix-final-windows-20261014.log",
+    "original_sha256": "3e9b139e7160c5621b769e6ae19f9bcb427ee435a8b5471063aee6e4444388c8",
+    "stored_sha256": "3e9b139e7160c5621b769e6ae19f9bcb427ee435a8b5471063aee6e4444388c8",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-final-workspace-20261014.log",
+    "stored": "deppy-full-fix-final-workspace-20261014.log",
+    "original_sha256": "c85974f849fd0880a32230622380fc01932dc9a5b6f3d792801fc8a51ea6a048",
+    "stored_sha256": "b701621cf77b0fcaf3ad00a9ea230daa791a522be1428c7b1a4bb16010aa5598",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-first-workspace-counts-20261014.json",
+    "stored": "deppy-full-fix-first-workspace-counts-20261014.json",
+    "original_sha256": "00a84473c69ce8c100d9f5b863fc912e7d8333c182df7ad4834b5e86f4b9240a",
+    "stored_sha256": "00a84473c69ce8c100d9f5b863fc912e7d8333c182df7ad4834b5e86f4b9240a",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-final-app-documents-20261014.log",
+    "stored": "deppy-full-fix-green-final-app-documents-20261014.log",
+    "original_sha256": "5f61d37ba03a6163417937e37ea98e8a25222271a4dc2f5ed2320dfdd8c6d569",
+    "stored_sha256": "1254a0e7ee30862e174ad0d70c91b4c8c95913898a8d495b86056a00bbc5ea12",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-integrated-app-targeted-20261014.log",
+    "stored": "deppy-full-fix-green-integrated-app-targeted-20261014.log",
+    "original_sha256": "fb51af4cf7a95c8dce84a7269217afaf0685e0a6fe585906555a60164b8246ee",
+    "stored_sha256": "c535125f94854b689ef0d733632915f2b467325120f3cc12075f4c2c1abfa2a9",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-integrated-data-three-20261014.log",
+    "stored": "deppy-full-fix-green-integrated-data-three-20261014.log",
+    "original_sha256": "f8d1d48f71374ddec0ffe9726f478b12915d663d413550689302960b4386a75a",
+    "stored_sha256": "55cbd3383c6f65317ebe8d0d6a2d61f6372532d2269808ebf44100ba8cca5669",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-integrated-runtime-web-20261014.log",
+    "stored": "deppy-full-fix-green-integrated-runtime-web-20261014.log",
+    "original_sha256": "e7dc712799027604d6e9d436a1a36c56e14ae2e5871e80971968f38451c91859",
+    "stored_sha256": "e7dc712799027604d6e9d436a1a36c56e14ae2e5871e80971968f38451c91859",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-integrated-seven-20261014.log",
+    "stored": "deppy-full-fix-green-integrated-seven-20261014.log",
+    "original_sha256": "4f5e953051c7f693b552e08e9ec83d302e64f988a17b46230d68e4ea621830d0",
+    "stored_sha256": "4f5e953051c7f693b552e08e9ec83d302e64f988a17b46230d68e4ea621830d0",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-lifecycle-deppy-sijo-20261014.log",
+    "stored": "deppy-full-fix-green-lifecycle-deppy-sijo-20261014.log",
+    "original_sha256": "e1b560ff9452e384fdde740b7a3bcf2ab2707be151082eff5797306b20d8f22e",
+    "stored_sha256": "e1b560ff9452e384fdde740b7a3bcf2ab2707be151082eff5797306b20d8f22e",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-lifecycle-pty-20261014.log",
+    "stored": "deppy-full-fix-green-lifecycle-pty-20261014.log",
+    "original_sha256": "eb897ce721b4ef4e98349a0b694f3be428c4ed9de67a2af3160832e473d648c2",
+    "stored_sha256": "eb897ce721b4ef4e98349a0b694f3be428c4ed9de67a2af3160832e473d648c2",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-lifecycle-runtime-20261014.log",
+    "stored": "deppy-full-fix-green-lifecycle-runtime-20261014.log",
+    "original_sha256": "76c5f671d48eeac1b1ba6aae9d2b8ba63ea70532c1d7dfda558b3602132fe4f5",
+    "stored_sha256": "76c5f671d48eeac1b1ba6aae9d2b8ba63ea70532c1d7dfda558b3602132fe4f5",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-relay-measurements-20261014.log",
+    "stored": "deppy-full-fix-green-relay-measurements-20261014.log",
+    "original_sha256": "72e9994717bbfa577a81d7358f9e58586370c4752981c14c5905fbb5f4c0a971",
+    "stored_sha256": "3f73e1a4bf13f581a86a3e662de66856913dca47cb1c57c8657699269c25a79f",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-root-usage-20261014.log",
+    "stored": "deppy-full-fix-green-root-usage-20261014.log",
+    "original_sha256": "c11aa72c252d18388baf534e697da54911e5fd990c0c6092fcb29a516e30bc0a",
+    "stored_sha256": "300863342bcfe9aa541c5a79be062d45db5a31964707daeb120e232cc55bf16b",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-green-root-usage-final-20261014.log",
+    "stored": "deppy-full-fix-green-root-usage-final-20261014.log",
+    "original_sha256": "4d1a589e398b98ed388559ecd289bc853c26488e419a5d2d9049ad644af02091",
+    "stored_sha256": "80f57c700235c0629a9a5060243e7e6ad1dda34239d0d8337f2dca0dd8380b21",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-html-syntax-20261014.log",
+    "stored": "deppy-full-fix-html-syntax-20261014.log",
+    "original_sha256": "bdfef7cde44395bc35c50279a7a551142616c85f162917d1e0c5d771ef47962f",
+    "stored_sha256": "bdfef7cde44395bc35c50279a7a551142616c85f162917d1e0c5d771ef47962f",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-lifecycle-20261014-manifest.json",
+    "stored": "deppy-full-fix-lifecycle-20261014-manifest.json",
+    "original_sha256": "5553324635a78f711f18f9254d39b9607bccdd80c37fcf08aa1126fb91e6ad2b",
+    "stored_sha256": "5553324635a78f711f18f9254d39b9607bccdd80c37fcf08aa1126fb91e6ad2b",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-lifecycle-20261014.patch",
+    "stored": "deppy-full-fix-lifecycle-20261014.patch",
+    "original_sha256": "6b9cda1a89cd499ac012e1ae2c066675c85a83649b474b1178f0c3657c42fa18",
+    "stored_sha256": "6b9cda1a89cd499ac012e1ae2c066675c85a83649b474b1178f0c3657c42fa18",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-native-memory-probe-20261014.log",
+    "stored": "deppy-full-fix-native-memory-probe-20261014.log",
+    "original_sha256": "d271548e74a594766edda91dcbf7ed791817136f9251b86aba6ada2bdcb6d9fc",
+    "stored_sha256": "dfd81e5777850e95e1086cb1647b7eaed7c6df3bb45b2e510c28ebf446a850a9",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-post-lint-app-new-20261014.log",
+    "stored": "deppy-full-fix-post-lint-app-new-20261014.log",
+    "original_sha256": "6176cde12c0f2da1d7ddcdec2db9a8708ddbd61c17283f2362cd07d819d34198",
+    "stored_sha256": "0ae3004a274517a8a5d5b0ace9e8a21f212bd6a5a5d6c60b4d0c29a29cff6ca4",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-post-lint-coordinator-20261014.log",
+    "stored": "deppy-full-fix-post-lint-coordinator-20261014.log",
+    "original_sha256": "08a570f22c3ab3d04908f8bd2937242a1a1b75326cfbe82a2c88d4969a8c6086",
+    "stored_sha256": "8fb35bf2220a6e1cf83358f07093e37c8be6f8ff8adb81084e5f22370f193b1e",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-post-lint-history-20261014.log",
+    "stored": "deppy-full-fix-post-lint-history-20261014.log",
+    "original_sha256": "5b95c70a36a0d5f2b0ab7cda1f2b0e9c62b5019bca5383920a0e4698d62f9ab6",
+    "stored_sha256": "50e6a20317a91667181224bd09bc6e73b926a1f50a076bf53d290d7263ebe87c",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-post-lint-session-aux-20261014.log",
+    "stored": "deppy-full-fix-post-lint-session-aux-20261014.log",
+    "original_sha256": "11c191e4cba2806eb2025b4d5792f1ea2f1df526cca2a1da5ff85118d2595833",
+    "stored_sha256": "521e8e7418db9d10d2217beb5b1a2039f66a1e242098d9fbe8a5d2a680000424",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-post-lint-tests-20261014.json",
+    "stored": "deppy-full-fix-post-lint-tests-20261014.json",
+    "original_sha256": "6611b0e9834bffe7dea19b93cffa4a9c4c97c597340f636dc7a8a482c4d8f5bc",
+    "stored_sha256": "6611b0e9834bffe7dea19b93cffa4a9c4c97c597340f636dc7a8a482c4d8f5bc",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-process-detect-after-bench-20261014.log",
+    "stored": "deppy-full-fix-process-detect-after-bench-20261014.log",
+    "original_sha256": "aae08a80ff4b49c61d4e785f52e1e5118bd1c86d6ed4b464a07d2030fbeec4aa",
+    "stored_sha256": "aae08a80ff4b49c61d4e785f52e1e5118bd1c86d6ed4b464a07d2030fbeec4aa",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-process-detect-before-bench-20261014.log",
+    "stored": "deppy-full-fix-process-detect-before-bench-20261014.log",
+    "original_sha256": "039bf9302c0e2e4a57bfd7b5f6b83ac27c079a43437e8731fe570863f33651b0",
+    "stored_sha256": "039bf9302c0e2e4a57bfd7b5f6b83ac27c079a43437e8731fe570863f33651b0",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-cross-review-pty-20261014.log",
+    "stored": "deppy-full-fix-red-cross-review-pty-20261014.log",
+    "original_sha256": "ffd98d8d4b60b9115bc508caafdad1f7a3e31949d4a3412e5cc66076a5b78726",
+    "stored_sha256": "8965e8a3e3c5c742a0bd832f359c77566b0606619921b8568c348b48aa2660e6",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-cross-review-runtime-20261014.log",
+    "stored": "deppy-full-fix-red-cross-review-runtime-20261014.log",
+    "original_sha256": "522bc8440c84165d55c1ebdf0147db3ba529d8d2a333ffb1f1cbffc17b892635",
+    "stored_sha256": "872679c02dfbb7b1faec02606dbfa68de90798c5647e034b031190c2fa9bd392",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-connector-service-20261014.log",
+    "stored": "deppy-full-fix-red-data-connector-service-20261014.log",
+    "original_sha256": "34e0f26293e729aaad0bc8050dc99705d7192b1f39c6d6d86b91795f42819857",
+    "stored_sha256": "34e0f26293e729aaad0bc8050dc99705d7192b1f39c6d6d86b91795f42819857",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-deppy-core-20261014.log",
+    "stored": "deppy-full-fix-red-data-deppy-core-20261014.log",
+    "original_sha256": "3774ffedbed1d876b1dbd3f2fc71104ebb2f5f32c777ffddf2cd508df0887cab",
+    "stored_sha256": "3774ffedbed1d876b1dbd3f2fc71104ebb2f5f32c777ffddf2cd508df0887cab",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-runtime-20261014.log",
+    "stored": "deppy-full-fix-red-data-runtime-20261014.log",
+    "original_sha256": "b1803242aedf96da05703be3f1c5588deb6f1707a1936184a9e73a503c75d14c",
+    "stored_sha256": "0e5c93dd6d074f76aae2b227436e74298f56c744820c04f62cca4a3e270248ab",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-storage-core-20261014.log",
+    "stored": "deppy-full-fix-red-data-storage-core-20261014.log",
+    "original_sha256": "28d7b16c96e04ff7aab271d26bf7ee655d344d82e268234e57e4ff67e79398d8",
+    "stored_sha256": "28d7b16c96e04ff7aab271d26bf7ee655d344d82e268234e57e4ff67e79398d8",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-storage-core-expanded-20261014.log",
+    "stored": "deppy-full-fix-red-data-storage-core-expanded-20261014.log",
+    "original_sha256": "dbb377edcc1c8b79664209274024144558e0a63e8cb413ac146ceaa2c8c7fcc8",
+    "stored_sha256": "b7ac7f8c7b7d4d811f153cfea1f236062f8c768f38a5167df12011f1498c6d01",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-data-web-remote-20261014.log",
+    "stored": "deppy-full-fix-red-data-web-remote-20261014.log",
+    "original_sha256": "ce9d206880fb89c133106d1498466f46b50d6ae482065548a82e1747bf47bf5a",
+    "stored_sha256": "ce9d206880fb89c133106d1498466f46b50d6ae482065548a82e1747bf47bf5a",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-documents-20261014.log",
+    "stored": "deppy-full-fix-red-documents-20261014.log.gz",
+    "original_sha256": "b323b8d8865e230edec735e9fed5a6235e6bdbe82746ef5409a92832c7a16671",
+    "stored_sha256": "402da739c59a78d12079d5283caa64c524230c077c9d87ad5fa6d64e960abafe",
+    "format": "gzip; original bytes preserved"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-final-clippy-20261014.log",
+    "stored": "deppy-full-fix-red-final-clippy-20261014.log",
+    "original_sha256": "90a26e33346dd29850c01b2c00b62968684dfca5cde89c6c4373dc9e64ebc749",
+    "stored_sha256": "90a26e33346dd29850c01b2c00b62968684dfca5cde89c6c4373dc9e64ebc749",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-lifecycle-deppy-sijo-20261014.log",
+    "stored": "deppy-full-fix-red-lifecycle-deppy-sijo-20261014.log",
+    "original_sha256": "00c3823ef48fa5a4fcd6e83e8fa56d15f8de5dfc29b5dae635949fba70b37f6b",
+    "stored_sha256": "8dba5971a3e93a63ab1acfa0d93358bad3ecbe482185f43ac288ff3b8a531290",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-lifecycle-pty-20261014.log",
+    "stored": "deppy-full-fix-red-lifecycle-pty-20261014.log",
+    "original_sha256": "74b33525377f378e4a6858ee412f89e69a9f3b0a05bf5a2ee2f36e9b3ad78638",
+    "stored_sha256": "8f5563b7bf32585dedc95ce1009acc597f1eaaedb6fda14f90348a96b5451791",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-lifecycle-runtime-20261014.log",
+    "stored": "deppy-full-fix-red-lifecycle-runtime-20261014.log",
+    "original_sha256": "a6dd5044d84f364446d864d07cef3f28ee8f451716e4426b088023a2a53b8a15",
+    "stored_sha256": "a6dd5044d84f364446d864d07cef3f28ee8f451716e4426b088023a2a53b8a15",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-backup-parent-20261014.log",
+    "stored": "deppy-full-fix-red-root-backup-parent-20261014.log",
+    "original_sha256": "203774e8a6c4d319ae16a0432c39e03cb1fc97797ba543c471b29051e338d8d0",
+    "stored_sha256": "6e2c318547cfac1c09cefe6249f9966b0880aebcc9418146834aa643d10724ca",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-host-completion-20261014.log",
+    "stored": "deppy-full-fix-red-root-host-completion-20261014.log",
+    "original_sha256": "bd5596f30ce45de1f813c1ceb6b6e9ce96a51653c62e27389433f824f440418e",
+    "stored_sha256": "4c7c4f572ab5f9d41c614897819e124392b495a0c3ce70d81d8fba318d813a9e",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-usage-20261014.log",
+    "stored": "deppy-full-fix-red-root-usage-20261014.log",
+    "original_sha256": "5f77459cc6e29d1be51c5603036731237992d3950887dbb2b5a31a268baf0c0a",
+    "stored_sha256": "f355d64e11bf65262a5a1b0ccc3784e1c0f90f7777027ea628478f28af5bfe3c",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-usage-age-20261014.log",
+    "stored": "deppy-full-fix-red-root-usage-age-20261014.log",
+    "original_sha256": "56f97dbc35cf83917ef92a5c224c6b172ee377618c425286af0e9df12735b62c",
+    "stored_sha256": "56f97dbc35cf83917ef92a5c224c6b172ee377618c425286af0e9df12735b62c",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-usage-age-qualified-20261014.log",
+    "stored": "deppy-full-fix-red-root-usage-age-qualified-20261014.log",
+    "original_sha256": "144c3a2c41b91994c8a326f09578ce650360e5e77a02c2625dbaa459809de2be",
+    "stored_sha256": "8c945565f924aac87e537811c53b84e79845752a97a4d4a540443c021108a1bb",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-usage-missing-20261014.log",
+    "stored": "deppy-full-fix-red-root-usage-missing-20261014.log",
+    "original_sha256": "4bffbd721acccdd360e8e09232170d20c486ca4022955f2341aa84c712b8540e",
+    "stored_sha256": "f9cfb3190e38b65e4a61c230f580c360968e22f9c41f3f295e86617e3f8a9b25",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-root-usage-missing-qualified-20261014.log",
+    "stored": "deppy-full-fix-red-root-usage-missing-qualified-20261014.log",
+    "original_sha256": "0194311e59887891a79834750de06b5885ff240bb5a7e8df825424392d5619ac",
+    "stored_sha256": "39fba28048158ff2897737e956374f74980d2d3ae9bcfd2a2597fa98489f1459",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-second-cross-deppy-sijo-20261014.log",
+    "stored": "deppy-full-fix-red-second-cross-deppy-sijo-20261014.log",
+    "original_sha256": "d9da5a2c3dfe5ad0f59320067bcf9e2c9f91b9703bb0da4d9b8a75748e6b5c2e",
+    "stored_sha256": "82fd5d757e474a8fe4b29692bb1141c26b43331110e5e96afddbae88995033d1",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-second-cross-pty-20261014.log",
+    "stored": "deppy-full-fix-red-second-cross-pty-20261014.log",
+    "original_sha256": "7e4ed7bb6d87e1d88a43d450359b5d5cf89e3ea89c69df8eb529631d446e8a85",
+    "stored_sha256": "bfca988e3fde5deacb3e8f679705ab61d99d78479543b06bd96b794e55050f5a",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-second-cross-runtime-20261014.log",
+    "stored": "deppy-full-fix-red-second-cross-runtime-20261014.log",
+    "original_sha256": "2e4714690bad948486c9433ff373e91c6bd648e80dbc6d19dfa255392269499e",
+    "stored_sha256": "da438dbb0b1b3dffbedc2783ba56701adb863e0e22082ee207865e9aa9ec19fc",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-second-final-clippy-20261014.log",
+    "stored": "deppy-full-fix-red-second-final-clippy-20261014.log",
+    "original_sha256": "ccc5a9449b4bb4cc908cc47597932420d7b68cc454e9cc05da1fa7788b2a9dfd",
+    "stored_sha256": "ccc5a9449b4bb4cc908cc47597932420d7b68cc454e9cc05da1fa7788b2a9dfd",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-red-stamp-consume-race-20261014.log",
+    "stored": "deppy-full-fix-red-stamp-consume-race-20261014.log",
+    "original_sha256": "ec47106705a32df3b99c2df74afb4e20f84b2cd002db7fb30a154e76e00629bc",
+    "stored_sha256": "1b47da004f0b87b069b9da25113609d325dcd2ba82a5f0b6c109d228bf371d57",
+    "format": "text; line-end whitespace and trailing blank lines removed"
+  },
+  {
+    "source": "canonical final evidence artifact",
+    "stored": "final-source-snapshot.json",
+    "original_sha256": "ea73f3a4b8f0f0dfed6c71000429319d78d8b6fd421c294ca57fbea921aca3e0",
+    "stored_sha256": "ea73f3a4b8f0f0dfed6c71000429319d78d8b6fd421c294ca57fbea921aca3e0",
+    "format": "original bytes"
+  },
+  {
+    "source": "canonical final evidence artifact",
+    "stored": "final-task-changes.patch",
+    "original_sha256": "c2b841f513409fb5272ef7e18d548fdc34d879094eb150d713e4fe007dc10dd5",
+    "stored_sha256": "c2b841f513409fb5272ef7e18d548fdc34d879094eb150d713e4fe007dc10dd5",
+    "format": "original bytes"
+  },
+  {
+    "source": "/private/tmp/deppy-native-memory-evidence-20261014/manifest.json",
+    "stored": "native-memory-primary-evidence-20261014.json",
+    "original_sha256": "4d39da376489d2633d9998f8a393020ca3bbf4280eb97e6d7bae81056b77b6bb",
+    "stored_sha256": "4d39da376489d2633d9998f8a393020ca3bbf4280eb97e6d7bae81056b77b6bb",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-baseline-20261014/products-before.patch",
+    "stored": "products-before.patch",
+    "original_sha256": "51581efbc7fc6f2d4e0977dba92202f3e1110ec9f2a014c6894791cfe8292956",
+    "stored_sha256": "51581efbc7fc6f2d4e0977dba92202f3e1110ec9f2a014c6894791cfe8292956",
+    "format": "original"
+  },
+  {
+    "source": "/private/tmp/deppy-full-fix-baseline-20261014/source-baseline.json",
+    "stored": "source-baseline.json",
+    "original_sha256": "d4314b4e9be58ef0fe4e3c0a06db64b3bd6e25bc4fa50cf082757e311743b215",
+    "stored_sha256": "d4314b4e9be58ef0fe4e3c0a06db64b3bd6e25bc4fa50cf082757e311743b215",
+    "format": "original"
+  }
+]

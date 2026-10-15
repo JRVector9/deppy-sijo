@@ -1,0 +1,16 @@
+frame=0 scroll_offset=0
+frame=1 scroll_offset=0
+frame=2 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667
+frame=2 scroll_offset=0
+frame=3 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667
+frame=3 scroll_offset=7.916667
+frame=4 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667
+frame=4 scroll_offset=15.833334
+frame=5 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667
+frame=5 scroll_offset=23.75
+
+thread 'main' (45180530) panicked at /private/tmp/deppy-workspace-secondary-drag-probe-20261014.rs:56:70:
+assertion `left == right` failed: right-button drag scrolled workspace list
+  left: 23.75
+ right: 0.0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,33 @@
+
+
+#[test]
+fn review_20261015_owner_can_revoke_read_consent_after_session_exit() {
+    let (mut bridge, mut target, review, _, _) = connection_fixture();
+    bridge.set_connection_access(&review, &target, true, false).unwrap();
+    target.live = false;
+    bridge.set_targets(vec![target.clone()]);
+    assert!(bridge.connection_permission(&review, &target).read);
+    assert!(!bridge.connection_permission(&review, &target).input);
+    // The controller already accepts safe revocation on the retained exited target.
+    bridge.set_connection_access(&review, &target, false, false).unwrap();
+    assert!(!bridge.connection_permission(&review, &target).read);
+    bridge.set_connection_access(&review, &target, true, false).unwrap();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .click();
+    harness.run();
+    assert!(
+        !harness.state().connection_permission(&review, &target).read,
+        "the owner cannot withdraw retained read consent using the exited session's checkbox"
+    );
+}

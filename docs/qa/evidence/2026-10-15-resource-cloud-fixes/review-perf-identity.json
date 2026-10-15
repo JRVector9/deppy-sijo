@@ -1,0 +1,169 @@
+{
+  "head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "method_file": "crates/app/src/cloud_agent.rs",
+  "method_lines": [
+    306,
+    324
+  ],
+  "method_sha256": "904cc13d7aa77e4ab0a19e4851c40c0b0045d48a9aa51640fbbe39e83a85f4fd",
+  "secret_source_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+  "secret_rlib": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libsecret-dbcd127907eff675.rlib",
+  "secret_rlib_sha256": "42eb51ae07c98c92685a7d0ece1dbc73c7b8aac9eb25c4033a68fbc94b22b358",
+  "optimized_redaction_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+  "secret_string_source_sha256": "6462815751ff23c3555c6f116c1190826527e39094f1792662c7ed7fd0c838d1",
+  "pty_rlib": {
+    "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libpty-129cd13a2c64482a.rlib",
+    "sha256": "ba8abcf8d9f509b28a233f93ac666192689e8d0a61f528b67520d0b9ee2e752a",
+    "mtime": 1791993172.783483
+  },
+  "libc_rlib": {
+    "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/liblibc-e8b4ceaeb7c818d7.rlib",
+    "sha256": "13e2a425384b2adb41b44d4aa0cd149418625cfb30c1f4c76fef78de145f374c"
+  },
+  "production_sources": {
+    "crates/pty/src/lib.rs": {
+      "sha256": "905717268d124c4938575b9d18fbcfd7f17bc08a45aec7d5397f206b1b57a70e",
+      "mtime": 1791988229.590663
+    },
+    "crates/pty/src/workload_signal.rs": {
+      "sha256": "cd205a7ea54eaf96bb98d8cb71ee3649f51e26ef338e8d3a0f7d1c536b20b75e",
+      "mtime": 1791987642.70318
+    },
+    "crates/app/src/cloud_agent.rs": {
+      "sha256": "76a973d53ecb3775bbea73cacedecb7f7c62d6ef5ac41a6da977cf5b830812ff",
+      "mtime": 1791869005.6834445
+    },
+    "crates/secret/src/redaction.rs": {
+      "sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+      "mtime": 1791859002.164165
+    }
+  },
+  "harness_sources": {
+    "redaction-production.rs": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+    "cloud_answers.rs": "0624b3bb0d7fa3ad07188953d17e2a9dd370049a4db306386b3e17f6452f7d1b",
+    "cloud_answers_optimized.rs": "34b2a4f1285c55e6970c32396abda607c3c23eff27b6b653b73897a9c4689f01",
+    "pty_nonfrozen.rs": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3"
+  },
+  "component_profiles": {
+    "secret-dbcd127907eff675": {
+      "rustc": 776363091828236830,
+      "features": "[]",
+      "declared_features": "[\"test-keyring-core\"]",
+      "target": 16016593377521430634,
+      "profile": 6675295047989516842,
+      "path": 10028241790879566848,
+      "deps": [
+        [
+          5278414788881890583,
+          "keyring_core",
+          false,
+          6824218041718898871
+        ],
+        [
+          5330460842384404171,
+          "serde_json",
+          false,
+          3199464084700103674
+        ],
+        [
+          10364619138950789809,
+          "anyhow",
+          false,
+          498932477327901009
+        ],
+        [
+          11320925355492709191,
+          "security_framework",
+          false,
+          8565127590075276224
+        ],
+        [
+          14063412941180217548,
+          "uuid",
+          false,
+          1782588006462945394
+        ],
+        [
+          15780690857268675611,
+          "core_foundation",
+          false,
+          4874559880089129544
+        ],
+        [
+          16217710483611827238,
+          "apple_native_keyring_store",
+          false,
+          1683166450050169546
+        ]
+      ],
+      "local": [
+        {
+          "CheckDepInfo": {
+            "dep_info": "debug/.fingerprint/secret-dbcd127907eff675/dep-lib-secret",
+            "checksum": false
+          }
+        }
+      ],
+      "rustflags": [],
+      "config": 8247474407144887393,
+      "compile_kind": 0
+    },
+    "pty-129cd13a2c64482a": {
+      "rustc": 776363091828236830,
+      "features": "[]",
+      "declared_features": "[]",
+      "target": 2546758406422367011,
+      "profile": 6675295047989516842,
+      "path": 11617896538172990327,
+      "deps": [
+        [
+          2950256323240053722,
+          "objc2_foundation",
+          false,
+          11688712215098699822
+        ],
+        [
+          6557439603276904804,
+          "serde",
+          false,
+          8762946889008840616
+        ],
+        [
+          10364619138950789809,
+          "anyhow",
+          false,
+          498932477327901009
+        ],
+        [
+          10504718112287328430,
+          "libc",
+          false,
+          17447893728885734710
+        ],
+        [
+          14757622794040968908,
+          "tracing",
+          false,
+          1422222354876996674
+        ],
+        [
+          17367423194345772232,
+          "portable_pty",
+          false,
+          15636605850962802349
+        ]
+      ],
+      "local": [
+        {
+          "CheckDepInfo": {
+            "dep_info": "debug/.fingerprint/pty-129cd13a2c64482a/dep-lib-pty",
+            "checksum": false
+          }
+        }
+      ],
+      "rustflags": [],
+      "config": 8247474407144887393,
+      "compile_kind": 0
+    }
+  }
+}

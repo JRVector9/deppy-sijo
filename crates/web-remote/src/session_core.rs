@@ -72,6 +72,25 @@ impl SessionCore {
         &self.dashboard
     }
 
+    pub fn set_cloud_control_sink(&self, sink: crate::cloud::CloudControlSink) {
+        self.dashboard.set_cloud_control_sink(sink);
+    }
+
+    /// Consume immediately before the App applies a queued operator effect.
+    pub fn authorize_cloud_control(
+        &self,
+        request: crate::cloud::CloudControlRequest,
+    ) -> Option<crate::cloud::CloudControlIntent> {
+        self.dashboard.authorize_cloud_control(request)
+    }
+
+    pub fn publish_cloud_snapshot(
+        &self,
+        snapshot: crate::cloud::CloudSnapshot,
+    ) -> Result<(), crate::cloud::CloudSnapshotError> {
+        self.dashboard.publish_cloud_snapshot(snapshot)
+    }
+
     /// 발송기가 아직 없으면 지금 만든다. 이미 있으면 그대로 둔다.
     ///
     /// Relay를 먼저 켜면 코어가 VAPID 키 없이 만들어진다. 그 뒤 web을 켜면 기존 코어를

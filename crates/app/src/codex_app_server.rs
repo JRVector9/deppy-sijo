@@ -400,6 +400,7 @@ pub struct CodexAppServerClient {
     events: Arc<EventBacklog>,
     stop_requested: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
+    child_termination: Option<Arc<Mutex<ChildTreeGuard>>>,
     /// chat wire 변환 프록시 (PR-L5) — client 수명에 묶여 shutdown/Drop 시 종료.
     llm_proxy: Option<crate::llm_proxy::LlmProxyHandle>,
 }
@@ -511,6 +512,9 @@ impl CodexAppServerClient {
         let (commands_tx, commands_rx) = mpsc::sync_channel(COMMAND_QUEUE_CAPACITY);
         let events = Arc::new(EventBacklog::default());
         let stop_requested = Arc::new(AtomicBool::new(false));
+        let stdin = AppServerStdin::new(stdin, Arc::clone(&stop_requested))?;
+        let child = Arc::new(Mutex::new(child));
+        let child_termination = Arc::clone(&child);
         let worker = thread::Builder::new()
             .name("codex-app-server".to_owned())
             .spawn({
@@ -537,6 +541,7 @@ impl CodexAppServerClient {
             events,
             stop_requested,
             worker: Some(worker),
+            child_termination: Some(child_termination),
             llm_proxy,
         })
     }
@@ -720,6 +725,14 @@ impl CodexAppServerClient {
 
     pub fn shutdown(&mut self) {
         self.stop_requested.store(true, Ordering::Release);
+        // Termination closes the pipe even if the worker is inside a platform blocking write.
+        // The guard keeps the leader unreaped until its entire process group has been killed.
+        if let Some(child) = self.child_termination.take() {
+            child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .terminate();
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -797,7 +810,10 @@ impl ChildTreeGuard {
     fn leader_exited_without_reap(&mut self) -> io::Result<bool> {
         #[cfg(unix)]
         {
-            let child_id = self.child_mut().id() as libc::id_t;
+            let Some(child) = self.child.as_ref() else {
+                return Ok(true);
+            };
+            let child_id = child.id() as libc::id_t;
             let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
             // SAFETY: `info` points to writable siginfo storage. WNOWAIT keeps
             // an exited leader waitable, so the pgid cannot be reused before
@@ -819,7 +835,9 @@ impl ChildTreeGuard {
         }
         #[cfg(not(unix))]
         {
-            self.child_mut().try_wait().map(|status| status.is_some())
+            self.child.as_mut().map_or(Ok(true), |child| {
+                child.try_wait().map(|status| status.is_some())
+            })
         }
     }
 }
@@ -1198,8 +1216,8 @@ impl WorkerState {
 
 #[allow(clippy::too_many_arguments)]
 fn worker_loop(
-    mut child: ChildTreeGuard,
-    mut stdin: ChildStdin,
+    child: Arc<Mutex<ChildTreeGuard>>,
+    mut stdin: AppServerStdin,
     stdout: ChildStdout,
     stderr: ChildStderr,
     options: CodexAppServerOptions,
@@ -1217,7 +1235,10 @@ fn worker_loop(
                 &repaint,
                 "transport_error:stdout_reader_spawn_failed".to_owned(),
             );
-            child.terminate();
+            child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .terminate();
             drop(incoming_rx);
             emit(&events, &repaint, CodexAppServerEvent::ConnectionStopped);
             return;
@@ -1231,7 +1252,10 @@ fn worker_loop(
                 &repaint,
                 "transport_error:stderr_reader_spawn_failed".to_owned(),
             );
-            child.terminate();
+            child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .terminate();
             drop(incoming_rx);
             let _ = stdout_reader.join();
             emit(&events, &repaint, CodexAppServerEvent::ConnectionStopped);
@@ -1273,7 +1297,14 @@ fn worker_loop(
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
 
-            match child.leader_exited_without_reap() {
+            if stop_requested.load(Ordering::Acquire) {
+                break;
+            }
+            match child
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .leader_exited_without_reap()
+            {
                 Ok(true) => {
                     emit_transport_error(
                         &events,
@@ -1302,7 +1333,10 @@ fn worker_loop(
     // Closing stdin requests a graceful shutdown first. If it does not exit
     // quickly, kill/reap prevents a detached helper from surviving app exit.
     drop(stdin);
-    child.terminate();
+    child
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .terminate();
     drop(incoming_rx);
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
@@ -1421,7 +1455,7 @@ fn io_error_code(error: &io::Error) -> &'static str {
 
 fn drain_incoming(
     incoming: &Receiver<Incoming>,
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     events: &EventBacklog,
     repaint: &egui::Context,
@@ -1456,7 +1490,7 @@ fn drain_incoming(
 
 fn handle_client_command(
     command: ClientCommand,
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     events: &EventBacklog,
     repaint: &egui::Context,
@@ -1700,7 +1734,7 @@ fn reject_client_command(
 }
 
 fn send_initialize(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     options: &CodexAppServerOptions,
 ) -> anyhow::Result<()> {
@@ -1726,7 +1760,7 @@ fn send_initialize(
 
 #[allow(clippy::too_many_arguments)] // Mirrors stable thread/start + first turn controls.
 fn start_thread(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: AgentSessionId,
     prompt: String,
@@ -1762,7 +1796,7 @@ fn start_thread(
 
 #[allow(clippy::too_many_arguments)] // Mirrors stable turn/start control fields.
 fn start_turn_for_session(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: AgentSessionId,
     prompt: String,
@@ -1806,7 +1840,7 @@ fn turn_start_params(
 }
 
 fn steer_turn_for_session(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: AgentSessionId,
     prompt: String,
@@ -1882,7 +1916,7 @@ fn insert_non_empty(params: &mut serde_json::Map<String, Value>, key: &str, valu
 }
 
 fn interrupt_turn(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: AgentSessionId,
 ) -> anyhow::Result<()> {
@@ -1907,7 +1941,7 @@ fn interrupt_turn(
 }
 
 fn respond_approval(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: &AgentSessionId,
     request_key: &str,
@@ -1927,7 +1961,7 @@ fn respond_approval(
 }
 
 fn request_thread_list(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     cursor: Option<String>,
     limit: Option<u32>,
@@ -1952,7 +1986,7 @@ fn request_thread_list(
 }
 
 fn request_thread_read(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     thread_id: String,
     include_turns: bool,
@@ -1981,7 +2015,7 @@ fn request_thread_read(
 
 #[allow(clippy::too_many_arguments)]
 fn request_thread_resume(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     session_id: AgentSessionId,
     thread_id: String,
@@ -2012,7 +2046,7 @@ fn request_thread_resume(
 }
 
 fn request_thread_archive(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     thread_id: String,
     reply: SyncSender<anyhow::Result<Value>>,
@@ -2039,7 +2073,7 @@ fn request_thread_archive(
 }
 
 fn request_model_list(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     cursor: Option<String>,
     limit: Option<u32>,
@@ -2064,7 +2098,7 @@ fn request_model_list(
 }
 
 fn request_skills_list(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     cwds: Vec<String>,
     force_reload: bool,
@@ -2088,7 +2122,7 @@ fn request_skills_list(
 }
 
 fn request_rate_limits(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     reply: SyncSender<anyhow::Result<Value>>,
 ) -> anyhow::Result<()> {
@@ -2161,7 +2195,7 @@ fn thread_resume_params(thread_id: String, cwd: Option<String>, model: Option<St
 
 fn handle_server_message(
     message: Value,
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     events: &EventBacklog,
     repaint: &egui::Context,
@@ -2179,7 +2213,7 @@ fn handle_server_message(
 
 fn handle_response(
     mut message: Value,
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     events: &EventBacklog,
     repaint: &egui::Context,
@@ -2904,7 +2938,7 @@ fn handle_notification(
 
 fn handle_server_request(
     message: Value,
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     state: &mut WorkerState,
     events: &EventBacklog,
     repaint: &egui::Context,
@@ -3007,7 +3041,7 @@ fn handle_server_request(
 }
 
 fn write_server_error(
-    stdin: &mut ChildStdin,
+    stdin: &mut AppServerStdin,
     id: Value,
     code: i64,
     message: &'static str,
@@ -3036,10 +3070,98 @@ fn session_and_turn(params: &Value, state: &WorkerState) -> Option<(AgentSession
     Some((session_id, turn_id))
 }
 
-fn write_message(stdin: &mut ChildStdin, message: &Value) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *stdin, message)?;
-    stdin.write_all(b"\n")?;
-    stdin.flush()?;
+/// One complete RPC frame owns a deadline; a peer that stops reading cannot occupy the
+/// command worker indefinitely. Shutdown also owns the child guard, so pipe cancellation
+/// reaches the ordinary reader join/reap path rather than detaching a blocked worker.
+struct AppServerStdin {
+    stream: ChildStdin,
+    stop_requested: Arc<AtomicBool>,
+}
+
+impl AppServerStdin {
+    fn new(stream: ChildStdin, stop_requested: Arc<AtomicBool>) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let fd = stream.as_raw_fd();
+            // SAFETY: stream owns this live pipe; no other writer shares its descriptor.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self {
+            stream,
+            stop_requested,
+        })
+    }
+
+    fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                if self.stop_requested.load(Ordering::Acquire) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "app-server stopped",
+                    ));
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "app-server write deadline",
+                    ));
+                }
+                match self.stream.write(remaining) {
+                    Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                    Ok(count) => remaining = &remaining[count..],
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        let mut descriptor = libc::pollfd {
+                            fd: self.stream.as_raw_fd(),
+                            events: libc::POLLOUT,
+                            revents: 0,
+                        };
+                        // SAFETY: descriptor is a single initialized pollfd for the live pipe.
+                        if unsafe { libc::poll(&mut descriptor, 1, 20) } < 0 {
+                            let error = io::Error::last_os_error();
+                            if error.kind() != io::ErrorKind::Interrupted {
+                                return Err(error);
+                            }
+                        }
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            if self.stop_requested.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "app-server stopped",
+                ));
+            }
+            // shutdown terminates the independently owned child before joining this writer.
+            self.stream.write_all(bytes)
+        }
+    }
+}
+
+fn write_message(stdin: &mut AppServerStdin, message: &Value) -> anyhow::Result<()> {
+    let mut bytes = serde_json::to_vec(message)?;
+    bytes.push(b'\n');
+    if let Err(error) = stdin.write_frame(&bytes) {
+        // A partial JSON frame cannot be followed by another request on this connection.
+        stdin.stop_requested.store(true, Ordering::Release);
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -3690,7 +3812,11 @@ mod tests {
             .stderr(Stdio::null());
         configure_process_group(&mut command);
         let mut child = ChildTreeGuard::new(command.spawn().unwrap());
-        let mut stdin = child.child_mut().stdin.take().unwrap();
+        let mut stdin = AppServerStdin::new(
+            child.child_mut().stdin.take().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
         let (tx, rx) = mpsc::sync_channel(1);
         tx.send(Incoming::StdoutError(
             "protocol_error:invalid_json".to_owned(),
@@ -3718,6 +3844,7 @@ mod tests {
             events: Arc::new(EventBacklog::default()),
             stop_requested: Arc::new(AtomicBool::new(false)),
             worker: None,
+            child_termination: None,
             llm_proxy: None,
         };
         for index in 0..COMMAND_QUEUE_CAPACITY {
@@ -4013,7 +4140,7 @@ mod tests {
         assert!(production.contains("ChildTreeGuard::new(child)"));
         assert!(production.contains("configure_process_group(&mut command)"));
         assert!(production.contains("libc::WNOWAIT"));
-        assert!(production.contains("child.terminate();\n    drop(incoming_rx);"));
+        assert!(production.contains(".terminate();\n    drop(incoming_rx);"));
         assert!(production.contains("EVENT_BACKPRESSURE_ERROR"));
         assert!(!production.contains(".get(\"result\").cloned()"));
         let worker = production
@@ -4024,5 +4151,204 @@ mod tests {
             .next()
             .unwrap();
         assert!(!worker.contains("try_wait"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_review_20261014_codex_stalled_stdin_shutdown_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("deppy-codex-stdin-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("fake-codex");
+        let pid_path = dir.join("pid");
+        let ready_path = dir.join("ready");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys, time
+pathlib.Path({pid:?}).write_text(str(os.getpid()))
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get('method') == 'initialize':
+        print(json.dumps({{'id': message['id'], 'result': {{}}}}), flush=True)
+    elif message.get('method') == 'thread/start':
+        pathlib.Path({ready:?}).write_text('ready')
+        print(json.dumps({{'id': message['id'], 'result': {{'thread': {{'id': 'fixture-thread'}}}}}}), flush=True)
+        time.sleep(30)
+        break
+"#,
+            pid = pid_path.to_string_lossy(),
+            ready = ready_path.to_string_lossy()
+        );
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut client = CodexAppServerClient::spawn(
+            CodexAppServerOptions {
+                executable: helper.as_os_str().to_owned(),
+                ..CodexAppServerOptions::default()
+            },
+            egui::Context::default(),
+        )
+        .unwrap();
+        client
+            .start_session(
+                "fixture-session".into(),
+                "x".repeat(200 * 1024),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !ready_path.exists() && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready_path.exists(),
+            "fake app-server must finish thread/start first"
+        );
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        // Wait for ThreadStarted, emitted just before production sends the oversized turn/start.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut thread_started = false;
+        while std::time::Instant::now() < deadline {
+            thread_started |= client.drain_events().into_iter().any(|event| {
+                matches!(
+                    event,
+                    CodexAppServerEvent::Session {
+                        event: AgentSessionEvent::ThreadStarted { .. },
+                        ..
+                    }
+                )
+            });
+            if thread_started {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            thread_started,
+            "production worker must enter its turn/start send"
+        );
+        thread::sleep(Duration::from_millis(50));
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        let shutdown = thread::spawn(move || {
+            client.shutdown();
+            let _ = done_tx.send(client.drain_events());
+        });
+        let first_result = done_rx.recv_timeout(Duration::from_millis(500));
+        let completed_without_rescue = first_result.is_ok();
+        let mut final_events = first_result.ok();
+        if !completed_without_rescue {
+            // Fixture-only rescue: avoid leaving a stuck test/helper. Never targets a live provider.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+            final_events = Some(
+                done_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("fixture rescue unblocks shutdown"),
+            );
+        }
+        shutdown.join().unwrap();
+        assert!(
+            final_events
+                .unwrap()
+                .iter()
+                .any(|event| matches!(event, CodexAppServerEvent::ConnectionStopped))
+        );
+        // The production guard must reap the fixture leader before shutdown returns.
+        assert_ne!(unsafe { libc::kill(pid, 0) }, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            completed_without_rescue,
+            "shutdown required externally killing the fake child because write_message cannot observe stop_requested"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_fix_lifecycle_codex_normal_large_rpc_and_event_drain_remain_intact() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("deppy-normal-rpc-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("fake-codex");
+        let payload_path = dir.join("payload-size");
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialize':
+        print(json.dumps({{'id': message['id'], 'result': {{}}}}), flush=True)
+    elif method == 'thread/start':
+        print(json.dumps({{'id': message['id'], 'result': {{'thread': {{'id': 'thread'}}}}}}), flush=True)
+    elif method == 'turn/start':
+        pathlib.Path({payload:?}).write_text(str(len(message['params']['input'][0]['text'])))
+        print(json.dumps({{'id': message['id'], 'result': {{'turn': {{'id': 'turn'}}}}}}), flush=True)
+"#,
+            payload = payload_path.to_string_lossy()
+        );
+        std::fs::write(&helper, script).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut client = CodexAppServerClient::spawn(
+            CodexAppServerOptions {
+                executable: helper.into_os_string(),
+                ..Default::default()
+            },
+            egui::Context::default(),
+        )
+        .unwrap();
+        client
+            .start_session(
+                "session".into(),
+                "x".repeat(200 * 1024),
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            events.extend(client.drain_events());
+            if events.iter().any(|event| {
+                matches!(
+                    event,
+                    CodexAppServerEvent::Session {
+                        event: AgentSessionEvent::TurnStarted { .. },
+                        ..
+                    }
+                )
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        client.shutdown();
+        events.extend(client.drain_events());
+        let payload_size = std::fs::read_to_string(payload_path).ok();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(payload_size.as_deref(), Some("204800"));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            CodexAppServerEvent::Session {
+                event: AgentSessionEvent::TurnStarted { .. },
+                ..
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, CodexAppServerEvent::ConnectionStopped))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, CodexAppServerEvent::TransportError { .. }))
+        );
     }
 }

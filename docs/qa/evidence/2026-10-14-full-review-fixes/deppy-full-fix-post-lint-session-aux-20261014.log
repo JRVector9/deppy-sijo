@@ -1,0 +1,10 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.18s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 4 tests
+test session_aux::tests::full_fix_20261014_document_explicit_recovery_excludes_live_owner ... ok
+test session_aux::tests::git_results_drop_only_when_the_same_kind_is_reissued ... ok
+test session_aux::tests::session_aux_retains_live_or_open_documents_only ... ok
+test session_aux::tests::session_aux_switch_restores_views_and_routes_late_results ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 3249 filtered out; finished in 0.00s

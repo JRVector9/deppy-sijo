@@ -1,0 +1,22 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 13.79s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 1 test
+test cloud_agent::ui::redesign_tests::redesign_narrow_settings_description_fits_before_the_next_row ... FAILED
+
+failures:
+
+---- cloud_agent::ui::redesign_tests::redesign_narrow_settings_description_fits_before_the_next_row stdout ----
+
+thread 'cloud_agent::ui::redesign_tests::redesign_narrow_settings_description_fits_before_the_next_row' (27863116) panicked at crates/app/src/cloud_agent/ui/redesign_tests.rs:550:5:
+wrapped description is clipped by the fixed row: [[34.0 259.0] - [322.0 304.0]], next=[[34.0 311.0] - [94.8 327.0]]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    cloud_agent::ui::redesign_tests::redesign_narrow_settings_description_fits_before_the_next_row
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3189 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

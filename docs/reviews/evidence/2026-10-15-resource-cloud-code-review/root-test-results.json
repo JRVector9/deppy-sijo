@@ -1,0 +1,83 @@
+[
+  {
+    "name": "app-cloud",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "cloud_agent::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/app-cloud.log",
+    "summaries": [
+      "test result: ok. 161 passed; 0 failed; 3 ignored; 0 measured; 3089 filtered out; finished in 26.23s"
+    ]
+  },
+  {
+    "name": "cloud-history-worker",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "cloud_history_worker::",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/cloud-history-worker.log",
+    "summaries": [
+      "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 3247 filtered out; finished in 0.07s"
+    ]
+  },
+  {
+    "name": "agent-mcp-web",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "agent-mcp",
+      "-p",
+      "web-remote",
+      "--no-fail-fast",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/agent-mcp-web.log",
+    "summaries": [
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.00s",
+      "test result: ok. 67 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.23s",
+      "test result: ok. 388 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 42.17s",
+      "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.10s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+      "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+    ]
+  }
+]

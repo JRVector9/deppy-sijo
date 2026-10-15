@@ -1,0 +1,2456 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.20s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 4 tests
+test cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy ... FAILED
+test cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement ... FAILED
+
+failures:
+
+---- cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display stdout ----
+
+thread 'cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display' (22854658) panicked at crates/app/src/cloud_agent.rs:2119:9:
+assertion `left == right` failed
+  left: "fixture-secret-access-token-123456789"
+ right: "[REDACTED]"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement stdout ----
+
+thread 'cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement' (22854659) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:486:5:
+assertion `left == right` failed
+  left: "First: fixture-notify-\naccess-token-123456789. Second: fixture-notify-\nreplaced-token-987654321."
+ right: "First: [REDACTED]. Second: fixture-notify-\nreplaced-token-987654321."
+
+---- cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy stdout ----
+
+thread 'cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy' (22854660) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:592:13:
+No nodes found matching the query:
+By {
+    label: "First: [REDACTED]. Second: fixture-notify-\nreplaced-token-987654321.",
+}
+
+On node:
+Node {
+    id: NodeId(
+        TreeIndex(
+            0,
+        ),
+        #13826925289788388,
+    ),
+    role: Window,
+    focused: true,
+    hidden: false,
+    disabled: false,
+    children: [
+        Node {
+            id: NodeId(
+                TreeIndex(
+                    0,
+                ),
+                #18356943641707106210,
+            ),
+            role: GenericContainer,
+            focused: false,
+            hidden: false,
+            disabled: false,
+            children: [
+                Node {
+                    id: NodeId(
+                        TreeIndex(
+                            0,
+                        ),
+                        #17717534622495252412,
+                    ),
+                    role: GenericContainer,
+                    focused: false,
+                    hidden: false,
+                    disabled: false,
+                    children: [
+                        Node {
+                            id: NodeId(
+                                TreeIndex(
+                                    0,
+                                ),
+                                #15707054694645992835,
+                            ),
+                            role: GenericContainer,
+                            focused: false,
+                            hidden: false,
+                            disabled: false,
+                            children: [
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #17970341196664973444,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #8714522455845931962,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #10978825285480028651,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #16336440534934440713,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Cloud answer · Review Bot · late-notify-run · just now",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #13469840653692588432,
+                                                            ),
+                                                            role: GenericContainer,
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #13865406263329443368,
+                                                                    ),
+                                                                    role: GenericContainer,
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #3872332532555673730,
+                                                                            ),
+                                                                            role: Label,
+                                                                            value: "First: fixture-notify-\naccess-token-123456789. Second: fixture-notify-\nreplaced-token-987654321.",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #16397811757406857668,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "First: fixture-notify-\n",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #6643552383208595506,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "access-token-123456789. Second: fixture-notify-\n",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #12719659322956293830,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "replaced-token-987654321.",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                            ],
+                                                                        },
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #11880849760349034234,
+                                                                            ),
+                                                                            role: Button,
+                                                                            label: "Copy answer",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [],
+                                                                        },
+                                                                    ],
+                                                                },
+                                                            ],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
+
+---- cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement stdout ----
+
+thread 'cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement' (22854661) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:517:13:
+No nodes found matching the query:
+By {
+    label: "First: [REDACTED]. Second: fixture-notify-\nreplaced-token-987654321.",
+}
+
+On node:
+Node {
+    id: NodeId(
+        TreeIndex(
+            0,
+        ),
+        #13826925289788388,
+    ),
+    role: Window,
+    focused: true,
+    hidden: false,
+    disabled: false,
+    children: [
+        Node {
+            id: NodeId(
+                TreeIndex(
+                    0,
+                ),
+                #18356943641707106210,
+            ),
+            role: GenericContainer,
+            focused: false,
+            hidden: false,
+            disabled: false,
+            children: [
+                Node {
+                    id: NodeId(
+                        TreeIndex(
+                            0,
+                        ),
+                        #17717534622495252412,
+                    ),
+                    role: GenericContainer,
+                    focused: false,
+                    hidden: false,
+                    disabled: false,
+                    children: [
+                        Node {
+                            id: NodeId(
+                                TreeIndex(
+                                    0,
+                                ),
+                                #15707054694645992835,
+                            ),
+                            role: GenericContainer,
+                            focused: false,
+                            hidden: false,
+                            disabled: false,
+                            children: [
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #8669862286004795004,
+                                    ),
+                                    role: Label,
+                                    value: "Cloud agents",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17553581888735200045,
+                                            ),
+                                            role: TextRun,
+                                            value: "Cloud agents",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #14039979715550713147,
+                                    ),
+                                    role: Label,
+                                    value: "Cloud agents can read shared sessions and send their own answers back here.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #18367637817827435277,
+                                            ),
+                                            role: TextRun,
+                                            value: "Cloud agents can read shared sessions and send their own answers back here.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #14643775803381868189,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17965116076298040953,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #13047799966108097551,
+                                                    ),
+                                                    role: RadioButton,
+                                                    label: "Generate address automatically",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    toggled: False,
+                                                    children: [],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #10860645148375964996,
+                                                    ),
+                                                    role: RadioButton,
+                                                    label: "Connect a fixed address",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    toggled: True,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #4224441750601460982,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #9464177661363267544,
+                                                    ),
+                                                    role: Label,
+                                                    value: "Local port",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #4172527019402657214,
+                                                            ),
+                                                            role: TextRun,
+                                                            value: "Local port",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #5096569956238024236,
+                                                    ),
+                                                    role: SpinButton,
+                                                    value: "8739",
+                                                    numeric_value: 8739.0,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    children: [],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #17038491087661471696,
+                                                    ),
+                                                    role: Label,
+                                                    value: "Public HTTPS host",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #17956801779120904170,
+                                                            ),
+                                                            role: TextRun,
+                                                            value: "Public HTTPS host",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #13785465103212633149,
+                                                    ),
+                                                    role: TextInput,
+                                                    value: "",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #862944923867833458,
+                                                            ),
+                                                            role: TextRun,
+                                                            value: "",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #18221937910624050490,
+                                    ),
+                                    role: Label,
+                                    value: "For a stable address, enter a hostname and optional port only. Configure its HTTPS tunnel separately; use a different local port from mobile web.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #14228673169541781246,
+                                            ),
+                                            role: TextRun,
+                                            value: "For a stable address, enter a hostname and optional port only. Configure its HTTPS tunnel separately; use a different local port from mobile web.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #7353170750549303982,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5194166168094706679,
+                                            ),
+                                            role: Button,
+                                            label: "Connection profiles",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #12879995488181275330,
+                                    ),
+                                    role: Label,
+                                    value: "Local MCP server ready · 127.0.0.1:64885",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17264494918056882749,
+                                            ),
+                                            role: TextRun,
+                                            value: "Local MCP server ready · 127.0.0.1:64885",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #14772891175037339825,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #7436388315351778554,
+                                            ),
+                                            role: Label,
+                                            value: "Local server only · cloud access needs a public HTTPS URL",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #12033884441269890504,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Local server only · cloud access needs a public HTTPS URL",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #2168849912905885805,
+                                    ),
+                                    role: Label,
+                                    value: "Server readiness does not confirm a bot connection. Register the URL in your connector, authenticate, then call list_sessions.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17560494722398124206,
+                                            ),
+                                            role: TextRun,
+                                            value: "Server readiness does not confirm a bot connection. Register the URL in your connector, authenticate, then call list_sessions.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15580703176334154587,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5412870696684376409,
+                                            ),
+                                            role: Button,
+                                            label: "Disconnect · revoke token",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #10458716779698667964,
+                                            ),
+                                            role: Button,
+                                            label: "Rotate token",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #14943208659467710602,
+                                            ),
+                                            role: Button,
+                                            label: "Take back all input control",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #10138386676511840483,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #4407006306294794910,
+                                            ),
+                                            role: Label,
+                                            value: "Local URL",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #1663751807892300042,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Local URL",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #488232958669910758,
+                                            ),
+                                            role: Label,
+                                            value: "http://127.0.0.1:64885/mcp",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #17511667381213234706,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "http://127.0.0.1:64885/mcp",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #10985873632779211233,
+                                            ),
+                                            role: Button,
+                                            label: "Copy URL",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #379802931078488989,
+                                    ),
+                                    role: Label,
+                                    value: "Token expires in 86400s · revoked when app exits.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17929699217756344847,
+                                            ),
+                                            role: TextRun,
+                                            value: "Token expires in 86400s · revoked when app exits.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #14587280960440394951,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5116240839776573848,
+                                            ),
+                                            role: CheckBox,
+                                            label: "Show token",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            toggled: False,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #9065350602173051073,
+                                            ),
+                                            role: Button,
+                                            label: "Copy token",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13995635006678710551,
+                                            ),
+                                            role: Label,
+                                            value: "••••••••••••••••",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #3819303758402113582,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "••••••••••••••••",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #9883033656702079441,
+                                    ),
+                                    role: Label,
+                                    value: "Connections",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #2619173934939808508,
+                                            ),
+                                            role: TextRun,
+                                            value: "Connections",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #7980009041364268819,
+                                    ),
+                                    role: Label,
+                                    value: "Issued credentials wait for actual authentication. Successful tools are observed separately; provider account compatibility is not certified.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #9214385522716574408,
+                                            ),
+                                            role: TextRun,
+                                            value: "Issued credentials wait for actual authentication. Successful tools are observed separately; provider account compatibility is not certified.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #106298063280242776,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #3531848574624913879,
+                                            ),
+                                            role: Label,
+                                            value: "New manual connection name",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #17748742615539151791,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "New manual connection name",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #3227062218459481385,
+                                            ),
+                                            role: TextInput,
+                                            label: "New manual connection name",
+                                            value: "",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #11464921243921123221,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #16693024927478272623,
+                                            ),
+                                            role: CheckBox,
+                                            label: "Include input scope",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            toggled: False,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #18380240161210343675,
+                                            ),
+                                            role: Button,
+                                            label: "Issue and copy independent token",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #18424199197807481569,
+                                    ),
+                                    role: Label,
+                                    value: "Each manual connector can have its own token. Read scope is the default; session reading and input still need separate owner consent.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5062829029010430553,
+                                            ),
+                                            role: TextRun,
+                                            value: "Each manual connector can have its own token. Read scope is the default; session reading and input still need separate owner consent.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #16128867753882555994,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #9440567304817587918,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #672592051984312622,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #5435742106991576477,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Review Bot · Credential issued · waiting for authentication",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            toggled: True,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #15868287488354301240,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #7771449841816700421,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Research Bot · Credential issued · waiting for authentication",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            toggled: False,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #14975279745961249171,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #13406554901896933674,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Shared manual bearer · Credential issued · waiting for authentication",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            toggled: False,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #3860295045600423958,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #11031249509926154245,
+                                            ),
+                                            role: Label,
+                                            value: "Connection name",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #15220498363901284187,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Connection name",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #15711498899489053703,
+                                            ),
+                                            role: TextInput,
+                                            label: "Connection name",
+                                            value: "Review Bot",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #16098240025202787849,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Review Bot",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #15511555772178872924,
+                                            ),
+                                            role: Button,
+                                            label: "Save connection name",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13299434657438930234,
+                                            ),
+                                            role: Button,
+                                            label: "Revoke this connection",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #1833889773028366035,
+                                    ),
+                                    role: Label,
+                                    value: "Manual bearer · Read and input scope · Authentication expires in 86400s",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #15049913828809932265,
+                                            ),
+                                            role: TextRun,
+                                            value: "Manual bearer · Read and input scope · Authentication expires in 86400s",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15630279651268710147,
+                                    ),
+                                    role: Label,
+                                    value: "ID: 5cbb5500-a7dc-46c6-8c5b-b3643766d93f",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #12518746555782624422,
+                                            ),
+                                            role: TextRun,
+                                            value: "ID: 5cbb5500-a7dc-46c6-8c5b-b3643766d93f",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #2791895439061494063,
+                                    ),
+                                    role: Label,
+                                    value: "Grant each connection reading and input separately. Input requires an unexpired single-writer lease.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #6394909047750880965,
+                                            ),
+                                            role: TextRun,
+                                            value: "Grant each connection reading and input separately. Input requires an unexpired single-writer lease.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #16925603162880130514,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #11588704025958003684,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #14798124276683333771,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #16118270238246400197,
+                                                            ),
+                                                            role: Label,
+                                                            value: "workspace · Review pane",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #7009144377543921710,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "workspace · Review pane",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #11268870887146339746,
+                                                            ),
+                                                            role: Label,
+                                                            value: "Agent · Codex · gpt-6.1-sol · xhigh",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #5611722877267795404,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "Agent · Codex · gpt-6.1-sol · xhigh",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #4124283714550976983,
+                                                            ),
+                                                            role: Label,
+                                                            value: "Local session status: Running",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #8589716005280418732,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "Local session status: Running",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #17492678908918685106,
+                                                            ),
+                                                            role: Label,
+                                                            value: "Status observation time unavailable",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #12768356944655805516,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "Status observation time unavailable",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #8800246616789983979,
+                                                            ),
+                                                            role: GenericContainer,
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #11621252342118115866,
+                                                                    ),
+                                                                    role: CheckBox,
+                                                                    label: "Allow this connection to read · receive answers",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    toggled: False,
+                                                                    children: [],
+                                                                },
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #6191046983408934128,
+                                                                    ),
+                                                                    role: CheckBox,
+                                                                    label: "Allow this connection to input",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: true,
+                                                                    toggled: False,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #17773394317146194612,
+                                                            ),
+                                                            role: Label,
+                                                            value: "Input controller: You",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #12787626621291975000,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "Input controller: You",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #18292019273754169189,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Take back this session's input",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: true,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #7889373947815104614,
+                                    ),
+                                    role: Label,
+                                    value: "Cloud work",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #1556624739301455697,
+                                            ),
+                                            role: TextRun,
+                                            value: "Cloud work",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #14779832762852528518,
+                                    ),
+                                    role: Label,
+                                    value: "State and progress are agent reports. Local terminal status is separate; a quiet screen or missing heartbeat does not prove completion. Recent work is bounded to 100 reports.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #6774240273466247442,
+                                            ),
+                                            role: TextRun,
+                                            value: "State and progress are agent reports. Local terminal status is separate; a quiet screen or missing heartbeat does not prove completion. Recent work is bounded to 100 reports.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #3581895982066404584,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #9489106157217628788,
+                                            ),
+                                            role: Label,
+                                            value: "Search cloud work",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #4752459460057787344,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "Search cloud work",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13244746593793151170,
+                                            ),
+                                            role: TextInput,
+                                            label: "Search cloud work",
+                                            value: "",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #14371613440941149542,
+                                                    ),
+                                                    role: TextRun,
+                                                    value: "",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #6045368989440647097,
+                                            ),
+                                            role: Button,
+                                            label: "All reports",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            toggled: True,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #9053613549157983998,
+                                            ),
+                                            role: Button,
+                                            label: "Unfinished · unknown",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            toggled: False,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #12596258839706677828,
+                                            ),
+                                            role: Button,
+                                            label: "Finished reports",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            toggled: False,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #13323497165515465598,
+                                    ),
+                                    role: Label,
+                                    value: "No cloud work reports yet. Use start_run and update_run from the connector.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #2560690632416400325,
+                                            ),
+                                            role: TextRun,
+                                            value: "No cloud work reports yet. Use start_run and update_run from the connector.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15060559624111917115,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #3473057389553263163,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #1400459719674496180,
+                                    ),
+                                    role: Label,
+                                    value: "Shared sessions",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #631146326128423308,
+                                            ),
+                                            role: TextRun,
+                                            value: "Shared sessions",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15679700590573628489,
+                                    ),
+                                    role: Label,
+                                    value: "Share reading and allow input separately. Input permission resets on app exit and token rotation.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #3382471451170009339,
+                                            ),
+                                            role: TextRun,
+                                            value: "Share reading and allow input separately. Input permission resets on app exit and token rotation.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15657824684640324812,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #15679684322915019605,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #4891389905375349087,
+                                                    ),
+                                                    role: CheckBox,
+                                                    label: "Read · receive answers",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    toggled: False,
+                                                    children: [],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #18072252279411170427,
+                                                    ),
+                                                    role: CheckBox,
+                                                    label: "Allow input",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: true,
+                                                    toggled: False,
+                                                    children: [],
+                                                },
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #8745500639900612085,
+                                                    ),
+                                                    role: Label,
+                                                    value: "workspace · Review pane / Codex · gpt-6.1-sol · xhigh",
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #11580342509592437322,
+                                                            ),
+                                                            role: TextRun,
+                                                            value: "workspace · Review pane / Codex · gpt-6.1-sol · xhigh",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #7534565986546409945,
+                                    ),
+                                    role: Label,
+                                    value: "Ended sessions",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13818753591057499817,
+                                            ),
+                                            role: TextRun,
+                                            value: "Ended sessions",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #15614966180934099134,
+                                    ),
+                                    role: Label,
+                                    value: "Includes closed sessions. Ended sessions cannot be shared or controlled.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #4971617139035800265,
+                                            ),
+                                            role: TextRun,
+                                            value: "Includes closed sessions. Ended sessions cannot be shared or controlled.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #8266194238240492946,
+                                    ),
+                                    role: Label,
+                                    value: "No ended sessions in history.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #10432924685430896102,
+                                            ),
+                                            role: TextRun,
+                                            value: "No ended sessions in history.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #9959096839351262672,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #3237706439682693957,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #6217762289917784507,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #24549957174152790,
+                                    ),
+                                    role: Button,
+                                    label: "Copy agent instructions",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #3252845554134139398,
+                                    ),
+                                    role: Label,
+                                    value: "Use notify to receive the agent's own answer in notifications and the history below.",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #13353002963041899587,
+                                            ),
+                                            role: TextRun,
+                                            value: "Use notify to receive the agent's own answer in notifications and the history below.",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #2424097068085140276,
+                                    ),
+                                    role: Label,
+                                    value: "Answers · input history",
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #17478662530951079458,
+                                            ),
+                                            role: TextRun,
+                                            value: "Answers · input history",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                    ],
+                                },
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #13277951990075469658,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #5463599451467108951,
+                                            ),
+                                            role: Button,
+                                            label: "Cloud answer · just now · review-s",
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [],
+                                        },
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #4068997111585693222,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #12186132024382937933,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #3538974072961424779,
+                                                            ),
+                                                            role: Label,
+                                                            value: "w / review-session",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #6533897234858772469,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "w / review-session",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #213668738641899110,
+                                                            ),
+                                                            role: Label,
+                                                            value: "Answer stored",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #16832854262784156567,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "Answer stored",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #515135505973000525,
+                                                            ),
+                                                            role: Label,
+                                                            value: "First: fixture-notify-\naccess-token-123456789. Second: fixture-notify-\nreplaced-token-987654321.",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #13885180482562126917,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "First: fixture-notify-\n",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #16023471695449862639,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "access-token-123456789. Second: fixture-notify-\n",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #11925111674350174036,
+                                                                    ),
+                                                                    role: TextRun,
+                                                                    value: "replaced-token-987654321.",
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [],
+                                                                },
+                                                            ],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #10625468081191750112,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Copy answer",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
+
+
+failures:
+    cloud_agent::integration_tests::late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display
+    cloud_agent::ui::management_tests::late_secret_notify_cloud_snapshot_rescrubs_loaded_history_and_replacement
+    cloud_agent::ui::management_tests::late_secret_notify_session_safe_view_masks_display_and_actual_copy
+    cloud_agent::ui::management_tests::late_secret_notify_settings_masks_display_and_actual_copy_after_replacement
+
+test result: FAILED. 0 passed; 4 failed; 0 ignored; 0 measured; 3170 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

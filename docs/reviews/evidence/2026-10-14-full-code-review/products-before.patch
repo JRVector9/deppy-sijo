@@ -1,0 +1,2717 @@
+diff --git a/crates/app/src/app.rs b/crates/app/src/app.rs
+index f7171e10..1f26bd5b 100644
+--- a/crates/app/src/app.rs
++++ b/crates/app/src/app.rs
+@@ -1,3 +1,6 @@
++#[path = "file_delete.rs"]
++pub(crate) mod file_delete;
++
+ #[cfg(test)]
+ #[path = "keychain_startup_tests.rs"]
+ mod keychain_startup_tests;
+@@ -5368,20 +5371,28 @@ fn execute_settings_job_with_repair(
+             SettingsOutcomeKind::DotenvResynced(result)
+         }
+         SettingsJobAction::SetProjectPath { path } => {
+-            let path_string = path.to_string_lossy().into_owned();
+-            let identity = (!path_string.trim().is_empty())
+-                .then(|| crate::folder_identity::probe(&path))
+-                .flatten();
+-            let result = db
+-                .set_workspace_path_and_anchor_with_volume(
++            // A failed picker selection is not an intentional detach. Resolve
++            // the selected directory before changing the saved path/identity.
++            let result = (|| {
++                let path_string = path.to_str().ok_or(SettingsErrorCode::ProjectPath)?;
++                let identity = if path_string.trim().is_empty() {
++                    None
++                } else {
++                    Some(
++                        crate::folder_identity::probe(&path)
++                            .ok_or(SettingsErrorCode::ProjectPath)?,
++                    )
++                };
++                db.set_workspace_path_and_anchor_with_volume(
+                     &workspace_id,
+-                    &path_string,
++                    path_string,
+                     identity.map(|value| value.anchor.dev),
+                     identity.map(|value| value.anchor.ino),
+                     identity.and_then(|value| value.volume),
+                 )
+-                .map_err(|_| SettingsErrorCode::ProjectPath);
+-            if result.is_ok() && path_string.trim().is_empty() && {
++                .map_err(|_| SettingsErrorCode::ProjectPath)
++            })();
++            if result.is_ok() && path.to_str().is_some_and(|value| value.trim().is_empty()) && {
+                 let mut repository = AppDotenvRepository(db);
+                 crate::dotenv_sync::remove_workspace_dotenv(
+                     &mut repository,
+@@ -13993,6 +14004,7 @@ impl AppHostIoFallback {
+                 operation,
+                 generation,
+                 result: Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure),
++                delete_guard: None,
+             }),
+             Self::FileTreeMaintenance {
+                 operation,
+@@ -14095,6 +14107,7 @@ struct AppFileTreeWatchJob {
+ /// 걸러낸다.
+ struct AppFileTreeWatchApplied {
+     root: PathBuf,
++    physical_root: PathBuf,
+     ignored_prefixes: Vec<PathBuf>,
+     show_hidden: bool,
+ }
+@@ -14140,6 +14153,7 @@ struct AppFileTreeWatcher {
+     generation: u64,
+     revision: u64,
+     root: PathBuf,
++    physical_root: PathBuf,
+     ignored_prefixes: Vec<PathBuf>,
+     show_hidden: bool,
+ }
+@@ -14220,6 +14234,7 @@ impl AppFileTreeWatcher {
+             generation: 0,
+             revision: 0,
+             root: PathBuf::new(),
++            physical_root: PathBuf::new(),
+             ignored_prefixes: Vec::new(),
+             show_hidden: false,
+         })
+@@ -14367,6 +14382,7 @@ impl AppFileTreeWatcher {
+         }
+         self.generation = completion.generation;
+         self.root = applied.root.clone();
++        self.physical_root = applied.physical_root.clone();
+         self.ignored_prefixes = applied.ignored_prefixes.clone();
+         self.show_hidden = applied.show_hidden;
+         *self
+@@ -14395,6 +14411,15 @@ impl AppFileTreeWatcher {
+         }
+         let mut events = Vec::with_capacity(ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS);
+         for path in paths {
++            // FSEvents returns physical paths. Map them using the namespace
++            // captured at registration, including files already deleted.
++            let path = if path.starts_with(&self.root) {
++                path
++            } else if let Ok(relative) = path.strip_prefix(&self.physical_root) {
++                self.root.join(relative)
++            } else {
++                continue;
++            };
+             if !path.starts_with(&self.root)
+                 || self
+                     .ignored_prefixes
+@@ -14476,21 +14501,31 @@ fn run_app_file_tree_watch_worker(
+             ignored_prefixes,
+             show_hidden,
+         } = job;
+-        let root = directories.first().cloned();
+         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+-            app_file_tree_apply_watch_diff(&mut watcher, &mut watched, directories)
+-        }));
+-        let result = match (outcome, root) {
+-            (Ok(Ok(())), Some(root)) => Ok(AppFileTreeWatchApplied {
++            use ui::file_tree::FileTreeMaintenanceErrorCode as Error;
++            let root = directories.first().cloned().ok_or(Error::InvalidSnapshot)?;
++            let physical_root =
++                std::fs::canonicalize(&root).map_err(|_| Error::WatchUnavailable)?;
++            let physical_directories = directories
++                .into_iter()
++                .map(|directory| {
++                    directory
++                        .strip_prefix(&root)
++                        .map(|relative| physical_root.join(relative))
++                        .map_err(|_| Error::InvalidSnapshot)
++                })
++                .collect::<Result<Vec<_>, _>>()?;
++            app_file_tree_apply_watch_diff(&mut watcher, &mut watched, physical_directories)?;
++            Ok(AppFileTreeWatchApplied {
+                 root,
++                physical_root,
+                 ignored_prefixes,
+                 show_hidden,
+-            }),
+-            // submit_replace가 빈 directories를 이미 걸러내므로 root == None은 실제로는
+-            // 도달하지 않는다 — 방어적 분기.
+-            (Ok(Ok(())), None) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot),
+-            (Ok(Err(code)), _) => Err(code),
+-            (Err(_), _) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
++            })
++        }));
++        let result = match outcome {
++            Ok(result) => result,
++            Err(_) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
+         };
+         let is_native_failure = matches!(
+             result,
+@@ -15268,6 +15303,7 @@ fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
+             .is_some_and(|name| ui::os_str_canonically_eq(name, requested_name))
+ }
+
++#[cfg(test)]
+ fn run_file_tree_host_io(
+     request: ui::file_tree::FileTreeIoRequest,
+     cancel: &std::sync::atomic::AtomicBool,
+@@ -15280,7 +15316,64 @@ fn run_file_tree_host_io(
+     )
+ }
+
++#[cfg(test)]
+ fn run_file_tree_host_io_with_native(
++    request: ui::file_tree::FileTreeIoRequest,
++    cancel: &std::sync::atomic::AtomicBool,
++    clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
++    trash_path: impl FnMut(&Path) -> Result<(), ()>,
++) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
++    run_file_tree_host_io_with_delete_guard(request, cancel, clipboard_paths, trash_path).0
++}
++
++fn run_file_tree_host_io_with_delete_guard(
++    request: ui::file_tree::FileTreeIoRequest,
++    cancel: &std::sync::atomic::AtomicBool,
++    clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
++    trash_path: impl FnMut(&Path) -> Result<(), ()>,
++) -> (
++    Result<(), ui::file_tree::FileTreeIoErrorCode>,
++    Option<file_delete::FileTreeDeleteGuard>,
++) {
++    use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreeIoRequest as Request};
++    let guard = if let Request::Trash {
++        root: Some(root),
++        target,
++        ..
++    } = &request
++    {
++        if app_host_file_operation_cancelled(cancel).is_err() {
++            return (Err(Error::NativeFailure), None);
++        }
++        match file_delete::FileTreeDeleteGuard::capture(root.as_path(), target.as_path()) {
++            Ok(guard) => Some(guard),
++            // A file can be movable without permission to open it. Keep the
++            // recoverable Trash attempt, but grant no permanent-delete proof.
++            Err(Error::InvalidPath | Error::NativeFailure) => None,
++            Err(error) => return (Err(error), None),
++        }
++    } else {
++        None
++    };
++    let target = match &request {
++        Request::Trash { target, .. } => Some(target.as_path().to_path_buf()),
++        _ => None,
++    };
++    let result = run_file_tree_host_io_effect(request, cancel, clipboard_paths, trash_path);
++    let guard = if result == Err(Error::TrashUnavailable)
++        && guard
++            .as_ref()
++            .zip(target.as_deref())
++            .is_some_and(|(guard, target)| guard.validate(target).is_ok())
++    {
++        guard
++    } else {
++        None
++    };
++    (result, guard)
++}
++
++fn run_file_tree_host_io_effect(
+     request: ui::file_tree::FileTreeIoRequest,
+     cancel: &std::sync::atomic::AtomicBool,
+     mut clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
+@@ -15365,7 +15458,9 @@ fn run_file_tree_host_io_with_native(
+             };
+             app_host_transfer_files(None, sources, destination.as_path(), move_files, cancel)
+         }
+-        Request::Trash { target, preflight } => {
++        Request::Trash {
++            target, preflight, ..
++        } => {
+             let mut validation = AppHostFileOperationBudget::default();
+             let target = if let Some((root, paths)) = preflight {
+                 let sources = app_host_prepare_file_sources(
+@@ -15394,13 +15489,7 @@ fn run_file_tree_host_io_with_native(
+             app_host_file_operation_cancelled(cancel).map_err(|_| Error::TrashUnavailable)?;
+             trash_path(&target).map_err(|_| Error::TrashUnavailable)
+         }
+-        Request::DeletePermanently { target } => {
+-            let mut validation = AppHostFileOperationBudget::default();
+-            app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
+-                .map_err(|_| Error::NativeFailure)?;
+-            app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
+-            app_host_remove_all(target.as_path()).map_err(|_| Error::NativeFailure)
+-        }
++        Request::DeletePermanently { target, guard } => guard.remove(target.as_path(), cancel),
+         Request::CopyFileUrls { paths } => {
+             ui::clipboard_image::copy_file_urls_to_clipboard(&paths.into_paths())
+                 .map_err(|_| Error::NativeFailure)
+@@ -15438,6 +15527,51 @@ pub(crate) fn pr11_private_file_fixture_io(
+     )
+ }
+
++#[cfg(test)]
++pub(crate) fn popup_review_unavailable_trash(
++    intent: ui::file_tree::FileTreeIoIntent,
++) -> ui::file_tree::FileTreeIoCompletion {
++    let (result, delete_guard) = run_file_tree_host_io_with_delete_guard(
++        intent.request,
++        &std::sync::atomic::AtomicBool::new(false),
++        || None,
++        |_| Err(()),
++    );
++    ui::file_tree::FileTreeIoCompletion {
++        operation: intent.operation,
++        generation: intent.generation,
++        result,
++        delete_guard,
++    }
++}
++
++#[cfg(test)]
++pub(crate) use file_delete::DeleteStage as PopupReviewDeleteStage;
++
++#[cfg(test)]
++pub(crate) fn popup_review_delete_at_boundary(
++    request: ui::file_tree::FileTreeIoRequest,
++    _root: &Path,
++    hook: impl FnMut(PopupReviewDeleteStage, &Path),
++) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
++    match request {
++        ui::file_tree::FileTreeIoRequest::DeletePermanently { target, guard } => guard
++            .remove_with_hook(
++                target.as_path(),
++                &std::sync::atomic::AtomicBool::new(false),
++                hook,
++            ),
++        _ => panic!("permanent deletion fixture only"),
++    }
++}
++
++#[cfg(test)]
++pub(crate) fn popup_review_cancelled_delete(
++    request: ui::file_tree::FileTreeIoRequest,
++) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
++    run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(true))
++}
++
+ fn read_inbox_log_preview(
+     source: &ui::inbox_waiting::LogPreviewSource,
+ ) -> Result<Option<ui::inbox_waiting::LogPreviewSnapshot>, ui::inbox_waiting::LogPreviewErrorCode> {
+@@ -15619,10 +15753,17 @@ fn run_app_host_io(
+         AppHostIoAction::FileTree(intent) => {
+             let operation = intent.operation;
+             let generation = intent.generation;
++            let (result, delete_guard) = run_file_tree_host_io_with_delete_guard(
++                intent.request,
++                cancel,
++                ui::clipboard_image::read_clipboard_file_list,
++                |path| trash::delete(path).map_err(|_| ()),
++            );
+             AppHostIoCompletion::FileTree(ui::file_tree::FileTreeIoCompletion {
+                 operation,
+                 generation,
+-                result: run_file_tree_host_io(intent.request, cancel),
++                result,
++                delete_guard,
+             })
+         }
+         AppHostIoAction::FileTreeMaintenance(intent) => {
+@@ -52294,6 +52435,7 @@ mod tests {
+         std::os::unix::fs::symlink(base.join("real"), base.join("alias")).unwrap();
+         let alias_target = base.join("alias/a.txt");
+         let request = Request::Trash {
++            root: Some(PathPayload::try_new(base.clone()).unwrap()),
+             target: PathPayload::try_new(alias_target.clone()).unwrap(),
+             preflight: Some((
+                 PathPayload::try_new(base.clone()).unwrap(),
+@@ -52414,6 +52556,7 @@ mod tests {
+         let first = base.join("a.txt");
+         std::fs::write(&first, b"first").unwrap();
+         let request = Request::Trash {
++            root: Some(PathPayload::try_new(base.clone()).unwrap()),
+             target: PathPayload::try_new(first.clone()).unwrap(),
+             preflight: Some((
+                 PathPayload::try_new(base.clone()).unwrap(),
+@@ -53438,6 +53581,7 @@ mod tests {
+             generation: gen1,
+             result: Ok(AppFileTreeWatchApplied {
+                 root: root1.clone(),
++                physical_root: root1.clone(),
+                 ignored_prefixes: Vec::new(),
+                 show_hidden: false,
+             }),
+@@ -53455,6 +53599,7 @@ mod tests {
+             generation: gen2,
+             result: Ok(AppFileTreeWatchApplied {
+                 root: root2.clone(),
++                physical_root: root2.clone(),
+                 ignored_prefixes: ignored2,
+                 show_hidden: hidden2,
+             }),
+@@ -53494,6 +53639,7 @@ mod tests {
+             generation: 0,
+             revision: 0,
+             root: PathBuf::new(),
++            physical_root: PathBuf::new(),
+             ignored_prefixes: Vec::new(),
+             show_hidden: false,
+         };
+@@ -59346,6 +59492,91 @@ mod tests {
+         );
+     }
+
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_native_trash_proof_only_survives_failed_unchanged_object() {
++        use ui::file_tree::{
++            FileTreeIoErrorCode as Error, FileTreeIoRequest as Request,
++            FileTreePathPayload as Payload,
++        };
++        let base = unique_temp_dir("popup-native-trash-proof");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let request = || Request::Trash {
++            root: Some(Payload::try_new(base.clone()).unwrap()),
++            target: Payload::try_new(target.clone()).unwrap(),
++            preflight: None,
++        };
++        let cancel = std::sync::atomic::AtomicBool::new(false);
++        let (result, proof) =
++            run_file_tree_host_io_with_delete_guard(request(), &cancel, || None, |_| Err(()));
++        assert_eq!(result, Err(Error::TrashUnavailable));
++        assert!(proof.unwrap().validate(&target).is_ok());
++        let (result, proof) = run_file_tree_host_io_with_delete_guard(
++            request(),
++            &cancel,
++            || None,
++            |actual| {
++                std::fs::rename(actual, base.join("retained.txt")).unwrap();
++                std::fs::write(actual, b"replacement").unwrap();
++                Err(())
++            },
++        );
++        assert_eq!(result, Err(Error::TrashUnavailable));
++        assert!(
++            proof.is_none(),
++            "a failed backend that replaced the object yields no deletion authority"
++        );
++        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
++        let (result, proof) = run_file_tree_host_io_with_delete_guard(
++            request(),
++            &cancel,
++            || None,
++            |actual| app_host_remove_all(actual).map_err(|_| ()),
++        );
++        assert_eq!(result, Ok(()));
++        assert!(
++            proof.is_none(),
++            "successful native deletion returns no permanent-delete permission"
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_unreadable_file_keeps_normal_native_trash_success() {
++        use std::os::unix::fs::PermissionsExt as _;
++        use ui::file_tree::{FileTreeIoRequest as Request, FileTreePathPayload as Payload};
++        let base = unique_temp_dir("popup-unreadable-trash");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o0)).unwrap();
++        assert_eq!(
++            std::fs::File::open(&target).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        let request = Request::Trash {
++            root: Some(Payload::try_new(base.clone()).unwrap()),
++            target: Payload::try_new(target.clone()).unwrap(),
++            preflight: None,
++        };
++        let mut native_calls = 0;
++        let (result, guard) = run_file_tree_host_io_with_delete_guard(
++            request,
++            &std::sync::atomic::AtomicBool::new(false),
++            || None,
++            |actual| {
++                native_calls += 1;
++                app_host_remove_all(actual).map_err(|_| ())
++            },
++        );
++        assert_eq!(result, Ok(()));
++        assert_eq!(native_calls, 1);
++        assert!(guard.is_none());
++        assert!(!target.exists());
++        std::fs::remove_dir_all(base).unwrap();
++    }
++
+     /// 정리 호출과 저장 조건이 실제로 배선돼 있는지 고정한다(2026-09-03 defect 5).
+     #[test]
+     fn refresh_workspaces는_순서_목록도_정리하고_저장한다() {
+@@ -59367,6 +59598,272 @@ mod tests {
+             "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
+         );
+     }
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn popup_audit_20261014_symlink_root_delivers_native_watch_events() {
++        let base = unique_temp_dir("popup-audit-symlink-watch")
++            .canonicalize()
++            .unwrap();
++        let physical = base.join("physical");
++        let logical = base.join("alias");
++        std::fs::create_dir(&physical).unwrap();
++        std::os::unix::fs::symlink(&physical, &logical).unwrap();
++        let ctx = egui::Context::default();
++        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
++        let (operation, generation, directories, ignored_prefixes, show_hidden) =
++            app_file_tree_watch_intent(&mut tree, logical.clone());
++        let mut watcher = AppFileTreeWatcher::new(ctx).unwrap();
++        watcher
++            .submit_replace(
++                operation,
++                generation,
++                directories,
++                ignored_prefixes,
++                show_hidden,
++            )
++            .unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
++        let completion = loop {
++            if let Some(completion) = watcher.poll_completion() {
++                break completion;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "native watch registration timeout"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        };
++        assert!(completion.result.is_ok());
++        std::fs::write(physical.join("new.txt"), b"native-change").unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        let observed_paths = loop {
++            let paths = watcher.pending.lock().unwrap().paths.clone();
++            if paths
++                .iter()
++                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("new.txt")))
++            {
++                break paths;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "native FSEvents callback did not observe the synthetic file change"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        };
++        let snapshot = watcher.take_snapshot().unwrap().unwrap();
++        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
++            operation,
++            generation,
++            result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
++        });
++        tree.apply_watch_snapshot(snapshot);
++        let refreshed = matches!(
++            tree.take_maintenance_intent(),
++            Some(ui::file_tree::FileTreeMaintenanceIntent {
++                request: ui::file_tree::FileTreeMaintenanceRequest::ListDirectory { .. },
++                ..
++            })
++        );
++        println!(
++            "symlink-watch raw={observed_paths:?}, physical={physical:?}, logical={logical:?}, refresh_queued={refreshed}"
++        );
++        drop(watcher);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            refreshed,
++            "native changes beneath a selected symlink root must reach the file tree in its logical path namespace"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor() {
++        let db_path = temp_db_path("popup-audit-missing-project-picker");
++        let base = unique_temp_dir("popup-audit-missing-project-picker");
++        let selected = base.join("selected");
++        std::fs::create_dir(&selected).unwrap();
++        let identity = crate::folder_identity::probe(&selected).unwrap();
++        let mut db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("anchored workspace").unwrap();
++        db.set_workspace_path_and_anchor_with_volume(
++            &workspace_id,
++            selected.to_str().unwrap(),
++            Some(identity.anchor.dev),
++            Some(identity.anchor.ino),
++            identity.volume,
++        )
++        .unwrap();
++        std::fs::rename(&selected, base.join("moved-after-native-selection")).unwrap();
++        let outcome = execute_settings_job(
++            &mut db,
++            &db_path,
++            &secret::RedactionService::new(),
++            SettingsJob {
++                generation: 1,
++                revision: 1,
++                workspace_id: workspace_id.clone(),
++                project_root: None,
++                action: SettingsJobAction::SetProjectPath {
++                    path: selected.clone(),
++                },
++            },
++        );
++        let reported_success = matches!(outcome.kind, SettingsOutcomeKind::ProjectPathSet(Ok(_)));
++        let stored_anchor = db.workspace_anchor(&workspace_id).unwrap();
++        let stored_path = db.workspace_path(&workspace_id).unwrap();
++        let stored_volume: Option<String> = rusqlite::Connection::open(&db_path)
++            .unwrap()
++            .query_row(
++                "SELECT volume_uuid FROM workspace_volume_identities WHERE workspace_id=?1",
++                [&workspace_id],
++                |row| row.get(0),
++            )
++            .ok();
++        println!(
++            "missing-picked-folder: reported_success={reported_success}, before={:?}, after={stored_anchor:?}",
++            identity.anchor
++        );
++        drop(db);
++        remove_sqlite_files(&db_path);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            !reported_success,
++            "a folder that disappeared before worker admission must fail instead of committing an unanchored path"
++        );
++        assert_eq!(
++            stored_anchor,
++            Some((identity.anchor.dev, identity.anchor.ino)),
++            "failed picker validation must preserve the prior workspace identity"
++        );
++        assert_eq!(stored_path.as_deref(), selected.to_str());
++        assert_eq!(stored_volume, identity.volume.map(|id| id.to_string()));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths() {
++        let base = unique_temp_dir("popup-audit-watch-path-filter")
++            .canonicalize()
++            .unwrap();
++        let physical = base.join("physical");
++        let logical = base.join("alias");
++        std::fs::create_dir(&physical).unwrap();
++        std::os::unix::fs::symlink(&physical, &logical).unwrap();
++        let ctx = egui::Context::default();
++        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
++        let (operation, generation, directories, _, show_hidden) =
++            app_file_tree_watch_intent(&mut tree, logical.clone());
++        let mut watcher = AppFileTreeWatcher::new(ctx).unwrap();
++        watcher
++            .submit_replace(
++                operation,
++                generation,
++                directories,
++                vec![logical.join("ignored")],
++                show_hidden,
++            )
++            .unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
++        loop {
++            if let Some(completion) = watcher.poll_completion() {
++                assert!(completion.result.is_ok());
++                break;
++            }
++            assert!(std::time::Instant::now() < deadline);
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        }
++        // Deleted callbacks cannot be canonicalized when consumed. Use the
++        // namespace captured by the actual native watch-registration worker.
++        *watcher.pending.lock().unwrap() = PendingFileTreeWatchEvents {
++            paths: vec![
++                physical.join(".env"),
++                physical.join("ignored/.env"),
++                physical.join(".hidden/nested.txt"),
++                base.join("outside/.env"),
++            ],
++            overflowed: false,
++        };
++        let snapshot = watcher.take_snapshot().unwrap().unwrap();
++        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
++            operation,
++            generation,
++            result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
++        });
++        tree.apply_watch_snapshot(snapshot);
++        let candidates = tree.take_env_warning_candidates();
++        drop(watcher);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert_eq!(
++            candidates,
++            vec![logical.join(".env")],
++            "physical events must map before env/ignore filtering even after a file disappears"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach() {
++        let db_path = temp_db_path("popup-audit-invalid-folder-picker");
++        let base = unique_temp_dir("popup-audit-invalid-folder-picker");
++        let file = base.join("file.txt");
++        std::fs::write(&file, b"not a folder").unwrap();
++        let identity = crate::folder_identity::probe(&base).unwrap();
++        let mut db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("anchored workspace").unwrap();
++        db.set_workspace_path_and_anchor_with_volume(
++            &workspace_id,
++            base.to_str().unwrap(),
++            Some(identity.anchor.dev),
++            Some(identity.anchor.ino),
++            identity.volume,
++        )
++        .unwrap();
++        let outcome = execute_settings_job(
++            &mut db,
++            &db_path,
++            &secret::RedactionService::new(),
++            SettingsJob {
++                generation: 1,
++                revision: 1,
++                workspace_id: workspace_id.clone(),
++                project_root: Some(base.clone()),
++                action: SettingsJobAction::SetProjectPath { path: file },
++            },
++        );
++        let rejected = matches!(
++            outcome.kind,
++            SettingsOutcomeKind::ProjectPathSet(Err(SettingsErrorCode::ProjectPath))
++        );
++        let preserved = db.workspace_path(&workspace_id).unwrap();
++        let detached = execute_settings_job(
++            &mut db,
++            &db_path,
++            &secret::RedactionService::new(),
++            SettingsJob {
++                generation: 2,
++                revision: 2,
++                workspace_id: workspace_id.clone(),
++                project_root: Some(base.clone()),
++                action: SettingsJobAction::SetProjectPath {
++                    path: PathBuf::new(),
++                },
++            },
++        );
++        let detached_ok = matches!(detached.kind, SettingsOutcomeKind::ProjectPathSet(Ok(ref row))
++            if row.path.is_empty() && row.folder_anchor.is_none());
++        drop(db);
++        remove_sqlite_files(&db_path);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            rejected,
++            "a selected regular file must not replace a folder binding"
++        );
++        assert_eq!(preserved.as_deref(), base.to_str());
++        assert!(
++            detached_ok,
++            "explicit empty-path detach must remain supported"
++        );
++    }
+ }
+
+ #[cfg(test)]
+diff --git a/crates/app/src/ui/file_tree.rs b/crates/app/src/ui/file_tree.rs
+index b5a41f6f..f7a72491 100644
+--- a/crates/app/src/ui/file_tree.rs
++++ b/crates/app/src/ui/file_tree.rs
+@@ -4,6 +4,8 @@
+ //! 가상화, immutable snapshot render. Leaf는 filesystem/watcher/thread/channel을 소유하지
+ //! 않고 bounded maintenance intent만 App host로 올린다.
+
++pub use crate::app::file_delete::FileTreeDeleteGuard;
++
+ use std::collections::{BTreeSet, HashMap, HashSet};
+ use std::ffi::{OsStr, OsString};
+ use std::path::{Path, PathBuf};
+@@ -683,11 +685,13 @@ pub enum FileTreeIoRequest {
+         move_files: bool,
+     },
+     Trash {
++        root: Option<FileTreePathPayload>,
+         target: FileTreePathPayload,
+         preflight: Option<(FileTreePathPayload, FileTreePathListPayload)>,
+     },
+     DeletePermanently {
+         target: FileTreePathPayload,
++        guard: FileTreeDeleteGuard,
+     },
+     CopyFileUrls {
+         paths: FileTreePathListPayload,
+@@ -751,6 +755,8 @@ pub struct FileTreeIoCompletion {
+     pub operation: FileTreeIoOperation,
+     pub generation: u64,
+     pub result: Result<(), FileTreeIoErrorCode>,
++    /// Only a failed native trash operation may authorize a permanent-delete retry.
++    pub delete_guard: Option<FileTreeDeleteGuard>,
+ }
+
+ const FILE_TREE_MAINTENANCE_QUEUE_CAP: usize = 1;
+@@ -1193,6 +1199,7 @@ pub struct FileTreeUi {
+     /// 휴지통 이동 실패 → 영구삭제 확인 대기 중인 대상 (§9-7). 경로가 아니라
+     /// `DeleteTarget`을 들고 있어야 확인 문구와 실제 삭제 경로가 같은 값에서 나온다.
+     confirm_delete: Option<DeleteTarget>,
++    confirm_delete_guard: Option<FileTreeDeleteGuard>,
+     /// 실측 행높이 (show_rows 자기보정). show_rows는 "모든 행 = 선언 높이" 계약인데
+     /// 실제 행높이는 폰트 메트릭(한글 폰트 라인높이 등)에 따라 선언값과 어긋날 수 있고,
+     /// 어긋나면 스크롤 위치·가시 범위가 리빌드마다 밀려 클릭이 다른 행에 떨어진다
+@@ -1298,6 +1305,7 @@ impl FileTreeUi {
+             edit: None,
+             edit_generation: 0,
+             confirm_delete: None,
++            confirm_delete_guard: None,
+             measured_row_height: None,
+             env_warning_candidates: BTreeSet::new(),
+             session_name_edit: None,
+@@ -1341,6 +1349,16 @@ impl FileTreeUi {
+         self.confirm_delete.is_some()
+     }
+
++    /// A file-row gesture owns keyboard input until another surface claims focus.
++    pub(crate) fn owns_keyboard_focus(ctx: &egui::Context) -> bool {
++        ctx.memory(|memory| memory.has_focus(tree_keyboard_focus_id()))
++    }
++
++    fn clear_delete_confirmation(&mut self) {
++        self.confirm_delete = None;
++        self.confirm_delete_guard = None;
++    }
++
+     /// 이번 프레임 트리가 소비한 (⌘V, ⌘C). App이 같은 프레임 터미널 이중 처리
+     /// (경로 삽입 붙여넣기/선택 복사 pasteboard 덮어쓰기)를 누르는 데 쓴다. 읽으면 리셋.
+     pub fn take_clipboard_shortcut_consumption(&mut self) -> (bool, bool) {
+@@ -1405,12 +1423,16 @@ impl FileTreeUi {
+         }
+         let pending = self.pending_io.take().expect("exact pending checked");
+         self.in_flight = 0;
++        if completion.result.is_ok() {
++            self.error = None;
++        }
++        // Native mutations can publish a prefix before returning an error. Never
++        // rely on the watcher to reconcile those already admitted effects.
++        for dir in &pending.refresh {
++            self.reload_dir(dir);
++        }
+         match completion.result {
+             Ok(()) => {
+-                self.error = None;
+-                for dir in pending.refresh {
+-                    self.reload_dir(&dir);
+-                }
+                 // 다중 삭제는 capacity-1 큐를 하나씩 통과한다.
+                 //
+                 // **직전 완료가 삭제였을 때만** 잇는다. 완료 종류를 안 보면 붙여넣기·복사·
+@@ -1433,6 +1455,7 @@ impl FileTreeUi {
+                     file_tree_io_error_message(FileTreeIoErrorCode::TrashUnavailable).to_owned(),
+                 );
+                 self.confirm_delete = pending.trash_target;
++                self.confirm_delete_guard = completion.delete_guard;
+                 if pending.edit_generation == self.edit_generation
+                     && let Some(edit) = pending.retry_edit
+                 {
+@@ -1822,7 +1845,7 @@ impl FileTreeUi {
+             .iter()
+             .any(|node| node.name == name && node.is_dir == target.is_dir);
+         if !still_there {
+-            self.confirm_delete = None;
++            self.clear_delete_confirmation();
+         }
+     }
+
+@@ -1946,7 +1969,7 @@ impl FileTreeUi {
+         self.error = None;
+         self.inaccessible_paths.clear();
+         self.cancel_edit();
+-        self.confirm_delete = None;
++        self.clear_delete_confirmation();
+         // 루트가 바뀌면 선택과 삭제 대기열도 함께 버린다. generation 검사는 **옛 완료**만
+         // 막을 뿐 큐 자체는 살아남아서, 새 워크스페이스에서 아무 IO나 성공하는 순간
+         // 옛 루트의 파일이 지워졌다(2026-09-04 리뷰 H2).
+@@ -1968,8 +1991,30 @@ impl FileTreeUi {
+             return;
+         };
+         self.root_error = None;
++        let mut recovered_state_changed = false;
++        for row in self
++            .flat
++            .iter()
++            .filter(|row| row.is_dir && self.inaccessible_paths.contains(&row.path))
++        {
++            if let Ok(relative) = row.path.strip_prefix(&root)
++                && let Some(node) = self
++                    .children
++                    .as_mut()
++                    .and_then(|children| node_mut(children, relative))
++                && (!node.expanded || node.children.is_none())
++            {
++                node.expanded = true;
++                node.children = Some(Vec::new());
++                recovered_state_changed = true;
++            }
++        }
+         self.enqueue_refresh_dir(root);
+-        self.drive_maintenance();
++        if recovered_state_changed {
++            self.rebuild_flat();
++        } else {
++            self.drive_maintenance();
++        }
+     }
+
+     /// flat 캐시 재계산 (펼침/접힘/숨김 토글/조작 후에만 호출).
+@@ -1997,9 +2042,6 @@ impl FileTreeUi {
+
+     /// 디렉터리 행 클릭: 펼침 ↔ 접힘. 펼칠 때만 host listing, 접으면 캐시 해제.
+     fn toggle_dir(&mut self, path: &Path) {
+-        if self.inaccessible_paths.contains(path) {
+-            return;
+-        }
+         let Some(root) = self.root.clone() else {
+             return;
+         };
+@@ -2788,11 +2830,17 @@ impl FileTreeUi {
+                                     // 중 둘 다 끈다) 목록을 스크롤할 방법이 아예 없었다 —
+                                     // 화면 밖 자리로는 워크스페이스를 옮길 수 없었다.
+                                     // 가장자리에 다가가면 목록이 스스로 흐르게 한다.
+-                                    let autoscroll = drag_autoscroll_delta(
+-                                        list_rect.y_range(),
+-                                        pointer.y,
+-                                        ui.input(|input| input.stable_dt),
+-                                    );
++                                    let autoscroll = ui.input(|input| {
++                                        if input.pointer.button_down(egui::PointerButton::Primary) {
++                                            drag_autoscroll_delta(
++                                                list_rect.y_range(),
++                                                pointer.y,
++                                                input.stable_dt,
++                                            )
++                                        } else {
++                                            0.0
++                                        }
++                                    });
+                                     if autoscroll != 0.0 {
+                                         // 프레임마다 그 프레임 몫만 미는 방식이라 애니메이션을
+                                         // 덧씌우면 두 번 완만해진다.
+@@ -2820,7 +2868,8 @@ impl FileTreeUi {
+                                 }
+                                 // 놓는 프레임이 아니어도 버튼이 이미 올라갔으면 상태를 놓아준다 —
+                                 // 드래그하던 행이 사라져 drag_stopped를 못 받는 경우의 안전망.
+-                                if drag_released || !ui.ctx().input(|input| input.pointer.any_down())
++                                if drag_released
++                                    || !ui.ctx().input(|input| input.pointer.button_down(egui::PointerButton::Primary))
+                                 {
+                                     self.workspace_drag = None;
+                                 }
+@@ -3382,20 +3431,26 @@ impl FileTreeUi {
+                     {
+                         ui.horizontal(|ui| {
+                             ui.add_space(12.0 + row.depth as f32 * 18.0);
++                            let id =
++                                egui::Id::new(("file_tree_rename", &*path, self.edit_generation));
++                            if std::mem::take(focus) {
++                                ui.memory_mut(|memory| memory.request_focus(id));
++                            }
++                            let owns_keys = inline_name_editor_owns_keys(ui, id);
+                             let resp = ui.add(
+                                 egui::TextEdit::singleline(buffer)
++                                    .id(id)
++                                    .return_key(None)
+                                     .margin(egui::Margin::ZERO) // 고정 행높이 유지 (§9-6)
+                                     .desired_width(f32::INFINITY),
+                             );
+                             *changed |= resp.changed();
+-                            if *focus {
+-                                resp.request_focus(); // §9-8 — 편집 키가 터미널로 새지 않게
+-                                *focus = false;
+-                            }
+-                            if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+-                                edit_done = Some(true);
+-                            } else if ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+-                                edit_done = Some(false);
++                            if let Some(result) = inline_name_editor_result(ui, &resp, owns_keys) {
++                                edit_done = Some(result == SessionNameEditResult::Submit);
++                                ui.memory_mut(|memory| memory.surrender_focus(id));
++                                ui.ctx().data_mut(|data| {
++                                    data.remove::<egui::text_edit::TextEditState>(id)
++                                });
+                             }
+                         });
+                         continue;
+@@ -3546,7 +3601,7 @@ impl FileTreeUi {
+                                     egui::vec2(10.0, 16.0),
+                                     egui::Sense::hover(),
+                                 );
+-                                if row.is_dir && !inaccessible {
++                                if row.is_dir {
+                                     paint_caret(ui.painter(), cr.center(), row.expanded, caret_col);
+                                 }
+                                 let (ir, _) = ui.allocate_exact_size(
+@@ -3728,8 +3783,12 @@ impl FileTreeUi {
+                     if single_clicked {
+                         select_click = Some((row.path.clone(), click_kind));
+                     }
+-                    if row.is_dir && !inaccessible {
+-                        if row_resp.double_clicked() || label_resp.double_clicked() {
++                    if row.is_dir {
++                        if inaccessible && (row_resp.clicked() || label_resp.clicked()) {
++                            toggle = Some(row.path.clone());
++                        } else if !inaccessible
++                            && (row_resp.double_clicked() || label_resp.double_clicked())
++                        {
+                             navigate_root = Some(row.path.clone());
+                         } else if single_clicked && click_kind == SelectionClick::Replace {
+                             // ⌘/Shift 클릭은 고르기만 한다 — 범위를 잡는 중에 폴더가
+@@ -4560,20 +4619,26 @@ impl FileTreeUi {
+                 let path = target.path.clone();
+                 let refresh: Vec<PathBuf> =
+                     path.parent().map(Path::to_path_buf).into_iter().collect();
+-                let request = FileTreePathPayload::try_new(path)
+-                    .map(|target| FileTreeIoRequest::DeletePermanently { target });
++                let request = self
++                    .confirm_delete_guard
++                    .clone()
++                    .ok_or(FileTreeIoErrorCode::InvalidPath)
++                    .and_then(|guard| {
++                        FileTreePathPayload::try_new(path)
++                            .map(|target| FileTreeIoRequest::DeletePermanently { target, guard })
++                    });
+                 // 확인은 삭제를 **접수했을 때만** 소비한다. 먼저 닫아버리면 큐가 거절할
+                 // 때(capacity-1 `Busy` 등) 아무것도 안 지운 채 확인만 사라져, 오류 문구
+                 // 하나 남기고 다시 누를 화면이 없어진다. 위 `spawn_trash`가 제스처마다
+                 // 무조건 닫는 것과 방향이 반대인 이유: 저기서는 **새 대상**이 옛 확인을
+                 // 무효로 만들지만, 여기서는 같은 대상이 아직 지워지지 않은 채 남아 있다.
+                 match request.and_then(|request| self.queue_io(request, refresh, None, None)) {
+-                    Ok(()) => self.confirm_delete = None,
++                    Ok(()) => self.clear_delete_confirmation(),
+                     Err(code) => self.reject_io(code),
+                 }
+             }
+             Some(super::popup::ConfirmationChoice::Cancel) => {
+-                self.confirm_delete = None;
++                self.clear_delete_confirmation();
+             }
+             None => {}
+         }
+@@ -4769,7 +4834,7 @@ impl FileTreeUi {
+         let preflight = match FileTreePathListPayload::try_new(chosen) {
+             Ok(paths) => paths,
+             Err(code) => {
+-                self.confirm_delete = None;
++                self.clear_delete_confirmation();
+                 self.reject_io(code);
+                 return;
+             }
+@@ -4781,7 +4846,7 @@ impl FileTreeUi {
+         {
+             Ok(root) => root,
+             Err(code) => {
+-                self.confirm_delete = None;
++                self.clear_delete_confirmation();
+                 self.reject_io(code);
+                 return;
+             }
+@@ -4829,7 +4894,7 @@ impl FileTreeUi {
+         match preflight {
+             Ok(preflight) => self.spawn_trash_preflight(target, preflight),
+             Err(code) => {
+-                self.confirm_delete = None;
++                self.clear_delete_confirmation();
+                 self.reject_io(code);
+                 false
+             }
+@@ -4850,18 +4915,23 @@ impl FileTreeUi {
+         // 드롭, 트리 내 이동, 더블클릭 열기 중 하나라도) `queue_io`가 `Busy`를 돌려주는데,
+         // 그때 확인을 남겨두면 "파일 작업이 진행 중입니다" 바로 아래에 **예전 대상**
+         // 확인이 서서 방금 고른 파일 이야기처럼 읽힌다.
+-        self.confirm_delete = None;
++        self.clear_delete_confirmation();
+         let refresh: Vec<PathBuf> = target
+             .path
+             .parent()
+             .map(Path::to_path_buf)
+             .into_iter()
+             .collect();
+-        let request = FileTreePathPayload::try_new(target.path.clone()).map(|payload| {
+-            FileTreeIoRequest::Trash {
++        let request = FileTreePathPayload::try_new(target.path.clone()).and_then(|payload| {
++            Ok(FileTreeIoRequest::Trash {
++                root: self
++                    .root
++                    .clone()
++                    .map(FileTreePathPayload::try_new)
++                    .transpose()?,
+                 target: payload,
+                 preflight,
+-            }
++            })
+         });
+         match request.and_then(|request| self.queue_io(request, refresh, Some(target), None)) {
+             Ok(()) => true,
+@@ -4879,7 +4949,11 @@ impl FileTreeUi {
+             return;
+         };
+         if dir == root {
+-            self.refresh();
++            // Operation/watch reconciliation retries only expanded folders;
++            // permission recovery belongs to manual Refresh or explicit expand.
++            self.root_error = None;
++            self.enqueue_refresh_dir(root);
++            self.drive_maintenance();
+             return;
+         }
+         let Ok(rel) = dir.strip_prefix(&root) else {
+@@ -5918,10 +5992,10 @@ fn track_workspace_drag(
+     workspace_id: &str,
+     drag: &mut Option<String>,
+ ) -> bool {
+-    if response.drag_started() {
++    if response.drag_started_by(egui::PointerButton::Primary) {
+         *drag = Some(workspace_id.to_owned());
+     }
+-    if response.dragged() {
++    if response.dragged_by(egui::PointerButton::Primary) {
+         response.ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+     }
+     // Escape로 **취소한** 드래그도 `drag_stopped`를 낸다 — egui는 Escape에서 dragged id를
+@@ -7147,11 +7221,7 @@ fn inline_name_editor(
+         // 시작할 때 한 번만 요청한다. 매 프레임 터미널/다른 입력창의 포커스를 빼앗지 않는다.
+         ui.memory_mut(|memory| memory.request_focus(id));
+     }
+-    let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
+-    let owns_keys = ui.memory(|memory| {
+-        memory.has_focus(id)
+-            || (memory.focused().is_none() && memory.had_focus_last_frame(id) && escape_pressed)
+-    });
++    let owns_keys = inline_name_editor_owns_keys(ui, id);
+     let response = ui.put(
+         rect,
+         egui::TextEdit::singleline(text)
+@@ -7163,6 +7233,23 @@ fn inline_name_editor(
+             .margin(egui::Margin::ZERO)
+             .vertical_align(egui::Align::Center),
+     );
++    inline_name_editor_result(ui, &response, owns_keys)
++}
++
++fn inline_name_editor_owns_keys(ui: &egui::Ui, id: egui::Id) -> bool {
++    let escape_pressed = ui.input(|input| input.key_pressed(egui::Key::Escape));
++    ui.memory(|memory| {
++        memory.has_focus(id)
++            || (memory.focused().is_none() && memory.had_focus_last_frame(id) && escape_pressed)
++    })
++}
++
++/// Shared by file, workspace and session Rename. Closing owns the entire input batch.
++fn inline_name_editor_result(
++    ui: &egui::Ui,
++    response: &egui::Response,
++    owns_keys: bool,
++) -> Option<SessionNameEditResult> {
+     if owns_keys && !terminal::renderer_egui::frame_has_active_preedit(ui.ctx()) {
+         let result = ui.input(|input| {
+             let mut result = None;
+@@ -8642,6 +8729,41 @@ fn reread(base: &Path, old: &[TreeNode]) -> std::io::Result<Vec<TreeNode>> {
+     Ok(fresh)
+ }
+
++#[cfg(test)]
++impl FileTreeUi {
++    pub(super) fn input_regression_listing(&mut self, names: &[&str]) {
++        let root = PathBuf::from("/private/tmp/deppy-file-tree-input-regression");
++        if self.root.as_ref() != Some(&root) {
++            self.set_root(Some(root.clone()));
++        }
++        let items = names
++            .iter()
++            .map(|name| FileTreeListingItem::try_new(OsString::from(name), false).unwrap())
++            .collect();
++        self.apply_listing_snapshot(root, FileTreeListingSnapshot::try_new(items).unwrap());
++    }
++
++    pub(super) fn input_regression_begin_rename(&mut self, name: &str) {
++        self.start_edit(EditState::Rename {
++            path: self.root.as_ref().unwrap().join(name),
++            buffer: name.to_owned(),
++            focus: true,
++            changed: false,
++        });
++    }
++
++    pub(super) fn input_regression_rename(&self) -> Option<(&Path, &str)> {
++        match &self.edit {
++            Some(EditState::Rename { path, buffer, .. }) => Some((path, buffer)),
++            _ => None,
++        }
++    }
++
++    pub(super) fn input_regression_owns_keyboard(ctx: &egui::Context) -> bool {
++        Self::owns_keyboard_focus(ctx)
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -8880,6 +9002,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation.wrapping_add(1),
+             result: Ok(()),
++            delete_guard: None,
+         });
+         assert!(
+             tree.pending_io.is_some(),
+@@ -8889,6 +9012,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         assert!(tree.pending_io.is_none());
+         assert_eq!(tree.in_flight, 0);
+@@ -10122,6 +10246,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result: Ok(()),
++                delete_guard: None,
+             });
+             drain_listings(&mut tree);
+             assert!(
+@@ -10184,6 +10309,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result: Err(FileTreeIoErrorCode::Conflict),
++                delete_guard: None,
+             });
+             if action == "cancelled" {
+                 assert!(
+@@ -11796,6 +11922,7 @@ mod tests {
+             operation,
+             generation,
+             result: Err(FileTreeIoErrorCode::NativeFailure),
++            delete_guard: None,
+         });
+         // 시뮬레이션 시간 경과 — 직전 클릭 연쇄를 끊는다 (egui triple 판정 창 0.6s는
+         // 마지막 클릭과의 거리만 보므로, 붙여서 클릭하면 pdf 2번째가 triple로 잡힌다).
+@@ -12096,6 +12223,41 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn popup_input_secondary_workspace_drag_does_not_autoscroll() {
++        use egui_kittest::kittest::Queryable;
++        let mut harness = workspace_reorder_harness(20);
++        let from = harness.get_by_label("Workspace 00").rect().center();
++        let before = harness.get_by_label("Workspace 19").rect().top();
++        harness.hover_at(from);
++        harness.input_mut().events.push(egui::Event::PointerButton {
++            pos: from,
++            button: egui::PointerButton::Secondary,
++            pressed: true,
++            modifiers: egui::Modifiers::NONE,
++        });
++        harness.step();
++        let edge = egui::pos2(from.x, 690.0);
++        harness.hover_at(edge);
++        for _ in 0..5 {
++            harness.step();
++        }
++        let after = harness.get_by_label("Workspace 19").rect().top();
++        assert!(harness.state().tree.workspace_drag.is_none());
++        assert!(
++            (after - before).abs() < 0.5,
++            "secondary drag scrolled {before} -> {after}"
++        );
++        harness.input_mut().events.push(egui::Event::PointerButton {
++            pos: edge,
++            button: egui::PointerButton::Secondary,
++            pressed: false,
++            modifiers: egui::Modifiers::NONE,
++        });
++        harness.step();
++        assert!(harness.state().reordered.is_none());
++    }
++
+     /// Escape는 드래그를 **취소**한다. egui는 Escape에서 dragged id를 지우고
+     /// (`interaction.rs`) 그 프레임에 `drag_stopped`가 뜨는데, 그것만 보면 취소와 드롭이
+     /// 구별되지 않아 취소가 그대로 순서를 확정했다(2026-09-03 리뷰 H1).
+@@ -12405,6 +12567,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result: Ok(()),
++                delete_guard: None,
+             });
+         }
+         assert!(tree.trash_queue.is_empty());
+@@ -12429,6 +12592,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         assert!(
+             tree.take_io_intent().is_none(),
+@@ -12477,6 +12641,7 @@ mod tests {
+             operation: old.operation,
+             generation: old.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+
+         assert!(
+@@ -12737,6 +12902,7 @@ mod tests {
+             operation: first.operation,
+             generation: first.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         harness.state_mut().last_external_paste =
+             Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+@@ -12924,6 +13090,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result: Ok(()),
++                delete_guard: None,
+             });
+             crate::native_key_monitor::tests::record_move_paste_key(key_code, characters, true);
+             harness.event(egui::Event::Paste("held clipboard text".to_owned()));
+@@ -13018,6 +13185,7 @@ mod tests {
+             operation: first.operation,
+             generation: first.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         harness.state_mut().last_external_paste =
+             Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+@@ -13237,6 +13405,7 @@ mod tests {
+             operation: first.operation,
+             generation: first.generation,
+             result,
++            delete_guard: None,
+         });
+         let next = tree.take_io_intent().unwrap();
+         let result = crate::app::pr11_private_file_fixture_io(next.request, &base);
+@@ -13280,6 +13449,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result,
++                delete_guard: None,
+             });
+             assert_eq!(std::fs::read_dir(destination).unwrap().count(), 64);
+             for (i, source) in sources.iter().enumerate() {
+@@ -13308,6 +13478,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result,
++                delete_guard: None,
+             });
+             assert!(deleted <= 64);
+         }
+@@ -13415,6 +13586,7 @@ mod tests {
+             operation: old.operation,
+             generation: old.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         assert_eq!(
+             tree.pending_io.as_ref().unwrap().operation,
+@@ -13467,6 +13639,7 @@ mod tests {
+             operation: keyboard.operation,
+             generation: keyboard.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         let menu =
+             trash_row_via_context_menu(&mut harness, point, &catalog.t("file_tree.copy_file", &[]));
+@@ -13535,6 +13708,7 @@ mod tests {
+                     operation: intent.operation,
+                     generation: intent.generation,
+                     result: Ok(()),
++                    delete_guard: None,
+                 });
+                 drain_listings(&mut harness.state_mut().0);
+                 harness.step();
+@@ -13699,6 +13873,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Err(FileTreeIoErrorCode::TrashUnavailable),
++            delete_guard: None,
+         });
+
+         assert_eq!(tree.confirm_delete, Some(target("a.txt")));
+@@ -13713,6 +13888,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Err(FileTreeIoErrorCode::NativeFailure),
++            delete_guard: None,
+         });
+         assert!(
+             tree.trash_queue.is_empty(),
+@@ -13735,6 +13911,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Err(FileTreeIoErrorCode::TrashUnavailable),
++            delete_guard: None,
+         });
+         assert_eq!(tree.confirm_delete, Some(first.clone()));
+
+@@ -13761,6 +13938,7 @@ mod tests {
+             operation: queued.operation,
+             generation: queued.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         tree.spawn_trash(first.clone());
+         let intent = tree.take_io_intent().expect("second trash intent");
+@@ -13768,6 +13946,7 @@ mod tests {
+             operation: intent.operation,
+             generation: intent.generation,
+             result: Err(FileTreeIoErrorCode::TrashUnavailable),
++            delete_guard: None,
+         });
+         assert_eq!(tree.confirm_delete, Some(first));
+         // 다른 파일 조작(⌘C 복사)이 같은 큐를 차지한다 — 트리 내 이동·Finder 드롭·
+@@ -13858,11 +14037,10 @@ mod tests {
+             }
+             other => panic!("unexpected request: {other:?}"),
+         }
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: intent.operation,
+-            generation: intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(intent));
+         harness.run();
+
+         let prompt = catalog.t(
+@@ -13902,7 +14080,7 @@ mod tests {
+             })
+             .expect("delete intent");
+         match &deleted.request {
+-            FileTreeIoRequest::DeletePermanently { target } => {
++            FileTreeIoRequest::DeletePermanently { target, .. } => {
+                 assert_eq!(
+                     target.as_path(),
+                     base.join("src/mod.rs"),
+@@ -13915,6 +14093,7 @@ mod tests {
+             operation: deleted.operation,
+             generation: deleted.generation,
+             result: Ok(()),
++            delete_guard: None,
+         });
+         harness.step();
+
+@@ -13929,11 +14108,10 @@ mod tests {
+             .0
+             .take_io_intent()
+             .expect("folder trash intent");
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: folder.operation,
+-            generation: folder.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(folder));
+         harness.step();
+         assert!(
+             harness
+@@ -14101,11 +14279,10 @@ mod tests {
+             }
+             other => panic!("unexpected request: {other:?}"),
+         }
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: file_intent.operation,
+-            generation: file_intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(file_intent));
+         harness.run();
+
+         assert!(
+@@ -14144,11 +14321,10 @@ mod tests {
+             }
+             other => panic!("unexpected request: {other:?}"),
+         }
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: folder_intent.operation,
+-            generation: folder_intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(folder_intent));
+         harness.step();
+
+         assert!(
+@@ -14192,11 +14368,10 @@ mod tests {
+             .0
+             .take_io_intent()
+             .expect("trash intent");
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: intent.operation,
+-            generation: intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(intent));
+         // 다른 파일 조작(⌘C 복사)이 capacity-1 큐를 차지한다 — intent를 꺼내지 않아
+         // 클릭하는 동안 계속 점유 상태다.
+         harness
+@@ -14282,11 +14457,7 @@ mod tests {
+                 is_dir,
+             });
+             let intent = tree.take_io_intent().expect("trash intent");
+-            tree.complete_io(FileTreeIoCompletion {
+-                operation: intent.operation,
+-                generation: intent.generation,
+-                result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-            });
++            tree.complete_io(crate::app::popup_review_unavailable_trash(intent));
+             assert!(
+                 tree.confirm_delete.is_some(),
+                 "확인이 서지 않아 검증 전제가 깨졌다"
+@@ -14401,11 +14572,10 @@ mod tests {
+             .0
+             .take_io_intent()
+             .expect("trash intent");
+-        harness.state_mut().0.complete_io(FileTreeIoCompletion {
+-            operation: intent.operation,
+-            generation: intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        harness
++            .state_mut()
++            .0
++            .complete_io(crate::app::popup_review_unavailable_trash(intent));
+         // 그 위에 새 파일 조작을 얹어 진행 표시까지 셋이 동시에 뜨게 한다.
+         harness
+             .state_mut()
+@@ -16997,11 +17167,7 @@ mod tests {
+             is_dir: false,
+         });
+         let intent = tree.take_io_intent().unwrap();
+-        tree.complete_io(FileTreeIoCompletion {
+-            operation: intent.operation,
+-            generation: intent.generation,
+-            result: Err(FileTreeIoErrorCode::TrashUnavailable),
+-        });
++        tree.complete_io(crate::app::popup_review_unavailable_trash(intent));
+         assert!(tree.confirm_delete.is_some());
+         let config = crate::config::ShortcutsConfig::default();
+         let binding = crate::shortcuts::effective_binding(
+@@ -17057,6 +17223,7 @@ mod tests {
+                 operation: intent.operation,
+                 generation: intent.generation,
+                 result: Err(FileTreeIoErrorCode::TrashUnavailable),
++                delete_guard: None,
+             });
+             let mut harness = delete_confirm_harness(tree, &catalog);
+             harness.run();
+@@ -17071,4 +17238,605 @@ mod tests {
+             assert!(!harness.state().0.has_pending_confirmation());
+         }
+     }
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_child_permission_recovery_retries_listing() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let base = temp_root("popup-audit-permission-recovery");
++        let child = base.join("restricted");
++        std::fs::create_dir(&child).unwrap();
++        std::fs::write(child.join("recovered.txt"), b"recoverable").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o0)).unwrap();
++        assert_eq!(
++            std::fs::read_dir(&child).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        tree.toggle_dir(&child);
++        let denied = tree
++            .take_maintenance_intent()
++            .expect("child listing was admitted");
++        assert!(
++            matches!(&denied.request, FileTreeMaintenanceRequest::ListDirectory { directory, .. } if directory.as_path() == child)
++        );
++        tree.complete_maintenance(FileTreeMaintenanceCompletion {
++            operation: denied.operation,
++            generation: denied.generation,
++            result: Err(FileTreeMaintenanceErrorCode::PermissionDenied),
++        });
++        drain_listings(&mut tree);
++        assert!(tree.inaccessible_paths.contains(&child));
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(std::fs::read_dir(&child).is_ok());
++        tree.refresh();
++        drain_listings(&mut tree);
++        let was_retried = !tree.inaccessible_paths.contains(&child);
++        let recovered_visible = tree
++            .flat
++            .iter()
++            .any(|row| row.path == child.join("recovered.txt"));
++        println!(
++            "restored child access: retry={was_retried}, inaccessible={}",
++            tree.inaccessible_paths.contains(&child)
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            was_retried && recovered_visible,
++            "after access is restored, manual Refresh must retry the denied child and show its contents"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_partial_copy_failure_refreshes_destination() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let base = temp_root("popup-audit-partial-copy");
++        let source = base.join("source");
++        let destination = base.join("destination");
++        std::fs::create_dir(&source).unwrap();
++        std::fs::create_dir(&destination).unwrap();
++        let readable = source.join("first.txt");
++        let denied = source.join("last.txt");
++        std::fs::write(&readable, b"first-content").unwrap();
++        std::fs::write(&denied, b"last-content").unwrap();
++        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o0)).unwrap();
++        assert_eq!(
++            std::fs::File::open(&denied).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(destination.clone()));
++        drain_listings(&mut tree);
++        tree.queue_io(
++            FileTreeIoRequest::CopyInto {
++                root: None,
++                sources: FileTreePathListPayload::try_new(vec![readable, denied.clone()]).unwrap(),
++                destination: FileTreePathPayload::try_new(destination.clone()).unwrap(),
++            },
++            vec![destination.clone()],
++            None,
++            None,
++        )
++        .unwrap();
++        let intent = tree.take_io_intent().unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++        assert!(result.is_err());
++        let first_published = destination.join("first.txt").is_file();
++        tree.complete_io(FileTreeIoCompletion {
++            operation: intent.operation,
++            generation: intent.generation,
++            result,
++            delete_guard: None,
++        });
++        drain_listings(&mut tree);
++        let first_visible = tree
++            .flat
++            .iter()
++            .any(|row| row.path == destination.join("first.txt"));
++        println!(
++            "partial-copy result: first_published={first_published}, first_visible={first_visible}"
++        );
++        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            first_published,
++            "native worker must really publish the first member before the last member fails"
++        );
++        assert!(
++            first_visible,
++            "a partially applied host failure must refresh the affected destination without depending on a healthy OS watcher"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation() {
++        use egui_kittest::kittest::Queryable as _;
++        use std::os::unix::fs::MetadataExt as _;
++        let base = temp_root("popup-audit-replaced-confirmation");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"old-selected-content").unwrap();
++        let old_inode = std::fs::symlink_metadata(&target).unwrap().ino();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget {
++            path: target.clone(),
++            label: "selected.txt".into(),
++            is_dir: false,
++        });
++        let failed_trash = tree.take_io_intent().unwrap();
++        tree.complete_io(crate::app::popup_review_unavailable_trash(failed_trash));
++        assert!(tree.confirm_delete.is_some());
++        std::fs::rename(&target, base.join("original-retained.txt")).unwrap();
++        std::fs::write(&target, b"new-unselected-content").unwrap();
++        let new_inode = std::fs::symlink_metadata(&target).unwrap().ino();
++        assert_ne!(old_inode, new_inode);
++        tree.refresh();
++        drain_listings(&mut tree);
++        let old_confirmation_retained = tree.confirm_delete.is_some();
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        let mut issued_delete = false;
++        if let Some(button) = harness.query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
++        {
++            button.click();
++            if let Some(intent) = (0..8).find_map(|_| {
++                harness.step();
++                harness.state_mut().0.take_io_intent()
++            }) {
++                issued_delete = true;
++                assert!(
++                    matches!(&intent.request, FileTreeIoRequest::DeletePermanently { target: payload, .. } if payload.as_path() == target)
++                );
++                let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++                assert!(
++                    result.is_err(),
++                    "stale authorization must fail closed at the native worker"
++                );
++            }
++        }
++        let replacement_survived = target.exists();
++        let original_survived =
++            std::fs::read(base.join("original-retained.txt")).unwrap() == b"old-selected-content";
++        println!(
++            "replaced-file confirmation: inode {old_inode}->{new_inode}, retained={old_confirmation_retained}, issued_delete={issued_delete}, new_survived={replacement_survived}, original_survived={original_survived}"
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            replacement_survived,
++            "an old failed-trash confirmation must not authorize permanent deletion of a different inode created by a subsequent checkout/build"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_permanent_delete_rejects_redirected_parent() {
++        use egui_kittest::kittest::Queryable as _;
++        let base = temp_root("popup-audit-confirmation-parent-escape");
++        let root = base.join("tree");
++        let child = root.join("sub");
++        let outside = base.join("outside");
++        std::fs::create_dir_all(&child).unwrap();
++        std::fs::create_dir(&outside).unwrap();
++        let target = child.join("selected.txt");
++        let outside_target = outside.join("selected.txt");
++        std::fs::write(&target, b"original-selected-content").unwrap();
++        std::fs::write(&outside_target, b"unselected-outside-content").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(root.clone()));
++        drain_listings(&mut tree);
++        tree.toggle_dir(&child);
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget {
++            path: target.clone(),
++            label: "sub/selected.txt".into(),
++            is_dir: false,
++        });
++        let failed_trash = tree.take_io_intent().unwrap();
++        tree.complete_io(crate::app::popup_review_unavailable_trash(failed_trash));
++        assert!(tree.confirm_delete.is_some());
++        std::fs::rename(&child, root.join("original-sub-retained")).unwrap();
++        std::os::unix::fs::symlink(&outside, &child).unwrap();
++        tree.refresh();
++        drain_listings(&mut tree);
++        let retained = tree.confirm_delete.is_some();
++        assert!(
++            outside_target.is_file(),
++            "the outside file exists before the confirmation click"
++        );
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        let mut issued_delete = false;
++        if let Some(button) = harness.query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
++        {
++            button.click();
++            if let Some(intent) = (0..8).find_map(|_| {
++                harness.step();
++                harness.state_mut().0.take_io_intent()
++            }) {
++                issued_delete = true;
++                assert!(
++                    matches!(&intent.request, FileTreeIoRequest::DeletePermanently { target: payload, .. } if payload.as_path() == target)
++                );
++                let result = crate::app::pr11_private_file_fixture_io(intent.request, &root);
++                assert!(
++                    result.is_err(),
++                    "stale authorization must fail closed at the native worker"
++                );
++            }
++        }
++        let outside_survived = outside_target.exists();
++        let original_survived = std::fs::read(root.join("original-sub-retained/selected.txt"))
++            .unwrap()
++            == b"original-selected-content";
++        println!(
++            "permanent-delete parent escape: root_refresh_retained_confirm={retained}, issued_delete={issued_delete}, outside_survived={outside_survived}, original_survived={original_survived}"
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            outside_survived,
++            "an old failed-trash confirmation must not permanently delete an unselected file outside the original tree after the parent is redirected"
++        );
++    }
++
++    #[cfg(unix)]
++    fn popup_review_approved_delete_intent(root: &Path, target: &Path) -> FileTreeIoIntent {
++        use egui_kittest::kittest::Queryable as _;
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(root.to_path_buf()));
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget {
++            path: target.to_path_buf(),
++            label: target.strip_prefix(root).unwrap().display().to_string(),
++            is_dir: std::fs::symlink_metadata(target).unwrap().is_dir(),
++        });
++        let trash = tree.take_io_intent().unwrap();
++        let completion = crate::app::popup_review_unavailable_trash(trash);
++        assert_eq!(
++            completion.result,
++            Err(FileTreeIoErrorCode::TrashUnavailable)
++        );
++        tree.complete_io(completion);
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        harness
++            .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
++            .click();
++        (0..8)
++            .find_map(|_| {
++                harness.step();
++                harness.state_mut().0.take_io_intent()
++            })
++            .expect("explicit confirmation admits permanent deletion")
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_approved_delete_rejects_worker_time_inode_replacement() {
++        let base = temp_root("popup-worker-replaced-target");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        std::fs::rename(&target, base.join("retained.txt")).unwrap();
++        std::fs::write(&target, b"unselected replacement").unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++        let replacement = std::fs::read(&target).ok();
++        let original = std::fs::read(base.join("retained.txt")).unwrap();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            result.is_err(),
++            "worker must reject replacement after UI approval"
++        );
++        assert_eq!(
++            replacement.as_deref(),
++            Some(b"unselected replacement".as_slice())
++        );
++        assert_eq!(original, b"selected");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_approved_delete_rejects_worker_time_parent_redirect() {
++        let base = temp_root("popup-worker-parent-redirect");
++        let root = base.join("root");
++        let parent = root.join("sub");
++        let outside = base.join("outside");
++        std::fs::create_dir_all(&parent).unwrap();
++        std::fs::create_dir(&outside).unwrap();
++        let target = parent.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        std::fs::write(outside.join("selected.txt"), b"outside").unwrap();
++        let intent = popup_review_approved_delete_intent(&root, &target);
++        std::fs::rename(&parent, root.join("retained")).unwrap();
++        std::os::unix::fs::symlink(&outside, &parent).unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &root);
++        let outside_bytes = std::fs::read(outside.join("selected.txt")).ok();
++        let original = std::fs::read(root.join("retained/selected.txt")).unwrap();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            result.is_err(),
++            "worker must reject parent escape after UI approval"
++        );
++        assert_eq!(outside_bytes.as_deref(), Some(b"outside".as_slice()));
++        assert_eq!(original, b"selected");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_approved_delete_rejects_worker_time_root_replacement() {
++        let base = temp_root("popup-worker-root-replacement");
++        let root = base.join("root");
++        std::fs::create_dir(&root).unwrap();
++        let target = root.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&root, &target);
++        std::fs::rename(&root, base.join("retained-root")).unwrap();
++        std::fs::create_dir(&root).unwrap();
++        std::fs::write(&target, b"new root target").unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &root);
++        let replacement = std::fs::read(&target).ok();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(result.is_err(), "worker must reject changed root identity");
++        assert_eq!(replacement.as_deref(), Some(b"new root target".as_slice()));
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_approved_delete_removes_original_file_directory_and_symlink() {
++        let base = temp_root("popup-normal-guarded-delete");
++        for kind in ["file", "directory", "symlink"] {
++            let target = base.join(kind);
++            let outside = base.join("outside-kept.txt");
++            std::fs::write(&outside, b"keep").unwrap();
++            match kind {
++                "directory" => {
++                    std::fs::create_dir(&target).unwrap();
++                    std::fs::write(target.join("child.txt"), b"child").unwrap();
++                }
++                "symlink" => std::os::unix::fs::symlink(&outside, &target).unwrap(),
++                _ => std::fs::write(&target, b"file").unwrap(),
++            }
++            let intent = popup_review_approved_delete_intent(&base, &target);
++            assert_eq!(
++                crate::app::pr11_private_file_fixture_io(intent.request, &base),
++                Ok(())
++            );
++            assert!(std::fs::symlink_metadata(&target).is_err());
++            assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
++        }
++        std::fs::remove_dir_all(&base).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_explicit_expand_retries_permission_denied_child() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let base = temp_root("popup-expand-permission-recovery");
++        let child = base.join("restricted");
++        std::fs::create_dir(&child).unwrap();
++        std::fs::write(child.join("recovered.txt"), b"recoverable").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o0)).unwrap();
++        assert_eq!(
++            std::fs::read_dir(&child).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        tree.toggle_dir(&child);
++        let denied = tree.take_maintenance_intent().unwrap();
++        tree.complete_maintenance(FileTreeMaintenanceCompletion {
++            operation: denied.operation,
++            generation: denied.generation,
++            result: Err(FileTreeMaintenanceErrorCode::PermissionDenied),
++        });
++        drain_listings(&mut tree);
++        assert!(tree.inaccessible_paths.contains(&child));
++        assert!(
++            tree.take_maintenance_intent().is_none(),
++            "denial must not automatically loop"
++        );
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
++        tree.toggle_dir(&child);
++        drain_listings(&mut tree);
++        let recovered = !tree.inaccessible_paths.contains(&child)
++            && tree
++                .flat
++                .iter()
++                .any(|row| row.path == child.join("recovered.txt"));
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(recovered, "explicit expand must retry and restore contents");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_delete_boundary_replacement_is_restored() {
++        let base = temp_root("popup-delete-boundary-replacement");
++        let target = base.join("selected.txt");
++        let retained = base.join("retained.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        let result =
++            crate::app::popup_review_delete_at_boundary(intent.request, &base, |stage, _| {
++                if stage == crate::app::PopupReviewDeleteStage::Move {
++                    std::fs::rename(&target, &retained).unwrap();
++                    std::fs::write(&target, b"boundary replacement").unwrap();
++                }
++            });
++        let replacement = std::fs::read(&target).ok();
++        let original = std::fs::read(&retained).unwrap();
++        let count = std::fs::read_dir(&base).unwrap().count();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            result.is_err(),
++            "replacement at mutation boundary must be rejected"
++        );
++        assert_eq!(
++            replacement.as_deref(),
++            Some(b"boundary replacement".as_slice())
++        );
++        assert_eq!(original, b"selected");
++        assert_eq!(
++            count, 2,
++            "restored mismatch must clean its empty quarantine"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_delete_boundary_restore_conflict_preserves_both_new_files() {
++        let base = temp_root("popup-delete-boundary-conflict");
++        let target = base.join("selected.txt");
++        let retained = base.join("retained.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        let result =
++            crate::app::popup_review_delete_at_boundary(intent.request, &base, |stage, _| {
++                match stage {
++                    crate::app::PopupReviewDeleteStage::Move => {
++                        std::fs::rename(&target, &retained).unwrap();
++                        std::fs::write(&target, b"first replacement").unwrap();
++                    }
++                    crate::app::PopupReviewDeleteStage::Restore => {
++                        std::fs::write(&target, b"second replacement").unwrap();
++                    }
++                    _ => {}
++                }
++            });
++        let restored_path = std::fs::read(&target).ok();
++        let quarantined = std::fs::read_dir(&base)
++            .unwrap()
++            .filter_map(|entry| {
++                let entry = entry.unwrap();
++                entry
++                    .file_type()
++                    .unwrap()
++                    .is_dir()
++                    .then(|| std::fs::read(entry.path().join("item")).ok())
++                    .flatten()
++            })
++            .collect::<Vec<_>>();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(result.is_err());
++        assert_eq!(
++            restored_path.as_deref(),
++            Some(b"second replacement".as_slice())
++        );
++        assert_eq!(
++            quarantined,
++            vec![b"first replacement".to_vec()],
++            "restore conflict must preserve the unselected inode in quarantine"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_delete_cleanup_failure_keeps_unexpected_file_and_reports_error() {
++        let base = temp_root("popup-delete-cleanup-failure");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        let mut retained = None;
++        let result =
++            crate::app::popup_review_delete_at_boundary(intent.request, &base, |stage, holder| {
++                if stage == crate::app::PopupReviewDeleteStage::Cleanup {
++                    let path = holder.join("unexpected.txt");
++                    std::fs::write(&path, b"must survive").unwrap();
++                    retained = Some(path);
++                }
++            });
++        assert!(
++            result.is_err(),
++            "cleanup must not hide an unexpected occupied quarantine"
++        );
++        assert!(!target.exists());
++        assert_eq!(std::fs::read(retained.unwrap()).unwrap(), b"must survive");
++        std::fs::remove_dir_all(&base).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_delete_cancellation_before_mutation_preserves_target() {
++        let base = temp_root("popup-delete-cancelled");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"selected").unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        let result = crate::app::popup_review_cancelled_delete(intent.request);
++        assert!(result.is_err());
++        assert_eq!(std::fs::read(&target).unwrap(), b"selected");
++        assert_eq!(
++            std::fs::read_dir(&base).unwrap().count(),
++            1,
++            "cancellation creates no quarantine"
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_delete_depth_budget_refuses_before_mutation() {
++        let base = temp_root("popup-delete-depth-budget");
++        let target = base.join("selected");
++        std::fs::create_dir(&target).unwrap();
++        let intent = popup_review_approved_delete_intent(&base, &target);
++        let mut path = target.clone();
++        // Exceed the 128-level worker budget without exceeding macOS PATH_MAX.
++        for _ in 0..130 {
++            path.push("n");
++            std::fs::create_dir(&path).unwrap();
++        }
++        std::fs::write(path.join("retained.txt"), b"retain").unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++        assert!(result.is_err());
++        assert_eq!(std::fs::read(path.join("retained.txt")).unwrap(), b"retain");
++        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
++        std::fs::remove_dir_all(&base).unwrap();
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_synthetic_trash_failure_cannot_authorize_deletion() {
++        use egui_kittest::kittest::Queryable as _;
++        let base = temp_root("popup-unproven-delete");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"keep").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget {
++            path: target.clone(),
++            label: "selected.txt".into(),
++            is_dir: false,
++        });
++        let intent = tree.take_io_intent().unwrap();
++        tree.complete_io(FileTreeIoCompletion {
++            operation: intent.operation,
++            generation: intent.generation,
++            result: Err(FileTreeIoErrorCode::TrashUnavailable),
++            delete_guard: None,
++        });
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        harness
++            .get_by_label(&catalog.t("file_tree.permanent_delete", &[]))
++            .click();
++        for _ in 0..8 {
++            harness.step();
++        }
++        assert!(harness.state_mut().0.take_io_intent().is_none());
++        assert!(harness.state().0.confirm_delete.is_some());
++        assert_eq!(
++            harness.state().0.error.as_deref(),
++            Some(file_tree_io_error_message(FileTreeIoErrorCode::InvalidPath))
++        );
++        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
++        std::fs::remove_dir_all(&base).unwrap();
++    }
+ }
+diff --git a/crates/app/src/ui/workspace.rs b/crates/app/src/ui/workspace.rs
+index 6a7009d8..56e46467 100644
+--- a/crates/app/src/ui/workspace.rs
++++ b/crates/app/src/ui/workspace.rs
+@@ -7816,8 +7816,13 @@ impl WorkspaceUi {
+                 true
+             };
+         let any_blocking_window_visible = super::popup::background_input_blocked(ui.ctx());
++        // Runtime acknowledgements must not reclaim a newer file-tree gesture. Explicit
++        // App navigation and terminal clicks still use their existing refocus paths.
++        let tree_keyboard_owned = super::file_tree::FileTreeUi::owns_keyboard_focus(ui.ctx())
++            && self.explicit_pending_focus.as_ref() != Some(pane_id);
+         let terminal_keyboard_active = terminal_input_owner
+             && !search_input_focused
++            && !tree_keyboard_owned
+             && terminal_keyboard_input_allowed(
+                 ui.ctx().text_edit_focused(),
+                 ui.ctx().any_popup_open(),
+@@ -8222,6 +8227,7 @@ impl WorkspaceUi {
+         if input_enabled
+             && mode.is_local()
+             && focused
++            && !tree_keyboard_owned
+             // Share the same ownership gate as preview, candidate output and
+             // input admission. Keep automatic refocus pending for a TextEdit
+             // IME batch; explicit pane clicks below still claim focus directly.
+@@ -22325,6 +22331,338 @@ https://example.test/login \
+     // 메꾼다. 두 테스트 모두 특수문자 없는 순수 한글(가/나)만 써서 문장부호
+     // 중복제거 원장(native_key_monitor 기반)이 애초에 관여하지 않는 경로를
+     // 검증한다.
++    struct FileTreeInputState {
++        tree: crate::ui::file_tree::FileTreeUi,
++        workspace: WorkspaceUi,
++        fonts_ready: bool,
++        native_paste: bool,
++    }
++
++    fn file_tree_input_harness() -> egui_kittest::Harness<'static, FileTreeInputState> {
++        use crate::ui::file_tree::{
++            FileTreeUi, SidebarSnapshot, SidebarWorkspaceEntry, SidebarWorkspaceState,
++        };
++        let text = catalog();
++        let config = TerminalConfig::default();
++        let workspaces = vec![SidebarWorkspaceEntry {
++            id: "ws-input".into(),
++            name: "Input regression".into(),
++            state: SidebarWorkspaceState::Active,
++            summary: Default::default(),
++        }];
++        let mut workspace = WorkspaceUi::new();
++        workspace.mux = Some(mux(
++            "primary",
++            vec![tab(
++                "primary",
++                vec![pane("pane", SessionId(7))],
++                LayoutNode::Pane(pane_id("pane")),
++            )],
++            "pane",
++        ));
++        workspace.last_focused_pane = Some(pane_id("pane"));
++        workspace.pending_focus = Some(pane_id("pane"));
++        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.input_regression_listing(&["b.txt", "c.txt"]);
++        let mut harness = egui_kittest::Harness::builder()
++            .with_size(egui::vec2(1100.0, 720.0))
++            .build_ui_state(
++                move |ui, state: &mut FileTreeInputState| {
++                    if !state.fonts_ready {
++                        return;
++                    }
++                    if std::mem::take(&mut state.native_paste) {
++                        crate::native_key_monitor::tests::record_paste();
++                    }
++                    let sidebar = SidebarSnapshot {
++                        active_workspace_id: "ws-input",
++                        workspaces: &workspaces,
++                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
++                        home_notice_count: 0,
++                        fleet_summary: Default::default(),
++                        history_tab_active: false,
++                        git_tab_active: false,
++                        agents_open: false,
++                        workspace_note: None,
++                    };
++                    state.tree.panel(ui, &HashMap::new(), &sidebar, &text);
++                    let (paste, copy) = state.tree.take_clipboard_shortcut_consumption();
++                    state
++                        .workspace
++                        .suppress_clipboard_shortcuts_this_frame(paste, copy);
++                    state
++                        .workspace
++                        .show_with_input(ui, &config, &[], &text, true);
++                },
++                FileTreeInputState {
++                    tree,
++                    workspace,
++                    fonts_ready: false,
++                    native_paste: false,
++                },
++            );
++        let fonts = crate::config::Config::default();
++        crate::fonts::install_cjk_fallback(
++            &harness.ctx,
++            None,
++            &fonts.terminal.mono_font,
++            &fonts.terminal.mono_weight,
++        );
++        harness.state_mut().fonts_ready = true;
++        harness.run();
++        drain_protocol(&mut harness.state_mut().workspace);
++        while harness.state_mut().workspace.take_io_intent().is_some() {}
++        harness
++    }
++
++    fn begin_file_tree_input_rename(harness: &mut egui_kittest::Harness<'_, FileTreeInputState>) {
++        harness
++            .state_mut()
++            .tree
++            .input_regression_begin_rename("b.txt");
++        harness.run();
++        assert!(
++            harness.ctx.text_edit_focused(),
++            "actual file Rename must own input"
++        );
++        drain_protocol(&mut harness.state_mut().workspace);
++    }
++
++    fn assert_no_file_tree_terminal_input(
++        harness: &mut egui_kittest::Harness<'_, FileTreeInputState>,
++    ) {
++        assert!(
++            written_bytes(drain_protocol(&mut harness.state_mut().workspace)).is_empty(),
++            "file-tree input reached the terminal protocol"
++        );
++        while let Some(intent) = harness.state_mut().workspace.take_io_intent() {
++            assert!(
++                !matches!(intent, WorkspaceIoIntent::ReadTerminalClipboard { .. }),
++                "file Rename native batch reached terminal clipboard IO"
++            );
++        }
++    }
++
++    #[test]
++    fn popup_input_file_rename_enter_consumes_raw_and_native_batch() {
++        use crate::ui::file_tree::FileTreeIoRequest;
++        let mut harness = file_tree_input_harness();
++        begin_file_tree_input_rename(&mut harness);
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Paste("-renamed".into()));
++        harness.key_press(egui::Key::Enter);
++        harness.state_mut().native_paste = true;
++        harness.run_steps(1);
++        assert!(
++            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Rename { source, name } if source.as_path().ends_with("b.txt") && name == "b.txt-renamed")
++        );
++        assert_no_file_tree_terminal_input(&mut harness);
++        harness.run_steps(1);
++        assert_no_file_tree_terminal_input(&mut harness);
++    }
++
++    #[test]
++    fn popup_input_file_rename_escape_consumes_raw_and_native_batch() {
++        let mut harness = file_tree_input_harness();
++        begin_file_tree_input_rename(&mut harness);
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Paste("-discarded".into()));
++        harness.key_press(egui::Key::Escape);
++        harness.state_mut().native_paste = true;
++        harness.run_steps(1);
++        assert!(harness.state().tree.input_regression_rename().is_none());
++        assert!(harness.state_mut().tree.take_io_intent().is_none());
++        assert_no_file_tree_terminal_input(&mut harness);
++        harness.run_steps(1);
++        assert_no_file_tree_terminal_input(&mut harness);
++    }
++
++    #[test]
++    fn popup_input_file_rename_ime_enter_keeps_composition_owned() {
++        let mut harness = file_tree_input_harness();
++        begin_file_tree_input_rename(&mut harness);
++        harness.input_mut().events.extend([
++            preedit_event("가"),
++            egui::Event::Key {
++                key: egui::Key::Enter,
++                physical_key: None,
++                pressed: true,
++                repeat: false,
++                modifiers: egui::Modifiers::NONE,
++            },
++        ]);
++        harness.run_steps(1);
++        assert!(
++            harness.state().tree.input_regression_rename().is_some(),
++            "IME Enter must finish composition before Rename submission"
++        );
++        assert_no_file_tree_terminal_input(&mut harness);
++        harness.input_mut().events.push(commit_event("가"));
++        harness.run_steps(1);
++        assert_no_file_tree_terminal_input(&mut harness);
++        assert!(
++            harness
++                .state()
++                .tree
++                .input_regression_rename()
++                .unwrap()
++                .1
++                .contains('가')
++        );
++        harness.key_press(egui::Key::Enter);
++        harness.run_steps(1);
++        assert!(harness.state_mut().tree.take_io_intent().is_some());
++        assert_no_file_tree_terminal_input(&mut harness);
++    }
++
++    #[test]
++    fn popup_input_file_rename_listing_insert_keeps_focus_and_target() {
++        use crate::ui::file_tree::FileTreeIoRequest;
++        let mut harness = file_tree_input_harness();
++        begin_file_tree_input_rename(&mut harness);
++        let input_id = harness.ctx.memory(|memory| memory.focused()).unwrap();
++        harness
++            .state_mut()
++            .tree
++            .input_regression_listing(&["a.txt", "b.txt", "c.txt"]);
++        harness.run_steps(1);
++        assert_eq!(
++            harness.ctx.memory(|memory| memory.focused()),
++            Some(input_id),
++            "watcher insertion changed the actual Rename widget owner"
++        );
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Text("x".into()));
++        harness.run_steps(1);
++        assert_eq!(
++            harness.state().tree.input_regression_rename().unwrap().1,
++            "b.txtx"
++        );
++        harness.key_press(egui::Key::Enter);
++        harness.run_steps(1);
++        assert!(
++            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Rename { source, name } if source.as_path().ends_with("b.txt") && name == "b.txtx")
++        );
++        assert_no_file_tree_terminal_input(&mut harness);
++    }
++
++    #[test]
++    fn popup_input_tree_click_keeps_keyboard_for_next_frame_delete() {
++        use crate::ui::file_tree::{FileTreeIoRequest, FileTreeUi};
++        use egui_kittest::kittest::Queryable;
++        let mut harness = file_tree_input_harness();
++        harness.get_by_label("b.txt").click();
++        harness.run_steps(1);
++        assert!(
++            FileTreeUi::input_regression_owns_keyboard(&harness.ctx),
++            "terminal renderer reclaimed the clicked tree owner"
++        );
++        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Backspace);
++        harness.run_steps(1);
++        assert!(
++            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Trash { target, .. } if target.as_path().ends_with("b.txt"))
++        );
++        assert_no_file_tree_terminal_input(&mut harness);
++    }
++
++    #[test]
++    fn popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste() {
++        use crate::ui::file_tree::FileTreeUi;
++        use egui_kittest::kittest::Queryable;
++        let mut harness = file_tree_input_harness();
++        harness.get_by_label("b.txt").click();
++        harness.run_steps(1);
++        assert!(FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
++        let pos = egui::pos2(800.0, 350.0);
++        for pressed in [true, false] {
++            harness.input_mut().events.extend([
++                egui::Event::PointerMoved(pos),
++                egui::Event::PointerButton {
++                    pos,
++                    button: egui::PointerButton::Primary,
++                    pressed,
++                    modifiers: egui::Modifiers::NONE,
++                },
++            ]);
++            harness.run_steps(1);
++        }
++        assert!(!FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
++        drain_protocol(&mut harness.state_mut().workspace);
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Text("x".into()));
++        harness.run_steps(1);
++        assert_eq!(
++            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
++            b"x"
++        );
++        harness.input_mut().events.push(preedit_event("가"));
++        harness.run_steps(1);
++        assert!(
++            harness
++                .state()
++                .workspace
++                .preedit
++                .is_active_for(SessionId(7))
++        );
++        harness.input_mut().events.push(commit_event("가"));
++        harness.run_steps(1);
++        assert_eq!(
++            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
++            "가".as_bytes()
++        );
++        harness.state_mut().native_paste = true;
++        harness.run_steps(1);
++        assert!(matches!(
++            harness.state_mut().workspace.take_io_intent(),
++            Some(WorkspaceIoIntent::ReadTerminalClipboard { .. })
++        ));
++    }
++
++    #[test]
++    fn popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it() {
++        use crate::ui::file_tree::FileTreeUi;
++        use egui_kittest::kittest::Queryable;
++        let mut harness = file_tree_input_harness();
++        harness.get_by_label("b.txt").click();
++        harness.run_steps(1);
++        assert!(FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
++        harness.state_mut().workspace.pending_focus = Some(pane_id("pane"));
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Text("q".into()));
++        harness.run_steps(1);
++        assert!(
++            FileTreeUi::input_regression_owns_keyboard(&harness.ctx),
++            "a deferred runtime focus must not steal the newer tree gesture"
++        );
++        assert_no_file_tree_terminal_input(&mut harness);
++        harness
++            .state_mut()
++            .workspace
++            .arm_terminal_focus(pane_id("pane"));
++        harness.run_steps(1);
++        assert!(!FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
++        harness
++            .input_mut()
++            .events
++            .push(egui::Event::Text("r".into()));
++        harness.run_steps(1);
++        assert_eq!(
++            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
++            b"r"
++        );
++    }
++
+     #[test]
+     fn popup_behavior_probe_workspace_rename_does_not_paste_into_terminal() {
+         use crate::ui::file_tree::{
+diff --git a/crates/connector-ui/src/lib.rs b/crates/connector-ui/src/lib.rs
+index d987cef5..a4aa1705 100644
+--- a/crates/connector-ui/src/lib.rs
++++ b/crates/connector-ui/src/lib.rs
+@@ -18,8 +18,12 @@ use egui::{Button, ComboBox, Label, ScrollArea, TextEdit, Ui};
+ use i18n::Catalog;
+
+ pub use connector_contract as contract;
++mod draft_text_edit;
+ pub mod popup;
+
++#[cfg(test)]
++mod oauth_secret_tests;
++
+ const SERVER_ROW_HEIGHT: f32 = 30.0;
+ const SERVER_LIST_HEIGHT: f32 = 180.0;
+ const TOOL_ROW_HEIGHT: f32 = 58.0;
+@@ -1068,11 +1072,15 @@ fn render_oauth_client_form(
+             .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
+     );
+     ui.label(&labels.client_secret);
+-    ui.add(
+-        TextEdit::singleline(&mut current.client_secret)
+-            .password(true)
+-            .char_limit(ResourceLimits::PRODUCTION_CEILING.tool_input_bytes),
+-    );
++    let secret_id = ui.make_persistent_id("connector_oauth_client_secret");
++    current.secret_input_state.track(ui.ctx(), secret_id);
++    {
++        let mut secret = popup::MaskedSecretBuffer::new(
++            &mut current.client_secret,
++            ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
++        );
++        popup::secret_input(ui, &mut secret, secret_id, "", false);
++    }
+     ui.label(&labels.workspace_hint);
+     ui.add(
+         TextEdit::singleline(&mut current.workspace_hint)
+@@ -1587,6 +1595,7 @@ struct OAuthClientDraft {
+     server_id: ServerId,
+     client_id: String,
+     client_secret: String,
++    secret_input_state: draft_text_edit::DraftTextEditState,
+     workspace_hint: String,
+ }
+
+@@ -1604,6 +1613,7 @@ impl OAuthClientDraft {
+             server_id: oauth.server_id.clone(),
+             client_id: String::new(),
+             client_secret: String::new(),
++            secret_input_state: draft_text_edit::DraftTextEditState::default(),
+             workspace_hint: String::new(),
+         }
+     }
+diff --git a/crates/runtime/src/in_process.rs b/crates/runtime/src/in_process.rs
+index 6699ec46..d2063c1a 100644
+--- a/crates/runtime/src/in_process.rs
++++ b/crates/runtime/src/in_process.rs
+@@ -14243,6 +14243,98 @@ mod tests {
+         (worker, group)
+     }
+
++    #[test]
++    #[cfg(unix)]
++    fn composer_wide_placeholder_accepts_input_without_moving_viewport() {
++        for offset in [0, 5, i32::MAX] {
++            let (mut worker, group) =
++                scrolled_composer_worker("› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H", true);
++            let id = SessionId(1);
++            worker.sessions.get_mut(&id).unwrap().scroll(offset);
++            let before = worker
++                .sessions
++                .get_mut(&id)
++                .unwrap()
++                .take_snapshot()
++                .unwrap();
++            let deadline = Instant::now() + Duration::from_secs(5);
++            let admission =
++                crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
++                    .with_agent_guard(crate::AgentInputGuard {
++                        foreground_process_group: group,
++                        provider: crate::AgentPromptKind::Codex,
++                        intent: crate::AgentInputIntent::ExplicitPrompt,
++                    });
++            let body = "\x1b[200~한글 새 입력\nWIDE-COMPOSER-END\x1b[201~";
++            assert_eq!(
++                worker.admit_input_batch_checked(id, &[body.as_bytes(), b"\r"], Some(&admission)),
++                Ok(()),
++                "an untouched wide hint must accept explicit input at scroll offset {offset}"
++            );
++            let after = worker
++                .sessions
++                .get_mut(&id)
++                .unwrap()
++                .take_snapshot()
++                .unwrap();
++            assert_eq!(after.scroll_offset, before.scroll_offset);
++            assert_eq!(after.visible_cells, before.visible_cells);
++            while !worker.sessions[&id]
++                .screen_text()
++                .contains("WIDE-COMPOSER-END")
++            {
++                assert!(Instant::now() < deadline, "input must reach the owned PTY");
++                let effects = worker.collect_session_pump_effects(&[id], false, true);
++                worker.finish_session_pump_effects(effects);
++                std::thread::sleep(Duration::from_millis(1));
++            }
++        }
++    }
++
++    #[test]
++    #[cfg(unix)]
++    fn composer_wide_cursor_still_protects_drafts_and_automatic_input() {
++        for (editor, intent) in [
++            (
++                "› 한글 초안\x1b[1;4H",
++                crate::AgentInputIntent::ExplicitPrompt,
++            ),
++            (
++                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;6H",
++                crate::AgentInputIntent::ExplicitPrompt,
++            ),
++            (
++                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H",
++                crate::AgentInputIntent::AutomaticPrompt,
++            ),
++        ] {
++            for offset in [0, 5, i32::MAX] {
++                let (mut worker, group) = scrolled_composer_worker(editor, false);
++                let id = SessionId(1);
++                worker.sessions.get_mut(&id).unwrap().scroll(offset);
++                let admission = crate::InputAdmission::new(
++                    crate::InputPermit::new(),
++                    Instant::now() + Duration::from_secs(5),
++                    |write| write(),
++                )
++                .with_agent_guard(crate::AgentInputGuard {
++                    foreground_process_group: group,
++                    provider: crate::AgentPromptKind::Codex,
++                    intent,
++                });
++                assert_eq!(
++                    worker.admit_input_batch_checked(
++                        id,
++                        &[b"must-not-send", b"\r"],
++                        Some(&admission)
++                    ),
++                    Err(pty::PtyInputRejectReason::AdmissionDenied),
++                    "wide cursor normalization must preserve {intent:?} protection at offset {offset}"
++                );
++            }
++        }
++    }
++
+     #[test]
+     #[cfg(unix)]
+     fn composer_scrollback_submit_uses_live_editor_and_preserves_viewport() {
+diff --git a/crates/terminal/src/alacritty_backend.rs b/crates/terminal/src/alacritty_backend.rs
+index 7cd0c2df..3727d5c0 100644
+--- a/crates/terminal/src/alacritty_backend.rs
++++ b/crates/terminal/src/alacritty_backend.rs
+@@ -802,7 +802,12 @@ impl TerminalBackend for AlacrittyBackend {
+             }
+         }
+         // A navigation/vi cursor is not the editor cursor that will receive input.
+-        let cursor = grid.cursor.point;
++        let mut cursor = grid.cursor.point;
++        // Match rendered cursor coordinates at a wide glyph's trailing cell,
++        // without moving the native editor cursor or the user's viewport.
++        if grid[cursor].flags.contains(Flags::WIDE_CHAR_SPACER) {
++            cursor.column -= 1;
++        }
+         let (shape, shape_visible) = map_cursor_shape(self.term.cursor_style().shape);
+         Some(TerminalViewportSnapshot {
+             cols: cols as u16,
+@@ -1562,6 +1567,41 @@ mod tests {
+     use super::*;
+     use crate::backend::TerminalBackend;
+
++    #[test]
++    fn input_snapshot_normalizes_wide_cursor_without_moving_native_cursor() {
++        for hint in ["한글 힌트", "界面提示", "😀 hint"] {
++            for alternate in [false, true] {
++                let mut backend = AlacrittyBackend::new(80, 4, 100);
++                feed(&mut backend, "past output\r\n".repeat(20).as_bytes());
++                if alternate {
++                    feed(&mut backend, b"\x1b[?1049h");
++                }
++                feed(
++                    &mut backend,
++                    format!("\x1b[2J\x1b[H› \x1b[2m{hint}\x1b[0m\x1b[1;4H").as_bytes(),
++                );
++                let native = backend.term.grid().cursor.point;
++                assert_eq!(native.column.0, 3);
++                assert!(
++                    backend.term.grid()[native]
++                        .flags
++                        .contains(Flags::WIDE_CHAR_SPACER)
++                );
++                for offset in [0, 5] {
++                    backend.scroll(offset);
++                    let viewport = backend.viewport_snapshot().unwrap();
++                    let input = backend.input_snapshot().unwrap();
++                    assert_eq!(input.cursor.col, 2, "{hint}, alternate={alternate}");
++                    assert_eq!(input.cursor.row, 0);
++                    assert_eq!(input.scroll_offset, 0);
++                    assert_eq!(input.is_alt_screen, alternate);
++                    assert_eq!(backend.term.grid().cursor.point, native);
++                    assert_eq!(backend.viewport_snapshot().unwrap(), viewport);
++                }
++            }
++        }
++    }
++
+     #[test]
+     fn input_snapshot_uses_native_cursor_in_vi_mode_and_alternate_screen() {
+         let mut backend = AlacrittyBackend::new(80, 4, 100);

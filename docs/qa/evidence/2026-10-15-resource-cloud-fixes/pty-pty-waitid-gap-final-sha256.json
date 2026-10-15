@@ -1,0 +1,23 @@
+{
+  "crates/pty/src/lib.rs": {
+    "canonical_before": "edacafeabf3d94bb2fa88bbf718c6839b8c07f327b18e4b69099504c09a48e7c",
+    "worker_after": "951f2068fe5af8d9f3a01f626d6390811f19fa1f7c9a243e96678547c1036222"
+  },
+  "crates/pty/src/workload_signal.rs": {
+    "canonical_before": "ac6172710590451cd7ff0008268f841faf0ba434e8836b2a740743a52541f0a4",
+    "worker_after": "ac6172710590451cd7ff0008268f841faf0ba434e8836b2a740743a52541f0a4"
+  },
+  "crates/pty/src/foreground_teardown_tests.rs": {
+    "canonical_before": "0b33978efe953d0b5987df5544295490033487572ea070d8b593e3896fe46810",
+    "worker_after": "0b33978efe953d0b5987df5544295490033487572ea070d8b593e3896fe46810"
+  },
+  "pty-waitid-gap-final-product.patch": {
+    "sha256": "52b8f23b9a26146bd0bc25938f86043347d9e0703ae0332bc52e006162425091"
+  },
+  "pty-waitid-gap-final-combined.patch": {
+    "sha256": "1afb220824ba078e4804c08dbc20819859203c7330d97d886a735c8766d61da9"
+  },
+  "pty-waitid-gap-final-cumulative.patch": {
+    "sha256": "b719fb6093a9015337f11c15c18c328f5b7be11332e6c5dcdfae8d4652d7ba38"
+  }
+}

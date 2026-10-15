@@ -1,4 +1,13 @@
 //! App-owned authorization and effects for the outward MCP bridge.
+mod access;
+#[cfg(test)]
+mod bridge_tests;
+mod continuity;
+mod control;
+mod management;
+pub(crate) mod navigation;
+mod output;
+mod pwa;
 mod tunnel;
 mod ui;
 use crate::agent_detect::AgentExecutionIdentity;
@@ -18,11 +27,15 @@ pub struct Target {
     pub workspace_name: String,
     pub title: String,
     pub agent_line: Option<String>,
+    pub local_status: Option<runtime::SessionStatus>,
+    pub local_status_observed_at: Option<u64>,
+    pub local_agent_present: bool,
     pub runtime: u64,
     pub session: runtime::SessionId,
     pub pane: runtime::MuxPaneId,
     pub live: bool,
     pub screen: Option<String>,
+    pub screen_observed_at: Option<u64>,
     pub provider: Option<AgentProvider>,
     pub execution: Option<AgentExecutionIdentity>,
     pub known_ai: bool,
@@ -48,6 +61,7 @@ struct Screen {
     generation: String,
     cursor: u64,
     text: String,
+    observed_at: Option<u64>,
 }
 pub enum Effect {
     Input {
@@ -61,6 +75,10 @@ pub enum Effect {
         admission: runtime::InputAdmission,
     },
     Watch,
+    History {
+        operation_id: u64,
+        query: terminal::TerminalHistoryQuery,
+    },
 }
 
 pub struct AnswerNotice {
@@ -98,6 +116,9 @@ struct PendingClaim {
     require_bracketed_paste: bool,
     submit: bool,
     answer: Option<String>,
+    context: agent_mcp::OperationContext,
+    lease_epoch: Option<u64>,
+    continuity: Option<continuity::ClockSample>,
 }
 struct PendingFinish {
     reply: Option<mpsc::SyncSender<Result<Value, String>>>,
@@ -105,11 +126,20 @@ struct PendingFinish {
     notice: Option<AnswerNotice>,
 }
 
+struct AnswerProjection {
+    source: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    corpus_revision: u64,
+    answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+}
+
 pub struct CloudAgent {
     pub boot: String,
     pub port: u16,
     pub hostname: String,
     pub automatic: bool,
+    pub reconnect: bool,
+    pub profiles: Vec<crate::config::CloudConnectionProfile>,
+    pub profile_name: String,
     connection: Connection,
     generated_hostname: Option<String>,
     tunnel: Option<tunnel::Tunnel>,
@@ -124,7 +154,20 @@ pub struct CloudAgent {
     ended_last_refresh: Option<Instant>,
     ended_load_failed: bool,
     grants: HashMap<String, Grant>,
+    control: control::ControlManager,
+    lease_permits: HashMap<u64, runtime::InputPermit>,
+    issued_leases: HashMap<String, secret::RedactionLease>,
+    operation_contexts: HashMap<String, agent_mcp::OperationContext>,
+    management: management::Management,
+    output: output::OutputState,
+    recovery: continuity::Recovery,
+    operator_tx: mpsc::SyncSender<web_remote::cloud::CloudControlRequest>,
+    operator_rx: mpsc::Receiver<web_remote::cloud::CloudControlRequest>,
+    last_cloud_publish: Option<Instant>,
     screens: HashMap<String, Screen>,
+    screen_observations: HashMap<(u64, runtime::SessionId), u64>,
+    native_navigation: Option<navigation::RunNavigation>,
+    navigation_state: navigation::NavigationState,
     history: HistoryWorker,
     history_ready: bool,
     history_initialized: bool,
@@ -139,7 +182,9 @@ pub struct CloudAgent {
     finishes: HashMap<u64, PendingFinish>,
     finish_queue: std::collections::VecDeque<(u64, Job)>,
     records: Vec<Record>,
-    pub answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    pub history_truncated: bool,
+    answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    answer_projection: std::cell::RefCell<Option<AnswerProjection>>,
     pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
@@ -160,11 +205,15 @@ impl CloudAgent {
         )
     }
     fn with_worker(history: HistoryWorker, redaction: secret::RedactionService) -> Self {
+        let (operator_tx, operator_rx) = mpsc::sync_channel(16);
         Self {
             boot: uuid::Uuid::new_v4().to_string(),
             port: 8739,
             hostname: String::new(),
             automatic: true,
+            reconnect: false,
+            profiles: Vec::new(),
+            profile_name: String::new(),
             connection: Connection::Idle,
             generated_hostname: None,
             tunnel: None,
@@ -179,7 +228,22 @@ impl CloudAgent {
             ended_last_refresh: None,
             ended_load_failed: false,
             grants: HashMap::new(),
+            control: control::ControlManager::with_legacy_connection(
+                agent_mcp::LEGACY_CONNECTION_ID,
+            ),
+            lease_permits: HashMap::new(),
+            issued_leases: HashMap::new(),
+            operation_contexts: HashMap::new(),
+            management: management::Management::default(),
+            output: output::OutputState::default(),
+            recovery: continuity::Recovery::default(),
+            operator_tx,
+            operator_rx,
+            last_cloud_publish: None,
             screens: HashMap::new(),
+            screen_observations: HashMap::new(),
+            native_navigation: None,
+            navigation_state: navigation::NavigationState::default(),
             history,
             history_ready: false,
             history_initialized: false,
@@ -194,7 +258,9 @@ impl CloudAgent {
             finishes: HashMap::new(),
             finish_queue: std::collections::VecDeque::new(),
             records: vec![],
+            history_truncated: false,
             answers: std::sync::Arc::from([]),
+            answer_projection: std::cell::RefCell::new(None),
             pending: HashMap::new(),
             redaction,
             token_lease: None,
@@ -214,11 +280,30 @@ impl CloudAgent {
             return;
         }
         self.history_revision = revision;
+        self.answer_projection.get_mut().take();
+        let connections = self.connection_infos();
         self.answers = rows
             .iter()
             .filter(|r| r.tool == "notify" && !r.message.is_empty())
             .map(|r| crate::ui::cloud_answer::Answer {
-                id: r.id.clone(),
+                id: agent_mcp::operation_key(
+                    r.connection_id
+                        .as_deref()
+                        .unwrap_or(agent_mcp::LEGACY_CONNECTION_ID),
+                    &r.id,
+                )
+                .unwrap_or_else(|_| r.id.clone()),
+                connection: connections
+                    .iter()
+                    .find(|info| Some(info.principal.id.as_str()) == r.connection_id.as_deref())
+                    .map(|info| self.redact(&info.principal.name))
+                    .unwrap_or_else(|| {
+                        r.connection_id
+                            .clone()
+                            .unwrap_or_else(|| agent_mcp::LEGACY_CONNECTION_ID.into())
+                    }),
+                run: r.run_id.clone(),
+                run_label: r.run_id.clone(),
                 session: r.session.clone(),
                 created: r.created,
                 message: r.message.clone(),
@@ -226,6 +311,40 @@ impl CloudAgent {
             .collect::<Vec<_>>()
             .into();
         self.records = rows;
+    }
+    pub fn cloud_answers(&self) -> std::sync::Arc<[crate::ui::cloud_answer::Answer]> {
+        // One corpus lock makes both the cache check and a rebuilt projection coherent with
+        // credential registration, replacement, fail-closed changes and grace expiration.
+        let redaction = self.redaction.snapshot();
+        let mut cache = self.answer_projection.borrow_mut();
+        if let Some(projection) = cache.as_ref()
+            && std::sync::Arc::ptr_eq(&projection.source, &self.answers)
+            && projection.corpus_revision == redaction.revision()
+        {
+            return std::sync::Arc::clone(&projection.answers);
+        }
+        let answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]> = self
+            .answers
+            .iter()
+            .cloned()
+            .map(|mut answer| {
+                answer.message = redaction.redact_wrapped_text(&answer.message);
+                answer.connection = redaction.redact_wrapped_text(&answer.connection);
+                answer.run_label = answer.run.as_deref().map(|run| {
+                    let mut label = redaction.redact_wrapped_text(run);
+                    truncate_utf8(&mut label, 512);
+                    label
+                });
+                answer
+            })
+            .collect::<Vec<_>>()
+            .into();
+        *cache = Some(AnswerProjection {
+            source: std::sync::Arc::clone(&self.answers),
+            corpus_revision: redaction.revision(),
+            answers: std::sync::Arc::clone(&answers),
+        });
+        answers
     }
     fn operation_token(&mut self) -> u64 {
         self.next_operation = self
@@ -237,7 +356,7 @@ impl CloudAgent {
     fn initialize_history(&mut self) {
         if !self.history_initialized
             && !self.history_open_pending
-            && self.history.request(0, Job::Open).is_ok()
+            && self.history.request(0, Job::OpenPage).is_ok()
         {
             self.history_open_pending = true;
             self.history_initialized = true;
@@ -248,6 +367,31 @@ impl CloudAgent {
         let mut bytes = redactor.redact_chunk(text.as_bytes());
         bytes.extend(redactor.flush());
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+    pub(super) fn redact_screen(&self, text: &str) -> String {
+        self.redaction.redact_wrapped_fragment(text)
+    }
+    pub fn observed_screen_at(&self, runtime: u64, session: runtime::SessionId) -> Option<u64> {
+        self.screen_observations.get(&(runtime, session)).copied()
+    }
+    fn observe_screen_events(&mut self, runtime: u64, events: &[runtime::RuntimeEvent], at: u64) {
+        for event in events {
+            let Some((session, _, _, _)) = event.viewport() else {
+                continue;
+            };
+            let key = (runtime, session);
+            if !self.screen_observations.contains_key(&key)
+                && self.screen_observations.len() >= MAX_TARGETS
+                && let Some(oldest) = self
+                    .screen_observations
+                    .iter()
+                    .min_by_key(|(_, observed)| *observed)
+                    .map(|(key, _)| *key)
+            {
+                self.screen_observations.remove(&oldest);
+            }
+            self.screen_observations.insert(key, at);
+        }
     }
     pub fn wants_screen(&self, id: &str) -> bool {
         self.server.is_some() && self.grants.contains_key(id)
@@ -342,6 +486,23 @@ impl CloudAgent {
                     && t.workspace == g.workspace
             })
         });
+        let identities: Vec<_> = self
+            .targets
+            .iter()
+            .map(|t| (t.id.as_str(), t.generation.as_str()))
+            .collect();
+        let revoked = self.control.retain_targets(&identities);
+        self.revoke_leases(revoked);
+        let ended: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|t| !t.live)
+            .map(|t| t.id.clone())
+            .collect();
+        for id in ended {
+            let revoked = self.control.revoke_session(&id);
+            self.revoke_leases(revoked);
+        }
         for target in &self.targets {
             if !target.live
                 && let Some(grant) = self.grants.get_mut(&target.id)
@@ -357,17 +518,21 @@ impl CloudAgent {
             if self.grants.contains_key(&t.id)
                 && let Some(text) = &t.screen
             {
-                let mut text = self.redact(text);
+                let mut text = self.redact_screen(text);
                 truncate_utf8(&mut text, MAX_SCREEN);
                 let screen = self.screens.entry(t.id.clone()).or_insert_with(|| Screen {
                     generation: t.generation.clone(),
                     cursor: 0,
                     text: String::new(),
+                    observed_at: t.screen_observed_at,
                 });
                 if screen.generation != t.generation {
                     screen.generation = t.generation.clone();
                     screen.cursor = 0;
                     screen.text.clear();
+                }
+                if let Some(observed_at) = t.screen_observed_at {
+                    screen.observed_at = Some(observed_at);
                 }
                 if screen.cursor == 0 || screen.text != text {
                     screen.cursor = screen.cursor.saturating_add(1);
@@ -380,6 +545,8 @@ impl CloudAgent {
         }
     }
     pub fn share(&mut self, t: &Target, shared: bool) {
+        let revoked = self.control.revoke_session(&t.id);
+        self.revoke_leases(revoked);
         if shared {
             self.grant_incarnation = self.grant_incarnation.wrapping_add(1).max(1);
             self.grants.insert(
@@ -402,6 +569,8 @@ impl CloudAgent {
         }
     }
     pub fn allow_input(&mut self, id: &str, allow: bool) {
+        let revoked = self.control.revoke_session(id);
+        self.revoke_leases(revoked);
         if let Some(g) = self.grants.get_mut(id) {
             g.permit.revoke();
             g.input_epoch = g.input_epoch.wrapping_add(1);
@@ -412,6 +581,8 @@ impl CloudAgent {
         }
     }
     pub fn take_control(&mut self) {
+        let revoked = self.control.take_control();
+        self.revoke_leases(revoked);
         for g in self.grants.values_mut() {
             g.permit.revoke();
             g.input_epoch = g.input_epoch.wrapping_add(1);
@@ -480,7 +651,11 @@ impl CloudAgent {
         }
     }
     fn start_auto(&mut self, ctx: &egui::Context, executable: std::path::PathBuf) {
-        if self.busy() || !self.start_server(ctx, "") {
+        if self.busy() {
+            return;
+        }
+        if !self.start_server(ctx, "") {
+            self.recovery.failed(Instant::now());
             return;
         }
         let port = self.server.as_ref().unwrap().addr.port();
@@ -498,6 +673,7 @@ impl CloudAgent {
             Err(_) => {
                 self.stop_connection();
                 self.error = Some("tunnel_worker_failed".into());
+                self.recovery.failed(Instant::now());
             }
         }
     }
@@ -505,7 +681,12 @@ impl CloudAgent {
         self.history_start_requested = false;
         self.take_control();
         self.server = None;
+        self.grants.clear();
+        self.screens.clear();
+        self.control =
+            control::ControlManager::with_legacy_connection(agent_mcp::LEGACY_CONNECTION_ID);
         self.token_lease = None;
+        self.issued_leases.clear();
         self.generated_hostname = None;
         self.reveal = false;
         self.connection = if let Some(worker) = &self.tunnel {
@@ -516,6 +697,10 @@ impl CloudAgent {
         };
     }
     pub fn shutdown(&mut self) {
+        // Seal new maintenance admission before any completion can schedule a
+        // retry. Accepted durable work and its finite continuations still drain.
+        self.seal_management();
+        self.recovery.stop();
         self.stop_connection();
         if let Some(mut worker) = self.tunnel.take() {
             worker.shutdown();
@@ -544,6 +729,15 @@ impl CloudAgent {
                 &mut Vec::new(),
             );
         }
+        self.poll_management();
+        while let Some(completion) = self.history.drain_one() {
+            self.complete_history(
+                completion,
+                &mut |_, _| Err("shutdown_no_effect".into()),
+                &mut Vec::new(),
+            );
+            self.poll_management();
+        }
         self.history.shutdown();
         self.finishes.clear();
     }
@@ -561,6 +755,9 @@ impl CloudAgent {
                             tunnel.acknowledge_address(&host);
                         }
                         self.generated_hostname = Some(host);
+                        if self.connection == Connection::Ready {
+                            self.take_control();
+                        }
                         self.connection = Connection::Verifying;
                     } else {
                         self.stop_connection();
@@ -576,6 +773,7 @@ impl CloudAgent {
                     {
                         self.generated_hostname = Some(host);
                         self.connection = Connection::Ready;
+                        self.recovery.success();
                     } else {
                         self.stop_connection();
                         self.error = Some("tunnel_hostname_failed".into());
@@ -584,6 +782,7 @@ impl CloudAgent {
                 Some(tunnel::Event::Failed(code)) => {
                     self.stop_connection();
                     self.error = Some(code.into());
+                    self.recovery.failed(Instant::now());
                 }
                 Some(tunnel::Event::Stopped) => {
                     self.stop_connection();
@@ -595,6 +794,7 @@ impl CloudAgent {
             if self.connection != Connection::Stopping {
                 self.stop_connection();
                 self.error = Some("tunnel_worker_failed".into());
+                self.recovery.failed(Instant::now());
             }
             self.tunnel = None;
             self.connection = Connection::Idle;
@@ -603,10 +803,43 @@ impl CloudAgent {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
+    pub fn set_reconnect(&mut self, enabled: bool) {
+        self.reconnect = enabled;
+        self.recovery.start(enabled && self.automatic);
+    }
+    fn observe_continuity(&mut self, clocks: Option<continuity::ClockSample>) {
+        let resumed = self.recovery.frame(clocks);
+        let unknown =
+            cfg!(any(target_os = "macos", target_os = "linux", windows)) && clocks.is_none();
+        if (resumed || unknown) && self.server.is_some() {
+            // A fresh request may sample good clocks before the next App frame
+            // verifies the old baseline. Retire existing input consent now.
+            self.take_control();
+            if resumed && let Some(tunnel) = &self.tunnel {
+                tunnel.revalidate();
+                self.connection = Connection::Verifying;
+            }
+        }
+    }
     pub fn apply_action(&mut self, ctx: &egui::Context) {
+        if !self.reconnect || !self.automatic {
+            self.recovery.stop();
+        }
+        self.observe_continuity(continuity::clock_sample());
         self.poll_connection(ctx);
+        let retry = self.action.is_none() && !self.busy() && self.recovery.retry(Instant::now());
+        if retry {
+            self.action = Some(Action::Start);
+        }
+        if let Some(due) = self.recovery.due() {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
+
         match self.action.take() {
             Some(Action::Start) if !self.busy() => {
+                if !retry {
+                    self.recovery.start(self.reconnect && self.automatic);
+                }
                 if !self.history_ready {
                     if !self.history_open_pending {
                         self.history_initialized = false;
@@ -630,12 +863,15 @@ impl CloudAgent {
                 }
             }
             Some(Action::Stop) => {
+                self.recovery.stop();
                 self.stop_connection();
                 self.error = None;
             }
             Some(Action::Rotate) => {
+                self.recovery.stop();
                 if let Some(s) = &self.server {
                     s.auth.rotate_at(now());
+                    self.issued_leases.clear();
                     let token = secret::SecretString::new(s.auth.token_for_user().to_string());
                     match self.redaction.acquire_rotating(&token) {
                         Ok(lease) => self.token_lease = Some(lease),
@@ -646,14 +882,19 @@ impl CloudAgent {
                     }
                     ctx.request_repaint_after(std::time::Duration::from_secs(agent_mcp::TOKEN_TTL));
                 }
+                let revoked = self.control.retire_auth_connections();
+                self.revoke_leases(revoked);
                 self.take_control();
                 self.reveal = false;
             }
             _ => {}
         }
+        if let Some(due) = self.recovery.due() {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
     }
     pub fn needs_target_projection(&self) -> bool {
-        self.server.is_some() || !self.claims.is_empty()
+        self.server.is_some() || !self.claims.is_empty() || self.has_cloud_runs()
     }
     pub fn next_request(&self) -> Option<Request> {
         self.server.as_ref()?.requests.try_recv().ok()
@@ -689,6 +930,7 @@ impl CloudAgent {
             self.complete_history(completion, &mut send, &mut notices);
         }
         self.dispatch_history();
+        self.poll_management();
         notices
     }
     fn dispatch_history(&mut self) {
@@ -704,7 +946,7 @@ impl CloudAgent {
             && self.finish_queue.is_empty()
         {
             let token = self.operation_token();
-            if self.history.request(token, Job::Recent).is_ok() {
+            if self.history.request(token, Job::RecentPage).is_ok() {
                 self.history_list = Some(token);
                 self.history_dirty = false;
             }
@@ -717,7 +959,25 @@ impl CloudAgent {
         notices: &mut Vec<AnswerNotice>,
     ) {
         let token = completion.token;
-        match completion.result {
+        let result = match completion.result {
+            ResultKind::OpenPage(page) => {
+                if let Ok(page) = &page {
+                    self.history_truncated = page.truncated;
+                }
+                ResultKind::Open(page.map(|page| page.records))
+            }
+            ResultKind::RecentPage(page) => {
+                if self.history_list == Some(token)
+                    && !self.history_dirty
+                    && let Ok(page) = &page
+                {
+                    self.history_truncated = page.truncated;
+                }
+                ResultKind::Recent(page.map(|page| page.records))
+            }
+            result => result,
+        };
+        match result {
             ResultKind::Open(result) => {
                 self.history_open_pending = false;
                 match result {
@@ -753,7 +1013,7 @@ impl CloudAgent {
                     Err(()) => self.error = Some("history_read_failed".into()),
                 }
             }
-            ResultKind::Claim(result) => {
+            ResultKind::Claim(result) | ResultKind::ClaimScoped(result) => {
                 let Some(claim) = self.claims.remove(&token) else {
                     return;
                 };
@@ -770,10 +1030,16 @@ impl CloudAgent {
                     Ok(Claim::Existing(outcome)) => {
                         let _ = claim.request.reply.try_send(Ok(outcome));
                     }
-                    Ok(Claim::New) => self.dispatch_claim(op, claim, send),
+                    Ok(Claim::New) => {
+                        let internal = agent_mcp::operation_key(&claim.context.connection_id, &op)
+                            .expect("validated operation context");
+                        self.operation_contexts
+                            .insert(internal.clone(), claim.context.clone());
+                        self.dispatch_claim(internal, claim, send);
+                    }
                 }
             }
-            ResultKind::Finish(result) => {
+            ResultKind::Finish(result) | ResultKind::FinishScoped(result) => {
                 let Some(finish) = self.finishes.remove(&token) else {
                     return;
                 };
@@ -791,6 +1057,7 @@ impl CloudAgent {
                     let _ = reply.try_send(receipt);
                 }
             }
+            result => self.complete_management(token, result),
         }
     }
     fn finish_operation(
@@ -810,14 +1077,21 @@ impl CloudAgent {
                 notice,
             },
         );
-        self.finish_queue.push_back((
-            token,
+        let job = if let Some(context) = self.operation_contexts.remove(&op) {
+            Job::FinishScoped {
+                id: context.operation_id,
+                connection_id: context.connection_id,
+                outcome,
+                message,
+            }
+        } else {
             Job::Finish {
                 id: op,
                 outcome,
                 message,
-            },
-        ));
+            }
+        };
+        self.finish_queue.push_back((token, job));
         self.dispatch_history();
     }
     fn dispatch_claim(
@@ -847,10 +1121,24 @@ impl CloudAgent {
                             .execution
                             .is_none_or(AgentExecutionIdentity::is_current)))
         });
+        let valid_client = self
+            .authorize_connection(&claim.request.principal, &claim.target, input)
+            .is_ok();
+        let valid_lease = !input
+            || claim.lease_epoch.is_some_and(|epoch| {
+                self.control.owns(
+                    &claim.context.connection_id,
+                    &claim.target.id,
+                    &claim.target.generation,
+                    claim.context.run_id.as_deref(),
+                    epoch,
+                    now(),
+                )
+            });
         let valid_grant = self.grants.get(&claim.target.id).is_some_and(|g| {
             g.incarnation == claim.grant && (!input || g.input_epoch == claim.input_epoch)
         });
-        if !valid_auth || !valid_target || !valid_grant {
+        if !valid_auth || !valid_target || !valid_grant || !valid_client || !valid_lease {
             let code = if !valid_auth {
                 "expired_or_revoked_request_no_effect"
             } else {
@@ -874,12 +1162,25 @@ impl CloudAgent {
             let auth = claim.auth;
             let epoch = claim.request.epoch;
             let access_key = claim.request.access_key;
+            let accepted_clock = claim.continuity;
             let execution = if paste { claim.target.execution } else { None };
+            let lease_expires = claim.lease_epoch.and_then(|epoch| {
+                self.control
+                    .lease(&claim.target.id, now())
+                    .filter(|lease| lease.epoch == epoch)
+                    .map(|lease| lease.expires_at)
+            });
             let mut admission =
                 runtime::InputAdmission::new(claim.permit, claim.request.deadline, move |write| {
-                    if execution.is_none_or(AgentExecutionIdentity::is_current) {
+                    if continuity::input_current(accepted_clock)
+                        && lease_expires.is_none_or(|expiry| now() < expiry)
+                        && execution.is_none_or(AgentExecutionIdentity::is_current)
+                    {
                         auth.admit_current_access(epoch, access_key.as_deref(), &mut || {
-                            if execution.is_none_or(AgentExecutionIdentity::is_current) {
+                            if continuity::input_current(accepted_clock)
+                                && lease_expires.is_none_or(|expiry| now() < expiry)
+                                && execution.is_none_or(AgentExecutionIdentity::is_current)
+                            {
                                 write();
                             }
                         })
@@ -940,7 +1241,7 @@ impl CloudAgent {
             };
             self.finish_operation(
                 op.clone(),
-                json!({"status":"stored","operation_id":op}),
+                json!({"status":"stored","operation_id":claim.context.operation_id}),
                 message,
                 Some(claim.request.reply),
                 Some(notice),
@@ -948,6 +1249,8 @@ impl CloudAgent {
         }
     }
     pub fn observe_input(&mut self, runtime: u64, events: &[runtime::RuntimeEvent]) {
+        self.observe_screen_events(runtime, events, now());
+        self.observe_history(runtime, events);
         for event in events {
             let runtime::RuntimeEvent::InputAdmitted {
                 session,
@@ -973,20 +1276,40 @@ impl CloudAgent {
                     json!({"status":"unknown","error":"pty_admission_unknown","retry":false,"completion":"not_confirmed"})
                 }
                 Err(reason) => {
-                    json!({"status":"rejected","error":format!("pty_{reason:?}"),"retry":false})
+                    json!({"status":"rejected","error":match reason { runtime::PtyInputRejectReason::QueueFull => "pty_queue_full", runtime::PtyInputRejectReason::SessionClosed => "pty_session_closed", runtime::PtyInputRejectReason::WriterUnavailable => "pty_writer_unavailable", runtime::PtyInputRejectReason::PayloadTooLarge => "pty_input_too_large", runtime::PtyInputRejectReason::AdmissionDenied => "pty_admission_revoked", runtime::PtyInputRejectReason::AdmissionUnknown => unreachable!() },"retry":false})
                 }
             };
             self.finish_operation(operation_id.clone(), outcome, String::new(), p.reply, None);
         }
     }
     pub fn expire_pending(&mut self) {
+        let revoked = self.control.expire(now());
+        self.revoke_leases(revoked);
+        self.expire_history_queries();
         self.pending.retain(|_, p| {
             let expired = Instant::now() >= p.deadline;
             if expired && let Some(reply) = p.reply.take() {
                 let _ = reply.try_send(Err("outcome_unknown_do_not_retry_input".into()));
             }
-            Instant::now() < p.deadline + std::time::Duration::from_secs(30)
+            true
         });
+        let abandoned: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| Instant::now() >= p.deadline + std::time::Duration::from_secs(30))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for op in abandoned {
+            if let Some(pending) = self.pending.remove(&op) {
+                self.finish_operation(
+                    op,
+                    json!({"status":"unknown","retry":false,"completion":"not_confirmed"}),
+                    String::new(),
+                    pending.reply,
+                    None,
+                );
+            }
+        }
     }
     fn prepare(
         &mut self,
@@ -1008,11 +1331,46 @@ impl CloudAgent {
         let allowed: &[&str] = match req.tool.as_str() {
             "list_sessions" => &[],
             "read_output" => &["session_id", "generation", "cursor"],
-            "send_text" | "paste_text" => {
-                &["session_id", "generation", "operation_id", "text", "submit"]
-            }
-            "send_ctrl_c" => &["session_id", "generation", "operation_id"],
-            "notify" => &["session_id", "generation", "operation_id", "message"],
+            "send_text" | "paste_text" => &[
+                "session_id",
+                "generation",
+                "operation_id",
+                "text",
+                "submit",
+                "run_id",
+            ],
+            "send_ctrl_c" => &["session_id", "generation", "operation_id", "run_id"],
+            "notify" => &[
+                "session_id",
+                "generation",
+                "operation_id",
+                "message",
+                "run_id",
+            ],
+            "start_run" => &["session_id", "generation", "run_id", "title", "instruction"],
+            "update_run" => &[
+                "session_id",
+                "generation",
+                "run_id",
+                "state",
+                "progress",
+                "message",
+                "result",
+                "artifacts",
+            ],
+            "get_run" => &["session_id", "generation", "run_id"],
+            "list_runs" => &[
+                "session_id",
+                "generation",
+                "state",
+                "before",
+                "limit",
+                "max_bytes",
+            ],
+            "get_operation" => &["session_id", "generation", "operation_id"],
+            "read_history" => &["session_id", "generation", "cursor", "max_bytes"],
+            "acquire_control" => &["session_id", "generation", "run_id", "ttl_seconds"],
+            "release_control" => &["session_id", "generation", "run_id"],
             _ => return Err("unknown_tool".into()),
         };
         if !a.is_object()
@@ -1024,8 +1382,34 @@ impl CloudAgent {
             return Err("invalid_arguments".into());
         }
         if req.tool == "list_sessions" {
-            let sessions: Vec<_> = self.targets.iter().filter_map(|t| self.grants.get(&t.id).map(|g| json!({"session_id":t.id,"generation":t.generation,"workspace":t.workspace,"workspace_name":t.workspace_name,"title":t.title,"input_allowed":g.input&&t.live&&req.input_scope,"live":t.live,"paste_bracketed":t.bracketed_paste,"paste_text_max_bytes":agent_mcp::MAX_PASTE,"paste_ai_confirmed":!t.known_ai||t.execution.is_some()}))).collect();
+            let redaction = self.redaction.snapshot();
+            let sessions: Vec<_> = self.targets.iter()
+                .filter(|target| self.authorize_connection(&req.principal, target, false).is_ok())
+                .filter_map(|target| self.grants.get(&target.id).map(|grant| {
+                    // Redact before clipping, so a clipped credential never escapes as a prefix.
+                    let mut title = redaction.redact_wrapped_text(&target.title);
+                    let mut workspace_name = redaction.redact_wrapped_text(&target.workspace_name);
+                    truncate_utf8(&mut title, 512);
+                    truncate_utf8(&mut workspace_name, 512);
+                    json!({
+                        "session_id": target.id,
+                        "generation": target.generation,
+                        "workspace": target.workspace,
+                        "workspace_name": workspace_name,
+                        "title": title,
+                        "input_allowed": grant.input && target.live && req.input_scope
+                            && self.control.allows(&req.principal.id, &target.id, &target.generation, true),
+                        "live": target.live,
+                        "paste_bracketed": target.bracketed_paste,
+                        "paste_text_max_bytes": agent_mcp::MAX_PASTE,
+                        "paste_ai_confirmed": !target.known_ai || target.execution.is_some(),
+                    })
+                }))
+                .collect();
             return Ok(Some(json!({"sessions":sessions})));
+        }
+        if req.tool == "list_runs" {
+            return self.prepare_management(req, None);
         }
         let id = field(a, "session_id", 128)?;
         let generation = field(a, "generation", 192)?;
@@ -1037,6 +1421,51 @@ impl CloudAgent {
             return Err("oauth_input_scope_required".into());
         }
         let target = self.authorize(id, generation, input)?;
+        self.authorize_connection(&req.principal, &target, input)?;
+        if matches!(
+            req.tool.as_str(),
+            "start_run" | "update_run" | "get_run" | "get_operation"
+        ) {
+            return self.prepare_management(req, Some(&target));
+        }
+        if req.tool == "read_history" {
+            return self.prepare_history_query(req, &target, send);
+        }
+        let run_id = a
+            .get("run_id")
+            .map(|_| field(a, "run_id", 128).map(str::to_owned))
+            .transpose()?;
+        if run_id
+            .as_deref()
+            .is_some_and(|run| !self.management_run_owned(&req.principal.id, run, &target))
+        {
+            return Err("run_not_loaded_or_not_owned".into());
+        }
+        if (input || req.tool == "acquire_control")
+            && run_id
+                .as_ref()
+                .is_some_and(|id| !self.management_run_accepts_input(&req.principal.id, id))
+        {
+            return Err("run_not_loaded_or_not_owned".into());
+        }
+        if req.tool == "acquire_control" {
+            let ttl = a
+                .get("ttl_seconds")
+                .map(|v| v.as_u64().ok_or("invalid_ttl_seconds"))
+                .transpose()?
+                .unwrap_or(30);
+            let lease = self.acquire_lease(req, &target, run_id.as_deref(), ttl)?;
+            return Ok(Some(
+                json!({"control":"acquired","expires_at":lease.expires_at,"session_id":id,"generation":generation,"run_id":run_id}),
+            ));
+        }
+        if req.tool == "release_control" {
+            let revoked =
+                self.control
+                    .release(&req.principal.id, id, generation, run_id.as_deref())?;
+            self.revoke_leases(revoked);
+            return Ok(Some(json!({"control":"released"})));
+        }
         if req.tool == "read_output" {
             send(&target, Effect::Watch)?;
             let cursor = match a.get("cursor") {
@@ -1049,7 +1478,7 @@ impl CloudAgent {
                 ));
             };
             return Ok(Some(
-                json!({"cursor":screen.cursor,"screen":if cursor != screen.cursor {Some(&screen.text)} else {None},"reset":cursor==0 || cursor>screen.cursor,"source":"visible_screen","lossless":false,"refresh_requested":true,"may_be_stale":true,"retry_after_ms":250}),
+                json!({"cursor":screen.cursor,"screen":if cursor != screen.cursor {Some(&screen.text)} else {None},"reset":cursor==0 || cursor>screen.cursor,"source":"visible_screen","lossless":false,"refresh_requested":true,"may_be_stale":true,"retry_after_ms":250,"observed_at":screen.observed_at,"age_seconds":screen.observed_at.map(|at|now().saturating_sub(at)),"observation_source":"app_receive"}),
             ));
         }
         let op = field(a, "operation_id", 128)?.to_owned();
@@ -1100,11 +1529,15 @@ impl CloudAgent {
             if message.contains('\0') {
                 return Err("invalid_message".into());
             }
-            let clean: String = message
+            // Mask before stripping ANSI, then mask again after controls can
+            // join secret fragments. Keep the existing bounded output policy.
+            let redacted = self.redaction.redact_wrapped_text(message);
+            let plain = crate::agent_model_probe::strip_ansi(&redacted);
+            let clean: String = plain
                 .chars()
                 .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
                 .collect();
-            let mut clean = self.redact(&clean);
+            let mut clean = self.redaction.redact_wrapped_text(&clean);
             truncate_utf8(&mut clean, agent_mcp::MAX_ANSWER);
             Some(clean)
         } else {
@@ -1134,13 +1567,39 @@ impl CloudAgent {
         {
             return Err("busy_no_effect".into());
         }
+        let lease = if input {
+            if req.principal.id == agent_mcp::LEGACY_CONNECTION_ID {
+                Some(self.acquire_lease(req, &target, run_id.as_deref(), 30)?)
+            } else {
+                Some(
+                    self.control
+                        .lease(&target.id, now())
+                        .filter(|l| {
+                            l.connection_id == req.principal.id
+                                && l.generation == target.generation
+                                && l.run_id == run_id
+                        })
+                        .cloned()
+                        .ok_or("control_required_no_effect")?,
+                )
+            }
+        } else {
+            None
+        };
+        let context = agent_mcp::OperationContext {
+            connection_id: req.principal.id.clone(),
+            operation_id: op.clone(),
+            run_id,
+            generation: target.generation.clone(),
+        };
         let token = self.operation_token();
-        let job = Job::Claim {
+        let job = Job::ClaimScoped {
             id: op.clone(),
             tool: req.tool.clone(),
             args: std::mem::take(&mut req.args),
             workspace: target.workspace.clone(),
             session: target.id.clone(),
+            context: context.clone(),
         };
         self.history
             .request(token, job)
@@ -1149,9 +1608,17 @@ impl CloudAgent {
         // Retain only operation_id in App, not another full copy of request arguments.
         let stored_request = Request {
             epoch: req.epoch,
+            principal: req.principal.clone(),
             access_key: req.access_key.clone(),
             input_scope: req.input_scope,
-            deadline: req.deadline,
+            deadline: lease
+                .as_ref()
+                .map(|l| {
+                    Instant::now()
+                        + std::time::Duration::from_secs(l.expires_at.saturating_sub(now()))
+                })
+                .map(|expires| expires.min(req.deadline))
+                .unwrap_or(req.deadline),
             tool: req.tool.clone(),
             args: json!({"operation_id":op}),
             reply: req.reply.clone(),
@@ -1164,12 +1631,18 @@ impl CloudAgent {
                 auth: self.server.as_ref().unwrap().auth.clone(),
                 grant: grant.incarnation,
                 input_epoch: grant.input_epoch,
-                permit: grant.permit.clone(),
+                permit: lease
+                    .as_ref()
+                    .map(|l| self.lease_permits[&l.epoch].clone())
+                    .unwrap_or_else(|| grant.permit.clone()),
                 bytes,
                 paste,
                 require_bracketed_paste,
                 submit,
                 answer,
+                context,
+                lease_epoch: lease.map(|l| l.epoch),
+                continuity: continuity::clock_sample(),
             },
         );
         Ok(None)
@@ -1237,10 +1710,22 @@ pub fn target_matches(
         })
 }
 
+#[cfg(test)]
 pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
+    let (mut text, _) = screen_text_with_truncation(s);
+    truncate_utf8(&mut text, MAX_SCREEN);
+    text
+}
+
+pub(super) fn screen_text_with_truncation(
+    s: &terminal::TerminalViewportSnapshot,
+) -> (String, bool) {
+    // Redaction must see the whole bounded snapshot before a public byte cap.
+    // A partial extraction could cut through a credential and hide its match.
+    const MAX_RAW_SCREEN: usize = 1024 * 1024;
     let mut out = String::new();
     if s.cols == 0 || s.rows == 0 || s.visible_cells.is_empty() {
-        return out;
+        return (out, false);
     }
     let mut line = String::with_capacity(usize::from(s.cols).min(MAX_SCREEN));
     for (row_index, row) in s
@@ -1257,17 +1742,17 @@ pub fn screen_text(s: &terminal::TerminalViewportSnapshot) -> String {
             if !c.c.is_control() {
                 s.push_cell_text(row_index * s.cols as usize + col, &mut line);
             }
-            if out.len() + line.len() > MAX_SCREEN {
-                return out;
+            if out.len() + line.len() > MAX_RAW_SCREEN {
+                return ("[REDACTED]".into(), true);
             }
         }
         out.push_str(line.trim_end());
         out.push('\n');
-        if out.len() >= MAX_SCREEN {
-            break;
+        if out.len() > MAX_RAW_SCREEN {
+            return ("[REDACTED]".into(), true);
         }
     }
-    out
+    (out, false)
 }
 #[cfg(test)]
 mod grapheme_snapshot_tests {
@@ -1314,11 +1799,15 @@ impl Target {
             workspace_name: "workspace".into(),
             title: "session".into(),
             agent_line: None,
+            local_status: None,
+            local_status_observed_at: None,
+            local_agent_present: false,
             runtime: 1,
             session: runtime::SessionId(1),
             pane: runtime::MuxPaneId::new(),
             live: true,
             screen: Some("hello".into()),
+            screen_observed_at: Some(now()),
             provider: None,
             execution: None,
             known_ai: false,
@@ -1453,6 +1942,12 @@ mod integration_tests {
         (
             Request {
                 epoch,
+                principal: auth
+                    .authenticate_principal(
+                        &format!("Bearer {}", auth.token_for_user().as_str()),
+                        now(),
+                    )
+                    .unwrap(),
                 access_key: None,
                 input_scope: true,
                 deadline: Instant::now() + Duration::from_secs(3),
@@ -1662,6 +2157,240 @@ mod integration_tests {
         }
     }
     #[test]
+    fn full_fix_cloud_20261015_unchanged_answer_projection_reuses_safe_arc() {
+        let mut bridge = CloudAgent::memory();
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: "projection-operation".into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: "original-session".into(),
+                created: now() as i64,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: "An unchanged safe answer".into(),
+                connection_id: Some("original-connection".into()),
+                run_id: Some("original-run".into()),
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let first = bridge.cloud_answers();
+        let second = bridge.cloud_answers();
+        assert_eq!(first[0].message, second[0].message);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unchanged history and redaction corpus must reuse the safe projection"
+        );
+    }
+    #[test]
+    fn full_fix_cloud_20261015_projection_changes_with_history_and_fail_closed_corpus() {
+        let mut bridge = CloudAgent::memory();
+        let record = |message: &str| Record {
+            id: "projection-operation".into(),
+            tool: "notify".into(),
+            workspace: "workspace".into(),
+            session: "original-session".into(),
+            created: 17,
+            outcome: r#"{"status":"stored"}"#.into(),
+            message: message.into(),
+            connection_id: Some("original-connection".into()),
+            run_id: Some("original-run".into()),
+            generation: Some("generation".into()),
+            sequence: 1,
+        };
+        bridge.install_history(1, vec![record("First answer")]);
+        let first = bridge.cloud_answers();
+        // Replacing the accepted source at the same revision must also invalidate its projection.
+        bridge.install_history(1, vec![record("Replacement answer")]);
+        let changed = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed[0].message, "Replacement answer");
+        assert_eq!(first[0].message, "First answer");
+        bridge
+            .redaction
+            .register(&secret::SecretString::new("x".repeat(64 * 1024)));
+        let closed = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&changed, &closed));
+        assert_eq!(closed[0].message, "[REDACTED]");
+        assert_eq!(closed[0].connection, "[REDACTED]");
+        assert_eq!(closed[0].run_label.as_deref(), Some("[REDACTED]"));
+        assert_eq!(closed[0].id, changed[0].id);
+        assert_eq!(closed[0].session, changed[0].session);
+        assert_eq!(closed[0].run, changed[0].run);
+        assert_eq!(closed[0].created, 17);
+        assert!(std::sync::Arc::ptr_eq(&closed, &bridge.cloud_answers()));
+    }
+    #[test]
+    fn full_fix_cloud_20261015_projection_tracks_rotating_lease_grace_expiration() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Clock(AtomicU64);
+        impl secret::RedactionClock for Clock {
+            fn now(&self) -> Duration {
+                Duration::from_secs(self.0.load(Ordering::SeqCst))
+            }
+        }
+        let clock = std::sync::Arc::new(Clock(AtomicU64::new(0)));
+        let redaction = secret::RedactionService::with_clock(
+            secret::RedactionCorpusLimits::PRODUCTION,
+            Duration::from_secs(10),
+            clock.clone(),
+        )
+        .unwrap();
+        let mut bridge =
+            CloudAgent::with_worker(HistoryWorker::new(None, || {}), redaction.clone());
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: "original-operation".into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: "original-session".into(),
+                created: 19,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: "Answer: rotating-display-secret".into(),
+                connection_id: Some("original-connection".into()),
+                run_id: None,
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let before = bridge.cloud_answers();
+        let lease = redaction
+            .acquire_rotating(&secret::SecretString::new("rotating-display-secret".into()))
+            .unwrap();
+        let active = bridge.cloud_answers();
+        assert_eq!(active[0].message, "Answer: [REDACTED]");
+        assert!(!std::sync::Arc::ptr_eq(&before, &active));
+        drop(lease);
+        let retired = bridge.cloud_answers();
+        assert_eq!(retired[0].message, "Answer: [REDACTED]");
+        clock.0.store(11, Ordering::SeqCst);
+        let expired = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&retired, &expired));
+        assert_eq!(expired[0].message, before[0].message);
+        assert!(std::sync::Arc::ptr_eq(&expired, &bridge.cloud_answers()));
+        assert_eq!(expired[0].id, before[0].id);
+        assert_eq!(active[0].message, "Answer: [REDACTED]");
+    }
+    #[test]
+    fn late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label()
+    {
+        let mut bridge = CloudAgent::memory();
+        let first = "fixture-secret-access-token-123456789";
+        let second = "fixture-replaced-access-token-987654321";
+        let message = "First: fixture-secret-\naccess-token-123456789. Second: fixture-replaced-\naccess-token-987654321.";
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: first.into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: first.into(),
+                created: now() as i64,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: message.into(),
+                connection_id: Some(first.into()),
+                run_id: Some(first.into()),
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let raw = bridge.cloud_answers();
+        assert_eq!(raw[0].message, message);
+        assert_eq!(raw[0].connection, first);
+        assert_eq!(raw[0].run_label.as_deref(), Some(first));
+        let first_secret = secret::SecretString::new(first.into());
+        let first_lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&first_secret])
+            .unwrap();
+        let first_view = bridge.cloud_answers();
+        assert_eq!(first_view[0].connection, "[REDACTED]");
+        assert_eq!(first_view[0].run_label.as_deref(), Some("[REDACTED]"));
+        let snapshot = bridge.cloud_snapshot();
+        assert_eq!(snapshot.answers[0].connection_name, "[REDACTED]");
+        assert_eq!(snapshot.answers[0].title, "[REDACTED]");
+        assert_eq!(snapshot.answers[0].connection_id, first);
+        assert_eq!(snapshot.answers[0].session_id, first);
+        assert_eq!(
+            first_view[0].message,
+            "First: [REDACTED]. Second: fixture-replaced-\naccess-token-987654321."
+        );
+        drop(first_lease);
+        let second_secret = secret::SecretString::new(second.into());
+        let _second_lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&second_secret])
+            .unwrap();
+        let current = bridge.cloud_answers();
+        assert_eq!(current[0].message, "First: [REDACTED]. Second: [REDACTED].");
+        assert_eq!(current[0].connection, "[REDACTED]");
+        assert_eq!(current[0].run_label.as_deref(), Some("[REDACTED]"));
+        for view in [&first_view[0], &current[0]] {
+            assert_eq!(view.id, raw[0].id);
+            assert_eq!(view.session, raw[0].session);
+            assert_eq!(view.run, raw[0].run);
+            assert_eq!(view.created, raw[0].created);
+        }
+        assert_eq!(
+            bridge.answers[0].message, message,
+            "retain the source cache"
+        );
+    }
+    #[test]
+    fn notify_known_wrapped_secret_masks_claim_finish_notice_and_history() {
+        assert_notify_message_scrubbed("fixture-secret-\r\naccess-token-123456789");
+    }
+    #[test]
+    fn notify_known_mixed_control_ansi_secret_masks_claim_finish_notice_and_history() {
+        assert_notify_message_scrubbed(
+            "fixture-secret-\x07\x1b[31m\r\naccess-token-123456789\x1b[0m",
+        );
+    }
+    fn assert_notify_message_scrubbed(obfuscated: &str) {
+        let (mut bridge, target) = setup();
+        let secret = secret::SecretString::new("fixture-secret-access-token-123456789".into());
+        let _lease = bridge
+            .redaction
+            .acquire_execution_lease(&[&secret])
+            .unwrap();
+        let message = format!("Answer: {obfuscated}");
+        let (request, reply) = request(
+            &bridge,
+            "notify",
+            json!({"session_id":target.id,"generation":target.generation,"operation_id":"known-secret-answer","message":message}),
+        );
+        bridge.handle(request, |_, _| panic!("notify must never enter PTY input"));
+        let completion = bridge.history.wait().unwrap();
+        assert!(matches!(
+            completion.result,
+            ResultKind::Claim(_) | ResultKind::ClaimScoped(_)
+        ));
+        bridge.complete_history(
+            completion,
+            &mut |_, _| panic!("notify must never dispatch input"),
+            &mut Vec::new(),
+        );
+        let notices = bridge.drain_history(|_, _| panic!("notify must never type"));
+        assert_eq!(reply.recv().unwrap().unwrap()["status"], "stored");
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].message, "Answer: [REDACTED]");
+        let record = &bridge.records[0];
+        assert_eq!(record.message, "Answer: [REDACTED]", "SQLite readback");
+        assert_eq!(record.id, "known-secret-answer");
+        assert_eq!(record.session, target.id);
+        assert_eq!(
+            record.generation.as_deref(),
+            Some(target.generation.as_str())
+        );
+        assert_eq!(bridge.cloud_answers()[0].message, "Answer: [REDACTED]");
+        assert_eq!(
+            bridge.cloud_snapshot().answers[0].body,
+            "Answer: [REDACTED]"
+        );
+    }
+    #[test]
     fn pr9_notify_own_answer_stays_original_after_switch_and_connection_stop() {
         let (mut b, t) = setup();
         let (req, rx) = request(
@@ -1671,7 +2400,10 @@ mod integration_tests {
         );
         b.handle(req, |_, _| panic!("notify must never enter stdin"));
         let completion = b.history.wait().unwrap();
-        assert!(matches!(completion.result, ResultKind::Claim(_)));
+        assert!(matches!(
+            completion.result,
+            ResultKind::Claim(_) | ResultKind::ClaimScoped(_)
+        ));
         b.complete_history(
             completion,
             &mut |_, _| panic!("notify must never type"),
@@ -2406,7 +3138,7 @@ mod guarded_input_tests {
     }
     #[test]
     fn queued_cloud_input_is_cancelled_before_pty_admission() {
-        for action in [
+        check_queued_input_rejection(&[
             "take_control",
             "unshare",
             "disable",
@@ -2415,7 +3147,31 @@ mod guarded_input_tests {
             "generation",
             "expire",
             "reenable",
-        ] {
+            "client_revoke",
+            "client_lease_expire",
+            "client_lease_shorten",
+            "wake",
+            "client_wake",
+        ]);
+    }
+    #[test]
+    fn queued_legacy_input_after_resume_before_app_frame_is_rejected() {
+        check_queued_input_rejection(&["wake_before_app"]);
+    }
+    #[test]
+    fn queued_named_input_after_resume_before_app_frame_is_rejected() {
+        check_queued_input_rejection(&["client_wake_before_app"]);
+    }
+    #[test]
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    fn unavailable_frame_clock_rejects_already_queued_legacy_and_named_input() {
+        check_queued_input_rejection(&[
+            "frame_clock_unavailable",
+            "client_frame_clock_unavailable",
+        ]);
+    }
+    fn check_queued_input_rejection(actions: &[&str]) {
+        for &action in actions {
             let root =
                 std::env::temp_dir().join(format!("deppy-guarded-input-{}", uuid::Uuid::new_v4()));
             std::fs::create_dir_all(&root).unwrap();
@@ -2486,13 +3242,19 @@ mod guarded_input_tests {
                 .authenticate(&format!("Bearer {}", auth.token_for_user().as_str()), now())
                 .unwrap();
             let (reply, rx) = mpsc::sync_channel(1);
-            let req = Request {
+            let mut req = Request {
                 epoch,
+                principal: auth
+                    .authenticate_principal(
+                        &format!("Bearer {}", auth.token_for_user().as_str()),
+                        now(),
+                    )
+                    .unwrap(),
                 access_key: None,
                 input_scope: true,
                 deadline: Instant::now()
                     + if action == "expire" {
-                        Duration::from_millis(25)
+                        Duration::from_secs(1)
                     } else {
                         Duration::from_secs(3)
                     },
@@ -2500,7 +3262,53 @@ mod guarded_input_tests {
                 args: json!({"session_id":t.id,"generation":t.generation,"operation_id":"queued-before-revoke","text":"printf 'DEPPY_REVOKED_INPUT\\n'","submit":true}),
                 reply,
             };
-            b.handle_and_drain(req, |t, e| match e {
+            if action.starts_with("client_") {
+                use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+                use sha2::{Digest, Sha256};
+                let auth = &b.server.as_ref().unwrap().auth;
+                let (principal, token) = auth
+                    .mint_manual_connection("Independent bot", true, now())
+                    .unwrap();
+                let header = format!("Bearer {}", token.as_str());
+                req.epoch = auth.authenticate(&header, now()).unwrap();
+                req.principal = auth.authenticate_principal(&header, now()).unwrap();
+                req.access_key = Some(URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())));
+                b.set_connection_access(&principal.id, &t, true, true)
+                    .unwrap();
+                b.acquire_lease(
+                    &req,
+                    &t,
+                    None,
+                    if action == "client_lease_expire" {
+                        1
+                    } else {
+                        30
+                    },
+                )
+                .unwrap();
+            }
+            let lease_recheck = Request {
+                epoch: req.epoch,
+                principal: req.principal.clone(),
+                access_key: req.access_key.clone(),
+                input_scope: req.input_scope,
+                deadline: req.deadline,
+                tool: "acquire_control".into(),
+                args: json!({}),
+                reply: req.reply.clone(),
+            };
+            let connection = req.principal.id.clone();
+            b.handle(req, |_, _| panic!("input must wait for the durable claim"));
+            if action.ends_with("wake_before_app") {
+                // Simulate the exact native-clock evidence of a suspend after
+                // acceptance. The queued runtime resumes before any App frame.
+                let current = continuity::clock_sample().unwrap();
+                b.claims.values_mut().next().unwrap().continuity = Some(continuity::ClockSample {
+                    continuous: current.continuous - Duration::from_secs(2),
+                    awake: current.awake,
+                });
+            }
+            b.drain_history(|t, e| match e {
                 Effect::Input {
                     operation_id,
                     bytes,
@@ -2510,7 +3318,10 @@ mod guarded_input_tests {
                     .map_err(|_| "queue rejected".into()),
                 _ => panic!("unexpected watch"),
             });
-            assert!(rx.try_recv().is_err());
+            assert!(
+                rx.try_recv().is_err(),
+                "{action}: input must wait for actual PTY admission"
+            );
             match action {
                 "take_control" => b.take_control(),
                 "unshare" => b.share(&t, false),
@@ -2527,7 +3338,26 @@ mod guarded_input_tests {
                     t.generation = "generation-2".into();
                     b.set_targets(vec![t.clone()]);
                 }
-                "expire" => std::thread::sleep(Duration::from_millis(40)),
+                "expire" => std::thread::sleep(Duration::from_millis(1100)),
+                "client_lease_shorten" => {
+                    b.acquire_lease(&lease_recheck, &t, None, 1).unwrap();
+                }
+                "client_revoke" => b.revoke_connection(&connection),
+                "client_lease_expire" => std::thread::sleep(Duration::from_millis(1100)),
+                "wake" | "client_wake" => {
+                    b.observe_continuity(Some(continuity::ClockSample {
+                        continuous: Duration::from_secs(100),
+                        awake: Duration::from_secs(50),
+                    }));
+                    b.observe_continuity(Some(continuity::ClockSample {
+                        continuous: Duration::from_secs(140),
+                        awake: Duration::from_secs(51),
+                    }));
+                }
+                "wake_before_app" | "client_wake_before_app" => {}
+                "frame_clock_unavailable" | "client_frame_clock_unavailable" => {
+                    b.observe_continuity(None);
+                }
                 "reenable" => {
                     b.take_control();
                     b.allow_input(&t.id, true);
@@ -2854,6 +3684,7 @@ mod http_end_to_end_tests {
                         })
                         .map_err(|_| "watch_rejected".into()),
                     Effect::Input { .. } => panic!("paste and notify must not use legacy typing"),
+                    Effect::History { .. } => panic!("unexpected history query in paste fixture"),
                 }
             };
             notices.extend(bridge.poll_history(&mut send));
@@ -2871,6 +3702,12 @@ mod http_end_to_end_tests {
         let (reply, receipt) = mpsc::sync_channel(1);
         let req = Request {
             epoch,
+            principal: auth
+                .authenticate_principal(
+                    &format!("Bearer {}", auth.token_for_user().as_str()),
+                    now(),
+                )
+                .unwrap(),
             access_key: None,
             input_scope: true,
             deadline: Instant::now() + Duration::from_secs(3),
@@ -2942,7 +3779,7 @@ mod http_end_to_end_tests {
             std::thread::sleep(Duration::from_millis(2));
         };
         assert_eq!(rejected["status"], "rejected");
-        assert_eq!(rejected["error"], "pty_AdmissionDenied");
+        assert_eq!(rejected["error"], "pty_admission_revoked");
         bridge.stop_connection();
         notices.extend(bridge.drain_history(|_, _| panic!("stopped connection input")));
         assert_eq!(notices.len(), 1);
@@ -3150,12 +3987,19 @@ mod http_end_to_end_tests {
             };
             let args = json!({"session_id":"real-session","generation":"real-generation","operation_id":"real-input","text":"printf 'DEPPY_%s\\n' REAL_OUTPUT","submit":true});
             let response = call(1, "send_text", args.clone());
-            assert_eq!(response["result"]["isError"], false);
+            assert_eq!(
+                response["result"]["isError"], false,
+                "first input: {response}"
+            );
             let result: Value =
                 serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
                     .unwrap();
             assert_eq!(result["admission"], "pty_queue");
-            assert_eq!(call(2, "send_text", args)["result"]["isError"], false);
+            let duplicate = call(2, "send_text", args);
+            assert_eq!(
+                duplicate["result"]["isError"], false,
+                "duplicate receipt: {duplicate}"
+            );
             let mut found = false;
             for n in 0..40 {
                 let r = call(
@@ -3204,6 +4048,17 @@ mod http_end_to_end_tests {
             }
             bridge.set_targets(vec![target.clone()]);
             while let Some(req) = bridge.next_request() {
+                if req.principal.id != agent_mcp::LEGACY_CONNECTION_ID {
+                    bridge
+                        .set_connection_access(&req.principal.id, &target, true, req.input_scope)
+                        .unwrap();
+                    if matches!(
+                        req.tool.as_str(),
+                        "send_text" | "paste_text" | "send_ctrl_c"
+                    ) {
+                        bridge.acquire_lease(&req, &target, None, 30).unwrap();
+                    }
+                }
                 notice |= bridge
                     .handle_and_drain(req, |t, e| {
                         let command = match e {
@@ -3232,6 +4087,14 @@ mod http_end_to_end_tests {
                                     )
                                     .map_err(|_| "runtime_error".into());
                             }
+                            Effect::History {
+                                operation_id,
+                                query,
+                            } => runtime::RuntimeCommand::QueryTerminalHistory {
+                                session: t.session,
+                                operation_id,
+                                query,
+                            },
                             Effect::Watch => runtime::RuntimeCommand::SetRemoteViewing {
                                 session: t.session,
                                 viewing: true,

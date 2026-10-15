@@ -7,6 +7,25 @@ pub(crate) struct FolderIdentity {
     pub volume: Option<uuid::Uuid>,
 }
 
+/// Directory validity is required on every platform; a Unix relocation anchor
+/// is only available where that identity format is supported.
+pub(crate) fn selected_folder(path: &Path) -> Result<Option<FolderIdentity>, ()> {
+    #[cfg(unix)]
+    {
+        probe(path).map(Some).ok_or(())
+    }
+    #[cfg(not(unix))]
+    {
+        unanchored_directory(path)
+    }
+}
+
+#[cfg(any(not(unix), test))]
+fn unanchored_directory(path: &Path) -> Result<Option<FolderIdentity>, ()> {
+    let metadata = std::fs::metadata(path).map_err(|_| ())?;
+    if metadata.is_dir() { Ok(None) } else { Err(()) }
+}
+
 #[cfg(unix)]
 pub(crate) fn probe(path: &Path) -> Option<FolderIdentity> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
@@ -97,6 +116,21 @@ fn volume_uuid(_folder: &std::fs::File) -> Option<uuid::Uuid> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_fix_20261014_document_portable_folder_validation_does_not_require_anchor() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-portable-folder-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("file"), "fixture").unwrap();
+        let directory = unanchored_directory(&root);
+        let file = unanchored_directory(&root.join("file"));
+        let missing = unanchored_directory(&root.join("missing"));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(directory, Ok(None));
+        assert_eq!(file, Err(()));
+        assert_eq!(missing, Err(()));
+    }
 
     #[test]
     fn popup_review_fifo_is_rejected_without_waiting_for_a_writer() {

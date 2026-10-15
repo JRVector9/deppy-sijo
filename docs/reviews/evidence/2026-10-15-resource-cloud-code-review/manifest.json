@@ -1,0 +1,368 @@
+{
+  "review": "2026-10-15-resource-cloud-code-review",
+  "head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "version": "0.12.1",
+  "files": [
+    {
+      "stored": "root-agent-mcp-web.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/agent-mcp-web.log",
+      "original_sha256": "c201944ad54cd8b4365ba08f07e639c869f6fd77a64d65f797bbef01019b248f",
+      "stored_sha256": "9b5309318d4a7827cd11e9306e5d22901fad40582b62652bed9890ba9ab4da05",
+      "bytes": 49545,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-app-bootstrap-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/app-bootstrap-repro.log",
+      "original_sha256": "a45fa9a19968817cb6cccac29071db7916e2f7d94fa91608a2ec07e16e1f177f",
+      "stored_sha256": "d76f4afb9a14799033fe4ad1d998fb124093f4dc7ec44af6d25bb1792bb02391",
+      "bytes": 1043,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-app-cloud.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/app-cloud.log",
+      "original_sha256": "40a9103dc777e33dd75954d15972bfee688f101f2e16ca49dede159be0f7ea39",
+      "stored_sha256": "40a9103dc777e33dd75954d15972bfee688f101f2e16ca49dede159be0f7ea39",
+      "bytes": 18102,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-app-ended-consent-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/app-ended-consent-repro.log",
+      "original_sha256": "e4d515e76be70a55ffa19245eec8424800a9ae266de4f28a299e76a5ed75bc95",
+      "stored_sha256": "4ea138007e6cc21cfa30592c269234f0885be5c776e794a30ad30cbda0b69f8c",
+      "bytes": 986,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-app-metadata-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/app-metadata-repro.log",
+      "original_sha256": "5889fba3f2fdea0e4dc0144ad07c4acb1f611f7b44ca4fbfaa1107b9cd61bfb5",
+      "stored_sha256": "48899296c02ef9285fd520edc535ba94fc7d1a7829c3d7c0a02687ddaa97e41f",
+      "bytes": 3834,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-app-shutdown-stale-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/app-shutdown-stale-repro.log",
+      "original_sha256": "1eb5435dc7cba2d64b83f61642c030b0b7fc7dce3a3455ac08dc7556811b9456",
+      "stored_sha256": "1eb5435dc7cba2d64b83f61642c030b0b7fc7dce3a3455ac08dc7556811b9456",
+      "bytes": 1703,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-cloud-history-worker.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/cloud-history-worker.log",
+      "original_sha256": "4650fdf5076d9a7d0c039ea1f45e81f524c837fd6c3f5dff4dc3d55d5f84b0ab",
+      "stored_sha256": "4650fdf5076d9a7d0c039ea1f45e81f524c837fd6c3f5dff4dc3d55d5f84b0ab",
+      "bytes": 967,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-cloud_answers_optimized-independent.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/cloud_answers_optimized-independent.log",
+      "original_sha256": "a97202af90c36a75148ea3ec5b335db8c3c611bc6eae07d5c4dceba043bd959c",
+      "stored_sha256": "a97202af90c36a75148ea3ec5b335db8c3c611bc6eae07d5c4dceba043bd959c",
+      "bytes": 6002,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-codex-review-result.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/codex-review-result.json",
+      "original_sha256": "66c2180d29ed3c9480ea76ad65b2e3b3874423ee3a6583e8d46c0d8926c40e5d",
+      "stored_sha256": "66c2180d29ed3c9480ea76ad65b2e3b3874423ee3a6583e8d46c0d8926c40e5d",
+      "bytes": 745,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-codex-review.log.gz",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/codex-review.log",
+      "original_sha256": "99fb3e566503e5783e7acb1f4d32e4632a954c9df7eccf2f4a06aa1f5604861f",
+      "stored_sha256": "f05d7a0d537436e504bf2a4ab18222ec6481b39779f5a4988f7869cf4df9fbf0",
+      "bytes": 228863,
+      "transform": "gzip raw log"
+    },
+    {
+      "stored": "root-combined-patch-check.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/combined-patch-check.json",
+      "original_sha256": "69162801178a877d34c41b335bf195ecf6436fee64205fa1a500f9bd473532f7",
+      "stored_sha256": "69162801178a877d34c41b335bf195ecf6436fee64205fa1a500f9bd473532f7",
+      "bytes": 506,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-combined-review-regressions.tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/combined-review-regressions.tests-only.patch",
+      "original_sha256": "ebe671d4e3c220458ad5647e1f496dc9c651b0f3ed1e42ed2628ac853af79f95",
+      "stored_sha256": "ebe671d4e3c220458ad5647e1f496dc9c651b0f3ed1e42ed2628ac853af79f95",
+      "bytes": 13607,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-direct-ws-deadline-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/direct-ws-deadline-repro.log",
+      "original_sha256": "dfd3c57addb8b84fc54a87d1846065e9c9da41a80e0fb71f28be0ca90a5939be",
+      "stored_sha256": "dfd3c57addb8b84fc54a87d1846065e9c9da41a80e0fb71f28be0ca90a5939be",
+      "bytes": 2340,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-direct-ws-qualified-repro.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/direct-ws-qualified-repro.log",
+      "original_sha256": "7280761ae037352b73e2b57c59e27bec9a51810bfde76134499072681c0d8568",
+      "stored_sha256": "7280761ae037352b73e2b57c59e27bec9a51810bfde76134499072681c0d8568",
+      "bytes": 1092,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-direct-ws-tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/direct-ws-tests-only.patch",
+      "original_sha256": "059c99c0690661a9276d6e18200766b8fb55cdac78a6e927e8e6f008c65fc354",
+      "stored_sha256": "059c99c0690661a9276d6e18200766b8fb55cdac78a6e927e8e6f008c65fc354",
+      "bytes": 2259,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-existing-test-counts.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/existing-test-counts.json",
+      "original_sha256": "7f9d454fb7edd03eb755078339eeab3c8749a108bef394488aca5048ad07f929",
+      "stored_sha256": "7f9d454fb7edd03eb755078339eeab3c8749a108bef394488aca5048ad07f929",
+      "bytes": 5773,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-independent-probe-results.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/independent-probe-results.json",
+      "original_sha256": "ea7a16acab8904625df360e3e01cd452503a91c6681e725472fa73b096f1c152",
+      "stored_sha256": "ea7a16acab8904625df360e3e01cd452503a91c6681e725472fa73b096f1c152",
+      "bytes": 513,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-preservation-check.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/preservation-check.json",
+      "original_sha256": "fdd30562becf86570af521733b9ac9228cedcf4715da6e43acbc78493a75c0b5",
+      "stored_sha256": "fdd30562becf86570af521733b9ac9228cedcf4715da6e43acbc78493a75c0b5",
+      "bytes": 128,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-products-start.patch",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/products-start.patch",
+      "original_sha256": "256310dc351b51f659a2db6b02af93f2692889d57311ebb845adf7eb708f94c3",
+      "stored_sha256": "256310dc351b51f659a2db6b02af93f2692889d57311ebb845adf7eb708f94c3",
+      "bytes": 414902,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-pty_nonfrozen-independent.log",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/pty_nonfrozen-independent.log",
+      "original_sha256": "57f17199364246ffa9eb401fa176e35f86264bb4b06659c87695f2d4fc57e024",
+      "stored_sha256": "57f17199364246ffa9eb401fa176e35f86264bb4b06659c87695f2d4fc57e024",
+      "bytes": 2198,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "root-repro-followup-results.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/repro-followup-results.json",
+      "original_sha256": "28a91bf28976d813b670229968677c89d194fcfbb2fcd9077e5b9c3e23b42806",
+      "stored_sha256": "28a91bf28976d813b670229968677c89d194fcfbb2fcd9077e5b9c3e23b42806",
+      "bytes": 1236,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-repro-results.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/repro-results.json",
+      "original_sha256": "32d042b5c9d5f039347c47ee38eec24c8f4ea321d4e044af6cfe5d1c2c5aa19a",
+      "stored_sha256": "32d042b5c9d5f039347c47ee38eec24c8f4ea321d4e044af6cfe5d1c2c5aa19a",
+      "bytes": 2540,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-source-start.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/source-start.json",
+      "original_sha256": "34d24cd700ae5a9cea14c5b375ab10218ba0f47b381b3ceeba28c45290fbe128",
+      "stored_sha256": "34d24cd700ae5a9cea14c5b375ab10218ba0f47b381b3ceeba28c45290fbe128",
+      "bytes": 46369,
+      "transform": "identity"
+    },
+    {
+      "stored": "root-test-results.json",
+      "original": "/private/tmp/deppy-cloud-review-root-20261015/test-results.json",
+      "original_sha256": "8111b7617f9ac801e51605565851e72223a247546455e91940af7b076a6b2ac2",
+      "stored_sha256": "8111b7617f9ac801e51605565851e72223a247546455e91940af7b076a6b2ac2",
+      "bytes": 3325,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-cloud_answers.rs",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/cloud_answers.rs",
+      "original_sha256": "0624b3bb0d7fa3ad07188953d17e2a9dd370049a4db306386b3e17f6452f7d1b",
+      "stored_sha256": "0624b3bb0d7fa3ad07188953d17e2a9dd370049a4db306386b3e17f6452f7d1b",
+      "bytes": 5715,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-cloud_answers_optimized.rs",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/cloud_answers_optimized.rs",
+      "original_sha256": "34b2a4f1285c55e6970c32396abda607c3c23eff27b6b653b73897a9c4689f01",
+      "stored_sha256": "34b2a4f1285c55e6970c32396abda607c3c23eff27b6b653b73897a9c4689f01",
+      "bytes": 7951,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-redaction-production.rs",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/redaction-production.rs",
+      "original_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+      "stored_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+      "bytes": 87348,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-cloud_answers.log",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/cloud_answers.log",
+      "original_sha256": "f2417d96b72e977b587b1a22367fe10cef96290537e8fd29a6ff856f11c9cbe5",
+      "stored_sha256": "f2417d96b72e977b587b1a22367fe10cef96290537e8fd29a6ff856f11c9cbe5",
+      "bytes": 6018,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "perf-cloud_answers_optimized.log",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/cloud_answers_optimized.log",
+      "original_sha256": "5a32ec781fb22b5db6f0b6ec45e44bd586b54b5427a32a0cb5dd2e3df1b95ae1",
+      "stored_sha256": "5a32ec781fb22b5db6f0b6ec45e44bd586b54b5427a32a0cb5dd2e3df1b95ae1",
+      "bytes": 6002,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "perf-pty_nonfrozen.rs",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.rs",
+      "original_sha256": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3",
+      "stored_sha256": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3",
+      "bytes": 4110,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-owned-workload.py",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/owned-workload.py",
+      "original_sha256": "8c3c99a57bdb3d19a6075aa2aba377d16fab55840fbbe1870cb9dbd1e724eb84",
+      "stored_sha256": "8c3c99a57bdb3d19a6075aa2aba377d16fab55840fbbe1870cb9dbd1e724eb84",
+      "bytes": 351,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-pty_nonfrozen.log",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.log",
+      "original_sha256": "8508855da3e8babe531f33552b37d84d8cbf0d1b9d2cca92939dfa85bb0a2e10",
+      "stored_sha256": "8508855da3e8babe531f33552b37d84d8cbf0d1b9d2cca92939dfa85bb0a2e10",
+      "bytes": 2194,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "perf-identity.json",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/identity.json",
+      "original_sha256": "a20f0cfaabd4478fa7826746777cbac2a055ce76ae6f622fc4d5cb578080e036",
+      "stored_sha256": "a20f0cfaabd4478fa7826746777cbac2a055ce76ae6f622fc4d5cb578080e036",
+      "bytes": 5062,
+      "transform": "identity"
+    },
+    {
+      "stored": "perf-report.md",
+      "original": "/private/tmp/deppy-cloud-review-perf-20261015/report.md",
+      "original_sha256": "60a5a9b79839af7926f1ae0ba9f8cc247914b30169adc429faddbdb90d2d25b7",
+      "stored_sha256": "60a5a9b79839af7926f1ae0ba9f8cc247914b30169adc429faddbdb90d2d25b7",
+      "bytes": 14214,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "quality-bootstrap-regression.tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-quality-20261015/bootstrap-regression.tests-only.patch",
+      "original_sha256": "6af932beed1f02cf9427e656fc62e3708236e282a9c63477a25d91e74574bf84",
+      "stored_sha256": "6af932beed1f02cf9427e656fc62e3708236e282a9c63477a25d91e74574bf84",
+      "bytes": 3561,
+      "transform": "identity"
+    },
+    {
+      "stored": "quality-quality-review.md",
+      "original": "/private/tmp/deppy-cloud-review-quality-20261015/quality-review.md",
+      "original_sha256": "ce2cf59a059b28713d61b7d3463770765b4c12f9f82892dd415ff1e83de5e930",
+      "stored_sha256": "ce2cf59a059b28713d61b7d3463770765b4c12f9f82892dd415ff1e83de5e930",
+      "bytes": 8884,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "quality-reviewed-source-sha256.json",
+      "original": "/private/tmp/deppy-cloud-review-quality-20261015/reviewed-source-sha256.json",
+      "original_sha256": "69218afe8250a6279345bfcc2c632e98c2ba0a66035ba4be98b3ef3b4baec915",
+      "stored_sha256": "69218afe8250a6279345bfcc2c632e98c2ba0a66035ba4be98b3ef3b4baec915",
+      "bytes": 2461,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-list-sessions-redaction-tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/list-sessions-redaction-tests-only.patch",
+      "original_sha256": "f985d57789b9883574ff3b876a8ed39a188dbaa0f71cf21d5ff094f6c4f287ba",
+      "stored_sha256": "f985d57789b9883574ff3b876a8ed39a188dbaa0f71cf21d5ff094f6c4f287ba",
+      "bytes": 1658,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-exited-read-revocation-tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/exited-read-revocation-tests-only.patch",
+      "original_sha256": "c8c01bfc3fd9851dcc04ff383d0f3498298a49187228a12fda4e52725b031c7e",
+      "stored_sha256": "c8c01bfc3fd9851dcc04ff383d0f3498298a49187228a12fda4e52725b031c7e",
+      "bytes": 1671,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-shutdown-stale-retry-tests-only.patch",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/shutdown-stale-retry-tests-only.patch",
+      "original_sha256": "0a8b92e1d0a3ff77f6e26f2de50f57efc8e6329dfb6c9f942cefb89a57f93e09",
+      "stored_sha256": "0a8b92e1d0a3ff77f6e26f2de50f57efc8e6329dfb6c9f942cefb89a57f93e09",
+      "bytes": 4322,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-list-sessions-redaction-test.rs",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/list-sessions-redaction-test.rs",
+      "original_sha256": "d46083e3f69de4316ef22ec9259d55a25d6ffd1602dcabcb1883623692fda7a6",
+      "stored_sha256": "d46083e3f69de4316ef22ec9259d55a25d6ffd1602dcabcb1883623692fda7a6",
+      "bytes": 1399,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-exited-read-revocation-test.rs",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/exited-read-revocation-test.rs",
+      "original_sha256": "a73ac6d77db1db3338d8461eb114c0f97028efa18c0ccf086c92abc0bbe79973",
+      "stored_sha256": "a73ac6d77db1db3338d8461eb114c0f97028efa18c0ccf086c92abc0bbe79973",
+      "bytes": 1370,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-shutdown-stale-retry-test.rs",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/shutdown-stale-retry-test.rs",
+      "original_sha256": "c062463d6996b40fc827beaaba9f9c1d5160715228239bffdd7aaa61a4463b1f",
+      "stored_sha256": "c062463d6996b40fc827beaaba9f9c1d5160715228239bffdd7aaa61a4463b1f",
+      "bytes": 4098,
+      "transform": "identity"
+    },
+    {
+      "stored": "logic-source-review.md",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/source-review.md",
+      "original_sha256": "5a14f9144aa51c44eff7a23ff87d5b735e0382cf33c9c5cdd2af24bce23adda3",
+      "stored_sha256": "5a14f9144aa51c44eff7a23ff87d5b735e0382cf33c9c5cdd2af24bce23adda3",
+      "bytes": 16382,
+      "transform": "text trailing whitespace/newline normalization"
+    },
+    {
+      "stored": "logic-manifest.json",
+      "original": "/private/tmp/deppy-cloud-review-logic-20261015/manifest.json",
+      "original_sha256": "fb6ec945ce989c2539560304de501aca49d5f4480d1b821a62989da896c50d8c",
+      "stored_sha256": "fb6ec945ce989c2539560304de501aca49d5f4480d1b821a62989da896c50d8c",
+      "bytes": 742,
+      "transform": "identity"
+    }
+  ],
+  "note": "Original source/patch bytes retained; text logs/reports strip trailing spaces only. gzip CLI log has raw decoded SHA. manifest does not hash itself."
+}

@@ -1,0 +1,30 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/core)
+   Compiling secret v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/secret)
+   Compiling mux v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/mux)
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/pty)
+   Compiling persist v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/persist)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/terminal)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/audit)
+   Compiling mcp-store v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/mcp-store)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/storage-core)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/session)
+   Compiling storage v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/storage)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.30s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-92b62424000a532a)
+
+running 1 test
+test agent_wrapper::tests::full_fix_lifecycle_failed_exit_stamp_cannot_launch_a_fallback_owner ...
+thread 'agent_wrapper::tests::full_fix_lifecycle_failed_exit_stamp_cannot_launch_a_fallback_owner' (49122292) panicked at crates/runtime/src/agent_wrapper.rs:477:9:
+failed exit stamp created an untracked fallback owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    agent_wrapper::tests::full_fix_lifecycle_failed_exit_stamp_cannot_launch_a_fallback_owner
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 400 filtered out; finished in 0.29s
+
+error: test failed, to rerun pass `-p runtime --lib`

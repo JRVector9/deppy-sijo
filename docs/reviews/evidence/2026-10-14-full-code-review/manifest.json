@@ -1,0 +1,188 @@
+{
+  "workspace-tests.log": {
+    "original": "/private/tmp/deppy-full-review-workspace-tests-20261014.log",
+    "original_sha256": "4131e66157c36013ec048fbb03192908685a07e0ad80441d5fed23ddba1588c7",
+    "stored_sha256": "8bfeb3f08c620d0287fa17c080ebbd04518f6076074a14357e5d64a24378b27b",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "codex-shutdown.log": {
+    "original": "/private/tmp/deppy-full-review-codex-shutdown-20261014.log",
+    "original_sha256": "d06ba491dae7c0a980494bd8711ba6b7852dd594a824c0dd4d956f96ea344d6d",
+    "stored_sha256": "afa025fbe9fe5bddea4e42bdefa84589948f57681029a81446cbbbebfe5a21eb",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-fifo.log": {
+    "original": "/private/tmp/deppy-full-review-document-fifo-20261014.log",
+    "original_sha256": "b24ff645ab9d4e37c11c58a030202ec4d318eadc81abd73c67b84813fd236a7b",
+    "stored_sha256": "b24ff645ab9d4e37c11c58a030202ec4d318eadc81abd73c67b84813fd236a7b",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "usage-fifo.log": {
+    "original": "/private/tmp/deppy-full-review-usage-fifo-20261014.log",
+    "original_sha256": "c35c5d9ea584d0de3ecb9f67238626033b73fef9f754ed14ac1914716d5cab89",
+    "stored_sha256": "c35c5d9ea584d0de3ecb9f67238626033b73fef9f754ed14ac1914716d5cab89",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-symlink.log": {
+    "original": "/private/tmp/deppy-full-review-document-symlink-20261014.log",
+    "original_sha256": "23f31faae0112ca5a7986e745844bb6ea6b1f1051a9d43ff1f8ad3736a9c0ac2",
+    "stored_sha256": "23f31faae0112ca5a7986e745844bb6ea6b1f1051a9d43ff1f8ad3736a9c0ac2",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-save-race.log": {
+    "original": "/private/tmp/deppy-full-review-document-save-race-20261014.log",
+    "original_sha256": "5b8a1ea652b792642d0aa84c66445b202011d0354a4f297349ce9713530497bb",
+    "stored_sha256": "5b8a1ea652b792642d0aa84c66445b202011d0354a4f297349ce9713530497bb",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-orphan.log": {
+    "original": "/private/tmp/deppy-full-review-document-orphan-20261014.log",
+    "original_sha256": "fde7aa55bda4567e2db224b8ef1b78e336360518a618cfb6145d1fa142fc6731",
+    "stored_sha256": "fde7aa55bda4567e2db224b8ef1b78e336360518a618cfb6145d1fa142fc6731",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "editor-paste.log": {
+    "original": "/private/tmp/deppy-full-review-editor-paste-20261014.log",
+    "original_sha256": "2bb8ebe8c37748aab7f6dc478f8ede788f47059b3e2a8dda538616ca1d2ed18f",
+    "stored_sha256": "2bb8ebe8c37748aab7f6dc478f8ede788f47059b3e2a8dda538616ca1d2ed18f",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "atomic-write.log": {
+    "original": "/private/tmp/deppy-full-review-atomic-write-20261014.log",
+    "original_sha256": "e460ef1addd39cc5d6ebe071c1b7aed036c67b63e4141d07718789e0e9ec47d4",
+    "stored_sha256": "d15656f9529ef1f8003ac414c7c5eef0d29aeced61c838bb1b35ea514473d2b8",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "backup-production.log": {
+    "original": "/private/tmp/deppy-full-review-backup-production-20261014.log",
+    "original_sha256": "2bf55f7372a6eb7c84f105fef4f9760d900c1c2318d520374b7aef8d099f9e84",
+    "stored_sha256": "2bf55f7372a6eb7c84f105fef4f9760d900c1c2318d520374b7aef8d099f9e84",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "runtime-first.log": {
+    "original": "/private/tmp/deppy-full-review-runtime-regressions-20261014.log",
+    "original_sha256": "4e9ff8832edb1e9946d89b84a7a9424af79b91fee65d11488d74fae896917a31",
+    "stored_sha256": "024604052eaa8c0c34e5157f6869a8c7ef2e54387d75742c2cde73dd52a2d95b",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "late-query-diagnostic.log": {
+    "original": "/private/tmp/deppy-full-review-late-query-diagnostic-20261014.log",
+    "original_sha256": "fcc82488458ea2ccfa2c63e6b4a05eeacbb86bbb0882c1ced4941a409f3f59cc",
+    "stored_sha256": "16b476f9fa4a042695a51ffa8b44ea83150a44804c812638220317fe3df3908f",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "late-query-confirmed.log": {
+    "original": "/private/tmp/deppy-full-review-late-query-confirmed-20261014.log",
+    "original_sha256": "40e886a398eab7103cc78c0a06543349747c6b796c74a44d664bd899deeebb91",
+    "stored_sha256": "40e886a398eab7103cc78c0a06543349747c6b796c74a44d664bd899deeebb91",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "foreground-freeze.log": {
+    "original": "/private/tmp/deppy-full-review-foreground-freeze-20261014.log",
+    "original_sha256": "b16b1364fbd16b0670fa4ce39a5587b1c453eb0f1df1c600cdae07cdf85da14a",
+    "stored_sha256": "d85eb7c755b258dc38f2982b6080741c87aca18d3763ce32207c70b2850fc623",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "connector-import-queue.log": {
+    "original": "/private/tmp/deppy-full-review-connector-import-queue-20261014.log",
+    "original_sha256": "55ffe45d820e0a67aadbffb3638a2dd7d2ee70289a62f73e9d2106aa241e80cd",
+    "stored_sha256": "55ffe45d820e0a67aadbffb3638a2dd7d2ee70289a62f73e9d2106aa241e80cd",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "relay-shutdown.log": {
+    "original": "/private/tmp/deppy-full-review-relay-shutdown-20261014.log",
+    "original_sha256": "7cde8ce25795fa6a76a78229ce28b027e65ae7df6dcccc96842364c3aa56bf67",
+    "stored_sha256": "7cde8ce25795fa6a76a78229ce28b027e65ae7df6dcccc96842364c3aa56bf67",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "relay-receive.log": {
+    "original": "/private/tmp/deppy-all-review-remote-data-20261014/relay-receive-production.log",
+    "original_sha256": "6c5e3981731f926f874e9ca870df1f05fcc661b1f0061cd784a1560e513dc6fe",
+    "stored_sha256": "6c5e3981731f926f874e9ca870df1f05fcc661b1f0061cd784a1560e513dc6fe",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "process-detect-bench.log": {
+    "original": "/private/tmp/deppy-full-review-process-detect-bench-20261014.log",
+    "original_sha256": "bc5f8aa390be0afe8057a81286ddbcb7ad6245bf34b0201d1f1ec66d1370863e",
+    "stored_sha256": "bc5f8aa390be0afe8057a81286ddbcb7ad6245bf34b0201d1f1ec66d1370863e",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-probe.rs": {
+    "original": "/private/tmp/deppy-ui-doc-review-20261014.rs",
+    "original_sha256": "ca224583bf6cc87f874f949b0b708ec961b3e9cb73e3b10533a9b403baf2212a",
+    "stored_sha256": "ca224583bf6cc87f874f949b0b708ec961b3e9cb73e3b10533a9b403baf2212a",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "document-orphan-probe.rs": {
+    "original": "/private/tmp/deppy-ui-session-review-20261014.rs",
+    "original_sha256": "7f752772a73acc365233f120c21f5001e25c4a3234c41c58abfe015d06c6e3ba",
+    "stored_sha256": "7f752772a73acc365233f120c21f5001e25c4a3234c41c58abfe015d06c6e3ba",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "editor-paste-probe.rs": {
+    "original": "/private/tmp/deppy-ui-editor-review-20261014.rs",
+    "original_sha256": "5c11abaa63e3e8e62bcfae6af93b8efae48a8d9b2fec114dcafd636f245a3ae5",
+    "stored_sha256": "5c11abaa63e3e8e62bcfae6af93b8efae48a8d9b2fec114dcafd636f245a3ae5",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "usage-fifo-probe.rs": {
+    "original": "/private/tmp/deppy-full-review-usage-fifo-20261014.rs",
+    "original_sha256": "23ab1ddbb2d6a1dc053f668d2172b170a3f8d0df4657b7c3e002dfd11067c8bb",
+    "stored_sha256": "23ab1ddbb2d6a1dc053f668d2172b170a3f8d0df4657b7c3e002dfd11067c8bb",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "atomic-write-probe.rs": {
+    "original": "/private/tmp/deppy-atomic-write-audit-20261014.rs",
+    "original_sha256": "fd906a69d6d2f5e4660f06ee9a4f52016bff0b1dca8e66c294c04015dba37f93",
+    "stored_sha256": "fd906a69d6d2f5e4660f06ee9a4f52016bff0b1dca8e66c294c04015dba37f93",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "backup-production-probe.rs": {
+    "original": "/private/tmp/deppy-all-review-remote-data-20261014/backup-production.rs",
+    "original_sha256": "25a0c0bc39f310ecb73acb90dbee49769167a1c54745698cd0466da11d2f61d4",
+    "stored_sha256": "25a0c0bc39f310ecb73acb90dbee49769167a1c54745698cd0466da11d2f61d4",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "relay-receive-probe.rs": {
+    "original": "/private/tmp/deppy-all-review-remote-data-20261014/relay-receive-production.rs",
+    "original_sha256": "bc7ea013536c0b7c5a1a1d74d30c345438a12cd5e24206490f0aabe0e427e3be",
+    "stored_sha256": "bc7ea013536c0b7c5a1a1d74d30c345438a12cd5e24206490f0aabe0e427e3be",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "relay-shutdown-probe.rs": {
+    "original": "/private/tmp/deppy-all-review-remote-data-20261014/relay-shutdown-production.rs",
+    "original_sha256": "700e720a16a2810dccca0cba6382f3bf4aa41b3ef9867b5019ff3be3cba35b21",
+    "stored_sha256": "700e720a16a2810dccca0cba6382f3bf4aa41b3ef9867b5019ff3be3cba35b21",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "relay-tls-production-copy.rs": {
+    "original": "/private/tmp/deppy-all-review-remote-data-20261014/tls-production-copy.rs",
+    "original_sha256": "1833c800ed96d3975c400288c7601fdef0c54ea8d3b07e180692c692e58475d7",
+    "stored_sha256": "1833c800ed96d3975c400288c7601fdef0c54ea8d3b07e180692c692e58475d7",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "process-detect-bench.rs": {
+    "original": "/private/tmp/deppy-detect-descendants-bench-20261014.rs",
+    "original_sha256": "b9f396aa01edca0827adbce87c35d1208edcbcfcccdbdf387abc4d18591797c7",
+    "stored_sha256": "b9f396aa01edca0827adbce87c35d1208edcbcfcccdbdf387abc4d18591797c7",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "source-before.json": {
+    "original": "/private/tmp/deppy-full-review-20261014/source-before.json",
+    "original_sha256": "d4314b4e9be58ef0fe4e3c0a06db64b3bd6e25bc4fa50cf082757e311743b215",
+    "stored_sha256": "d4314b4e9be58ef0fe4e3c0a06db64b3bd6e25bc4fa50cf082757e311743b215",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "products-before.patch": {
+    "original": "/private/tmp/deppy-full-review-20261014/products-before.patch",
+    "original_sha256": "51581efbc7fc6f2d4e0977dba92202f3e1110ec9f2a014c6894791cfe8292956",
+    "stored_sha256": "136c7acfa77d65f400ae6be0fbee892df51a56750fc810dc6e67b56adc40f642",
+    "normalization": "trailing line whitespace and final blank lines only"
+  },
+  "reproductions-tests-only.patch": {
+    "original": "/private/tmp/deppy-full-review-20261014/tests-only-reproduction.patch",
+    "original_sha256": "6a5da150b7fac52793bae3c2b62a98ed757fc530af7f3f106d27b760a6bbcf0e",
+    "stored_sha256": "8d85c48da6070d0ac697026de78b7308376283e1c8de4834a869f13fd91f6acb",
+    "normalization": "trailing line whitespace and final blank lines only"
+  }
+}

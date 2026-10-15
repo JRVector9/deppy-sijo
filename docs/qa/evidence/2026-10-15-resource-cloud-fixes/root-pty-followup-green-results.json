@@ -1,0 +1,35 @@
+[
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "pty",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 16.388218879699707,
+    "log": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-green.log"
+  },
+  {
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "runtime",
+      "pr13_exit_teardown_releases_authorization_before_revocation_handshake",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "seconds": 29.21277379989624,
+    "log": "/private/tmp/deppy-cloud-fix-root-20261015/runtime-exit-handshake-green.log"
+  }
+]

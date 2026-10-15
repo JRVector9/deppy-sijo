@@ -1,0 +1,8 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 2 tests
+test ui::cloud_answer::tests::late_secret_run_reference_legacy_answer_omits_unavailable_run_label ... ok
+test ui::cloud_answer::tests::answers_display_only_in_the_original_session_and_copy_without_input ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3183 filtered out; finished in 0.01s

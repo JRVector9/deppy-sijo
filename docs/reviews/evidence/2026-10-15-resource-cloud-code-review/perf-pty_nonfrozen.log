@@ -1,0 +1,16 @@
+before kind=normal action=drop freeze=false shell=ProcessIdentity { pid: Some(67166), process_group: Some(67166), source: PortablePty } workload=Identity { pid: 67167, group: 67167, session: 67166, birth: (1791993455, 583114), zombie: false } actual_foreground=Some(67167)
+after kind=normal action=drop freeze=false teardown_ms=52.606 same_live_workload_survives=false identity=None
+cleanup kind=normal action=drop freeze=false PASS
+before kind=ignore-hup action=drop freeze=false shell=ProcessIdentity { pid: Some(67200), process_group: Some(67200), source: PortablePty } workload=Identity { pid: 67201, group: 67201, session: 67200, birth: (1791993456, 610482), zombie: false } actual_foreground=Some(67201)
+after kind=ignore-hup action=drop freeze=false teardown_ms=51.938 same_live_workload_survives=true identity=Some(Identity { pid: 67201, group: 67201, session: 67200, birth: (1791993456, 610482), zombie: false })
+cleanup kind=ignore-hup action=drop freeze=false PASS
+before kind=ignore-hup action=kill freeze=false shell=ProcessIdentity { pid: Some(67358), process_group: Some(67358), source: PortablePty } workload=Identity { pid: 67361, group: 67361, session: 67358, birth: (1791993457, 7157), zombie: false } actual_foreground=Some(67361)
+after kind=ignore-hup action=kill freeze=false teardown_ms=53.354 same_live_workload_survives=true identity=Some(Identity { pid: 67361, group: 67361, session: 67358, birth: (1791993457, 7157), zombie: false })
+cleanup kind=ignore-hup action=kill freeze=false PASS
+before kind=ignore-hup action=drop freeze=true shell=ProcessIdentity { pid: Some(67618), process_group: Some(67618), source: PortablePty } workload=Identity { pid: 67619, group: 67619, session: 67618, birth: (1791993457, 390866), zombie: false } actual_foreground=Some(67619)
+after kind=ignore-hup action=drop freeze=true teardown_ms=234.962 same_live_workload_survives=false identity=None
+cleanup kind=ignore-hup action=drop freeze=true PASS
+
+thread 'main' (51525763) panicked at /private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.rs:32:308:
+non-frozen foreground escaped pane/session close
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,210 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.26s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 1 test
+test ui::cloud_answer::tests::late_secret_run_reference_legacy_answer_omits_unavailable_run_label ... FAILED
+
+failures:
+
+---- ui::cloud_answer::tests::late_secret_run_reference_legacy_answer_omits_unavailable_run_label stdout ----
+
+thread 'ui::cloud_answer::tests::late_secret_run_reference_legacy_answer_omits_unavailable_run_label' (23918155) panicked at crates/app/src/ui/cloud_answer.rs:99:17:
+No nodes found matching the query:
+By {
+    label: "Cloud answer · Grok · just now",
+}
+
+On node:
+Node {
+    id: NodeId(
+        TreeIndex(
+            0,
+        ),
+        #13826925289788388,
+    ),
+    role: Window,
+    focused: true,
+    hidden: false,
+    disabled: false,
+    children: [
+        Node {
+            id: NodeId(
+                TreeIndex(
+                    0,
+                ),
+                #18356943641707106210,
+            ),
+            role: GenericContainer,
+            focused: false,
+            hidden: false,
+            disabled: false,
+            children: [
+                Node {
+                    id: NodeId(
+                        TreeIndex(
+                            0,
+                        ),
+                        #17717534622495252412,
+                    ),
+                    role: GenericContainer,
+                    focused: false,
+                    hidden: false,
+                    disabled: false,
+                    children: [
+                        Node {
+                            id: NodeId(
+                                TreeIndex(
+                                    0,
+                                ),
+                                #15707054694645992835,
+                            ),
+                            role: GenericContainer,
+                            focused: false,
+                            hidden: false,
+                            disabled: false,
+                            children: [
+                                Node {
+                                    id: NodeId(
+                                        TreeIndex(
+                                            0,
+                                        ),
+                                        #17970341196664973444,
+                                    ),
+                                    role: GenericContainer,
+                                    focused: false,
+                                    hidden: false,
+                                    disabled: false,
+                                    children: [
+                                        Node {
+                                            id: NodeId(
+                                                TreeIndex(
+                                                    0,
+                                                ),
+                                                #8714522455845931962,
+                                            ),
+                                            role: GenericContainer,
+                                            focused: false,
+                                            hidden: false,
+                                            disabled: false,
+                                            children: [
+                                                Node {
+                                                    id: NodeId(
+                                                        TreeIndex(
+                                                            0,
+                                                        ),
+                                                        #10978825285480028651,
+                                                    ),
+                                                    role: GenericContainer,
+                                                    focused: false,
+                                                    hidden: false,
+                                                    disabled: false,
+                                                    children: [
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #10356571857641282172,
+                                                            ),
+                                                            role: Button,
+                                                            label: "Cloud answer · Grok · opaque-original-run-reference · just now",
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [],
+                                                        },
+                                                        Node {
+                                                            id: NodeId(
+                                                                TreeIndex(
+                                                                    0,
+                                                                ),
+                                                                #13469840653692588432,
+                                                            ),
+                                                            role: GenericContainer,
+                                                            focused: false,
+                                                            hidden: false,
+                                                            disabled: false,
+                                                            children: [
+                                                                Node {
+                                                                    id: NodeId(
+                                                                        TreeIndex(
+                                                                            0,
+                                                                        ),
+                                                                        #9505066316524393600,
+                                                                    ),
+                                                                    role: GenericContainer,
+                                                                    focused: false,
+                                                                    hidden: false,
+                                                                    disabled: false,
+                                                                    children: [
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #8678632417034394080,
+                                                                            ),
+                                                                            role: Label,
+                                                                            value: "Grok final answer",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [
+                                                                                Node {
+                                                                                    id: NodeId(
+                                                                                        TreeIndex(
+                                                                                            0,
+                                                                                        ),
+                                                                                        #13288957972688433597,
+                                                                                    ),
+                                                                                    role: TextRun,
+                                                                                    value: "Grok final answer",
+                                                                                    focused: false,
+                                                                                    hidden: false,
+                                                                                    disabled: false,
+                                                                                    children: [],
+                                                                                },
+                                                                            ],
+                                                                        },
+                                                                        Node {
+                                                                            id: NodeId(
+                                                                                TreeIndex(
+                                                                                    0,
+                                                                                ),
+                                                                                #5112246387464451274,
+                                                                            ),
+                                                                            role: Button,
+                                                                            label: "Copy answer",
+                                                                            focused: false,
+                                                                            hidden: false,
+                                                                            disabled: false,
+                                                                            children: [],
+                                                                        },
+                                                                    ],
+                                                                },
+                                                            ],
+                                                        },
+                                                    ],
+                                                },
+                                            ],
+                                        },
+                                    ],
+                                },
+                            ],
+                        },
+                    ],
+                },
+            ],
+        },
+    ],
+}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ui::cloud_answer::tests::late_secret_run_reference_legacy_answer_omits_unavailable_run_label
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3184 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

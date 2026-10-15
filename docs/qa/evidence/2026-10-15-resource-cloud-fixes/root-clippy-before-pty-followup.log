@@ -1,0 +1,34 @@
+    Checking deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+    Checking secret v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+    Checking storage-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+    Checking mcp-store v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+    Checking mux v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+    Checking audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+    Checking persist v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+    Checking relay-protocol v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-protocol)
+    Checking storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+    Checking terminal v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+    Checking pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+    Checking http-client v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/http-client)
+    Checking winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-performance/third_party/winit-0.30.13)
+    Checking session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+    Checking runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+    Checking mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+    Checking web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+    Checking auth v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+    Checking connector-contract v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-contract)
+    Checking egui-wgpu v0.36.1
+    Checking accesskit_winit v0.32.2
+    Checking i18n v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n)
+    Checking egui-winit v0.36.1
+    Checking egui_kittest v0.36.1
+    Checking eframe v0.36.1
+    Checking connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+    Checking connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+    Checking agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+    Checking platform v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/platform)
+    Checking relay-server v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-server)
+    Checking xtask v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/xtask)
+    Checking deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Checking mcp-proxy v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-proxy)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 47s

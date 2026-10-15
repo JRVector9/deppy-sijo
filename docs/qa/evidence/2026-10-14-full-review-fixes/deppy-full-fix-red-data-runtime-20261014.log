@@ -1,0 +1,28 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/core)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage-core)
+   Compiling mux v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/mux)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/audit)
+   Compiling persist v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/persist)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/session)
+   Compiling storage v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.52s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-92b62424000a532a)
+
+running 1 test
+test persistence::tests::all_review_20261014_respawn_must_retire_queued_exit_status ...
+thread 'persistence::tests::all_review_20261014_respawn_must_retire_queued_exit_status' (48481053) panicked at crates/runtime/src/persistence.rs:741:9:
+assertion `left == right` failed: old queued exit overwrote respawn
+  left: "exited"
+ right: "running"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    persistence::tests::all_review_20261014_respawn_must_retire_queued_exit_status
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 395 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p runtime --lib`

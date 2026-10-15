@@ -1,0 +1,5 @@
+worker_receive_slice_ms=1000 shutdown_elapsed_ms=3108
+
+thread 'main' (47937917) panicked at /private/tmp/deppy-all-review-remote-data-20261014/tls-production-copy.rs:490:5:
+actual RelayWorker shutdown blocked on continuously fragmented message
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

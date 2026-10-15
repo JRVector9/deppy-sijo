@@ -1,0 +1,74 @@
+contract=PASS late-registration/wrapped-secret/routing-identity
+scope=exact cloud_answers production body; synthetic fixtures; per-call time incl allocations and Arc publication, excluding fixture setup/output drop; existing debug secret rlib; caller optimized
+fixture rows=0 message_bytes=0 raw_keys=32 corpus=RedactionCorpusStats { items: 64, bytes: 2656, permanent_items: 64, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=1 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=2 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=3 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=4 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=5 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=6 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=7 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=8 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+sample=9 ms=0.000 allocs=1 cumulative_alloc_bytes=16
+summary rows=0 message_bytes=0 raw_keys=32 mean_ms=0.000 median_ms=0.000 min_ms=0.000 max_ms=0.000 allocs_per_call=1 cumulative_alloc_bytes_per_call=16
+fixture rows=1 message_bytes=1024 raw_keys=1 corpus=RedactionCorpusStats { items: 2, bytes: 83, permanent_items: 2, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=0.129 allocs=27 cumulative_alloc_bytes=22668
+sample=1 ms=0.088 allocs=27 cumulative_alloc_bytes=22668
+sample=2 ms=0.086 allocs=27 cumulative_alloc_bytes=22668
+sample=3 ms=0.092 allocs=27 cumulative_alloc_bytes=22668
+sample=4 ms=0.094 allocs=27 cumulative_alloc_bytes=22668
+sample=5 ms=0.094 allocs=27 cumulative_alloc_bytes=22668
+sample=6 ms=0.136 allocs=27 cumulative_alloc_bytes=22668
+sample=7 ms=0.096 allocs=27 cumulative_alloc_bytes=22668
+sample=8 ms=0.112 allocs=27 cumulative_alloc_bytes=22668
+sample=9 ms=0.091 allocs=27 cumulative_alloc_bytes=22668
+summary rows=1 message_bytes=1024 raw_keys=1 mean_ms=0.102 median_ms=0.094 min_ms=0.086 max_ms=0.136 allocs_per_call=27 cumulative_alloc_bytes_per_call=22668
+fixture rows=10 message_bytes=1024 raw_keys=32 corpus=RedactionCorpusStats { items: 64, bytes: 2656, permanent_items: 64, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=11.277 allocs=1492 cumulative_alloc_bytes=638216
+sample=1 ms=11.064 allocs=1492 cumulative_alloc_bytes=638216
+sample=2 ms=10.839 allocs=1492 cumulative_alloc_bytes=638216
+sample=3 ms=12.263 allocs=1492 cumulative_alloc_bytes=638216
+sample=4 ms=12.266 allocs=1492 cumulative_alloc_bytes=638216
+sample=5 ms=12.256 allocs=1492 cumulative_alloc_bytes=638216
+sample=6 ms=10.761 allocs=1492 cumulative_alloc_bytes=638216
+sample=7 ms=10.754 allocs=1492 cumulative_alloc_bytes=638216
+sample=8 ms=10.837 allocs=1492 cumulative_alloc_bytes=638216
+sample=9 ms=11.304 allocs=1492 cumulative_alloc_bytes=638216
+summary rows=10 message_bytes=1024 raw_keys=32 mean_ms=11.362 median_ms=11.170 min_ms=10.754 max_ms=12.266 allocs_per_call=1492 cumulative_alloc_bytes_per_call=638216
+fixture rows=100 message_bytes=16384 raw_keys=1 corpus=RedactionCorpusStats { items: 2, bytes: 83, permanent_items: 2, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=157.264 allocs=2502 cumulative_alloc_bytes=32985306
+sample=1 ms=161.694 allocs=2502 cumulative_alloc_bytes=32985306
+sample=2 ms=145.021 allocs=2502 cumulative_alloc_bytes=32985306
+sample=3 ms=138.109 allocs=2502 cumulative_alloc_bytes=32985306
+sample=4 ms=142.496 allocs=2502 cumulative_alloc_bytes=32985306
+sample=5 ms=143.621 allocs=2502 cumulative_alloc_bytes=32985306
+sample=6 ms=135.325 allocs=2502 cumulative_alloc_bytes=32985306
+sample=7 ms=135.201 allocs=2502 cumulative_alloc_bytes=32985306
+sample=8 ms=138.049 allocs=2502 cumulative_alloc_bytes=32985306
+sample=9 ms=135.116 allocs=2502 cumulative_alloc_bytes=32985306
+summary rows=100 message_bytes=16384 raw_keys=1 mean_ms=143.190 median_ms=140.303 min_ms=135.116 max_ms=161.694 allocs_per_call=2502 cumulative_alloc_bytes_per_call=32985306
+fixture rows=100 message_bytes=16384 raw_keys=32 corpus=RedactionCorpusStats { items: 64, bytes: 2656, permanent_items: 64, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=1538.680 allocs=14902 cumulative_alloc_bytes=37102106
+sample=1 ms=1582.049 allocs=14902 cumulative_alloc_bytes=37102106
+sample=2 ms=1634.052 allocs=14902 cumulative_alloc_bytes=37102106
+sample=3 ms=1495.827 allocs=14902 cumulative_alloc_bytes=37102106
+sample=4 ms=1465.686 allocs=14902 cumulative_alloc_bytes=37102106
+sample=5 ms=1510.233 allocs=14902 cumulative_alloc_bytes=37102106
+sample=6 ms=1582.432 allocs=14902 cumulative_alloc_bytes=37102106
+sample=7 ms=1459.720 allocs=14902 cumulative_alloc_bytes=37102106
+sample=8 ms=1471.523 allocs=14902 cumulative_alloc_bytes=37102106
+sample=9 ms=1465.052 allocs=14902 cumulative_alloc_bytes=37102106
+summary rows=100 message_bytes=16384 raw_keys=32 mean_ms=1520.525 median_ms=1503.030 min_ms=1459.720 max_ms=1634.052 allocs_per_call=14902 cumulative_alloc_bytes_per_call=37102106
+fixture rows=100 message_bytes=16384 raw_keys=128 corpus=RedactionCorpusStats { items: 256, bytes: 10624, permanent_items: 256, rotating_items: 0, active_leases: 0, fail_closed: false }
+sample=0 ms=5509.675 allocs=53302 cumulative_alloc_bytes=49850906
+sample=1 ms=5651.426 allocs=53302 cumulative_alloc_bytes=49850906
+sample=2 ms=5469.552 allocs=53302 cumulative_alloc_bytes=49850906
+sample=3 ms=5540.853 allocs=53302 cumulative_alloc_bytes=49850906
+sample=4 ms=5493.124 allocs=53302 cumulative_alloc_bytes=49850906
+sample=5 ms=5499.165 allocs=53302 cumulative_alloc_bytes=49850906
+sample=6 ms=5545.832 allocs=53302 cumulative_alloc_bytes=49850906
+sample=7 ms=5705.330 allocs=53302 cumulative_alloc_bytes=49850906
+sample=8 ms=5671.560 allocs=53302 cumulative_alloc_bytes=49850906
+sample=9 ms=5815.809 allocs=53302 cumulative_alloc_bytes=49850906
+summary rows=100 message_bytes=16384 raw_keys=128 mean_ms=5590.233 median_ms=5543.342 min_ms=5469.552 max_ms=5815.809 allocs_per_call=53302 cumulative_alloc_bytes_per_call=49850906

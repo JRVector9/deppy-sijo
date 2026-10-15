@@ -50,6 +50,9 @@ pub trait RelaySession: Send {
     fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError>;
     fn send(&mut self, frame: &[u8]) -> Result<(), TransportError>;
     fn close(&mut self);
+    /// Production I/O can observe shutdown while inside TLS/WS reads and writes.
+    /// Test transports may rely on their own bounded receive contract instead.
+    fn set_stop_signal(&mut self, _stop: Arc<AtomicBool>) {}
 }
 
 /// 프레임 하나를 처리한 뒤 워커가 무엇을 해야 하는가.
@@ -262,7 +265,7 @@ fn run(
     deadlines: RelayDeadlines,
     inbox: &Receiver<RelayCommand>,
     wake: &Wake,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::SeqCst) {
         if !apply_commands(lifecycle, inbox, observer) {
@@ -310,8 +313,9 @@ fn pump(
     deadlines: RelayDeadlines,
     inbox: &Receiver<RelayCommand>,
     wake: &Wake,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
 ) {
+    session.set_stop_signal(Arc::clone(stop));
     // 세션이 열리자마자 싱크가 라우트 입장 자격증명을 낸다. 이 프레임이 나가지 못하면
     // 이 세션에서는 아무것도 일어나지 않으므로, 실패는 곧 세션 실패다.
     sink.session_started();

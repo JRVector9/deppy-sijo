@@ -7816,8 +7816,13 @@ impl WorkspaceUi {
                 true
             };
         let any_blocking_window_visible = super::popup::background_input_blocked(ui.ctx());
+        // Runtime acknowledgements must not reclaim a newer file-tree gesture. Explicit
+        // App navigation and terminal clicks still use their existing refocus paths.
+        let tree_keyboard_owned = super::file_tree::FileTreeUi::owns_keyboard_focus(ui.ctx())
+            && self.explicit_pending_focus.as_ref() != Some(pane_id);
         let terminal_keyboard_active = terminal_input_owner
             && !search_input_focused
+            && !tree_keyboard_owned
             && terminal_keyboard_input_allowed(
                 ui.ctx().text_edit_focused(),
                 ui.ctx().any_popup_open(),
@@ -8222,6 +8227,7 @@ impl WorkspaceUi {
         if input_enabled
             && mode.is_local()
             && focused
+            && !tree_keyboard_owned
             // Share the same ownership gate as preview, candidate output and
             // input admission. Keep automatic refocus pending for a TextEdit
             // IME batch; explicit pane clicks below still claim focus directly.
@@ -8962,6 +8968,15 @@ impl WorkspaceUi {
         self.send(RuntimeCommand::ClosePane { pane });
     }
 
+    pub(crate) fn submit_document_resolved_close(&mut self, command: RuntimeCommand) -> bool {
+        matches!(
+            command,
+            RuntimeCommand::ClosePane { .. }
+                | RuntimeCommand::CloseTab { .. }
+                | RuntimeCommand::KillSession { .. }
+        ) && self.send_keep_selection(command)
+    }
+
     /// pane 닫기 요청 — 실행 중 세션이면 확인을 거치고, 아니면 즉시 닫는다.
     /// (세션 상태를 모르면 보수적으로 확인을 띄운다 — 실수 즉사 방지가 목적.)
     /// 사이드바 컨텍스트 메뉴(App 경유)도 같은 경로를 쓴다.
@@ -9660,7 +9675,7 @@ impl WorkspaceUi {
             .get(&session)?
             .snapshot
             .as_ref()
-            .map(|s| crate::cloud_agent::screen_text(s))
+            .map(|s| crate::cloud_agent::screen_text_with_truncation(s).0)
     }
 
     pub fn session_bracketed_paste(&self, session: SessionId) -> bool {
@@ -11203,6 +11218,34 @@ mod tests {
             });
         }
         commands
+    }
+
+    #[test]
+    fn full_fix_20261014_document_resolved_close_admission_retries_after_queue_full() {
+        let mut ui = WorkspaceUi::new();
+        for index in 0..WORKSPACE_PROTOCOL_CAP {
+            ui.queue_protocol_intent(RuntimeCommand::Scroll {
+                session: SessionId(index as u64 + 20),
+                delta: 1,
+            })
+            .unwrap();
+        }
+        let close = RuntimeCommand::ClosePane {
+            pane: runtime::MuxPaneId("document-owner".into()),
+        };
+        assert!(!ui.submit_document_resolved_close(close.clone()));
+        let queued = drain_protocol(&mut ui);
+        assert_eq!(queued.len(), WORKSPACE_PROTOCOL_CAP);
+        assert!(
+            !queued
+                .iter()
+                .any(|command| matches!(command, RuntimeCommand::ClosePane { .. }))
+        );
+        assert!(ui.submit_document_resolved_close(close));
+        assert!(
+            matches!(drain_protocol(&mut ui).as_slice(), [RuntimeCommand::ClosePane { pane }] if pane.0 == "document-owner")
+        );
+        assert!(drain_protocol(&mut ui).is_empty());
     }
 
     #[test]
@@ -22325,6 +22368,338 @@ https://example.test/login \
     // 메꾼다. 두 테스트 모두 특수문자 없는 순수 한글(가/나)만 써서 문장부호
     // 중복제거 원장(native_key_monitor 기반)이 애초에 관여하지 않는 경로를
     // 검증한다.
+    struct FileTreeInputState {
+        tree: crate::ui::file_tree::FileTreeUi,
+        workspace: WorkspaceUi,
+        fonts_ready: bool,
+        native_paste: bool,
+    }
+
+    fn file_tree_input_harness() -> egui_kittest::Harness<'static, FileTreeInputState> {
+        use crate::ui::file_tree::{
+            FileTreeUi, SidebarSnapshot, SidebarWorkspaceEntry, SidebarWorkspaceState,
+        };
+        let text = catalog();
+        let config = TerminalConfig::default();
+        let workspaces = vec![SidebarWorkspaceEntry {
+            id: "ws-input".into(),
+            name: "Input regression".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        }];
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", SessionId(7))],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace.last_focused_pane = Some(pane_id("pane"));
+        workspace.pending_focus = Some(pane_id("pane"));
+        workspace.sessions.entry(SessionId(7)).or_default().snapshot = Some(snapshot("ready"));
+        let mut tree = FileTreeUi::new(egui::Context::default());
+        tree.input_regression_listing(&["b.txt", "c.txt"]);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1100.0, 720.0))
+            .build_ui_state(
+                move |ui, state: &mut FileTreeInputState| {
+                    if !state.fonts_ready {
+                        return;
+                    }
+                    if std::mem::take(&mut state.native_paste) {
+                        crate::native_key_monitor::tests::record_paste();
+                    }
+                    let sidebar = SidebarSnapshot {
+                        active_workspace_id: "ws-input",
+                        workspaces: &workspaces,
+                        view: crate::ui::agent_terminal::AgentTerminalView::Terminal,
+                        home_notice_count: 0,
+                        fleet_summary: Default::default(),
+                        history_tab_active: false,
+                        git_tab_active: false,
+                        agents_open: false,
+                        workspace_note: None,
+                    };
+                    state.tree.panel(ui, &HashMap::new(), &sidebar, &text);
+                    let (paste, copy) = state.tree.take_clipboard_shortcut_consumption();
+                    state
+                        .workspace
+                        .suppress_clipboard_shortcuts_this_frame(paste, copy);
+                    state
+                        .workspace
+                        .show_with_input(ui, &config, &[], &text, true);
+                },
+                FileTreeInputState {
+                    tree,
+                    workspace,
+                    fonts_ready: false,
+                    native_paste: false,
+                },
+            );
+        let fonts = crate::config::Config::default();
+        crate::fonts::install_cjk_fallback(
+            &harness.ctx,
+            None,
+            &fonts.terminal.mono_font,
+            &fonts.terminal.mono_weight,
+        );
+        harness.state_mut().fonts_ready = true;
+        harness.run();
+        drain_protocol(&mut harness.state_mut().workspace);
+        while harness.state_mut().workspace.take_io_intent().is_some() {}
+        harness
+    }
+
+    fn begin_file_tree_input_rename(harness: &mut egui_kittest::Harness<'_, FileTreeInputState>) {
+        harness
+            .state_mut()
+            .tree
+            .input_regression_begin_rename("b.txt");
+        harness.run();
+        assert!(
+            harness.ctx.text_edit_focused(),
+            "actual file Rename must own input"
+        );
+        drain_protocol(&mut harness.state_mut().workspace);
+    }
+
+    fn assert_no_file_tree_terminal_input(
+        harness: &mut egui_kittest::Harness<'_, FileTreeInputState>,
+    ) {
+        assert!(
+            written_bytes(drain_protocol(&mut harness.state_mut().workspace)).is_empty(),
+            "file-tree input reached the terminal protocol"
+        );
+        while let Some(intent) = harness.state_mut().workspace.take_io_intent() {
+            assert!(
+                !matches!(intent, WorkspaceIoIntent::ReadTerminalClipboard { .. }),
+                "file Rename native batch reached terminal clipboard IO"
+            );
+        }
+    }
+
+    #[test]
+    fn popup_input_file_rename_enter_consumes_raw_and_native_batch() {
+        use crate::ui::file_tree::FileTreeIoRequest;
+        let mut harness = file_tree_input_harness();
+        begin_file_tree_input_rename(&mut harness);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste("-renamed".into()));
+        harness.key_press(egui::Key::Enter);
+        harness.state_mut().native_paste = true;
+        harness.run_steps(1);
+        assert!(
+            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Rename { source, name } if source.as_path().ends_with("b.txt") && name == "b.txt-renamed")
+        );
+        assert_no_file_tree_terminal_input(&mut harness);
+        harness.run_steps(1);
+        assert_no_file_tree_terminal_input(&mut harness);
+    }
+
+    #[test]
+    fn popup_input_file_rename_escape_consumes_raw_and_native_batch() {
+        let mut harness = file_tree_input_harness();
+        begin_file_tree_input_rename(&mut harness);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Paste("-discarded".into()));
+        harness.key_press(egui::Key::Escape);
+        harness.state_mut().native_paste = true;
+        harness.run_steps(1);
+        assert!(harness.state().tree.input_regression_rename().is_none());
+        assert!(harness.state_mut().tree.take_io_intent().is_none());
+        assert_no_file_tree_terminal_input(&mut harness);
+        harness.run_steps(1);
+        assert_no_file_tree_terminal_input(&mut harness);
+    }
+
+    #[test]
+    fn popup_input_file_rename_ime_enter_keeps_composition_owned() {
+        let mut harness = file_tree_input_harness();
+        begin_file_tree_input_rename(&mut harness);
+        harness.input_mut().events.extend([
+            preedit_event("가"),
+            egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        harness.run_steps(1);
+        assert!(
+            harness.state().tree.input_regression_rename().is_some(),
+            "IME Enter must finish composition before Rename submission"
+        );
+        assert_no_file_tree_terminal_input(&mut harness);
+        harness.input_mut().events.push(commit_event("가"));
+        harness.run_steps(1);
+        assert_no_file_tree_terminal_input(&mut harness);
+        assert!(
+            harness
+                .state()
+                .tree
+                .input_regression_rename()
+                .unwrap()
+                .1
+                .contains('가')
+        );
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+        assert!(harness.state_mut().tree.take_io_intent().is_some());
+        assert_no_file_tree_terminal_input(&mut harness);
+    }
+
+    #[test]
+    fn popup_input_file_rename_listing_insert_keeps_focus_and_target() {
+        use crate::ui::file_tree::FileTreeIoRequest;
+        let mut harness = file_tree_input_harness();
+        begin_file_tree_input_rename(&mut harness);
+        let input_id = harness.ctx.memory(|memory| memory.focused()).unwrap();
+        harness
+            .state_mut()
+            .tree
+            .input_regression_listing(&["a.txt", "b.txt", "c.txt"]);
+        harness.run_steps(1);
+        assert_eq!(
+            harness.ctx.memory(|memory| memory.focused()),
+            Some(input_id),
+            "watcher insertion changed the actual Rename widget owner"
+        );
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            harness.state().tree.input_regression_rename().unwrap().1,
+            "b.txtx"
+        );
+        harness.key_press(egui::Key::Enter);
+        harness.run_steps(1);
+        assert!(
+            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Rename { source, name } if source.as_path().ends_with("b.txt") && name == "b.txtx")
+        );
+        assert_no_file_tree_terminal_input(&mut harness);
+    }
+
+    #[test]
+    fn popup_input_tree_click_keeps_keyboard_for_next_frame_delete() {
+        use crate::ui::file_tree::{FileTreeIoRequest, FileTreeUi};
+        use egui_kittest::kittest::Queryable;
+        let mut harness = file_tree_input_harness();
+        harness.get_by_label("b.txt").click();
+        harness.run_steps(1);
+        assert!(
+            FileTreeUi::input_regression_owns_keyboard(&harness.ctx),
+            "terminal renderer reclaimed the clicked tree owner"
+        );
+        harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::Backspace);
+        harness.run_steps(1);
+        assert!(
+            matches!(harness.state_mut().tree.take_io_intent().unwrap().request, FileTreeIoRequest::Trash { target, .. } if target.as_path().ends_with("b.txt"))
+        );
+        assert_no_file_tree_terminal_input(&mut harness);
+    }
+
+    #[test]
+    fn popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste() {
+        use crate::ui::file_tree::FileTreeUi;
+        use egui_kittest::kittest::Queryable;
+        let mut harness = file_tree_input_harness();
+        harness.get_by_label("b.txt").click();
+        harness.run_steps(1);
+        assert!(FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
+        let pos = egui::pos2(800.0, 350.0);
+        for pressed in [true, false] {
+            harness.input_mut().events.extend([
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            harness.run_steps(1);
+        }
+        assert!(!FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
+        drain_protocol(&mut harness.state_mut().workspace);
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("x".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
+            b"x"
+        );
+        harness.input_mut().events.push(preedit_event("가"));
+        harness.run_steps(1);
+        assert!(
+            harness
+                .state()
+                .workspace
+                .preedit
+                .is_active_for(SessionId(7))
+        );
+        harness.input_mut().events.push(commit_event("가"));
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
+            "가".as_bytes()
+        );
+        harness.state_mut().native_paste = true;
+        harness.run_steps(1);
+        assert!(matches!(
+            harness.state_mut().workspace.take_io_intent(),
+            Some(WorkspaceIoIntent::ReadTerminalClipboard { .. })
+        ));
+    }
+
+    #[test]
+    fn popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it() {
+        use crate::ui::file_tree::FileTreeUi;
+        use egui_kittest::kittest::Queryable;
+        let mut harness = file_tree_input_harness();
+        harness.get_by_label("b.txt").click();
+        harness.run_steps(1);
+        assert!(FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
+        harness.state_mut().workspace.pending_focus = Some(pane_id("pane"));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("q".into()));
+        harness.run_steps(1);
+        assert!(
+            FileTreeUi::input_regression_owns_keyboard(&harness.ctx),
+            "a deferred runtime focus must not steal the newer tree gesture"
+        );
+        assert_no_file_tree_terminal_input(&mut harness);
+        harness
+            .state_mut()
+            .workspace
+            .arm_terminal_focus(pane_id("pane"));
+        harness.run_steps(1);
+        assert!(!FileTreeUi::input_regression_owns_keyboard(&harness.ctx));
+        harness
+            .input_mut()
+            .events
+            .push(egui::Event::Text("r".into()));
+        harness.run_steps(1);
+        assert_eq!(
+            written_bytes(drain_protocol(&mut harness.state_mut().workspace)),
+            b"r"
+        );
+    }
+
     #[test]
     fn popup_behavior_probe_workspace_rename_does_not_paste_into_terminal() {
         use crate::ui::file_tree::{

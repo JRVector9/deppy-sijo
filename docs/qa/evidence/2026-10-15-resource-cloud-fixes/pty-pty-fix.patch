@@ -1,0 +1,515 @@
+--- a/crates/pty/src/lib.rs
++++ b/crates/pty/src/lib.rs
+@@ -1,6 +1,8 @@
+ //! PTY 격리 crate (설계문서 1.2 / 9장).
+ //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
+ 
++#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
++mod foreground_teardown_tests;
+ mod input_queue;
+ mod process_identity;
+ pub mod query_fence;
+@@ -1605,6 +1607,84 @@
+ }
+ 
+ impl PortablePtySession {
++    /// Pin the current shell/foreground executions while the original child and terminal still
++    /// exist. Once the master closes or the reaper consumes the shell, a cached PGID alone is
++    /// insufficient authority to signal a job-control foreground group.
++    #[cfg(unix)]
++    fn capture_owned_workloads(&self) -> Vec<workload_signal::FrozenGroup> {
++        let Ok(_child) = self.child.lock() else {
++            tracing::warn!("PTY child mutex poisoned during workload capture");
++            return Vec::new();
++        };
++        let Some(owner) = self.owner_process else {
++            return Vec::new();
++        };
++        let Some(current) = workload_signal::inspect(owner.pid) else {
++            return Vec::new(); // An already exited/reaped shell grants no new signal authority.
++        };
++        if !current.same_execution(owner) {
++            tracing::warn!("PTY owner identity changed during workload capture");
++            return Vec::new();
++        }
++        let mut groups = Vec::new();
++        let own_group = unsafe { libc::getpgrp() };
++        for group in [
++            Some(current.group),
++            self.foreground_process_group()
++                .and_then(|group| i32::try_from(group).ok()),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            if signal_target(Some(group), own_group).is_none()
++                || groups
++                    .iter()
++                    .any(|captured: &workload_signal::FrozenGroup| captured.group() == group)
++            {
++                continue;
++            }
++            match workload_signal::FrozenGroup::capture(group, owner) {
++                Ok(captured) => groups.push(captured),
++                Err(error) => {
++                    // Fail closed for this group; still cancel I/O, clean frozen groups and reap
++                    // the direct child. Short-lived shells can disappear during this snapshot.
++                    tracing::debug!(group, "PTY workload capture skipped: {error:#}");
++                }
++            }
++        }
++        groups
++    }
++
++    #[cfg(unix)]
++    fn terminate_captured_workloads(groups: &[workload_signal::FrozenGroup]) -> anyhow::Result<()> {
++        let mut first_error = None;
++        for (signal, grace) in [
++            (libc::SIGHUP, std::time::Duration::from_millis(20)),
++            (libc::SIGTERM, std::time::Duration::from_millis(200)),
++            (libc::SIGKILL, std::time::Duration::ZERO),
++        ] {
++            for group in groups {
++                if let Err(error) = group.signal_captured_members(signal) {
++                    first_error.get_or_insert(error);
++                }
++            }
++            let deadline = std::time::Instant::now() + grace;
++            while groups.iter().any(|group| group.captured_alive()) {
++                if std::time::Instant::now() >= deadline {
++                    break;
++                }
++                std::thread::sleep(std::time::Duration::from_millis(1));
++            }
++            if !groups.iter().any(|group| group.captured_alive()) {
++                break;
++            }
++        }
++        match first_error {
++            Some(error) => Err(error),
++            None => Ok(()),
++        }
++    }
++
+     /// Job-control foreground groups differ from the shell group. A stopped job cannot handle
+     /// HUP/TERM, so close its identity-checked group before the shell is reaped or PTY is closed.
+     #[cfg(unix)]
+@@ -1703,7 +1783,7 @@
+         join_worker(self.writer_thread.take(), "writer");
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+     fn signal_process_group(&self, signal: libc::c_int) {
+         let own = unsafe { libc::getpgrp() };
+         let Some(pgid) = signal_target(self.process_group, own) else {
+@@ -1724,11 +1804,26 @@
+         }
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+     fn process_group_alive(&self) -> bool {
+         self.process_group
+             .is_some_and(|pgid| unsafe { libc::killpg(pgid, 0) } == 0)
+     }
++}
++
++#[cfg(unix)]
++fn kill_unix_child_and_reap_bounded(child: &mut ChildPtyBox) -> anyhow::Result<()> {
++    // The reaper may already have cached the exit after HUP/TERM. Never kill the old PID after
++    // that cached status; holding the child mutex keeps try_wait and kill in one ownership scope.
++    let result = match child.try_wait() {
++        Ok(Some(_)) => Ok(()),
++        _ => match child.kill() {
++            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
++            other => other.context("프로세스 kill 실패"),
++        },
++    };
++    reap_child_bounded(child);
++    result
+ }
+ 
+ /// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
+@@ -1833,21 +1928,26 @@
+ 
+         #[cfg(unix)]
+         {
++            let workloads = self.capture_owned_workloads();
+             if let Err(error) = self.terminate_frozen_workloads() {
+                 tracing::warn!("frozen PTY workload teardown failed: {error:#}");
+             }
+             // Deterministic I/O cancellation wakes a writer
+             // blocked on a full PTY even if an escaped descendant still owns the slave endpoint.
+             self.stop_unix_worker_io();
+-            // 터미널 종료 규약: foreground process group에 SIGHUP —
+-            // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
++            if let Err(error) = Self::terminate_captured_workloads(&workloads) {
++                tracing::warn!("PTY workload teardown failed: {error:#}");
++            }
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             self.signal_process_group(libc::SIGHUP);
+             // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
+-            kill_and_reap_bounded(&mut self.child.lock().expect("PTY child mutex poisoned"));
+-            // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
+-            // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
+-            // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
+-            // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
++            if let Err(error) = kill_unix_child_and_reap_bounded(
++                &mut self.child.lock().expect("PTY child mutex poisoned"),
++            ) {
++                tracing::warn!("PTY child teardown failed: {error:#}");
++            }
++            // Keep the existing fallback on Unix platforms without birth/session inspection.
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             if let Some(pgid) = self.process_group
+                 && self.process_group_alive()
+             {
+@@ -2020,29 +2120,20 @@
+     fn kill(&mut self) -> anyhow::Result<()> {
+         #[cfg(unix)]
+         {
++            let workloads = self.capture_owned_workloads();
+             let frozen_result = self.terminate_frozen_workloads();
+-            // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
+-            // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             self.signal_process_group(libc::SIGHUP);
+             self.stop_unix_worker_io();
++            let workload_result = Self::terminate_captured_workloads(&workloads);
+             let mut child = self
+                 .child
+                 .lock()
+                 .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+-            // 바로 위 SIGHUP으로 자식이 죽으면 reaper가 25ms 안에 reap한다. 이미
+-            // 회수된 자식의 pid로 kill(2)을 보낼 수는 없다 — ESRCH가 나거나,
+-            // 최악에는 재사용된 남의 pid를 죽인다. 회수 여부를 먼저 보고, 그 사이의
+-            // 좁은 경합으로 ESRCH가 나면 이미 죽은 것으로 간주한다.
+-            let result = match child.try_wait() {
+-                Ok(Some(_)) => Ok(()),
+-                _ => match child.kill() {
+-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+-                    other => other.context("프로세스 kill 실패"),
+-                },
+-            };
++            let result = kill_unix_child_and_reap_bounded(&mut child);
+             drop(child);
+             self.join_unix_workers();
+-            frozen_result.and(result)
++            frozen_result.and(workload_result).and(result)
+         }
+ 
+         #[cfg(windows)]
+--- a/crates/pty/src/workload_signal.rs
++++ b/crates/pty/src/workload_signal.rs
+@@ -170,6 +170,47 @@
+         self.group
+     }
+ 
++    pub fn captured_alive(&self) -> bool {
++        self.members.iter().any(|captured| {
++            inspect(captured.pid)
++                .is_some_and(|current| current.same_execution(*captured) && !current.zombie)
++        })
++    }
++
++    /// Normal teardown can outlive the shell and race a running workload's forks. Signal only
++    /// the executions pinned before terminal close; a new group member must not broaden that
++    /// authority or prevent the already captured members from being terminated.
++    pub fn signal_captured_members(&self, signal: libc::c_int) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.group > 0 && self.group != unsafe { libc::getpgrp() },
++            "unsafe process group"
++        );
++        let mut first_error = None;
++        for captured in &self.members {
++            let Some(current) = inspect(captured.pid) else {
++                continue;
++            };
++            if !current.same_execution(*captured)
++                || current.zombie
++                || current.pid == unsafe { libc::getpid() }
++            {
++                continue;
++            }
++            // SAFETY: this individual member still has the captured PID/birth/group/session.
++            // No killpg is used after shell reap, so unpinned or reused groups are untouched.
++            if unsafe { libc::kill(current.pid, signal) } != 0 {
++                let error = std::io::Error::last_os_error();
++                if !super::signal_failure_is_already_gone(error.raw_os_error()) {
++                    first_error.get_or_insert(error);
++                }
++            }
++        }
++        match first_error {
++            Some(error) => Err(error.into()),
++            None => Ok(()),
++        }
++    }
++
+     fn current_members(&self) -> anyhow::Result<Vec<Process>> {
+         let current = members(self.group)?;
+         anyhow::ensure!(
+@@ -278,6 +319,69 @@
+     use std::io::{BufRead as _, Write as _};
+     use std::os::unix::process::CommandExt as _;
+     use std::process::{Command, Stdio};
++
++    #[test]
++    fn captured_signals_skip_changed_birth_group_and_session() {
++        let mut command = Command::new("python3");
++        command
++            .args([
++                "-c",
++                "import signal,time; signal.alarm(15); print('READY',flush=True); time.sleep(30)",
++            ])
++            .stdout(Stdio::piped());
++        unsafe {
++            command.pre_exec(|| {
++                if libc::setsid() < 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                Ok(())
++            });
++        }
++        struct Fixture(std::process::Child);
++        impl Drop for Fixture {
++            fn drop(&mut self) {
++                // This direct child has not been reaped, so its PID remains owned by this handle.
++                let _ = self.0.kill();
++                let _ = self.0.wait();
++            }
++        }
++        let mut fixture = Fixture(command.spawn().unwrap());
++        let mut output = std::io::BufReader::new(fixture.0.stdout.take().unwrap());
++        let mut line = String::new();
++        output.read_line(&mut line).unwrap();
++        assert_eq!(line.trim(), "READY");
++        let owner = inspect(fixture.0.id() as i32).unwrap();
++        assert!(FrozenGroup::capture(unsafe { libc::getpgrp() }, owner).is_err());
++        for field in 0..3 {
++            let mut group = FrozenGroup::capture(owner.group, owner).unwrap();
++            match field {
++                0 => group.members[0].birth.0 = group.members[0].birth.0.wrapping_add(1),
++                1 => group.members[0].group = -1,
++                _ => group.members[0].session = -1,
++            }
++            group.signal_captured_members(libc::SIGKILL).unwrap();
++            assert!(
++                !group.captured_alive(),
++                "changed identity must not remain pinned"
++            );
++            std::thread::sleep(Duration::from_millis(20));
++            assert!(
++                fixture.0.try_wait().unwrap().is_none(),
++                "a stale birth/group/session snapshot must not signal the live fixture"
++            );
++        }
++        let group = FrozenGroup::capture(owner.group, owner).unwrap();
++        assert!(group.captured_alive());
++        group.signal_captured_members(libc::SIGTERM).unwrap();
++        let deadline = Instant::now() + Duration::from_secs(1);
++        while fixture.0.try_wait().unwrap().is_none() {
++            assert!(
++                Instant::now() < deadline,
++                "matching captured process must terminate"
++            );
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
+ 
+     #[test]
+     fn failed_stop_verification_rolls_back_a_same_session_fork() {
+--- /dev/null
++++ b/crates/pty/src/foreground_teardown_tests.rs
+@@ -0,0 +1,190 @@
++//! Real job-control foreground regressions. Every signal is scoped to an owned PTY or a
++//! birth/group/session-checked fixture PID; the Python child also has a hard lifetime.
++
++use super::*;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++const WORKLOAD: &str = r#"import os, signal, sys, time
++signal.alarm(15)
++if sys.argv[2] != "normal":
++    signal.signal(signal.SIGHUP, signal.SIG_IGN)
++if sys.argv[2] == "ignore-hup-term":
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++with open(sys.argv[1], "x") as output:
++    output.write(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}\n")
++while True:
++    time.sleep(0.01)
++"#;
++
++struct Fixture {
++    session: Option<Box<dyn PtySession>>,
++    output: Option<PtyOutputReceiver>,
++    process: Option<workload_signal::Process>,
++    directory: PathBuf,
++}
++
++impl Fixture {
++    fn spawn(mode: &str) -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        let directory = std::env::temp_dir().join(format!(
++            "deppy-pty-foreground-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let pid_path = directory.join("identity");
++        let spec = CommandSpec {
++            program: "/bin/bash".into(),
++            args: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
++            env: vec![
++                ("HISTFILE".into(), "/dev/null".into()),
++                ("BASH_ENV".into(), "/dev/null".into()),
++                ("ENV".into(), "/dev/null".into()),
++                ("PS1".into(), "FIXTURE> ".into()),
++                (
++                    "DEPPY_FIXTURE_PID".into(),
++                    pid_path.to_str().unwrap().to_owned(),
++                ),
++                ("DEPPY_FIXTURE_MODE".into(), mode.into()),
++            ],
++            cwd: Some(directory.clone()),
++        };
++        let mut fixture = Self {
++            session: Some(PortablePtyBackend.spawn(&spec, 80, 24).unwrap()),
++            output: None,
++            process: None,
++            directory,
++        };
++        let session = fixture.session.as_mut().unwrap();
++        fixture.output = session.take_output();
++        // WORKLOAD contains no single quotes. Paths/modes are environment values, never shell code.
++        let command =
++            format!("python3 -c '{WORKLOAD}' \"$DEPPY_FIXTURE_PID\" \"$DEPPY_FIXTURE_MODE\"\n");
++        assert!(
++            session
++                .write_input(command.as_bytes())
++                .unwrap()
++                .is_accepted()
++        );
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let fields = loop {
++            if let Ok(text) = std::fs::read_to_string(fixture.directory.join("identity")) {
++                let fields: Vec<i32> = text
++                    .split_whitespace()
++                    .filter_map(|field| field.parse().ok())
++                    .collect();
++                if fields.len() == 3 {
++                    break fields;
++                }
++            }
++            while fixture.output.as_ref().unwrap().try_recv().is_ok() {}
++            assert!(Instant::now() < deadline, "foreground fixture not ready");
++            std::thread::sleep(Duration::from_millis(5));
++        };
++        let process = workload_signal::inspect(fields[0]).unwrap();
++        fixture.process = Some(process);
++        assert_eq!(process.group, fields[1]);
++        assert_eq!(process.session, fields[2]);
++        assert!(!process.zombie_for_test());
++        assert_eq!(
++            session.foreground_process_group(),
++            Some(process.group as u32)
++        );
++        assert_ne!(
++            session.process_identity().process_group,
++            Some(process.group as u32),
++            "fixture must run in a real job-control group separate from its shell"
++        );
++        fixture
++    }
++
++    fn same_process_alive(&self) -> bool {
++        self.process.is_some_and(|process| {
++            workload_signal::inspect(process.pid).is_some_and(|current| {
++                current.same_execution(process) && !current.zombie_for_test()
++            })
++        })
++    }
++
++    fn wait_for_exit(&self, timeout: Duration) -> bool {
++        let deadline = Instant::now() + timeout;
++        while self.same_process_alive() && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        !self.same_process_alive()
++    }
++}
++
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        // Rescue only this captured execution, even if the assertion or product teardown failed.
++        if self.same_process_alive() {
++            unsafe {
++                libc::kill(self.process.unwrap().pid, libc::SIGKILL);
++            }
++        }
++        drop(self.session.take());
++        drop(self.output.take());
++        let _ = self.wait_for_exit(Duration::from_secs(2));
++        let _ = std::fs::remove_dir_all(&self.directory);
++    }
++}
++
++fn foreground_teardown(mode: &str, use_kill: bool, frozen: bool) {
++    let mut fixture = Fixture::spawn(mode);
++    if frozen {
++        fixture.session.as_ref().unwrap().freeze().unwrap();
++    }
++    let started = Instant::now();
++    if use_kill {
++        // Check kill itself; Drop must not supply the missing foreground escalation.
++        fixture.session.as_mut().unwrap().kill().unwrap();
++    } else {
++        drop(fixture.session.take());
++    }
++    let elapsed = started.elapsed();
++    let gone_without_rescue = fixture.wait_for_exit(Duration::from_millis(500));
++    let process = fixture.process.unwrap();
++    // Complete identity-checked rescue before reporting the protective assertion.
++    drop(fixture);
++    assert!(
++        gone_without_rescue,
++        "same foreground execution survived: mode={mode} kill={use_kill} frozen={frozen} identity={process:?} teardown={elapsed:?}"
++    );
++    assert!(
++        elapsed < Duration::from_secs(4),
++        "unbounded teardown: {elapsed:?}"
++    );
++}
++
++#[test]
++fn normal_foreground_hup_control_exits_on_drop() {
++    foreground_teardown("normal", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_drop() {
++    foreground_teardown("ignore-hup", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_kill() {
++    foreground_teardown("ignore-hup", true, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop() {
++    foreground_teardown("ignore-hup-term", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill() {
++    foreground_teardown("ignore-hup-term", true, false);
++}
++
++#[test]
++fn frozen_foreground_control_exits_on_drop() {
++    foreground_teardown("ignore-hup-term", false, true);
++}

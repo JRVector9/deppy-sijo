@@ -1,0 +1,14 @@
+
+running 1 test
+
+thread 'known_pre_suspend_baseline_survives_failed_sample' (22123244) panicked at /private/tmp/deppy-rereview-clock-baseline-20261013.rs:15:5:
+a transient failed sample must not erase the last known baseline and hide 39 seconds of suspend
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test known_pre_suspend_baseline_survives_failed_sample ... FAILED
+
+failures:
+
+failures:
+    known_pre_suspend_baseline_survives_failed_sample
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s

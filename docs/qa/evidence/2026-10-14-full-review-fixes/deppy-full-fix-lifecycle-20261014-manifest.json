@@ -1,0 +1,42 @@
+[
+  {
+    "path": "crates/app/src/codex_app_server.rs",
+    "baseline_sha256": "c7cec0044b833e0345d4c970c54e1615201104b85f6f7f50fd3eaeb0f09b0e07",
+    "modified_sha256": "7191ec7b20d02320398b8dc67685ed789024c6b7556678a34e99e3a35a9d665f"
+  },
+  {
+    "path": "crates/pty/src/lib.rs",
+    "baseline_sha256": "fa986eacff7ddb523986f6de95641fbdea5c4c5532930a0938559bfcbbbc7c06",
+    "modified_sha256": "905717268d124c4938575b9d18fbcfd7f17bc08a45aec7d5397f206b1b57a70e"
+  },
+  {
+    "path": "crates/pty/src/input_queue.rs",
+    "baseline_sha256": "d187c3155c2ae7443f25b316860a380e4537db27201de140913bef28f50f56f1",
+    "modified_sha256": "3be052d1d3ac3963343ba996a64f2074240f126434bdfb7a60448bbbb86252d3"
+  },
+  {
+    "path": "crates/pty/src/query_fence.rs",
+    "baseline_sha256": null,
+    "modified_sha256": "95d3e4781754315c46dd284164a49721692919f873c9c65fbec37db203007e16"
+  },
+  {
+    "path": "crates/pty/src/workload_signal.rs",
+    "baseline_sha256": null,
+    "modified_sha256": "cd205a7ea54eaf96bb98d8cb71ee3649f51e26ef338e8d3a0f7d1c536b20b75e"
+  },
+  {
+    "path": "crates/runtime/src/agent_wrapper.rs",
+    "baseline_sha256": "155ca54bd8fce2d71f6693f514e58f6331c8df2303cbde07eee8de65ac59fd92",
+    "modified_sha256": "596980a7134b9d38b1b0d6c98903a9ac7a6d124750c2d5203f1f007c17458bb5"
+  },
+  {
+    "path": "crates/session/src/session.rs",
+    "baseline_sha256": "f14cdc7867f42f70409a172c849778d5934a5ba2219072936d68b034c9dfb1a7",
+    "modified_sha256": "7aac321fdd326639b128f207a8e62faaf250365ad2f400ea3e01a876ac7f471d"
+  },
+  {
+    "path": "crates/session/src/status.rs",
+    "baseline_sha256": "f8e9d96e2d5c089be85f738567bad30ee144888cdaf217fd098268b6b2173504",
+    "modified_sha256": "4bcd5465cd8392661f8006fd8019b3c93688964b20588c898c9c4922c2677355"
+  }
+]

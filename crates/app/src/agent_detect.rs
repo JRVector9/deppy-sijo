@@ -495,11 +495,12 @@ impl ProcessRowsCache {
 fn agent_kinds_from_rows(
     sessions: &[(SessionId, u32)],
     rows: &[ProcRow],
+    tree: &ProcessTree,
 ) -> HashMap<SessionId, RunningAgent> {
     sessions
         .iter()
         .filter_map(|(sid, shell_pid)| {
-            let descendants = descendant_pids(*shell_pid, rows);
+            let descendants = tree.descendants(*shell_pid);
             rows.iter()
                 .filter(|row| descendants.contains(&row.pid))
                 .find_map(|row| {
@@ -523,6 +524,7 @@ fn other_agent_kinds_from_rows(
     sessions: &[(SessionId, u32)],
     rows: &[ProcRow],
     linked: &HashMap<SessionId, RunningAgent>,
+    tree: &ProcessTree,
 ) -> HashMap<SessionId, crate::agent_launcher::AgentKind> {
     use crate::agent_launcher::AgentKind as Launcher;
     let others: Vec<Launcher> = Launcher::ALL
@@ -538,7 +540,7 @@ fn other_agent_kinds_from_rows(
         .iter()
         .filter(|(sid, _)| !linked.contains_key(sid))
         .filter_map(|(sid, shell_pid)| {
-            let descendants = descendant_pids(*shell_pid, rows);
+            let descendants = tree.descendants(*shell_pid);
             rows.iter()
                 .filter(|row| descendants.contains(&row.pid))
                 .find_map(|row| {
@@ -639,7 +641,9 @@ pub fn detect_kinds(
         return kinds_from_cache(sessions, cache);
     }
     cache.last_full_scan = Some(Instant::now());
-    agent_kinds_from_rows(sessions, process_cache.get(process_rows))
+    let rows = process_cache.get(process_rows);
+    let tree = ProcessTree::new(rows);
+    agent_kinds_from_rows(sessions, rows, &tree)
 }
 
 pub fn detect_cached(
@@ -693,8 +697,9 @@ pub fn detect_cached(
     // 같은 ps 결과를 재사용하므로 추가 비용이 없다. fast path 재사용을 위해 model/effort를
     // 캐시 항목에도 함께 싣는다(같은 kind일 때만 — 세션에 에이전트가 둘 이상이면
     // agent_kinds_from_rows가 고른 첫 후보가 find_agent의 "최적" 후보와 다를 수 있다).
-    let kinds = agent_kinds_from_rows(sessions, rows);
-    let others = other_agent_kinds_from_rows(sessions, rows, &kinds);
+    let tree = ProcessTree::new(rows);
+    let kinds = agent_kinds_from_rows(sessions, rows, &tree);
+    let others = other_agent_kinds_from_rows(sessions, rows, &kinds, &tree);
     for (sid, shell_pid) in sessions {
         // hook(SessionStart 등)이 보고한 바인딩이 있으면 그것이 결정적이다. 단 같은 pane에서
         // Codex를 종료한 뒤 Claude를 실행할 수 있으므로, 살아 있는 에이전트의 종류까지 hook
@@ -706,7 +711,7 @@ pub fn detect_cached(
             && hook.execution.kind == b.kind
             && hook.execution.is_current()
             && let owner = hook.execution.pid
-            && descendant_pids(*shell_pid, rows).contains(&owner)
+            && tree.descendants(*shell_pid).contains(&owner)
             && agent_pid_matches_kind(owner, b.kind, rows)
             && rows.iter().find(|row| row.pid == owner).is_some_and(|row| {
                 b.kind == AgentKind::Codex || hook_binding_matches_command(b, &row.command)
@@ -775,7 +780,7 @@ pub fn detect_cached(
             continue;
         }
         // 미스/종료 → 전체 탐색 후 캐시 갱신.
-        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, rows, &mut budget) {
+        if let Some((binding, owner_pid, det)) = find_agent(*shell_pid, rows, &mut budget, &tree) {
             let running = kinds.get(sid).filter(|r| r.kind == binding.kind);
             cache.entries.insert(
                 *sid,
@@ -911,8 +916,9 @@ fn find_agent(
     shell_pid: u32,
     rows: &[ProcRow],
     budget: &mut DetectionBudget,
+    tree: &ProcessTree,
 ) -> Option<(AgentBinding, u32, bool)> {
-    let descendants = descendant_pids(shell_pid, rows);
+    let descendants = tree.descendants(shell_pid);
     // 한 셸에 에이전트가 여럿일 수 있다(^Z 중단 후 재실행 등, 2026-07-07 실증: codex 2개).
     // 선택 기준: ①결정적(argv/lsof) 바인딩이 휴리스틱(cwd)보다 우선 — 휴리스틱 mtime이
     // 더 최신이어도 오바인딩일 수 있다(실증: fresh codex가 resume 세션으로 오바인딩).
@@ -2324,29 +2330,44 @@ pub(crate) fn project_display_name(
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
 
-/// 셸 pid의 모든 자손 pid 집합 (resource_monitor와 동일한 BFS).
-fn descendant_pids(root_pid: u32, rows: &[ProcRow]) -> std::collections::HashSet<u32> {
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    for row in rows.iter().take(MAX_PROCESS_ROWS) {
-        if let Some(parent) = row.ppid {
-            children.entry(parent).or_default().push(row.pid);
+/// One bounded adjacency index per process snapshot pass, shared by all session/tier lookups.
+struct ProcessTree {
+    children: HashMap<u32, Vec<u32>>,
+}
+
+impl ProcessTree {
+    fn new(rows: &[ProcRow]) -> Self {
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for row in rows.iter().take(MAX_PROCESS_ROWS) {
+            if let Some(parent) = row.ppid {
+                children.entry(parent).or_default().push(row.pid);
+            }
         }
+        Self { children }
     }
-    let mut wanted = HashSet::from([root_pid]);
-    let mut pending = VecDeque::from([root_pid]);
-    while let Some(parent) = pending.pop_front() {
-        if let Some(child_pids) = children.get(&parent) {
-            for &pid in child_pids {
-                if wanted.len() >= MAX_DESCENDANTS_PER_SESSION {
-                    return HashSet::new();
-                }
-                if wanted.insert(pid) {
-                    pending.push_back(pid);
+
+    fn descendants(&self, root_pid: u32) -> HashSet<u32> {
+        let mut wanted = HashSet::from([root_pid]);
+        let mut pending = VecDeque::from([root_pid]);
+        while let Some(parent) = pending.pop_front() {
+            if let Some(child_pids) = self.children.get(&parent) {
+                for &pid in child_pids {
+                    if wanted.len() >= MAX_DESCENDANTS_PER_SESSION {
+                        return HashSet::new();
+                    }
+                    if wanted.insert(pid) {
+                        pending.push_back(pid);
+                    }
                 }
             }
         }
+        wanted
     }
-    wanted
+}
+
+#[cfg(test)]
+fn descendant_pids(root_pid: u32, rows: &[ProcRow]) -> HashSet<u32> {
+    ProcessTree::new(rows).descendants(root_pid)
 }
 
 #[cfg(unix)]
@@ -4118,8 +4139,9 @@ mod tests {
             (SessionId(3), 300),
             (SessionId(4), 400),
         ];
-        let linked = agent_kinds_from_rows(&sessions, &rows);
-        let others = other_agent_kinds_from_rows(&sessions, &rows, &linked);
+        let linked = agent_kinds_from_rows(&sessions, &rows, &ProcessTree::new(&rows));
+        let others =
+            other_agent_kinds_from_rows(&sessions, &rows, &linked, &ProcessTree::new(&rows));
         assert_eq!(others.get(&SessionId(1)), Some(&Launcher::Gemini));
         assert_eq!(others.get(&SessionId(2)), Some(&Launcher::QwenCode));
         assert_eq!(
@@ -4167,7 +4189,7 @@ mod tests {
                     .into(),
             },
         ];
-        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows, &ProcessTree::new(&rows));
         let agent = found.get(&SessionId(1)).expect("Grok을 찾아야 한다");
         assert_eq!(agent.kind, AgentKind::Grok);
         assert_eq!(agent.model.as_deref(), Some("grok-4.6"));
@@ -4272,7 +4294,7 @@ mod tests {
                 command: "claude --model opus[1m] --effort high".into(),
             },
         ];
-        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows, &ProcessTree::new(&rows));
         let agent = found.get(&SessionId(1)).expect("에이전트를 찾아야 한다");
         assert_eq!(agent.kind, AgentKind::Claude);
         assert_eq!(agent.model.as_deref(), Some("opus[1m]"));
@@ -4440,7 +4462,7 @@ mod tests {
                     .into(),
             },
         ];
-        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows);
+        let found = agent_kinds_from_rows(&[(SessionId(1), 100)], &rows, &ProcessTree::new(&rows));
         let agent = found.get(&SessionId(1)).expect("Grok 세션을 찾아야 한다");
         assert_eq!(agent.kind, AgentKind::Grok);
         assert_eq!(agent.model.as_deref(), Some("grok-4.6"));
@@ -4488,7 +4510,7 @@ mod tests {
             (SessionId(2), 200),
             (SessionId(3), 300),
         ];
-        let kinds = agent_kinds_from_rows(&sessions, &rows);
+        let kinds = agent_kinds_from_rows(&sessions, &rows, &ProcessTree::new(&rows));
 
         assert_eq!(
             kinds.get(&SessionId(1)).map(|a| a.kind),

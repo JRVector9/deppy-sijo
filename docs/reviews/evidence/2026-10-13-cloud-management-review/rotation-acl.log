@@ -1,0 +1,30 @@
+warning: methods `lease` and `retain_targets` are never used
+   --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/app/src/cloud_agent/control.rs:191:12
+    |
+ 40 | impl ControlManager {
+    | ------------------- methods in this implementation
+...
+191 |     pub fn lease(&self, session: &str, now: u64) -> Option<&ControlLease> {
+    |            ^^^^^
+...
+237 |     pub fn retain_targets(&mut self, targets: &[(&str, &str)]) -> Vec<u64> {
+    |            ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: 1 warning emitted
+
+
+running 1 test
+
+thread 'parent::rotated_connections_must_not_exhaust_current_actor_permission_capacity' (19066637) panicked at /private/tmp/deppy-cloud-review-rotation-acl-20261013.rs:15:21:
+stale ACLs exhaust capacity after rotation=1, current_actor=7, session=0: Err("client_permission_limit")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test parent::rotated_connections_must_not_exhaust_current_actor_permission_capacity ... FAILED
+
+failures:
+
+failures:
+    parent::rotated_connections_must_not_exhaust_current_actor_permission_capacity
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.01s

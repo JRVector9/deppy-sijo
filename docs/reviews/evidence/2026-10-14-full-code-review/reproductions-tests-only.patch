@@ -1,0 +1,395 @@
+--- a/crates/app/src/codex_app_server.rs
++++ b/crates/app/src/codex_app_server.rs
+@@ -4025,4 +4025,106 @@
+             .unwrap();
+         assert!(!worker.contains("try_wait"));
+     }
+-}
++
++    #[cfg(unix)]
++    #[test]
++    fn full_review_20261014_codex_stalled_stdin_shutdown_is_bounded() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir =
++            std::env::temp_dir().join(format!("deppy-codex-stdin-audit-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let helper = dir.join("fake-codex");
++        let pid_path = dir.join("pid");
++        let ready_path = dir.join("ready");
++        let script = format!(
++            r#"#!/usr/bin/env python3
++import json, os, pathlib, sys, time
++pathlib.Path({pid:?}).write_text(str(os.getpid()))
++for line in sys.stdin:
++    message = json.loads(line)
++    if message.get('method') == 'initialize':
++        print(json.dumps({{'id': message['id'], 'result': {{}}}}), flush=True)
++    elif message.get('method') == 'thread/start':
++        pathlib.Path({ready:?}).write_text('ready')
++        print(json.dumps({{'id': message['id'], 'result': {{'thread': {{'id': 'fixture-thread'}}}}}}), flush=True)
++        time.sleep(30)
++        break
++"#,
++            pid = pid_path.to_string_lossy(),
++            ready = ready_path.to_string_lossy()
++        );
++        std::fs::write(&helper, script).unwrap();
++        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let mut client = CodexAppServerClient::spawn(
++            CodexAppServerOptions {
++                executable: helper.as_os_str().to_owned(),
++                ..CodexAppServerOptions::default()
++            },
++            egui::Context::default(),
++        )
++        .unwrap();
++        client
++            .start_session(
++                "fixture-session".into(),
++                "x".repeat(200 * 1024),
++                None,
++                None,
++                None,
++                vec![],
++            )
++            .unwrap();
++        let deadline = std::time::Instant::now() + Duration::from_secs(5);
++        while !ready_path.exists() && std::time::Instant::now() < deadline {
++            thread::sleep(Duration::from_millis(5));
++        }
++        assert!(
++            ready_path.exists(),
++            "fake app-server must finish thread/start first"
++        );
++        let pid: libc::pid_t = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
++        // Wait for ThreadStarted, emitted just before production sends the oversized turn/start.
++        let deadline = std::time::Instant::now() + Duration::from_secs(5);
++        let mut thread_started = false;
++        while std::time::Instant::now() < deadline {
++            thread_started |= client.drain_events().into_iter().any(|event| {
++                matches!(
++                    event,
++                    CodexAppServerEvent::Session {
++                        event: AgentSessionEvent::ThreadStarted { .. },
++                        ..
++                    }
++                )
++            });
++            if thread_started {
++                break;
++            }
++            thread::sleep(Duration::from_millis(5));
++        }
++        assert!(
++            thread_started,
++            "production worker must enter its turn/start send"
++        );
++        thread::sleep(Duration::from_millis(50));
++        let (done_tx, done_rx) = mpsc::sync_channel(1);
++        let shutdown = thread::spawn(move || {
++            client.shutdown();
++            let _ = done_tx.send(());
++        });
++        let completed_without_rescue = done_rx.recv_timeout(Duration::from_millis(500)).is_ok();
++        if !completed_without_rescue {
++            // Fixture-only rescue: avoid leaving a stuck test/helper. Never targets a live provider.
++            unsafe {
++                libc::killpg(pid, libc::SIGKILL);
++            }
++            done_rx
++                .recv_timeout(Duration::from_secs(5))
++                .expect("fixture rescue unblocks shutdown");
++        }
++        shutdown.join().unwrap();
++        let _ = std::fs::remove_dir_all(&dir);
++        assert!(
++            completed_without_rescue,
++            "shutdown required externally killing the fake child because write_message cannot observe stop_requested"
++        );
++    }
++}
+--- a/crates/runtime/src/in_process.rs
++++ b/crates/runtime/src/in_process.rs
+@@ -18429,4 +18429,81 @@
+         drop(client);
+         std::fs::remove_dir_all(&dir).ok();
+     }
++
++    #[cfg(unix)]
++    #[test]
++    fn full_review_20261014_late_agent_query_cannot_reach_fallback_shell() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir =
++            std::env::temp_dir().join(format!("deppy-late-query-audit-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let fallback = dir.join("fallback-shell");
++        let ready = dir.join("fallback-ready");
++        let script = format!(
++            "#!/bin/sh\nstty -echo -icanon min 1 time 0\nprintf READY\n: > '{}'\ndd bs=1 count=6 2>/dev/null | od -An -tx1\nsleep 30\n",
++            ready.display()
++        );
++        std::fs::write(&fallback, script).unwrap();
++        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
++        let command = CommandSpec {
++            program: "/bin/sh".to_owned(),
++            args: vec![
++                "-c".to_owned(),
++                crate::agent_wrapper::agent_then_shell_script(),
++                crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME.to_owned(),
++                "/bin/sh".to_owned(),
++                "-c".to_owned(),
++                "printf '\\033[6n'".to_owned(),
++            ],
++            env: vec![
++                ("SHELL".to_owned(), fallback.display().to_string()),
++                ("TMPDIR".to_owned(), dir.display().to_string()),
++            ],
++            cwd: Some(dir.clone()),
++        };
++        let mut live = Session::spawn_with_spec(
++            SessionId(1),
++            session::SessionKind::Agent,
++            &command,
++            80,
++            24,
++            100,
++        )
++        .unwrap();
++        let deadline = Instant::now() + Duration::from_secs(5);
++        while !ready.exists() && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        assert!(
++            ready.exists(),
++            "agent must be gone and fallback raw reader active before parser feed"
++        );
++        let deadline = Instant::now() + Duration::from_millis(500);
++        let mut output = Vec::new();
++        while Instant::now() < deadline {
++            live.pump(|bytes| output.extend_from_slice(bytes));
++            if String::from_utf8_lossy(&output)
++                .split_whitespace()
++                .collect::<Vec<_>>()
++                .windows(6)
++                .any(|bytes| bytes == ["1b", "5b", "31", "3b", "31", "52"])
++            {
++                break;
++            }
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        println!("late_query_output={:?}", String::from_utf8_lossy(&output));
++        let received_late_query_response = String::from_utf8_lossy(&output)
++            .split_whitespace()
++            .collect::<Vec<_>>()
++            .windows(6)
++            .any(|bytes| bytes == ["1b", "5b", "31", "3b", "31", "52"]);
++        drop(live);
++        let _ = std::fs::remove_dir_all(&dir);
++        assert!(
++            !received_late_query_response,
++            "fallback shell received late CPR after production wrapper's time-0 drain: {:?}",
++            String::from_utf8_lossy(&output)
++        );
++    }
+ }
+--- a/crates/runtime/src/persistence.rs
++++ b/crates/runtime/src/persistence.rs
+@@ -697,4 +697,51 @@
+         drop(pipe);
+         std::fs::remove_dir_all(&dir).unwrap();
+     }
++
++    #[test]
++    fn all_review_20261014_respawn_must_retire_queued_exit_status() {
++        let (dir, db_path) = temp_db("review-respawn-order");
++        let db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("runtime").unwrap();
++        drop(db);
++        let mut pipe = PersistPipe::open_with_worker_config(
++            &PersistConfig {
++                db_path: db_path.clone(),
++                workspace_id,
++            },
++            DbWriteWorkerConfig {
++                flush_interval: std::time::Duration::from_secs(3600),
++                ..DbWriteWorkerConfig::default()
++            },
++        )
++        .unwrap();
++        let old = SessionId(1);
++        pipe.session_spawned(
++            old,
++            "shell",
++            None,
++            "shell",
++            "/bin/sh",
++            &[],
++            "/tmp",
++            None,
++            None,
++            None,
++            None,
++        );
++        pipe.session_exited(old);
++        assert!(pipe.session_respawned(old, SessionId(2)));
++        pipe.flush_async_writes().unwrap();
++        let status: String = rusqlite::Connection::open(&db_path)
++            .unwrap()
++            .query_row("SELECT status FROM sessions", [], |r| r.get(0))
++            .unwrap();
++        drop(pipe);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(
++            status,
++            persist::SESSION_STATUS_RUNNING,
++            "old queued exit overwrote respawn"
++        );
++    }
+ }
+--- a/crates/pty/src/lib.rs
++++ b/crates/pty/src/lib.rs
+@@ -3031,6 +3031,66 @@
+         assert!(wait_exit(&mut session, Duration::from_secs(5)).is_some());
+     }
+
++    #[test]
++    fn full_review_20261014_freeze_stops_foreground_job_not_only_shell() {
++        let mut session = spawn("/bin/zsh", &["-d", "-f", "-i"]);
++        let output = session.take_output().unwrap();
++        let initial_group = session.process_identity().process_group.unwrap();
++        assert!(
++            session
++                .write_input(
++                    b"/bin/sh -c 'printf \"DEPPY_FG_%s\\n\" READY; while :; do sleep 1; done'\r"
++                )
++                .unwrap()
++                .is_accepted()
++        );
++        let mut bytes = Vec::new();
++        assert!(
++            receive_until(
++                &output,
++                &mut bytes,
++                b"DEPPY_FG_READY",
++                Duration::from_secs(5)
++            ),
++            "foreground fixture must enter userland: {:?}",
++            String::from_utf8_lossy(&bytes)
++        );
++        let foreground = session.foreground_process_group().unwrap();
++        assert_ne!(
++            foreground, initial_group,
++            "interactive shell must create a separate foreground job group"
++        );
++        session.freeze().unwrap();
++        let state = |pid: u32| {
++            let out = std::process::Command::new("ps")
++                .args(["-o", "state=", "-p", &pid.to_string()])
++                .output()
++                .unwrap();
++            String::from_utf8_lossy(&out.stdout).trim().to_owned()
++        };
++        let deadline = Instant::now() + Duration::from_millis(500);
++        let mut foreground_stopped = false;
++        while Instant::now() < deadline {
++            if state(foreground).starts_with('T') {
++                foreground_stopped = true;
++                break;
++            }
++            std::thread::sleep(Duration::from_millis(20));
++        }
++        let initial_state = state(initial_group);
++        let foreground_state = state(foreground);
++        session.resume().unwrap();
++        // Only kills the foreground job created in this private PTY fixture.
++        unsafe {
++            libc::killpg(foreground as libc::pid_t, libc::SIGKILL);
++        }
++        drop(session);
++        assert!(
++            foreground_stopped,
++            "freeze returned Ok but only shell group stopped: shell={initial_group}:{initial_state}, foreground={foreground}:{foreground_state}"
++        );
++    }
++
+     /// 고립된 1바이트 echo 왕복(`unix_reader_loop`의 coalesce wait 포함)이 옛 2ms 대기
+     /// 만큼 지연되지 않는지 고정한다. `/bin/cat`은 stdin을 그대로 stdout에 흘려보내므로
+     /// 셸 프롬프트/readline 지연 없이 reader loop 자체의 지연만 잰다.
+--- a/crates/connector-service/src/coordinator.rs
++++ b/crates/connector-service/src/coordinator.rs
+@@ -10155,6 +10155,75 @@
+     }
+
+     #[test]
++    fn all_review_20261014_import_completion_survives_command_backpressure() {
++        // Always release the synthetic repository gate before Fixture's joining Drop, including
++        // during assertion unwinding. No file picker, files, secrets or external transports run.
++        struct ReleaseGateOnDrop(Arc<Gate>);
++        impl Drop for ReleaseGateOnDrop {
++            fn drop(&mut self) {
++                self.0.release();
++            }
++        }
++
++        let open_gate = Arc::new(Gate::closed());
++        let fixture = fixture(
++            Arc::clone(&open_gate),
++            Arc::new(Gate::opened()),
++            Arc::new(Gate::opened()),
++            Arc::new(SystemCoordinatorClock::default()),
++        );
++        let _release_gate = ReleaseGateOnDrop(Arc::clone(&open_gate));
++        let operation_id =
++            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
++        let completion = || ConnectorIntent::CompleteImportSource {
++            operation_id: operation_id.clone(),
++            source: ImportSource::File,
++            display_name: Some("fixture.json".to_owned()),
++            contents: SensitiveInput::new(b"fixture".to_vec()),
++        };
++
++        // The same actual bounded worker lane as command_queue_is_exactly_eight_and_backpressures:
++        // repository open is gated before the worker can dequeue any command.
++        fixture
++            .coordinator
++            .dispatch(ConnectorIntent::Activate)
++            .unwrap();
++        wait_until(|| fixture.repo.opens.load(Ordering::Acquire) == 1);
++        for _ in 1..8 {
++            fixture
++                .coordinator
++                .dispatch(ConnectorIntent::Activate)
++                .unwrap();
++        }
++        let full_queue_depth = fixture.coordinator.metrics().command_queue_depth;
++        let first = fixture.coordinator.dispatch(completion());
++        let pending_after_backpressure = fixture.coordinator.inner.pending_host_import.is_pending();
++
++        open_gate.release();
++        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
++        let retry = fixture.coordinator.dispatch(completion());
++        if retry == Ok(DispatchOutcome::Queued) {
++            wait_until(|| fixture.repo.imports.load(Ordering::Acquire) == 1);
++        }
++        let parses = fixture.repo.parses.load(Ordering::Acquire);
++        let imports = fixture.repo.imports.load(Ordering::Acquire);
++        eprintln!(
++            "queue_depth={full_queue_depth} first={first:?} pending_after_backpressure={pending_after_backpressure} retry={retry:?} parses={parses} imports={imports}"
++        );
++
++        assert_eq!(full_queue_depth, 8, "the actual worker lane must be full");
++        assert_eq!(first, Err(DispatchError::Backpressure));
++        assert_eq!(
++            retry,
++            Ok(DispatchOutcome::Queued),
++            "a rejected import completion must retain its operation ownership for retry; pending_after_backpressure={pending_after_backpressure}, parses={parses}, imports={imports}"
++        );
++        assert!(pending_after_backpressure);
++        assert_eq!(parses, 1);
++        assert_eq!(imports, 1);
++    }
++
++    #[test]
+     fn import_bytes_and_server_count_are_bounded_before_persistence() {
+         let fixture = fixture(
+             Arc::new(Gate::opened()),

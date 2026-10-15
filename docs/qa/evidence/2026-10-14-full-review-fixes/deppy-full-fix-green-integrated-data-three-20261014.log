@@ -1,0 +1,152 @@
+   Compiling rusqlite v0.40.2
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling storage-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.19s
+     Running unittests src/lib.rs (target/debug/deps/connector_service-f2463c4e3b23b09c)
+
+running 85 tests
+test coordinator::tests::absent_to_persisted_ask_mutation_fails_preflight_before_external_call ... ok
+test coordinator::tests::accepted_remote_mcp_reuses_its_second_slot_while_one_job_is_active ... ok
+test coordinator::tests::accepted_remote_oauth_uses_its_exact_one_slot_and_releases_it ... ok
+test coordinator::tests::accepted_remote_pre_job_failure_releases_transferred_reservation ... ok
+test coordinator::tests::all_review_20261014_import_completion_survives_command_backpressure ... ok
+test coordinator::tests::approval_preflight_failure_and_double_resolve_never_call ... ok
+test coordinator::tests::authorized_success_uses_exact_order_operation_and_durable_outcome ... ok
+test coordinator::tests::backend_panic_completes_and_releases_operation_capacity ... ok
+test coordinator::tests::cancelled_job_holds_capacity_until_backend_exits_then_is_removed ... ok
+test coordinator::tests::command_queue_is_exactly_eight_and_backpressures ... ok
+test coordinator::tests::config_change_immediately_drops_pending_without_audit_or_call ... ok
+test coordinator::tests::config_invalidation_finalizes_actual_pending_singletons_without_user_response ... ok
+test coordinator::tests::config_revision_change_discards_stale_discovery ... ok
+test coordinator::tests::diagnostic_transition_ring_evicts_the_65th_oldest_without_payload_retention ... ok
+test coordinator::tests::discovery_item_and_descriptor_byte_ceilings_are_inclusive ... ok
+test coordinator::tests::dispatched_cancel_is_visible_before_blocked_schema_completion ... ok
+test coordinator::tests::dispatched_config_mutation_is_visible_before_blocked_schema_completion ... ok
+test coordinator::tests::durable_denial_never_reaches_external_call ... ok
+test coordinator::tests::each_subject_dispatch_uses_only_the_current_workspace ... ok
+test coordinator::tests::empty_stdio_command_stops_before_persistence_schema_and_call ... ok
+test coordinator::tests::env_connector_discover_cancel_soak_is_bounded_at_every_checkpoint ... ignored, set DEPPY_CONNECTOR_SOAK_CYCLES and run this exact test explicitly
+test coordinator::tests::exact_input_grant_mismatch_is_failed_before_external_call ... ok
+test coordinator::tests::exact_self_authored_allow_always_revision_rebinds_only_inflight_call ... ok
+test coordinator::tests::fake_clock_expires_idle_worker_without_sleep_or_polling ... ok
+test coordinator::tests::full_fix_20261014_import_completion_cancel_race_consumes_owner_once ... ok
+test coordinator::tests::full_fix_20261014_import_rejection_returns_exact_sensitive_payload_and_cancel_is_terminal ... ok
+test coordinator::tests::generation_entries_are_pruned_after_server_churn ... ok
+test coordinator::tests::host_action_queue_drops_dynamic_urls_but_preserves_static_user_actions ... ok
+test coordinator::tests::host_import_is_single_exact_cancelable_and_double_completion_safe ... ok
+test coordinator::tests::idle_deadline_reaps_backend_lease_before_exit_without_second_ttl ... ok
+test coordinator::tests::idle_restart_resumes_latest_snapshot_and_opens_one_new_repository ... ok
+test coordinator::tests::import_bytes_and_server_count_are_bounded_before_persistence ... ok
+test coordinator::tests::import_omission_and_combined_report_limits_fail_before_persistence ... ok
+test coordinator::tests::invalid_http_url_stops_before_persistence_schema_and_call ... ok
+test coordinator::tests::invoke_subject_survives_remote_trust_and_oauth_refresh_resume ... ok
+test coordinator::tests::known_expiry_refresh_publishes_before_any_mcp_and_resumes_at_committed_revision ... ok
+test coordinator::tests::known_tool_error_is_failed_and_backend_is_not_retried ... ok
+test coordinator::tests::late_cancel_after_known_ok_persists_succeeded_and_never_retries ... ok
+test coordinator::tests::lazy_secret_migration_preserves_stale_rejection_for_other_writers ... ok
+test coordinator::tests::lazy_secret_migration_rechecks_the_first_discover_without_a_second_click ... ok
+test coordinator::tests::legacy_dispatch_binds_a_global_subject_and_remains_compatible ... ok
+test coordinator::tests::malformed_scalar_and_array_inputs_stop_before_all_authorization_work ... ok
+test coordinator::tests::mcp_two_and_oauth_one_are_hard_concurrency_caps ... ok
+test coordinator::tests::mismatched_live_tool_target_stops_before_permission_preflight_and_call ... ok
+test coordinator::tests::mismatched_repository_server_stops_before_schema_authorization_and_call ... ok
+test coordinator::tests::mixed_import_report_preserves_omitted_secret_counts_after_commit ... ok
+test coordinator::tests::pending_approval_idle_ttl_denies_without_call_and_releases_pinned_lease ... ok
+test coordinator::tests::pending_approval_preserves_its_workspace_subject_through_preflight_and_call ... ok
+test coordinator::tests::pending_approvals_retain_exactly_two_slots_and_cancel_drops_them ... ok
+test coordinator::tests::prepared_grant_for_another_workspace_fails_durably_before_external_call ... ok
+test coordinator::tests::queued_oauth_browser_url_is_removed_before_cancel_can_be_drained ... ok
+test coordinator::tests::queued_oauth_browser_url_is_removed_before_config_invalidation_can_be_drained ... ok
+test coordinator::tests::reactive_auth_failure_is_failed_and_backend_is_not_retried ... ok
+test coordinator::tests::remote_trust_stale_denied_and_cancel_each_release_exactly_once ... ok
+test coordinator::tests::repeated_discover_cancel_returns_every_service_resource_to_quiescence ... ok
+test coordinator::tests::repeated_oauth_stage_failure_deletes_exact_slot_and_acks_ledger ... ok
+test coordinator::tests::repeated_outcome_failure_retains_one_slot_and_fails_closed_until_recovery ... ok
+test coordinator::tests::seeded_overview_is_visible_without_worker_repository_open_or_wake ... ok
+test coordinator::tests::slack_config_invalidation_clears_transient_and_stale_result_cannot_restore_it ... ok
+test coordinator::tests::slack_failure_and_recovery_survive_reload_and_consume_exact_url_once ... ok
+test coordinator::tests::slack_transient_survives_unrelated_reload_and_cancel_restores_durable_state ... ok
+test coordinator::tests::slack_workspace_choice_survives_completion_reload_while_durable_status_wins ... ok
+test coordinator::tests::snapshot_reader_clones_only_after_revision_change ... ok
+test coordinator::tests::stale_and_failed_imports_preserve_candidate_counts_without_added_rows ... ok
+test coordinator::tests::stale_oauth_singleton_response_does_not_consume_current_continuation ... ok
+test coordinator::tests::system_operation_ids_are_unique_across_coordinator_instances ... ok
+test coordinator::tests::unknown_delivery_is_durable_unknown_and_backend_is_not_retried ... ok
+test coordinator::tests::unknown_oauth_publish_outcome_retains_staged_slot_for_reconciliation ... ok
+test coordinator::tests::unused_coordinator_has_zero_thread_and_repository_open ... ok
+test mcp_adapter::tests::cancelling_pinned_schema_releases_process_and_lease ... ok
+test mcp_adapter::tests::env_local_stdio_reap_soak_returns_threads_processes_and_leases_to_baseline ... ignored, set DEPPY_CONNECTOR_STDIO_SOAK_CYCLES and run this exact test explicitly
+test mcp_adapter::tests::live_schema_and_authorized_call_use_same_pinned_connection ... ok
+test mcp_adapter::tests::two_pinned_operations_backpressure_third_before_spawn ... ok
+test mcp_adapter::tests::warm_discovery_reuses_connection_without_second_keyring_read_and_ttl_reaps ... ok
+test oauth_adapter::tests::blocking_oauth_calls_check_cancellation_before_and_after_without_retry ... ok
+test oauth_adapter::tests::continuation_budget_counts_capacity_and_compaction_reclaims_spare_allocations ... ok
+test oauth_adapter::tests::dcr_origin_is_not_persisted_as_manual_and_hint_does_not_clone_full_token ... ok
+test oauth_adapter::tests::production_adapter_rejects_stdio_before_network_or_host_action ... ok
+test oauth_adapter::tests::production_continuation_debug_never_exposes_provider_state ... ok
+test ports::tests::credential_resolution_debug_redacts_physical_slot ... ok
+test ports::tests::every_public_oauth_result_debug_is_low_cardinality_and_redacted ... ok
+test ports::tests::generic_repository_debug_never_formats_payloads ... ok
+test ports::tests::invocation_context_is_bounded_and_debug_never_exposes_workspace ... ok
+test ports::tests::oauth_and_http_binding_debug_hide_all_user_provider_coordinates ... ok
+test ports::tests::workspace_grant_cannot_cross_subject_and_request_debug_hides_operation ... ok
+
+test result: ok. 83 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 1.09s
+
+     Running unittests src/lib.rs (target/debug/deps/deppy_core-66b4d97e34861c68)
+
+running 19 tests
+test fs::tests::full_fix_20261014_atomic_write_cleans_only_its_temp_on_publication_failure ... ok
+test fs::tests::full_fix_20261014_atomic_write_parallel_saves_have_distinct_temporary_objects ... ok
+test fs::tests::full_fix_20261014_atomic_write_preserves_existing_private_mode ... ok
+test fs::tests::full_fix_20261014_atomic_write_preserves_preexisting_temp_symlink_target ... ok
+test fs::tests::기록_후_내용이_교체되고_tmp가_남지_않는다 ... ok
+test fs::tests::파일명_없는_경로는_에러다 ... ok
+test fs::tests::확장자가_없는_파일명도_처리한다 ... ok
+test process_identity::tests::hook_ancestry_is_bounded_and_rejects_cycles_bad_identity_and_runtime ... ok
+test process_identity::tests::hook_execution_capture_contains_the_current_process_and_parent ... ok
+test process_identity::tests::linux_stat_birth_is_raw_ticks_with_parent_and_bounded_input ... ok
+test project_keys::tests::bounded_sources_reject_dotenv_path_traversal_and_duplicate_selection ... ok
+test project_keys::tests::github_targets_require_exact_scope ... ok
+test project_keys::tests::project_keys_github_secret_names_reject_reserved_prefix_case_insensitively ... ok
+test project_keys::tests::project_keys_validation_rejects_remote_only_local_values_and_wrong_delivery_scope ... ok
+test session_key_tests::mux_pane_uuid는_세션키가_아니다 ... ok
+test session_key_tests::워크스페이스와_세션번호를_나눈다 ... ok
+test session_key_tests::형식이_아니면_none ... ok
+test time::tests::civil_date가_알려진_날짜와_일치한다 ... ok
+test time::tests::시각이_합리적인_범위다 ... ok
+
+test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+
+     Running unittests src/lib.rs (target/debug/deps/storage_core-d843b328786d89e3)
+
+running 6 tests
+test tests::full_fix_20261014_backup_contains_committed_wal_rows_with_live_reader ... ok
+test tests::full_fix_20261014_backup_does_not_follow_previous_backup_symlink ... ok
+test tests::full_fix_20261014_backup_publication_failure_gates_migration_and_cleans_temp ... ok
+test tests::빈_db가_최신으로_올라간다 ... ok
+test tests::앞선_버전_db는_거부 ... ok
+test tests::이미_최신이면_noop ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+
+   Doc-tests connector_service
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests deppy_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests storage_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

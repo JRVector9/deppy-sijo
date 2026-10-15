@@ -4,6 +4,7 @@
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Arc;
 
 use runtime::{SessionId, SessionStatus};
 
@@ -18,6 +19,11 @@ const MAX_STRUCTURED_SESSION_ID_BYTES: usize = 1_024;
 const MAX_NATIVE_BODY_BYTES: usize = 2 * 1_024;
 const MAX_NATIVE_SUMMARY_BYTES: usize = 4 * 1_024;
 const MAX_NATIVE_PAYLOAD_BYTES: usize = 5 * 1_024;
+const MAX_CLOUD_TITLE_SOURCE_BYTES: usize = 8 * 1_024;
+const MAX_CLOUD_MESSAGE_SOURCE_BYTES: usize = 16 * 1_024;
+
+/// Pure display-text projection supplied by the composition root.
+pub type CloudTextRedactor = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// One immutable, bounded request for the composition root to deliver through
 /// the operating-system notification API. The leaf never executes that effect.
@@ -25,6 +31,7 @@ const MAX_NATIVE_PAYLOAD_BYTES: usize = 5 * 1_024;
 pub struct NativeNotificationIntent {
     summary: Box<str>,
     body: Box<str>,
+    cloud_source: Option<CloudNativeSource>,
 }
 
 impl NativeNotificationIntent {
@@ -38,6 +45,7 @@ impl NativeNotificationIntent {
         Some(Self {
             summary: summary.into(),
             body: body.into(),
+            cloud_source: None,
         })
     }
 
@@ -48,6 +56,58 @@ impl NativeNotificationIntent {
     pub fn body(&self) -> &str {
         &self.body
     }
+}
+
+#[derive(Clone)]
+struct CloudNotificationText {
+    title: String,
+    message: String,
+}
+
+impl CloudNotificationText {
+    fn new(title: &str, message: &str, redactor: Option<&CloudTextRedactor>) -> Self {
+        Self {
+            title: Self::bounded_source(title, MAX_CLOUD_TITLE_SOURCE_BYTES, redactor),
+            message: Self::bounded_source(message, MAX_CLOUD_MESSAGE_SOURCE_BYTES, redactor),
+        }
+    }
+
+    fn bounded_source(text: &str, limit: usize, redactor: Option<&CloudTextRedactor>) -> String {
+        if text.len() > limit {
+            return "[REDACTED]".into();
+        }
+        let text = redactor.map_or_else(|| text.to_owned(), |redact| redact(text));
+        if text.len() > limit {
+            "[REDACTED]".into()
+        } else {
+            text
+        }
+    }
+
+    fn preview(&self) -> String {
+        self.message.chars().take(240).collect()
+    }
+
+    fn label(&self) -> String {
+        format!(
+            "{} — {}",
+            self.title.chars().take(120).collect::<String>(),
+            self.preview()
+        )
+    }
+
+    fn scrubbed(&self, redact: &CloudTextRedactor) -> Self {
+        // Preserve complete bounded sources so late keys can be masked before clipping.
+        Self {
+            title: redact(&self.title),
+            message: redact(&self.message),
+        }
+    }
+}
+
+struct CloudNativeSource {
+    text: CloudNotificationText,
+    summary_template: String,
 }
 
 impl fmt::Debug for NativeNotificationIntent {
@@ -123,6 +183,7 @@ impl AgentNotificationSource {
 pub struct NotificationsUi {
     items: Vec<NotificationItem>,
     native_intents: VecDeque<NativeNotificationIntent>,
+    cloud_redactor: Option<CloudTextRedactor>,
 }
 
 struct NotificationItem {
@@ -130,6 +191,7 @@ struct NotificationItem {
     source: AgentNotificationSource,
     status: SessionStatus,
     title: String,
+    cloud_text: Option<CloudNotificationText>,
     message_id: &'static str,
     read: bool,
     /// 생성 시각(unix 초) — 작업함 전체 페이지의 「N분 전」 표시용 (2026-07-18).
@@ -150,12 +212,8 @@ impl NotificationsUi {
         message: &str,
         catalog: &i18n::Catalog,
     ) {
-        let preview: String = message.chars().take(240).collect();
-        let label = format!(
-            "{} — {}",
-            title.chars().take(120).collect::<String>(),
-            preview
-        );
+        let text = CloudNotificationText::new(title, message, self.cloud_redactor.as_ref());
+        let label = text.label();
         let target = AgentNotificationTarget::CloudAnswer {
             workspace_id: workspace.to_owned(),
             session_id: session_id.to_owned(),
@@ -166,6 +224,7 @@ impl NotificationsUi {
             source: AgentNotificationSource::Cloud,
             status: SessionStatus::Done,
             title: label.clone(),
+            cloud_text: Some(text.clone()),
             message_id: "notification.cloud_answer",
             read: false,
             created_at_secs: deppy_core::time::unix_secs_i64(),
@@ -173,10 +232,14 @@ impl NotificationsUi {
         if self.items.len() > MAX_NOTIFICATION_HISTORY {
             self.items.remove(0);
         }
-        if let Some(intent) = NativeNotificationIntent::new(
+        if let Some(mut intent) = NativeNotificationIntent::new(
             catalog.t("notification.cloud_answer", &[("title", &label)]),
-            &preview,
+            &text.preview(),
         ) {
+            intent.cloud_source = Some(CloudNativeSource {
+                text,
+                summary_template: catalog.t("notification.cloud_answer", &[]),
+            });
             if self.native_intents.len() == MAX_NATIVE_INTENTS {
                 self.native_intents.pop_front();
             }
@@ -188,14 +251,46 @@ impl NotificationsUi {
         Self {
             items: Vec::new(),
             native_intents: VecDeque::with_capacity(MAX_NATIVE_INTENTS),
+            cloud_redactor: None,
         }
+    }
+
+    pub fn with_cloud_redactor(redactor: CloudTextRedactor) -> Self {
+        let mut result = Self::new();
+        result.cloud_redactor = Some(redactor);
+        result
     }
 
     /// Returns one pending native notification for `App::logic` to execute.
     /// The fixed-capacity queue keeps the latest burst and never creates a
     /// worker, channel, timer, or polling lifecycle.
     pub fn pop_native_intent(&mut self) -> Option<NativeNotificationIntent> {
-        self.native_intents.pop_front()
+        while let Some(mut intent) = self.native_intents.pop_front() {
+            let Some(redactor) = &self.cloud_redactor else {
+                return Some(intent);
+            };
+            let Some(source) = intent.cloud_source.take() else {
+                return Some(intent);
+            };
+            let text = source.text.scrubbed(redactor);
+            // Recheck the existing payload budgets after replacement expansion.
+            if let Some(intent) = NativeNotificationIntent::new(
+                source.summary_template.replace("{title}", &text.label()),
+                &text.preview(),
+            ) {
+                return Some(intent);
+            }
+        }
+        None
+    }
+
+    fn item_title<'a>(&self, item: &'a NotificationItem) -> std::borrow::Cow<'a, str> {
+        match (&self.cloud_redactor, &item.cloud_text) {
+            (Some(redactor), Some(text)) => {
+                std::borrow::Cow::Owned(text.scrubbed(redactor).label())
+            }
+            _ => std::borrow::Cow::Borrowed(&item.title),
+        }
     }
 
     /// 표시 시 모든 항목을 읽음 처리한다. 읽지 않은 게 있었으면 true (repaint 필요).
@@ -470,6 +565,7 @@ impl NotificationsUi {
             source,
             status,
             title: title.to_owned(),
+            cloud_text: None,
             message_id,
             // 생성 시엔 항상 안 읽음. on_status는 창이 숨겨져(minimized/occluded) ui()가
             // 스킵돼도 logic()에서 호출되므로, 여기서 self.open으로 읽음 처리하면 사용자가
@@ -612,7 +708,8 @@ impl NotificationsUi {
         // 최신 항목이 위로 — 팝오버는 최근 max_items개만 보여준다.
         for item in self.items.iter().rev().take(max_items) {
             let icon = status_icon(item.status);
-            let label = catalog.t(item.message_id, &[("title", &item.title)]);
+            let title = self.item_title(item);
+            let label = catalog.t(item.message_id, &[("title", &title)]);
             if matches!(item.target, AgentNotificationTarget::Workspace { .. }) {
                 ui.label(
                     egui::RichText::new(format!("{} {icon} {label}", item.source.badge()))
@@ -654,7 +751,8 @@ impl NotificationsUi {
         // 최신 항목이 위로
         for item in self.items.iter().rev() {
             let icon = status_icon(item.status);
-            let label = catalog.t(item.message_id, &[("title", &item.title)]);
+            let title = self.item_title(item);
+            let label = catalog.t(item.message_id, &[("title", &title)]);
             if matches!(item.target, AgentNotificationTarget::Workspace { .. }) {
                 ui.label(
                     egui::RichText::new(format!("{} {icon} {label}", item.source.badge()))
@@ -1366,6 +1464,164 @@ mod tests {
 #[cfg(test)]
 mod cloud_answer_tests {
     use super::*;
+    use egui_kittest::kittest::Queryable as _;
+
+    const FIRST: &str = "fixture-notify-access-token-123456789";
+    const SECOND: &str = "fixture-notify-replaced-token-987654321";
+
+    fn notifications_with_redaction(service: &secret::RedactionService) -> NotificationsUi {
+        let service = service.clone();
+        NotificationsUi::with_cloud_redactor(Arc::new(move |text| {
+            service.redact_wrapped_text(text)
+        }))
+    }
+
+    fn clipped_cloud_text() -> (String, String) {
+        (
+            format!("{}fixture-notify-\naccess-token-123456789", "x".repeat(110)),
+            format!(
+                "{}fixture-notify-\nreplaced-token-987654321",
+                "x".repeat(220)
+            ),
+        )
+    }
+
+    #[test]
+    fn late_secret_notify_notifications_known_corpus_masks_before_clipping() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let service = secret::RedactionService::new();
+        let first = secret::SecretString::new(FIRST.into());
+        let second = secret::SecretString::new(SECOND.into());
+        let _lease = service.acquire_execution_lease(&[&first, &second]).unwrap();
+        let mut notifications = notifications_with_redaction(&service);
+        let (title, message) = clipped_cloud_text();
+        notifications.on_cloud_answer(
+            "workspace",
+            "session",
+            "operation",
+            &title,
+            &message,
+            &catalog,
+        );
+        assert_eq!(
+            notifications.items[0].title.matches("[REDACTED]").count(),
+            2
+        );
+        assert!(!notifications.items[0].title.contains("fixture-notify"));
+        let intent = notifications.pop_native_intent().unwrap();
+        assert_eq!(intent.body(), format!("{}[REDACTED]", "x".repeat(220)));
+        assert_eq!(intent.summary().matches("[REDACTED]").count(), 2);
+        assert!(bounded_text(intent.summary(), MAX_NATIVE_SUMMARY_BYTES));
+        assert!(bounded_text(intent.body(), MAX_NATIVE_BODY_BYTES));
+        assert!(intent.summary().len() + intent.body().len() <= MAX_NATIVE_PAYLOAD_BYTES);
+    }
+
+    #[test]
+    fn late_secret_notify_notifications_cached_fragments_mask_both_ui_surfaces_and_keep_target() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let service = secret::RedactionService::new();
+        let mut notifications = notifications_with_redaction(&service);
+        let (title, message) = clipped_cloud_text();
+        notifications.on_cloud_answer(
+            "workspace",
+            "session",
+            "operation",
+            &title,
+            &message,
+            &catalog,
+        );
+        let raw_title = title.chars().take(120).collect::<String>();
+        let raw_preview = message.chars().take(240).collect::<String>();
+        let button = |label: &str| {
+            format!(
+                "[Cloud] ✅ {}",
+                catalog.t("notification.cloud_answer", &[("title", label)])
+            )
+        };
+        let raw_button = button(&format!("{raw_title} — {raw_preview}"));
+        let first_button = button(&format!("{}[REDACTED] — {raw_preview}", "x".repeat(110)));
+        let both_button = button(&format!(
+            "{}[REDACTED] — {}[REDACTED]",
+            "x".repeat(110),
+            "x".repeat(220)
+        ));
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1400.0, 900.0))
+            .build_ui_state(
+                move |ui, state: &mut (NotificationsUi, Vec<AgentNotificationTarget>)| {
+                    if let Some(target) = state.0.recent_section(ui, &catalog, 10) {
+                        state.1.push(target);
+                    }
+                    if let Some(target) = state.0.contents(ui, &catalog) {
+                        state.1.push(target);
+                    }
+                },
+                (notifications, Vec::new()),
+            );
+        assert_eq!(harness.get_all_by_label(&raw_button).count(), 2);
+        let first = secret::SecretString::new(FIRST.into());
+        let first_lease = service.acquire_execution_lease(&[&first]).unwrap();
+        harness.run();
+        assert_eq!(harness.get_all_by_label(&first_button).count(), 2);
+        assert!(harness.query_by_label(&raw_button).is_none());
+        drop(first_lease);
+        let second = secret::SecretString::new(SECOND.into());
+        let _second_lease = service.acquire_execution_lease(&[&second]).unwrap();
+        harness.run();
+        assert_eq!(harness.get_all_by_label(&both_button).count(), 2);
+        harness
+            .get_all_by_label(&both_button)
+            .next()
+            .unwrap()
+            .click();
+        harness.run();
+        assert_eq!(
+            harness.state().1.last(),
+            Some(&AgentNotificationTarget::CloudAnswer {
+                workspace_id: "workspace".into(),
+                session_id: "session".into(),
+                operation_id: "operation".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn late_secret_notify_notifications_pending_native_intents_rescrub_each_delivery() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let service = secret::RedactionService::new();
+        let mut notifications = notifications_with_redaction(&service);
+        let (title, message) = clipped_cloud_text();
+        for operation in ["first-operation", "second-operation"] {
+            notifications.on_cloud_answer(
+                "workspace",
+                "session",
+                operation,
+                &title,
+                &message,
+                &catalog,
+            );
+        }
+        let first = secret::SecretString::new(FIRST.into());
+        let first_lease = service.acquire_execution_lease(&[&first]).unwrap();
+        let intent = notifications.pop_native_intent().unwrap();
+        assert_eq!(intent.summary().matches("[REDACTED]").count(), 1);
+        assert!(
+            !intent.summary().contains("fixture-no —"),
+            "clipped title must be masked separately"
+        );
+        drop(first_lease);
+        let second = secret::SecretString::new(SECOND.into());
+        let _second_lease = service.acquire_execution_lease(&[&second]).unwrap();
+        let intent = notifications.pop_native_intent().unwrap();
+        assert_eq!(intent.summary().matches("[REDACTED]").count(), 2);
+        assert_eq!(intent.body(), format!("{}[REDACTED]", "x".repeat(220)));
+        assert!(!intent.summary().contains("fixture-notify"));
+        assert!(bounded_text(intent.summary(), MAX_NATIVE_SUMMARY_BYTES));
+        assert!(bounded_text(intent.body(), MAX_NATIVE_BODY_BYTES));
+        assert!(intent.summary().len() + intent.body().len() <= MAX_NATIVE_PAYLOAD_BYTES);
+        assert!(notifications.pop_native_intent().is_none());
+    }
+
     #[test]
     fn cloud_answer_keeps_stable_identity_without_suppressing_pty_completion() {
         let catalog = i18n::Catalog::load("ko-KR").unwrap();

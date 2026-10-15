@@ -537,7 +537,17 @@ fn run_hooks(args: &[String]) -> anyhow::Result<()> {
             if let Some(v) = parsed.as_ref() {
                 if let Some(mut event) = agent_attention::normalize(v, at_micros) {
                     agent_attention::confirm_grok_completion(v, &mut event);
-                    let _ = db.record_agent_attention(&session_key, &event);
+                    if provider.as_deref() == Some("codex") {
+                        let _ = db.record_agent_attention_with_proof(
+                            &session_key,
+                            &event,
+                            execution_stamp.as_ref(),
+                            v.get("prompt_digest").and_then(serde_json::Value::as_str),
+                            v.get("transcript_path").and_then(serde_json::Value::as_str),
+                        );
+                    } else {
+                        let _ = db.record_agent_attention(&session_key, &event);
+                    }
                 }
                 agent_attention::reconcile_codex_results(&db, &session_key, v, at_micros);
                 agent_attention::reconcile_claude_results(&db, &session_key, v, at_micros);

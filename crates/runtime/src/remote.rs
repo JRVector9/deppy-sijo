@@ -550,6 +550,25 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
         } if !agent_config_id.is_valid() => {
             return Err("agent_config_id가 비었거나 상한/NUL 규칙 위반");
         }
+        RuntimeEvent::SessionInputAccepted {
+            sequence,
+            operation_id,
+            at_micros,
+            ..
+        } if *sequence == 0
+            || *at_micros <= 0
+            || operation_id.as_deref().is_some_and(|id| {
+                id.strip_prefix('@').unwrap_or(id).is_empty()
+                    || id.len() > 128
+                    || !id
+                        .strip_prefix('@')
+                        .unwrap_or(id)
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b':'))
+            }) =>
+        {
+            return Err("invalid accepted input evidence");
+        }
         RuntimeEvent::SessionInputSubmitted { at_micros, .. } if *at_micros <= 0 => {
             return Err("input submission timestamp must be positive");
         }
@@ -3049,7 +3068,7 @@ mod tests {
                 features: CLIENT_FEATURES,
                 token: b"irrelevant".to_vec(),
             };
-            assert_eq!(PROTO_VERSION, 30);
+            assert_eq!(PROTO_VERSION, 31);
             assert!(!client_hello_matches_protocol(&old));
         }
     }
@@ -3914,12 +3933,22 @@ mod tests {
             RuntimeEvent::TerminalHistoryResult { .. } => "TerminalHistoryResult",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
             RuntimeEvent::SessionTitleChanged { .. } => "SessionTitleChanged",
+            RuntimeEvent::SessionInputAccepted { .. } => "SessionInputAccepted",
         }
     }
 
     #[test]
     fn unattached_session_event_names_and_remote_codecs_roundtrip() {
         let events = [
+            (
+                RuntimeEvent::SessionInputAccepted {
+                    session: SessionId(7),
+                    sequence: 9,
+                    operation_id: Some("@completion:operation".into()),
+                    at_micros: 140_000_001,
+                },
+                "SessionInputAccepted",
+            ),
             (
                 RuntimeEvent::SessionInputSubmitted {
                     session: SessionId(7),

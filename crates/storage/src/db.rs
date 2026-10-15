@@ -11,7 +11,10 @@ pub use project_keys::{
 mod agent_attention;
 #[path = "workspace_identity.rs"]
 mod workspace_identity;
-pub use agent_attention::{AgentAttentionEvent, AttentionEventKind};
+pub use agent_attention::{
+    AgentAttentionEvent, AttentionEventKind, NativeTurnCompletionProof, NativeTurnProof,
+    native_prompt_digest,
+};
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -1380,6 +1383,8 @@ pub struct AgentStateSnapshot {
     pub turn_done_sessions: Vec<(String, i64)>,
     /// Confirmed idle episodes: key, Unix seconds, and independent microsecond boundary generation.
     pub idle_sessions: Vec<(String, i64, i64)>,
+    /// Genuine native-turn evidence; independent of UI acknowledgement and global across warm runtimes.
+    pub native_turns: Vec<NativeTurnProof>,
     /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
     /// 기록. 전역이며 부모 단독 신호는2분 후 만료한다. 자식 lifecycle은 종료까지 유지한다.
     pub working_sessions: Vec<String>,
@@ -1406,6 +1411,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("response_session_count", &self.response_sessions.len())
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("idle_session_count", &self.idle_sessions.len())
+            .field("native_turn_count", &self.native_turns.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
             .field(
@@ -2964,6 +2970,32 @@ fn agent_state_job_retained_bytes(
     Ok(total)
 }
 
+fn checked_native_turn_retained_bytes(
+    total: &mut usize,
+    native_turns: &Vec<NativeTurnProof>,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    checked_agent_state_vec_allocation(total, native_turns)?;
+    for proof in native_turns {
+        for value in [
+            &proof.session_key,
+            &proof.runtime_instance,
+            &proof.native_session_id,
+            &proof.turn_id,
+            &proof.prompt_digest,
+            &proof.transcript_path,
+        ] {
+            checked_agent_state_string_capacity(total, value)?;
+        }
+        for stamp in std::iter::once(&proof.start_execution_stamp)
+            .chain(proof.completed.as_ref().map(|end| &end.execution_stamp))
+        {
+            checked_agent_state_string_capacity(total, &stamp.runtime_instance)?;
+            checked_agent_state_vec_allocation(total, &stamp.ancestors)?;
+        }
+    }
+    Ok(())
+}
+
 fn agent_state_snapshot_retained_bytes(
     snapshot: &AgentStateSnapshot,
 ) -> Result<usize, AgentStatePreparationErrorCode> {
@@ -3006,6 +3038,7 @@ fn agent_state_snapshot_retained_bytes(
     for (key, _, _) in &snapshot.idle_sessions {
         checked_agent_state_string_capacity(&mut total, key)?;
     }
+    checked_native_turn_retained_bytes(&mut total, &snapshot.native_turns)?;
     checked_agent_state_vec_allocation(&mut total, &snapshot.working_sessions)?;
     for session_key in &snapshot.working_sessions {
         checked_agent_state_string_capacity(&mut total, session_key)?;
@@ -8904,7 +8937,16 @@ impl Db {
         } else {
             None
         };
+        let native_turns = if job.include_attention {
+            agent_attention::native_turn_proofs_in(&tx, job.snapshot_bytes_max)?
+        } else {
+            Vec::new()
+        };
+        let mut native_turn_bytes = 0;
+        checked_native_turn_retained_bytes(&mut native_turn_bytes, &native_turns)
+            .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
         let logical_retained_bytes = [
+            native_turn_bytes,
             idle_probe
                 .as_ref()
                 .map_or(0, |(probe, _, _)| probe.retained_bytes),
@@ -9366,6 +9408,7 @@ impl Db {
             response_sessions,
             turn_done_sessions,
             idle_sessions,
+            native_turns,
             working_sessions,
             agent_sessions,
             global_agent_sessions,
@@ -17168,6 +17211,7 @@ mod tests {
             response_sessions: vec![marker.to_owned()],
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
             idle_sessions: vec![(marker.to_owned(), 0, 1)],
+            native_turns: Vec::new(),
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
             archived_agent_resume: vec![ArchivedAgentResumeRow {

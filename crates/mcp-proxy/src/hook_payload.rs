@@ -42,6 +42,7 @@ impl<'de> Visitor<'de> for Shape {
             // Normalize transport/internal envelopes before consuming the human
             // preview budget. The transient input still has the 8 MiB read cap;
             // only the bounded preview is retained in the metadata object.
+            let digest = storage::native_prompt_digest(value);
             let Some(value) = storage::task_prompt_text(value) else {
                 return Ok(Value::Null);
             };
@@ -59,7 +60,7 @@ impl<'de> Visitor<'de> for Shape {
                     preview.push(c);
                 }
             }
-            return Ok(Value::String(preview.trim().to_owned()));
+            return Ok(serde_json::json!({"preview": preview.trim(), "digest": digest}));
         }
         // 알림 문구와 식별자는 별도 상한을 둔다. 너무 큰 값은 상태에 넣지 않는다.
         Ok(if value.len() <= 4096 {
@@ -75,6 +76,26 @@ impl<'de> Visitor<'de> for Shape {
         while let Some(key) = map.next_key::<String>()? {
             if key.len() > 128 {
                 return Err(serde::de::Error::custom("hook metadata key limit"));
+            }
+            if matches!(self, Self::Hook) && key == "prompt_digest" {
+                return Err(serde::de::Error::custom("reserved prompt evidence"));
+            }
+            if matches!(self, Self::Hook) && key == "prompt" {
+                if result.contains_key(&key) {
+                    return Err(serde::de::Error::custom("duplicate hook metadata"));
+                }
+                let mut value = map.next_value_seed(Self::Preview)?;
+                let preview = value
+                    .get_mut("preview")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                let digest = value
+                    .get_mut("digest")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                result.insert(key, preview);
+                result.insert("prompt_digest".into(), digest);
+                continue;
             }
             if matches!(self, Self::Hook) && matches!(key.as_str(), "tool_input" | "toolInput") {
                 let alias = if key == "tool_input" { 1 } else { 2 };

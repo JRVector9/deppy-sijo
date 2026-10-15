@@ -5,6 +5,158 @@ use serde::{Deserialize, Serialize};
 const STATE_BYTES_MAX: usize = 32 * 1024;
 const REQUESTS_MAX: usize = 64;
 
+/// Full submitted UTF-8 prompt, with terminal line endings canonicalized only.
+/// Never use the shortened, whitespace-normalized display title for this evidence.
+pub fn native_prompt_digest(text: &str) -> String {
+    let mut digest = Sha256::new();
+    let mut parts = text.split('\r');
+    if let Some(first) = parts.next() {
+        digest.update(first.as_bytes());
+    }
+    for part in parts {
+        digest.update(b"\n");
+        digest.update(part.strip_prefix('\n').unwrap_or(part).as_bytes());
+    }
+    format!("{:x}", digest.finalize())
+}
+
+/// Independent native boundaries, never the consumed UI `turn_done` flag.
+/// Only the genuine Codex observer ingestion path supplies this evidence.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTurnProof {
+    pub session_key: String,
+    pub runtime_instance: String,
+    pub native_session_id: String,
+    pub session_generation: i64,
+    pub turn_id: String,
+    pub started_at_micros: i64,
+    pub start_execution_stamp: HookExecutionStamp,
+    pub prompt_digest: String,
+    pub transcript_path: String,
+    pub completed: Option<NativeTurnCompletionProof>,
+    pub completion_revision: i64,
+    pub waiting: bool,
+    pub children_working: bool,
+    pub cancelled: bool,
+    pub ended: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTurnCompletionProof {
+    pub at_micros: i64,
+    pub execution_stamp: HookExecutionStamp,
+}
+
+impl std::fmt::Debug for NativeTurnProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTurnProof")
+            .field("completion_revision", &self.completion_revision)
+            .field("completed", &self.completed.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for NativeTurnCompletionProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTurnCompletionProof")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeTurnProof {
+    pub fn is_valid(&self) -> bool {
+        let id = |value: &str| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        };
+        bounded_session_key_prefix(&self.session_key).is_ok()
+            && id(&self.runtime_instance)
+            && self.runtime_instance.len() <= 128
+            && id(&self.native_session_id)
+            && id(&self.turn_id)
+            && self.session_generation > 0
+            && self.started_at_micros >= self.session_generation
+            && self.start_execution_stamp.is_valid()
+            && self.start_execution_stamp.runtime_instance == self.runtime_instance
+            && self.prompt_digest.len() == 64
+            && self
+                .prompt_digest
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && valid_native_transcript_path(&self.transcript_path, &self.native_session_id)
+            && self.completed.as_ref().is_none_or(|end| {
+                end.at_micros >= self.started_at_micros
+                    && end.execution_stamp.is_valid()
+                    && end.execution_stamp.runtime_instance == self.runtime_instance
+            })
+            && self.completion_revision >= 0
+    }
+}
+
+fn valid_native_transcript_path(path: &str, native: &str) -> bool {
+    let path_ref = Path::new(path);
+    path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && path_ref.is_absolute()
+        && uuid::Uuid::parse_str(native).is_ok()
+        && path_ref
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("rollout-") && name.ends_with(&format!("-{native}.jsonl"))
+            })
+}
+
+struct NativeTurnObservation<'a> {
+    stamp: &'a HookExecutionStamp,
+    digest: Option<&'a str>,
+    transcript_path: &'a str,
+}
+
+/// Bounded global projection. Called inside the existing attention snapshot transaction.
+pub(super) fn native_turn_proofs_in(
+    tx: &rusqlite::Transaction<'_>,
+    budget: usize,
+) -> anyhow::Result<Vec<NativeTurnProof>> {
+    const MAX: usize = 256;
+    const SELECT: &str = "SELECT session_key, attention_json FROM agent_needs_input
+        WHERE instr(attention_json,'\"native_turn_proof\":{')>0 ORDER BY session_key LIMIT 257";
+    let (count, bytes, largest, key_bytes): (i64, i64, i64, i64) = tx.query_row(
+        &format!("SELECT count(*),coalesce(sum(length(CAST(attention_json AS BLOB))),0),coalesce(max(length(CAST(attention_json AS BLOB))),0),coalesce(max(length(CAST(session_key AS BLOB))),0) FROM ({SELECT})"),
+        [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    )?;
+    anyhow::ensure!(
+        count >= 0
+            && count as usize <= MAX
+            && largest <= STATE_BYTES_MAX as i64
+            && key_bytes <= BOUNDED_ID_BYTES_MAX as i64
+            && bytes >= 0
+            && bytes as usize <= budget,
+        "native_turn_projection_limit"
+    );
+    let mut result = Vec::with_capacity(count as usize);
+    let mut stmt = tx.prepare(SELECT)?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let key: String = row.get(0)?;
+        let state: AttentionState = serde_json::from_str(&row.get::<_, String>(1)?)
+            .map_err(|_| anyhow::anyhow!("native_turn_projection_invalid"))?;
+        let Some(proof) = state.native_turn_proof else {
+            continue;
+        };
+        anyhow::ensure!(
+            proof.is_valid()
+                && proof.session_key == key
+                && state.runtime_instance.as_deref() == Some(&proof.runtime_instance)
+                && state.native_session_id == proof.native_session_id
+                && state.generation == proof.session_generation
+                && state.current_turn.as_ref() == Some(&proof.turn_id),
+            "native_turn_projection_invalid"
+        );
+        result.push(proof);
+    }
+    Ok(result)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionEventKind {
     SessionStart,
@@ -89,6 +241,8 @@ struct AttentionState {
     termination_floor: i64,
     #[serde(default)]
     ended: bool,
+    #[serde(default)]
+    native_turn_proof: Option<NativeTurnProof>,
 }
 
 impl AttentionState {
@@ -103,6 +257,9 @@ impl AttentionState {
         self.completed_turn = None;
         self.completed_at_micros = None;
         self.completion_deferred = false;
+        if let Some(proof) = &mut self.native_turn_proof {
+            proof.completed = None;
+        }
         if self.child_completed_at_micros.is_some_and(|end| end <= at) {
             self.child_completed_at_micros = None;
         }
@@ -321,6 +478,41 @@ impl Db {
         key: &str,
         event: &AgentAttentionEvent,
         message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.record_agent_attention_inner(key, event, message, None)
+    }
+
+    /// Called only by the local Codex observer after capturing its own kernel ancestry.
+    /// Missing evidence retains ordinary UI reducer behavior without minting a proof.
+    pub fn record_agent_attention_with_proof(
+        &self,
+        key: &str,
+        event: &AgentAttentionEvent,
+        stamp: Option<&HookExecutionStamp>,
+        prompt_digest: Option<&str>,
+        transcript_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let observation = stamp
+            .zip(transcript_path)
+            .filter(|(stamp, path)| {
+                stamp.is_valid()
+                    && event.runtime_instance.as_deref() == Some(&stamp.runtime_instance)
+                    && valid_native_transcript_path(path, &event.native_session_id)
+            })
+            .map(|(stamp, transcript_path)| NativeTurnObservation {
+                stamp,
+                digest: prompt_digest,
+                transcript_path,
+            });
+        self.record_agent_attention_inner(key, event, None, observation)
+    }
+
+    fn record_agent_attention_inner(
+        &self,
+        key: &str,
+        event: &AgentAttentionEvent,
+        message: Option<&str>,
+        observation: Option<NativeTurnObservation<'_>>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             message.is_none_or(|text| bounded_text_is_valid(text, BOUNDED_MESSAGE_BYTES_MAX)),
@@ -675,6 +867,7 @@ impl Db {
                 }
             }
             K::TurnStart if latest => {
+                let previous_proof = state.native_turn_proof.take();
                 // 새 사용자 입력은 이전 부모 턴의 미해결 승인보다 강한 진행 증거다.
                 // PostToolUse가 빠졌어도 과거 승인이 새 턴까지 붙어 있지 않게 한다.
                 // 병렬 자식의 질문/승인은 부모 입력으로 해제됐다고 단정할 수 없다.
@@ -705,6 +898,37 @@ impl Db {
                 state.current_turn.clone_from(&event.turn_id);
                 state.turn_cancelled = false;
                 state.clear_completion_for_activity(event.at_micros);
+                state.native_turn_proof = observation.as_ref().and_then(|observation| {
+                    let turn = event.turn_id.as_ref()?;
+                    let digest = observation.digest?;
+                    let mut proof = NativeTurnProof {
+                        session_key: key.to_owned(),
+                        runtime_instance: event.runtime_instance.clone()?,
+                        native_session_id: event.native_session_id.clone(),
+                        session_generation: state.generation,
+                        turn_id: turn.clone(),
+                        started_at_micros: event.at_micros,
+                        start_execution_stamp: observation.stamp.clone(),
+                        prompt_digest: digest.to_owned(),
+                        transcript_path: observation.transcript_path.to_owned(),
+                        completed: None,
+                        completion_revision: revision,
+                        waiting: false,
+                        children_working: false,
+                        cancelled: false,
+                        ended: false,
+                    };
+                    if let Some(previous) = previous_proof.filter(|previous| {
+                        previous.turn_id == *turn
+                            && previous.prompt_digest == digest
+                            && previous.runtime_instance == proof.runtime_instance
+                            && previous.transcript_path == proof.transcript_path
+                    }) {
+                        proof.started_at_micros = previous.started_at_micros;
+                        proof.start_execution_stamp = previous.start_execution_stamp;
+                    }
+                    proof.is_valid().then_some(proof)
+                });
             }
             K::Working if latest || owner.is_some() => {
                 if latest {
@@ -726,6 +950,19 @@ impl Db {
                 }
             }
             K::Completed if latest && !state.turn_cancelled => {
+                if let Some(proof) = &mut state.native_turn_proof {
+                    proof.completed = observation
+                        .as_ref()
+                        .filter(|observation| {
+                            event.turn_id.as_ref() == Some(&proof.turn_id)
+                                && event.at_micros >= proof.started_at_micros
+                                && observation.transcript_path == proof.transcript_path
+                        })
+                        .map(|observation| NativeTurnCompletionProof {
+                            at_micros: event.at_micros,
+                            execution_stamp: observation.stamp.clone(),
+                        });
+                }
                 working = false;
                 state.active_tools.retain(|(id, turn)| {
                     request_owner(id).is_some()
@@ -1029,6 +1266,13 @@ impl Db {
         } else {
             revision
         };
+        if let Some(proof) = &mut state.native_turn_proof {
+            proof.completion_revision = completion_generation;
+            proof.waiting = waiting;
+            proof.children_working = state.children_working;
+            proof.cancelled = state.turn_cancelled;
+            proof.ended = state.ended;
+        }
         let idle_generation = idle_since.and_then(|since| {
             if new_completion {
                 Some(completion_generation.max(state.resolved_at_micros))
@@ -1042,7 +1286,11 @@ impl Db {
                     .map(|completed| completed.max(state.resolved_at_micros))
             }
         });
-        let json = serde_json::to_string(&state)?;
+        let mut json = serde_json::to_string(&state)?;
+        if json.len() > STATE_BYTES_MAX && state.native_turn_proof.take().is_some() {
+            // Optional cloud evidence must never prevent the existing attention update.
+            json = serde_json::to_string(&state)?;
+        }
         anyhow::ensure!(json.len() <= STATE_BYTES_MAX, "agent attention state limit");
         // 보관 시각은 초 단위를 유지하고 완료 소비에는 별도 단조 증가 세대를 쓴다.
         let now = deppy_core::time::unix_secs_i64();
@@ -1180,6 +1428,70 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_native_proof_survives_ui_ack_and_keeps_independent_boundaries() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("full submitted prompt");
+        for (kind, at) in [
+            (AttentionEventKind::SessionStart, 1),
+            (AttentionEventKind::TurnStart, 2),
+            (AttentionEventKind::Completed, 3),
+        ] {
+            let mut event = event(kind, "", at);
+            event.native_session_id = native.into();
+            event.runtime_instance = Some("runtime-proof".into());
+            event.turn_id = Some("own-turn".into());
+            db.record_agent_attention_with_proof(
+                KEY,
+                &event,
+                Some(&stamp),
+                Some(&digest),
+                Some(&path),
+            )
+            .unwrap();
+        }
+        let revision = db.list_turn_done_sessions().unwrap()[0].1;
+        db.clear_agent_turn_done(KEY, revision).unwrap();
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        let snapshot = db
+            .apply_agent_state_job(&AgentStateJob::projection(
+                KEY.rsplit_once(':').unwrap().0.to_owned(),
+            ))
+            .unwrap();
+        let proof = &snapshot.native_turns[0];
+        assert_eq!(proof.turn_id, "own-turn");
+        assert_eq!(proof.prompt_digest, digest);
+        assert_eq!(proof.started_at_micros, 2);
+        assert_eq!(proof.completed.as_ref().unwrap().at_micros, 3);
+        assert_eq!(proof.completion_revision, revision);
+        assert_eq!(proof.start_execution_stamp, stamp);
+        assert_eq!(proof.completed.as_ref().unwrap().execution_stamp, stamp);
+        assert!(!format!("{proof:?}").contains(&path));
+    }
+
+    #[test]
+    fn completion_prompt_digest_preserves_unicode_and_normalizes_only_terminal_newlines() {
+        assert_eq!(
+            native_prompt_digest("한글\r\nsecond\rthird"),
+            native_prompt_digest("한글\nsecond\nthird")
+        );
+        assert_ne!(native_prompt_digest(" a "), native_prompt_digest("a"));
+        assert_ne!(native_prompt_digest("é"), native_prompt_digest("e\u{301}"));
+    }
+
     fn waiting_since(db: &Db) -> Option<i64> {
         db.conn
             .query_row(

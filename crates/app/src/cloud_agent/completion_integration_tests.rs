@@ -424,20 +424,64 @@ impl Fixture {
         payload(&response)
     }
 
+    fn readonly_history(&self) -> rusqlite::Connection {
+        // History::open performs startup recovery. Inspect this live private worker's
+        // durable rows without accidentally recovering its still-pending watches.
+        let connection = rusqlite::Connection::open_with_flags(
+            self.history_path.canonicalize().unwrap(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        connection.busy_timeout(Duration::from_millis(100)).unwrap();
+        connection
+    }
+
     pub(super) fn receipt(&self, started: &Started) -> agent_mcp::CompletionReceipt {
-        agent_mcp::History::open(&self.history_path)
-            .unwrap()
-            .get_completion(&started.identity)
-            .unwrap()
-            .unwrap()
+        started.identity.validate().unwrap();
+        let key = agent_mcp::operation_key(
+            &started.identity.connection_id,
+            &started.identity.scope.operation_id,
+        )
+        .unwrap();
+        assert_eq!(key, started.internal);
+        let (identity, record): (String, String) = self
+            .readonly_history()
+            .query_row(
+                "SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END, CASE WHEN length(CAST(receipt AS BLOB))<=4096 THEN receipt END FROM local_completion_receipts WHERE operation_key=?1 AND expires>?2",
+                rusqlite::params![key, agent_mcp::now() as i64],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let identity: agent_mcp::CompletionIdentity = serde_json::from_str(&identity).unwrap();
+        identity.validate().unwrap();
+        assert_eq!(identity, started.identity);
+        let receipt: agent_mcp::CompletionReceipt = serde_json::from_str(&record).unwrap();
+        receipt.validate().unwrap();
+        assert_eq!(receipt.identity, started.identity);
+        receipt
     }
 
     pub(super) fn public_admission(&self, started: &Started) -> Value {
-        agent_mcp::History::open(&self.history_path)
-            .unwrap()
-            .get_operation(&started.identity.scope.operation_id, &self.connection)
-            .unwrap()
-            .unwrap()
+        started.identity.validate().unwrap();
+        assert_eq!(started.identity.connection_id, self.connection);
+        let key = agent_mcp::operation_key(
+            &started.identity.connection_id,
+            &started.identity.scope.operation_id,
+        )
+        .unwrap();
+        assert_eq!(key, started.internal);
+        let (identity, admission): (String, String) = self
+            .readonly_history()
+            .query_row(
+                "SELECT CASE WHEN length(CAST(r.identity AS BLOB))<=2048 THEN r.identity END, CASE WHEN length(CAST(o.outcome AS BLOB))<=2048 THEN o.outcome END FROM local_completion_receipts r JOIN operations o ON o.id=r.operation_key JOIN operation_context c ON c.operation_key=o.id WHERE o.id=?1 AND c.connection_id=?2 AND c.external_id=?3 AND o.workspace=?4 AND o.session=?5 AND c.generation=?6 AND c.run_id IS ?7",
+                rusqlite::params![key, started.identity.connection_id, started.identity.scope.operation_id, started.identity.scope.workspace, started.identity.scope.session_id, started.identity.scope.generation, started.identity.scope.run_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let identity: agent_mcp::CompletionIdentity = serde_json::from_str(&identity).unwrap();
+        identity.validate().unwrap();
+        assert_eq!(identity, started.identity);
+        serde_json::from_str(&admission).unwrap()
     }
 }
 

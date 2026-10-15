@@ -38,6 +38,8 @@ pub enum AgentInputIntent {
     ExplicitPrompt,
     /// Deliberate no-submit append; existing draft text is expected and preserved.
     ExplicitAppend,
+    /// Opt-in tracked Codex submit; admission still verifies the current native editor.
+    TrackedPrompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

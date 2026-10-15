@@ -1487,6 +1487,78 @@ mod tests {
     }
 
     #[test]
+    fn completion_expired_prompt_digest_is_scrubbed_without_losing_native_capability() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("temporary full prompt digest");
+        for (kind, at) in [
+            (AttentionEventKind::SessionStart, 1),
+            (AttentionEventKind::TurnStart, 2),
+            (AttentionEventKind::Completed, 3),
+        ] {
+            let mut event = event(kind, "", at);
+            event.native_session_id = native.into();
+            event.runtime_instance = Some("runtime-proof".into());
+            event.turn_id = Some("old-turn".into());
+            db.record_agent_attention_with_proof(
+                KEY,
+                &event,
+                Some(&stamp),
+                Some(&digest),
+                Some(&path),
+            )
+            .unwrap();
+        }
+        let read = || -> serde_json::Value {
+            let json: String = db
+                .conn
+                .query_row(
+                    "SELECT attention_json FROM agent_needs_input WHERE session_key=?1",
+                    [KEY],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        let before = read();
+        assert_eq!(before["native_turn_proof"]["prompt_digest"], digest);
+        let mut job = AgentStateJob::projection(KEY.rsplit_once(':').unwrap().0.to_owned());
+        job.include_attention = false;
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .native_turns
+                .is_empty()
+        );
+        assert_eq!(read(), before, "omitted attention must not mutate evidence");
+        job.include_attention = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.native_turns.len(), 1);
+        assert!(
+            snapshot.native_turns[0].is_valid(),
+            "idle capability survives digest expiry"
+        );
+        let mut expected = before;
+        expected["native_turn_proof"]["prompt_digest"] = serde_json::Value::Null;
+        assert_eq!(read(), expected, "only temporary digest may be scrubbed");
+        assert!(
+            serde_json::to_value(&snapshot.native_turns[0]).unwrap()["prompt_digest"].is_null()
+        );
+    }
+
+    #[test]
     fn completion_prompt_digest_preserves_unicode_and_normalizes_only_terminal_newlines() {
         assert_eq!(
             native_prompt_digest("한글\r\nsecond\rthird"),

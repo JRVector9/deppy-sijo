@@ -14407,6 +14407,68 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn completion_tracked_prompt_accepts_only_positive_codex_editor_evidence() {
+        let (mut worker, group) = scrolled_composer_worker("shell$ ", false);
+        let id = SessionId(1);
+        let hint = "› \x1b[2mAsk Codex to do anything\x1b[0m\r\x1b[2C";
+        for (provider, editor, accepted_draft, expected) in [
+            (crate::AgentPromptKind::Codex, "shell$ ", false, false),
+            (crate::AgentPromptKind::Claude, "❯ ", false, false),
+            (crate::AgentPromptKind::Other, "› ", false, false),
+            (crate::AgentPromptKind::Codex, "› ", false, true),
+            (crate::AgentPromptKind::Codex, hint, false, true),
+            (crate::AgentPromptKind::Codex, "› real draft", false, false),
+            (crate::AgentPromptKind::Codex, hint, true, false),
+            (
+                crate::AgentPromptKind::Codex,
+                "Enter to select\r\n› ",
+                false,
+                false,
+            ),
+        ] {
+            worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .replay_ansi(&mut format!("\x1b[2J\x1b[H{editor}").as_bytes())
+                .unwrap();
+            let detector = worker.detectors.get_mut(&id).unwrap();
+            *detector = session::StatusDetector::new(session::StatusPatterns::compile(
+                None, None, None, None,
+            ));
+            if accepted_draft {
+                detector.on_user_input(b"\x1b[A");
+            }
+            let guard = crate::AgentInputGuard {
+                foreground_process_group: group,
+                provider,
+                intent: crate::AgentInputIntent::TrackedPrompt,
+            };
+            assert_eq!(
+                guard.allows(&worker.sessions[&id], worker.detectors.get(&id)),
+                expected,
+                "tracked prompt editor evidence: provider={provider:?}, draft={accepted_draft}, editor={editor:?}"
+            );
+        }
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut format!("\x1b[2J\x1b[H{hint}").as_bytes())
+            .unwrap();
+        let guard = crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Codex,
+            intent: crate::AgentInputIntent::AutomaticPrompt,
+        };
+        assert!(
+            !guard.allows(&worker.sessions[&id], worker.detectors.get(&id)),
+            "the existing automatic intent must still reject placeholders"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn composer_wide_placeholder_accepts_input_without_moving_viewport() {
         for offset in [0, 5, i32::MAX] {
             let (mut worker, group) =

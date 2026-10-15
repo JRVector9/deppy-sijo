@@ -1,0 +1,39 @@
+{
+  "status": "pass",
+  "sdk_version": "1.32.1",
+  "sdk_integrity": "sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==",
+  "package_lock_sha256": "a4325ed00f5511a3a46afab307860a54facbbfd89b3590ec8791f8e4a4cc4c0b",
+  "outcomes": [
+    {
+      "operation": "normal-original-call",
+      "elapsed_ms": 52,
+      "resumed": false,
+      "final_event_id": "3f52e7c2-ee80-4d0e-93c6-cfd3f7cec8a8:1"
+    },
+    {
+      "operation": "configured-long-call",
+      "elapsed_ms": 782,
+      "resumed": false,
+      "final_event_id": "16469a0f-381f-417e-ad8c-700a368a394c:1"
+    },
+    {
+      "operation": "dropped-original-call",
+      "elapsed_ms": 1033,
+      "resumed": true,
+      "final_event_id": "92d231fc-115c-4fa0-8394-57a5b9c2083e:1"
+    }
+  ],
+  "submitted": 3,
+  "completed": 3,
+  "forced_disconnects": 1,
+  "wait_get_poll_tool_calls": 0,
+  "resumed_get_requests": 1,
+  "transport_errors": [],
+  "configured_normal_timeout_ms": 500,
+  "long_completion_delay_ms": 750,
+  "exceeds_sdk_default_60s": false,
+  "limitations": [
+    "synthetic transport fixture; no real provider/account or native-turn hook compatibility claim",
+    "explicit client timeout settings do not establish cloud-host deadline support"
+  ]
+}

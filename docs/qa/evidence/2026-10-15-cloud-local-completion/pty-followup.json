@@ -1,0 +1,27 @@
+{
+  "source_head": "fa2c248908b2b029d8984e0a9f14328f2b3be663",
+  "test": "tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill",
+  "attempts": [
+    {
+      "attempt": 1,
+      "exit_code": 0
+    },
+    {
+      "attempt": 2,
+      "exit_code": 0
+    },
+    {
+      "attempt": 3,
+      "exit_code": 0
+    },
+    {
+      "attempt": 4,
+      "exit_code": 0
+    },
+    {
+      "attempt": 5,
+      "exit_code": 0
+    }
+  ],
+  "note": "CI first attempt failed process group identity changed; automated nextest retry passed. PTY source is unchanged from base."
+}

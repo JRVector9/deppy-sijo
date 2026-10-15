@@ -1,3 +1,39 @@
+# 클라우드 자동 완료 반환 — main·0.13.0 빌드 완료, 최종 증거 문서 반영 중
+
+- Current objective: 승인된 feature 구현/교차리뷰/실제 테스트/PR235 main merge/0.13.0 사용자용 local-development 빌드 검증 완료. 이제 최종 evidence-only 문서를 main에 반영하고 완료 보고. 앱 stop/launch/restart 권한 없음, 실제로 하지 않음.
+- Product source/main **0b54b888e2d116fb1940a221b2aa53260407fafc**, PR235 testedhead **fa2c248908b2b029d8984e0a9f14328f2b3be663**, producttree diff없음. canonical `/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015`; 원 nominal/performance dirty tree 보존. user가 지정한 모든worker gpt-6.1-sol/xhigh, root만 Cargo/jobs2/shared performance target; 현재 Cargo/SDK/package 세션 모두 exit0종료.
+- Completed behavior: original initialized MCP 요청에 per-connection/session default-off opt-in; 검증된 Codex native turn+kernelexecution+fullpromptdigest+실제acceptedsequence+boundedrollout확인. 입력권한/제어권과 완료조회권한 분리, private durable receipt 뒤 원requestSSE응답, 정확한원stream재개만/입력재전송없음. runtimewire30→31. 유실·중간입력·권한회수·세대교체·늦은admission·만료는 Unknown/Revoked 등으로 종료. local와delivery/모델ACK분리. 마지막publish wake도 기존callback을 registry/Auth lock밖에서 호출.
+- Modified files in final phase: `docs/CODEX_HANDOFF.md`, `docs/qa/2026-10-15-cloud-local-completion.md`, `docs/superpowers/plans/2026-10-15-cloud-local-completion.md`, evidence디렉터리의 최종 affected/CI/SDK/rawlogs/package JSON·gz·SHA256SUMS. product변경은 PR235에 이미포함됐으며 이 마지막문서단계는 source/version수정없음. 세부변경과 이전실패는 아래단계별기록보존.
+- Actual tests: source793b74f6 localworkspace5814PASS0FAIL65ignored/78harness. 최종c7ba7f94 제품(문서headfa2c2489와동일) wake실제RED0PASS1FAIL→GREEN1PASS, fullMCP92PASS1ignored/Appcompletion76PASS, strictworkspacealltargetsClippy/fmt/boundary/deps exit0. SDK1.32.1 최신재빌드/quick3제출3완료/강제끊김1/입력재전송0/별도조회0/GETresume1/errors0. 이전61초configured대기성공은 별도cohort로보존.
+- Exactfinalhead GitHub8/8SUCCESS, nextest679+5136=5815최종PASS. 기존PTY kill test1개는 최초process-group-identity mismatch FAIL→설정retryPASS. 동일PTY/nextest설정은base와diff없음, 별도local5/5first-attemptPASS. 원인미확정/잔여간헐성으로기록, 검사완화/제품무관변경없음. 이 flaky를0retry라고보고하지말것.
+- Release: **0.12.3→0.13.0**, featureminor. Cargo.toml canonical+Cargo.lock27 inherited패키지/CHANGELOG반영. main source package actualexit0/96.766s, CLI와plist두값0.13.0, arm64, deepstrict서명·archive검증exit0. 안정산출물 `target/bundle-0.13.0/Deppy Sijo.app` 및`Deppy Sijo.zip`; sourcecopy hash일치/이전0.12.3산출물hash불변. localdevelopment package이며 Apple공증배포로주장하지않음. package-result.json에전체source/sha/검증값보존.
+- Remaining product limitations: Codex genuine prior proof/acceptedsequence기준이없는세션과다른provider는 입력전미지원. Quick Tunnel은공식SSE미지원이므로고정SSE터널필요. Dot/MetaMuse/GrokBot 실제계정·인터넷터널·host장시간시한/재연결·모델ACK는미검증. 사용자DB·키·clipboard·실계정·앱상태조작없음.
+- Next exact commands: `git diff --check`; `git status --short`; evidenceSHA검증; `git switch -c docs/cloud-completion-release-verified-20261015`; 명시docs staging/commit/push/docs-onlyPR → 실제CI확인후main merge. docs-only검사에서macOSskip은PASS실행으로세지않음. 원문서workingdiff는root소유, 다른worktree/stale localmain ref를prune/reset하지않음. 완료보고에PR/version/build경로/테스트와미검증범위를간결히기재.
+
+---
+
+# main 반영 완료 —0.13.0 package 진행, 2026-10-15
+
+- PR235 finalheadfa2c2489 GitHub8SUCCESS 및 실제CI5815최종PASS 확인 후 merge. main/source commit **0b54b888e2d116fb1940a221b2aa53260407fafc**, testedhead와 producttree diff없음. canonical featurebranch도 origin/main으로ff완료. 현재 docs-only미커밋수정 보존.
+- root package session18990: `/private/tmp/deppy-completion-package-20261015.py` 실제 실행중. 로그 `/private/tmp/deppy-completion-package-20261015.log`, 결과JSON `/private/tmp/deppy-completion-package-result-20261015.json`. source0.13.0 release빌드/main source freeze; 앱launch/restart없음. 안정copy/CLI/plist/arch/signature/archive검증 완료까지 release완료주장금지.
+- CI PTY test1개는 firstattemptfail/자동retryPASS, local5firstattemptPASS. 기존PTY/nextest config는base와동일. 원인불명identitytransition이며 본feature 원인으로단정하지 않음. 해당오류를숨기거나검사완화하지않고rawlog/JSON기록. 신규cloud검사재시도실패없음.
+- Next: poll18990 완료후 actualpackage JSON/log보존; QAguide/plan/handoff최종갱신. docs-onlybranch/PR로evidence main반영. root만Cargo, 사용자DB·키·실계정·clipboard·앱상태보존.
+
+---
+
+# 최종 source 검증 완료 — GitHub 최종 head 대기, 2026-10-15
+
+- Current objective: feature PR235 exact-head CI → main →0.13.0 local development package/CLI·plist2·signature/archive 검증. 사용자 `진행해`/앞선 parallel 구현 승인 범위 계속. 앱 launch/stop/restart 금지. 원 dirty trees/사용자DB·키·clipboard·실계정 보존.
+- 최종 제품source c7ba7f948cb9d2a9c97462e4141891ce92364d9d, PRhead fa2c248908b2b029d8984e0a9f14328f2b3be663(문서만추가), origin/main fb3357d2. source0.13.0, 이전shipped0.12.3. GitHub Build38726284997/security38726285133 검사 진행중, 아직 merge/package하지 않음.
+- 실제 마지막누락: idle delivery event에 consumer wake가 없어 최종 Returned 표시가 늦어짐. HTTP/SSE callback-only consumer 실제RED0PASS1FAIL/exit101 → existing callback을 registry/Auth lock 밖에서 호출하는 최소11line GREEN c7ba7f94. timer/worker추가 없음. root 직접diffreview, settings readonly App lifecycle/identity/durablefinish/consent clean; proof readonly spec scope 충족, userdoc SSE/baseline/runtime31오류만 수정.
+- root sole Cargo session77879 실제 exit0 종료. wake1PASS, fullMCP92PASS1ignored, Appcompletion76PASS, strictworkspacealltargetsClippy/fmt/boundary/deps 모두exit0. SDK fixture 최신0.13재빌드0 → officialSDK1.32.1 quick0: 정상52ms/설정750ms대기782ms/원stream끊김재개1033ms,3제출3완료/강제끊김1/입력재전송0/별도조회0/GETresume1/errors0. 이전61s 실행과 cohort를 합치지 않음.
+- 이전source793b74f6 actualfullworkspace5814PASS0FAIL65ignored/78harness +strictallPASS+GitHub8PASS. 마지막wake수정후 localfull을불필요하게반복하지않고 fullMCP/affectedApp+strict/SDK 및 exactfinalheadCI full을gate로사용. 최초full5812PASS2boundaryFAIL(같은test Fixture cfgmetadata원인), 최초CIClippy2FAIL도793에서실제로해결된증거보존.
+- Modified files 현재 docs only: handoff, QA guide, implementation plan 체크박스, evidence finalgates/rawlogs/provenance. root /private/tmp/deppy-completion-package-20261015.py 는 준비만했으며 미실행. package command는 기존검증된 localdev policy 두env explicitopt-in, main merge후실행. 안정산출물 target/bundle-0.13.0 생성예정,0.12.3보존. 최종binary/plist/arch/signature/archive actual전 release완료주장금지.
+- Final PRheadfa2c2489 GitHub8/8SUCCESS 실제확인, raw macOS CI nextest679+5136=5815최종PASS. 기존PTY kill test는 첫시도process group identity changed FAIL→설정retryPASS(1flaky). 같은PTY source는base와diff없음, root isolated5/5first-attemptPASS 실행. 검사완화 없음, identity transition 원인미확정으로evidence보존. package전Cargo모두종료. 집계는flaky괄호뒤134skipped도보존, 별도filter의skips합산안함.
+- Next exact commands: `gh pr view 235 --repo JRVector9/deppy-sijo --json headRefOid,statusCheckRollup,mergeable`; final8SUCCESS확인후 `gh run view 38726284997 --repo JRVector9/deppy-sijo --job 116392894938 --log` 보존/nextest실제합계집계; PRbody를최종결과로수정; fetchmain변경없음확인 → `gh pr merge 235 --repo JRVector9/deppy-sijo --merge --match-head-commit fa2c248908b2b029d8984e0a9f14328f2b3be663`; fetch + `git merge --ff-only origin/main`; `python3 /private/tmp/deppy-completion-package-20261015.py`. docsonlyworkingdiff는보존하고코드검증head이후변경없는지확인. Evidence/plan/handoff최종화후docs-onlyPR/main. root외Cargo실행없음.
+
+---
+
 # 최종 검증 진행 — idle delivery wake 추가 재현, 2026-10-15
 
 - Current objective: PR235 원 클라우드 요청 자동 완료 feature를 실제 최종 검증하고 main 반영/0.13.0 로컬 package 검증. 앱 stop/launch/restart 금지; 이전 IME0.12.3/main 완료는 반복하지 않음.

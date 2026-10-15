@@ -1,0 +1,35 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/core)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/terminal)
+   Compiling mux v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/mux)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/audit)
+   Compiling persist v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/persist)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage-core)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/session)
+   Compiling storage v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/runtime)
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 31.69s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/web_remote-d3ba62503b468508)
+
+running 2 tests
+test relay_client::tls::tests::full_fix_20261014_relay_receive_obeys_total_budget ... receive_budget_ms=40 elapsed_ms=259 received_bytes=8
+
+thread 'relay_client::tls::tests::full_fix_20261014_relay_receive_obeys_total_budget' (48500045) panicked at crates/web-remote/src/relay_client/tls.rs:446:9:
+production receive ignored total deadline while bytes continued arriving
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test relay_client::tls::tests::full_fix_20261014_relay_worker_shutdown_observes_receive_slice ... worker_receive_slice_ms=1000 shutdown_elapsed_ms=3084
+
+thread 'relay_client::tls::tests::full_fix_20261014_relay_worker_shutdown_observes_receive_slice' (48500090) panicked at crates/web-remote/src/relay_client/tls.rs:522:9:
+actual RelayWorker shutdown blocked on continuously fragmented message
+FAILED
+
+failures:
+
+failures:
+    relay_client::tls::tests::full_fix_20261014_relay_receive_obeys_total_budget
+    relay_client::tls::tests::full_fix_20261014_relay_worker_shutdown_observes_receive_slice
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 384 filtered out; finished in 3.40s
+
+error: test failed, to rerun pass `-p web-remote --lib`

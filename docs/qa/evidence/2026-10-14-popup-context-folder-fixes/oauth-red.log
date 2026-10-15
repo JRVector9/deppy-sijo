@@ -1,0 +1,59 @@
+   Compiling connector-ui v0.12.1 (/private/tmp/deppy-popup-fix-secret-20261014/crates/connector-ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.45s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_ui-393ac8cf42b2180f)
+
+running 9 tests
+
+thread 'oauth_secret_tests::oauth_secret_active_input_has_no_undo_history' (46790027) panicked at crates/connector-ui/src/oauth_secret_tests.rs:207:5:
+assertion failed: !state.undoer().has_undo(&(cursor, String::new()))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test oauth_secret_tests::oauth_secret_active_input_has_no_undo_history ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state' (46790029) panicked at crates/connector-ui/src/oauth_secret_tests.rs:222:5:
+assertion failed: egui::text_edit::TextEditState::load(&harness.ctx, id).is_none()
+test oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_revision_switch_clears_undo' (46790033) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_revision_switch_clears_undo ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_operation_switch_clears_undo' (46790032) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_operation_switch_clears_undo ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_server_switch_clears_undo' (46790034) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_server_switch_clears_undo ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_missing_snapshot_clears_undo' (46790031) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_missing_snapshot_clears_undo ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_hidden_surface_clears_undo_without_rendering' (46790030) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_hidden_surface_clears_undo_without_rendering ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits' (46790028) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits ... FAILED
+
+thread 'oauth_secret_tests::oauth_secret_success_does_not_restore_the_submitted_value' (46790035) panicked at crates/connector-ui/src/oauth_secret_tests.rs:111:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_success_does_not_restore_the_submitted_value ... FAILED
+
+failures:
+
+failures:
+    oauth_secret_tests::oauth_secret_active_input_has_no_undo_history
+    oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits
+    oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state
+    oauth_secret_tests::oauth_secret_hidden_surface_clears_undo_without_rendering
+    oauth_secret_tests::oauth_secret_missing_snapshot_clears_undo
+    oauth_secret_tests::oauth_secret_operation_switch_clears_undo
+    oauth_secret_tests::oauth_secret_revision_switch_clears_undo
+    oauth_secret_tests::oauth_secret_server_switch_clears_undo
+    oauth_secret_tests::oauth_secret_success_does_not_restore_the_submitted_value
+
+test result: FAILED. 0 passed; 9 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p connector-ui --lib`

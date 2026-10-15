@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.19s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 1 test
+test cloud_agent::management::tests::quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock ...
+thread 'cloud_agent::management::tests::quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock' (51632283) panicked at crates/app/src/cloud_agent/management.rs:1909:9:
+assertion `left == right` failed: a transient failed bootstrap must retry and reveal the saved run after SQLite recovers
+  left: 0
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    cloud_agent::management::tests::quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3255 filtered out; finished in 0.12s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

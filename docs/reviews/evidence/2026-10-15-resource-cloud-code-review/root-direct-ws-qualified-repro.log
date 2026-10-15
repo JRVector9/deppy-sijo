@@ -1,0 +1,20 @@
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.45s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/web_remote-e87460d57d8c6d0a)
+
+running 1 test
+test ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline ... auth whole deadline=5s; elapsed=6.363296458s; late valid message accepted=true
+
+thread 'ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline' (51669092) panicked at crates/web-remote/src/ws_api.rs:772:9:
+a valid auth message completed after the whole deadline must be rejected
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    ws_api::tests::review_20261015_auth_rejects_valid_message_completed_after_whole_deadline
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 6.37s
+
+error: test failed, to rerun pass `-p web-remote --lib`

@@ -1,0 +1,18 @@
+warning: variant `Other` is never constructed
+ --> /private/tmp/deppy-composer-review-20261014/wide_cursor_probe.rs:2:77
+  |
+2 | #[derive(Clone, Copy, PartialEq, Eq)] enum AgentPromptKind { Claude, Codex, Other }
+  |                                            ---------------                  ^^^^^
+  |                                            |
+  |                                            variant in this enum
+  |
+  = note: `AgentPromptKind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `choice_dialog` is never used
+   --> /private/tmp/deppy-composer-review-20261014/wide_cursor_probe.rs:100:4
+    |
+100 | fn choice_dialog(snapshot: &terminal::TerminalViewportSnapshot) -> bool {
+    |    ^^^^^^^^^^^^^
+
+warning: 2 warnings emitted

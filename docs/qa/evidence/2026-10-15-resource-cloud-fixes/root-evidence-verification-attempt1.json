@@ -1,0 +1,7 @@
+{
+  "command": ["python3", "/private/tmp/deppy-cloud-fix-root-20261015/verify-evidence.py"],
+  "exit_code": 1,
+  "cause": "The evidence verifier checked the README link to its own result before creating that result.",
+  "correction": "Defer only the self-result link existence assertion until after all checks and the result write, then rerun the complete verifier.",
+  "product_or_test_source_changed": false
+}

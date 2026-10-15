@@ -1,0 +1,14 @@
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.93s
+     Running unittests src/lib.rs (target/debug/deps/runtime-92b62424000a532a)
+
+running 6 tests
+test in_process::tests::composer_explicit_prompt_accepts_redrawn_empty_editor_after_cleared_native_draft ... ok
+test in_process::tests::composer_ready_hint_still_protects_current_question_and_accepted_draft ... ok
+test in_process::tests::composer_scrollback_still_protects_live_drafts_and_choice_dialogs ... ok
+test in_process::tests::composer_scrollback_submit_uses_live_editor_and_preserves_viewport ... ok
+test in_process::tests::composer_ready_prompt_is_not_vetoed_by_previous_stream_status ... ok
+test in_process::tests::composer_codex_placeholder_accepts_multiline_prompt_in_owned_pty ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 387 filtered out; finished in 0.49s

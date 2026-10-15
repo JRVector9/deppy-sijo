@@ -1,0 +1,69 @@
+warning: struct `InputPermit` is never constructed
+ --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:6:12
+  |
+6 | pub struct InputPermit(Arc<Mutex<bool>>);
+  |            ^^^^^^^^^^^
+  |
+  = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated items `new` and `revoke` are never used
+  --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:9:12
+   |
+ 8 | impl InputPermit {
+   | ---------------- associated items in this implementation
+ 9 |     pub fn new() -> Self {
+   |            ^^^
+...
+14 |     pub fn revoke(&self) {
+   |            ^^^^^^
+
+warning: variant `Other` is never constructed
+  --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:47:5
+   |
+44 | pub enum AgentPromptKind {
+   |          --------------- variant in this enum
+...
+47 |     Other,
+   |     ^^^^^
+   |
+   = note: `AgentPromptKind` has derived impls for the traits `Clone` and `Debug`, but these are intentionally ignored during dead code analysis
+
+warning: struct `InputAdmission` is never constructed
+  --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:50:12
+   |
+50 | pub struct InputAdmission {
+   |            ^^^^^^^^^^^^^^
+
+warning: type alias `InputAuthorizer` is never used
+  --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:58:6
+   |
+58 | type InputAuthorizer = dyn Fn(&mut dyn FnMut()) + Send + Sync;
+   |      ^^^^^^^^^^^^^^^
+
+warning: multiple associated items are never used
+  --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:61:12
+   |
+60 | impl InputAdmission {
+   | ------------------- associated items in this implementation
+61 |     pub fn new(
+   |            ^^^
+...
+75 |     pub fn with_agent_guard(mut self, guard: AgentInputGuard) -> Self {
+   |            ^^^^^^^^^^^^^^^^
+...
+81 |     pub fn with_bracketed_paste_required(mut self) -> Self {
+   |            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+86 |     pub(crate) fn requires_bracketed_paste(&self) -> bool {
+   |                   ^^^^^^^^^^^^^^^^^^^^^^^^
+...
+90 |     pub(crate) fn agent_guard(&self) -> Option<AgentInputGuard> {
+   |                   ^^^^^^^^^^^
+...
+94 |     pub(crate) fn deadline_elapsed(&self) -> bool {
+   |                   ^^^^^^^^^^^^^^^^
+...
+98 |     pub(crate) fn admit<T>(&self, write: impl FnOnce() -> T) -> Option<T> {
+   |                   ^^^^^
+
+warning: 6 warnings emitted

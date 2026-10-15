@@ -1,0 +1,14 @@
+{
+  "crates/pty/src/lib.rs": {
+    "canonical_before": "4f6fd68c25f3d9ba411f8483ee46918deb5a87d50c033d98a051d5a796bc644b",
+    "worker_after": "eec42ee82ca49f9afea88b646d8c23e102914014bb25f1ca81682a344e546676"
+  },
+  "crates/pty/src/workload_signal.rs": {
+    "canonical_before": "82030bd78708fe5d42728ef80a44c14b2d14090bf2345874ce905d3e0769d78c",
+    "worker_after": "20cc0722a32a0edb21d69678474792b3eccafc6673b36a692deaff520f282951"
+  },
+  "crates/pty/src/foreground_teardown_tests.rs": {
+    "canonical_before": "cd2455375ab4585a009f17e46931e08946da9d526736899eeeca68705b52970d",
+    "worker_after": "2b1600dc9a91fb6cf509822de004c13fe812504ec0e8d4814a639b78cdccd6b4"
+  }
+}

@@ -1,0 +1,1283 @@
+[
+  {
+    "branch": "build/macos-notarization-main",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "2cefb2542737ee1d7f81c9b788e684caff4e79b7",
+    "subjects": []
+  },
+  {
+    "branch": "build/ureq3-migration-20260907",
+    "main_only": 316,
+    "branch_only": 4,
+    "head": "bfecc7f485f6ca3e435d25ee9edc3c79990688c2",
+    "subjects": [
+      "bfecc7f4 docs(http): ureq 3 이관 검증 결과와 착지 절차를 기록한다",
+      "e34769d1 Merge remote-tracking branch 'origin/main' into build/ureq3-migration-20260907",
+      "4fac6419 build(http): ureq 3으로 이관하고 오류 본문과 SSE idle 제한을 보존한다",
+      "ef6c51b1 docs: ureq 3 HTTP 이관 설계와 검증 계획을 기록한다"
+    ]
+  },
+  {
+    "branch": "codex/grok-catalog",
+    "main_only": 387,
+    "branch_only": 5,
+    "head": "6ed7ebc52323096422b5e41c67b9653c48ebd9f2",
+    "subjects": [
+      "6ed7ebc5 fix(agent): skip malformed Grok object entries",
+      "3b602930 fix(agent): keep Grok object entries typed",
+      "d43c0a67 feat(agent): add Grok model effort defaults",
+      "cb500fb2 fix(agent): tolerate malformed Grok object entries",
+      "8ad2b83b fix(agent): parse Grok catalog defaults"
+    ]
+  },
+  {
+    "branch": "codex/grok-lifecycle-correction",
+    "main_only": 373,
+    "branch_only": 1,
+    "head": "05fd51f351f5e6e99b1f6d5bf98b608a7e13f669",
+    "subjects": [
+      "05fd51f3 fix(usage): Grok 측정 시각과 종료 상태 보존"
+    ]
+  },
+  {
+    "branch": "codex/grok-status-integration",
+    "main_only": 378,
+    "branch_only": 1,
+    "head": "58103bff76e9eea67d78960655700bcd448ce63c",
+    "subjects": [
+      "58103bff feat(usage): Grok 잔여 상태를 하단 바에 표시"
+    ]
+  },
+  {
+    "branch": "codex/grok-usage-parser",
+    "main_only": 387,
+    "branch_only": 5,
+    "head": "d1ff8cb4a63a1c6a54984c95acb63a3a09caba6d",
+    "subjects": [
+      "d1ff8cb4 fix(usage): harden Grok usage probing",
+      "728dc36f fix(usage): throttle failed Grok probe spawns",
+      "309a04dc feat(usage): Grok 사용량 프로브 추가",
+      "dfa968f3 fix(usage): clamp oversized Grok percentages",
+      "ecd1f555 feat(usage): Grok 잔여 사용량 파서 추가"
+    ]
+  },
+  {
+    "branch": "codex/unicode-path-correction",
+    "main_only": 373,
+    "branch_only": 1,
+    "head": "e1be562909109112120d10d8d1c30da27420213c",
+    "subjects": [
+      "e1be5629 fix(app): raw 파일명과 NFC 표시 분리"
+    ]
+  },
+  {
+    "branch": "design/environment-api-preview",
+    "main_only": 205,
+    "branch_only": 1,
+    "head": "3606ffc18b74b0858611bfa1adc86e754e920b24",
+    "subjects": [
+      "3606ffc1 design: 환경 연결 없는 API 보관 시안 보완"
+    ]
+  },
+  {
+    "branch": "dev/relay-local-runner-main",
+    "main_only": 309,
+    "branch_only": 0,
+    "head": "1b3169eb68ea9b501272ec346b8d8ff17e3ff957",
+    "subjects": []
+  },
+  {
+    "branch": "docs/ready-prs-main-final-20260909",
+    "main_only": 236,
+    "branch_only": 0,
+    "head": "23dc2a7b3da7d0fc35b8d75a41d2a7e13e6fb938",
+    "subjects": []
+  },
+  {
+    "branch": "feat/audit-nine-pr-v0.6.0-20261004",
+    "main_only": 0,
+    "branch_only": 23,
+    "head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+    "subjects": [
+      "d8826f0b fix(input): inspect live editor while terminal is scrolled",
+      "6a06d319 docs(cloud): record design parity review and native UI evidence",
+      "2fd73a5b fix(cloud): match permission column sizing and checkbox hit areas",
+      "51b23890 feat(cloud): align agent settings with approved tabbed design",
+      "70380aea docs(qa): record residual cloud fixes and regression evidence",
+      "7e02a46d fix(pwa): report observed cloud navigation completion and failures",
+      "8c5e0db4 fix(cloud): refresh cached display masking after credential changes",
+      "5fff2264 fix(cloud): retire input consent when continuity clocks are unavailable",
+      "bf13eb48 docs(cloud): record seven review fixes and executed verification",
+      "a3843d99 fix(cloud): preserve input continuity and reliable result navigation",
+      "18491c2e fix(mcp): retain approved OAuth connection names across refresh",
+      "cd614286 fix(cloud): redact obfuscated run data before storage and display",
+      "fcf237f7 docs(cloud): PR 1–6 수용 검증과 완료 기록을 남긴다",
+      "9d0ed76b feat(cloud): 연결별 권한과 작업 관리·이력·복구를 통합한다",
+      "1dd6d16d fix(runtime): 연결별 내부 작업 ID를 입력 수신증에 허용한다",
+      "2fdf4a4d fix(secret): 클라우드 출력의 줄바꿈과 부분 비밀을 안전하게 가린다",
+      "1878a449 feat(pwa): 클라우드 작업 결과와 권한별 관리 화면을 연결한다",
+      "35e8a264 fix(cloud): 서버 준비 상태와 연결 안내를 정확히 표시한다",
+      "19fa8df3 docs(cloud): 연결 관리 개선안과 병렬 구현 계약을 기록한다",
+      "3ac1f61f chore(release): 0.12.1",
+      "6bf56f53 docs: 우클릭 메뉴 감사 캡처를 새 폭·간격으로 갱신한다",
+      "5cdafd3f fix(ui): 우클릭 메뉴 폭을 항목에 맞추고 행 간격과 모서리를 넓힌다",
+      "e32a1353 chore(release): 0.12.0"
+    ]
+  },
+  {
+    "branch": "feat/automatic-mcp-connect",
+    "main_only": 127,
+    "branch_only": 0,
+    "head": "c2be1e79e2fd369909f722d35e57e6cccd3e1aeb",
+    "subjects": []
+  },
+  {
+    "branch": "feat/blank-tab-new-shell",
+    "main_only": 169,
+    "branch_only": 25,
+    "head": "cdf0b0a796daa5ae3f7eb889cd1025b69206409e",
+    "subjects": [
+      "cdf0b0a7 docs: 새 셸 탭 재리뷰 결과를 기록한다",
+      "47ba516d fix: 새 셸 클릭을 개별 재시도하고 상한을 둔다",
+      "fcda8f7d Document GitHub Actions admission failure",
+      "05fd3fde Record completed shell tab PR",
+      "79c4ec37 Open shell from empty session tab area",
+      "1a44ccea Document final stacked review and next tab feature",
+      "54dc92dd fix(file-tree): ignore file drops behind create modal",
+      "0ca7628f fix(file-tree): block clipboard shortcuts behind create modal",
+      "b0517e8d feat(file-tree): create files and folders in modal",
+      "fcdea53b Close file search after Escape clears focus",
+      "3053adca Include symlink names in file tree search",
+      "2f6059f4 fix(file-tree): anchor search root through directory handles",
+      "01191a97 fix(file-tree): scope search input and preserve delete confirmation",
+      "6a541095 fix(file-tree): count hidden entries toward search limit",
+      "ca7086ba fix(file-tree): search folders within root directory handles",
+      "f3391211 fix(file-tree): retain search keyboard ownership",
+      "6c971fa3 Search project files from the file tree menu",
+      "c8821b3b Reveal matching folder row from keyboard input",
+      "33116e7b Preserve visible restored screens during cache trimming",
+      "60a20885 Reveal exited shell output and preserve wide cell boundaries",
+      "5c7756c9 Account for restored terminal viewport in cache budget",
+      "140556b9 fix(session): show fresh prompt when restored screen is empty",
+      "96a06d8e fix(session): restore held screen after resize round trip",
+      "39bbf9f8 fix(session): keep bottom of restored screen on shrink",
+      "0d56aff7 Keep restored SSH shell screen visible until input"
+    ]
+  },
+  {
+    "branch": "feat/cloud-agent-mcp",
+    "main_only": 158,
+    "branch_only": 0,
+    "head": "78f054b9808851456ef687dbcbc72ba1a6cd823a",
+    "subjects": []
+  },
+  {
+    "branch": "feat/cursor-usage-status",
+    "main_only": 210,
+    "branch_only": 5,
+    "head": "d66d0d7cea31c1793e6c9609e99c91afb71a59fb",
+    "subjects": [
+      "d66d0d7c docs: Cursor 사용량 PR 검사 상태 기록",
+      "1716ed0c docs: Cursor 사용량 PR 인계 기록",
+      "5a3ba983 feat: Cursor 월간 사용량을 하단 상태바에 표시",
+      "7bad910f docs: Cursor 사용량 구현 진행 기록",
+      "a5295376 docs: Cursor 사용량 상태바 설계 기록"
+    ]
+  },
+  {
+    "branch": "feat/document-body",
+    "main_only": 451,
+    "branch_only": 0,
+    "head": "129b5538a00089fdbfeb13bd980d15f9de1290fc",
+    "subjects": []
+  },
+  {
+    "branch": "feat/document-multi-tab",
+    "main_only": 446,
+    "branch_only": 0,
+    "head": "4f34605c4856cb4e45da5c611ab0a41dbb7bd824",
+    "subjects": []
+  },
+  {
+    "branch": "feat/document-surface-design",
+    "main_only": 444,
+    "branch_only": 0,
+    "head": "4972b000b8e02749c6201315be5a72f7e15e25f8",
+    "subjects": []
+  },
+  {
+    "branch": "feat/environment-api-modern-view",
+    "main_only": 202,
+    "branch_only": 0,
+    "head": "d301882265d3a1d335559094b492ccbb4ef3b463",
+    "subjects": []
+  },
+  {
+    "branch": "feat/environment-application-status",
+    "main_only": 225,
+    "branch_only": 0,
+    "head": "502f71c34da175760f620264280f1ff04e1f675c",
+    "subjects": []
+  },
+  {
+    "branch": "feat/file-tree-create-modal",
+    "main_only": 169,
+    "branch_only": 20,
+    "head": "1a44ccea0a753ec87ba8e0105824e5da53326349",
+    "subjects": [
+      "1a44ccea Document final stacked review and next tab feature",
+      "54dc92dd fix(file-tree): ignore file drops behind create modal",
+      "0ca7628f fix(file-tree): block clipboard shortcuts behind create modal",
+      "b0517e8d feat(file-tree): create files and folders in modal",
+      "fcdea53b Close file search after Escape clears focus",
+      "3053adca Include symlink names in file tree search",
+      "2f6059f4 fix(file-tree): anchor search root through directory handles",
+      "01191a97 fix(file-tree): scope search input and preserve delete confirmation",
+      "6a541095 fix(file-tree): count hidden entries toward search limit",
+      "ca7086ba fix(file-tree): search folders within root directory handles",
+      "f3391211 fix(file-tree): retain search keyboard ownership",
+      "6c971fa3 Search project files from the file tree menu",
+      "c8821b3b Reveal matching folder row from keyboard input",
+      "33116e7b Preserve visible restored screens during cache trimming",
+      "60a20885 Reveal exited shell output and preserve wide cell boundaries",
+      "5c7756c9 Account for restored terminal viewport in cache budget",
+      "140556b9 fix(session): show fresh prompt when restored screen is empty",
+      "96a06d8e fix(session): restore held screen after resize round trip",
+      "39bbf9f8 fix(session): keep bottom of restored screen on shrink",
+      "0d56aff7 Keep restored SSH shell screen visible until input"
+    ]
+  },
+  {
+    "branch": "feat/file-tree-finder-clipboard",
+    "main_only": 324,
+    "branch_only": 13,
+    "head": "60b6bda860dfbe39d17eda1e6e6576bd21d42de9",
+    "subjects": [
+      "60b6bda8 docs: Finder 파일 트리 PR 인계 상태 기록",
+      "2591874d feat(file-tree): Finder식 복사·이동 단축키 지원",
+      "331b78b3 docs: 재실행 규칙과 작업 시안을 기록한다",
+      "4bbc7056 docs: 재빌드 차단 원인과 최신 실행 소스를 기록한다",
+      "75bf2c90 docs: Relay 재접속 전달 결과와 중단한 검사를 기록한다",
+      "215c276e feat(relay): 알려진 기기의 영속 재접속 인증을 구현한다",
+      "595d23d1 docs: main 착지와 브랜치 정리를 기록한다",
+      "3f519423 docs: main 착지와 남은 개발 범위를 기록한다",
+      "525d192e docs: 별도 레이아웃 PR 완료와 재실행 대기 상태 기록",
+      "2e1dc089 docs: 병렬 PR 검증 결과와 레이아웃 후속 조사 인계",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "feat/file-tree-multiselect-order-clean",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "1e761c54abd5c34d9fc0a36a3dd024515c5aa84d",
+    "subjects": []
+  },
+  {
+    "branch": "feat/file-tree-search",
+    "main_only": 169,
+    "branch_only": 16,
+    "head": "fcdea53b21bc44cc69b662b9ecb0f5d6bfca8822",
+    "subjects": [
+      "fcdea53b Close file search after Escape clears focus",
+      "3053adca Include symlink names in file tree search",
+      "2f6059f4 fix(file-tree): anchor search root through directory handles",
+      "01191a97 fix(file-tree): scope search input and preserve delete confirmation",
+      "6a541095 fix(file-tree): count hidden entries toward search limit",
+      "ca7086ba fix(file-tree): search folders within root directory handles",
+      "f3391211 fix(file-tree): retain search keyboard ownership",
+      "6c971fa3 Search project files from the file tree menu",
+      "c8821b3b Reveal matching folder row from keyboard input",
+      "33116e7b Preserve visible restored screens during cache trimming",
+      "60a20885 Reveal exited shell output and preserve wide cell boundaries",
+      "5c7756c9 Account for restored terminal viewport in cache budget",
+      "140556b9 fix(session): show fresh prompt when restored screen is empty",
+      "96a06d8e fix(session): restore held screen after resize round trip",
+      "39bbf9f8 fix(session): keep bottom of restored screen on shrink",
+      "0d56aff7 Keep restored SSH shell screen visible until input"
+    ]
+  },
+  {
+    "branch": "feat/file-tree-typeahead",
+    "main_only": 169,
+    "branch_only": 8,
+    "head": "c8821b3b40f729c5ff41147905543a3787de6b71",
+    "subjects": [
+      "c8821b3b Reveal matching folder row from keyboard input",
+      "33116e7b Preserve visible restored screens during cache trimming",
+      "60a20885 Reveal exited shell output and preserve wide cell boundaries",
+      "5c7756c9 Account for restored terminal viewport in cache budget",
+      "140556b9 fix(session): show fresh prompt when restored screen is empty",
+      "96a06d8e fix(session): restore held screen after resize round trip",
+      "39bbf9f8 fix(session): keep bottom of restored screen on shrink",
+      "0d56aff7 Keep restored SSH shell screen visible until input"
+    ]
+  },
+  {
+    "branch": "feat/fleet-one-list-and-relay-wip",
+    "main_only": 324,
+    "branch_only": 11,
+    "head": "331b78b3f8b80543a7f078a78da0be3060dfb9e7",
+    "subjects": [
+      "331b78b3 docs: 재실행 규칙과 작업 시안을 기록한다",
+      "4bbc7056 docs: 재빌드 차단 원인과 최신 실행 소스를 기록한다",
+      "75bf2c90 docs: Relay 재접속 전달 결과와 중단한 검사를 기록한다",
+      "215c276e feat(relay): 알려진 기기의 영속 재접속 인증을 구현한다",
+      "595d23d1 docs: main 착지와 브랜치 정리를 기록한다",
+      "3f519423 docs: main 착지와 남은 개발 범위를 기록한다",
+      "525d192e docs: 별도 레이아웃 PR 완료와 재실행 대기 상태 기록",
+      "2e1dc089 docs: 병렬 PR 검증 결과와 레이아웃 후속 조사 인계",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "feat/fleet-one-list-main",
+    "main_only": 314,
+    "branch_only": 0,
+    "head": "72d0d9bbac3ca9bdd4b5d22c6ebb69e9ad576b50",
+    "subjects": []
+  },
+  {
+    "branch": "feat/git-panel",
+    "main_only": 601,
+    "branch_only": 22,
+    "head": "0c1500a44b4015d8cb5262030cd152fe248cb25e",
+    "subjects": [
+      "0c1500a4 test(app): Git 탭 이동 검증을 레일 좌표로 고친다",
+      "b83e1f55 feat(i18n): git 보조 탭·워크트리 문구 (5로케일)",
+      "51d600ce feat(app): 워크트리 행 클릭으로 그 워크트리 셸을 연다",
+      "eb585aaa feat(app): git 패널을 보조 탭 마스터-디테일로 옮긴다",
+      "2070327c feat(app): Git 진입을 사이드바 도구에서 레일로 옮긴다",
+      "3483a8e2 feat(app): pane 보조 탭을 최대 2개로 넓힌다",
+      "b6b92562 feat(app): git 패널 워크트리 섹션과 셸 열기 intent",
+      "f8b97340 feat(app): git 패널 스냅샷에 워크트리 목록 추가",
+      "14d7f504 refactor(app): 보조 탭 상태 기계를 workspace로 이관",
+      "03dbc382 docs: git 패널 2차(보조 탭 배치·워크트리) 스펙·계획",
+      "6bd8d570 docs(app): 플로팅 diff 창 유지 근거를 코드·스펙에 기록",
+      "ca038f70 fix(app): 세션 「변경 보기」가 그 세션의 repo를 열게 되돌린다",
+      "08ad533e feat(app): git 패널 IO 배선과 메인 영역 diff 뷰 전환",
+      "94f12d2f feat(app): AgentTerminalView에 Diff 전면 뷰 추가",
+      "d18ce4b9 feat(app): 사이드바 Git 탭을 인라인 패널로 승격",
+      "44e4a44b feat(app): 실용형 diff 뷰어 렌더 (가상화·hunk 이동)",
+      "d0f4be80 feat(app): git 패널 사이드바 렌더 (헤더·섹션·행 클릭 intent)",
+      "20c2c5d4 feat(i18n): git 패널·diff 뷰어 문구 (5로케일)",
+      "902a036d feat(app): 실용형 diff 뷰어 파서 (hunk·gap·binary)",
+      "01755621 feat(app): git 패널 스냅샷 수집 (upstream 폴백·유계)",
+      "f075e101 docs: git 패널 계획 Task 2 체크박스 갱신",
+      "ad981ebf feat(app): git 패널 상태 파서와 데이터 모델"
+    ]
+  },
+  {
+    "branch": "feat/grok-session-detection-main",
+    "main_only": 312,
+    "branch_only": 0,
+    "head": "3278d74d7bb05cb3d75fd685e603784fc7823e75",
+    "subjects": []
+  },
+  {
+    "branch": "feat/history-card-redesign",
+    "main_only": 510,
+    "branch_only": 2,
+    "head": "bbc87ef47a7280d5eaef018b8c20b9d52156b77b",
+    "subjects": [
+      "bbc87ef4 fix(app): 이력 카드 제목 줄의 with_layout 높이 폭주를 잡는다",
+      "ee2988ec wip(app): 이력 카드 배경 단차 리디자인(원인 조사 전 스냅샷)"
+    ]
+  },
+  {
+    "branch": "feat/measured-seven-improvements",
+    "main_only": 134,
+    "branch_only": 0,
+    "head": "09e031bcbb2f7b65f88ad6c0141abb83a8b2e1fe",
+    "subjects": []
+  },
+  {
+    "branch": "feat/project-key-management-20261012",
+    "main_only": 15,
+    "branch_only": 0,
+    "head": "1d17a0297e6ab0586ce30e4ac35e186fb86b7e20",
+    "subjects": []
+  },
+  {
+    "branch": "feat/pwa-reading-pr4-20261008",
+    "main_only": 59,
+    "branch_only": 0,
+    "head": "2718608664c56fa9dea8b346272c09ac06bea93a",
+    "subjects": []
+  },
+  {
+    "branch": "feat/relay-app-adapter-main",
+    "main_only": 313,
+    "branch_only": 7,
+    "head": "eee3ed1326c5d169363e55e2d150db61f898634f",
+    "subjects": [
+      "eee3ed13 merge: Relay 공개 테스트 벡터 수정을 앱 어댑터에 보존한다",
+      "65d807e6 test(relay): 페어링 고정 벡터를 명백한 공개 테스트 값으로 바꾼다",
+      "fbb807f8 docs(relay): R3 검증과 PR 게시 상태를 기록한다",
+      "54528735 feat(relay): 앱 어댑터와 승인 세대 검증을 이관한다",
+      "8dae2232 docs: Relay 앱 어댑터 이관 계획을 기록한다",
+      "206a350a docs: Relay 분리 PR의 검증과 게시 상태를 기록한다",
+      "ce930906 feat(relay): 브라우저 셸과 공유 viewer를 코어 위에 이관한다"
+    ]
+  },
+  {
+    "branch": "feat/relay-app-adapter-main-clean",
+    "main_only": 307,
+    "branch_only": 0,
+    "head": "e89d3e9f1299f245238158a605db04c41212450f",
+    "subjects": []
+  },
+  {
+    "branch": "feat/relay-completion-20260906",
+    "main_only": 324,
+    "branch_only": 2,
+    "head": "e9600046a4b60a9e23ff46afe838ff4fb129dae5",
+    "subjects": [
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "feat/relay-reconnect-core-main",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "6ee7eb4c3427a289d7f2c120cf5e403af74b213f",
+    "subjects": []
+  },
+  {
+    "branch": "feat/relay-shell-main",
+    "main_only": 313,
+    "branch_only": 3,
+    "head": "65d807e6e7c3299b02788b283641987a710b4098",
+    "subjects": [
+      "65d807e6 test(relay): 페어링 고정 벡터를 명백한 공개 테스트 값으로 바꾼다",
+      "206a350a docs: Relay 분리 PR의 검증과 게시 상태를 기록한다",
+      "ce930906 feat(relay): 브라우저 셸과 공유 viewer를 코어 위에 이관한다"
+    ]
+  },
+  {
+    "branch": "feat/relay-shell-main-clean",
+    "main_only": 311,
+    "branch_only": 0,
+    "head": "850b7a8747bd71d74d7858a5d95f6c257a076857",
+    "subjects": []
+  },
+  {
+    "branch": "feat/scrollback-live-policy",
+    "main_only": 306,
+    "branch_only": 0,
+    "head": "9af1b807e89202a4c45626259af3687a7e229a7a",
+    "subjects": []
+  },
+  {
+    "branch": "feat/scrollback-policy-contract",
+    "main_only": 312,
+    "branch_only": 0,
+    "head": "d0d1e6655ed1ec38cdbbe889f698c9c740944354",
+    "subjects": []
+  },
+  {
+    "branch": "feat/session-row-dot-first",
+    "main_only": 677,
+    "branch_only": 4,
+    "head": "349ee6b84acebb9bd4336f6c1363c21b5da8973f",
+    "subjects": [
+      "349ee6b8 fix(pane): 헤더의 포커스 점을 없애 상태 팔레트와 겹치지 않게 한다",
+      "13d9920b feat(sidebar): 세션 행을 「점 우선」 주안으로 바꾸고 워크스페이스 헤더를 정리한다",
+      "436c3e4c refactor(ui): provider 로고 글리프를 홈과 런처가 공유하게 뽑는다",
+      "2fe7d415 refactor(ui): mix()를 designall로 올려 두 표면이 공유한다"
+    ]
+  },
+  {
+    "branch": "feat/workspace-credential-env",
+    "main_only": 230,
+    "branch_only": 0,
+    "head": "ee5288347f69fe75151a53471f36a41bbfe653f2",
+    "subjects": []
+  },
+  {
+    "branch": "feat/workspace-env-sources",
+    "main_only": 228,
+    "branch_only": 0,
+    "head": "4a5409a99172acc58c1a01b1c78dfe981e3f2336",
+    "subjects": []
+  },
+  {
+    "branch": "fix/agent-tui-input-harness",
+    "main_only": 116,
+    "branch_only": 0,
+    "head": "13345c449a9c1ab63535682d50456dcf36b853d4",
+    "subjects": []
+  },
+  {
+    "branch": "fix/agent-tui-korean-submit-order",
+    "main_only": 119,
+    "branch_only": 0,
+    "head": "34bdbc1639220963768d3dc13c7a86e3add476da",
+    "subjects": []
+  },
+  {
+    "branch": "fix/audit-pr1-prompt-delivery-20261004",
+    "main_only": 109,
+    "branch_only": 1,
+    "head": "957ae3b5c56c220f6dee109980c5907bde54d1e8",
+    "subjects": [
+      "957ae3b5 fix(input): track atomic prompt admission and retain drafts"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr10-direct-input-latency-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "1a1bdd4bb732e74dbb9300a92345f6ee95db32cd",
+    "subjects": [
+      "1a1bdd4b chore: internal source snapshot for audit wave followup-ready"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr10-direct-input-latency-wavefinal-followups-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "e428df3ccac7a95bb379ca512b7159d4f3dcebd6",
+    "subjects": [
+      "e428df3c fix(input): AI 터미널 직접 입력 지연과 전송 전 유실 수정",
+      "9c7af797 chore: internal source snapshot for audit wave final-followups"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr11-tree-multiselect-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "1a1bdd4bb732e74dbb9300a92345f6ee95db32cd",
+    "subjects": [
+      "1a1bdd4b chore: internal source snapshot for audit wave followup-ready"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr11-tree-multiselect-wavefinal-followups-20261004",
+    "main_only": 110,
+    "branch_only": 3,
+    "head": "350d8d4c5beea108af6fa39396764a246bda9784",
+    "subjects": [
+      "350d8d4c fix(tree): 네이티브 이동 붙여넣기 소유권과 볼륨 이름 충돌 검증",
+      "9d3ae0d7 fix(files): 다중 선택 전체 전송과 삭제 경계를 보강",
+      "9c7af797 chore: internal source snapshot for audit wave final-followups"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr12-combined-code-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "a3a8517b5b6d56f5ac218638794eef101daa0db9",
+    "subjects": [
+      "a3a8517b chore: internal source snapshot for audit wave nine-final"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr13-guard-output-freshness-20261004",
+    "main_only": 110,
+    "branch_only": 3,
+    "head": "87e205811ed41032b943bbbcaf768043f032a3a6",
+    "subjects": [
+      "87e20581 fix(runtime): 종료 PTY 정리를 입력 승인 잠금 밖으로 이동",
+      "5dcc81f6 fix(runtime): 입력 승인 직전 출력 상태와 종료 화면 보존",
+      "f64d8d9c chore: internal source snapshot for audit wave review-final"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr14-followup-revoke-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "89359378e921a7ffa6a107511f3934823d472ef4",
+    "subjects": [
+      "89359378 fix(fleet): 후속 예약 취소 시 입력 권한 회수",
+      "f64d8d9c chore: internal source snapshot for audit wave review-final"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr15-prompt-id-fix-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "e72f543f7ecd6527359705d8225a2da732ec5872",
+    "subjects": [
+      "e72f543f fix(prompt): 긴 제목 ID와 신규 저장 거절 복구",
+      "f64d8d9c chore: internal source snapshot for audit wave review-final"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr15-prompt-id-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "ba3f47bb4544c48c99cb192b9f15cc560e31db8a",
+    "subjects": [
+      "ba3f47bb chore: internal source snapshot for audit wave prompt-id-review"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr16-corrected-core-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "5327957f80b325f006a24470f0824961d2516950",
+    "subjects": [
+      "5327957f chore: internal source snapshot for audit wave corrected-core"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr17-followup-code-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "f875919b3d0fe9355f51126bba30b29cf6681eda",
+    "subjects": [
+      "f875919b chore: internal source snapshot for audit wave final-followup-review"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr18-runtime-test-secrets-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "0f8c85a934a942156b8b34d0020be1fb24f981b2",
+    "subjects": [
+      "0f8c85a9 test(runtime): 테스트 secret 저장소를 메모리로 격리",
+      "d7b0acaa chore: internal source snapshot for audit wave hermetic-runtime"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr19-final-corrective-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "8d0168f10fc404013d2193ed057f3a89da7e27bd",
+    "subjects": [
+      "8d0168f1 chore: internal source snapshot for audit wave final-correctives"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr2-ai-eligibility-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "63e3cbece98168a827d4670f5bcbb31e893893b6",
+    "subjects": [
+      "63e3cbec chore: internal source snapshot for audit wave 2"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr2-ai-eligibility-wave2-coherent-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "502bac403a056799e75f00e331d534da7919f4ca",
+    "subjects": [
+      "502bac40 fix: guard AI prompt delivery by execution identity and input intent",
+      "ed2c9163 chore: internal source snapshot for audit wave 2-coherent"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr20-move-layout-volume-fixtures-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "6a796b5b30a5ce24458c2faf32d80864921691bb",
+    "subjects": [
+      "6a796b5b fix(tree): 이동 붙여넣기 배열 판별과 볼륨 테스트 가정 수정",
+      "832cb06e chore: internal source snapshot for audit wave final-key-layout"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr21-final-layout-review-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "d1818e3355e9604998e6581285bad8e7edd88ffb",
+    "subjects": [
+      "d1818e33 chore: internal source snapshot for audit wave final-layout-review"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr3-library-recovery-20261004",
+    "main_only": 109,
+    "branch_only": 1,
+    "head": "f0b22dd92e361e5053deb03d118905519e7eb083",
+    "subjects": [
+      "f0b22dd9 fix(prompt-library): preserve recovery data and persist asynchronously"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr4-fleet-integration-20261004",
+    "main_only": 110,
+    "branch_only": 3,
+    "head": "c520ae54b218a2c81e8227d380715eb0562e3293",
+    "subjects": [
+      "c520ae54 fix(fleet): 공용 프롬프트 입력 제한과 미리보기 캐시 적용",
+      "3b9b45fa chore: internal integrated source before Fleet caller glue",
+      "38ee3bec chore: internal source snapshot for audit wave 9-pipeline"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr4-palette-cache-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "63e3cbece98168a827d4670f5bcbb31e893893b6",
+    "subjects": [
+      "63e3cbec chore: internal source snapshot for audit wave 2"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr4-palette-cache-wave2-coherent-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "314ecf376ede58961d910d6e600153261f8b4ffc",
+    "subjects": [
+      "314ecf37 perf(prompt): cache palette work and bound editor state",
+      "ed2c9163 chore: internal source snapshot for audit wave 2-coherent"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr4r-fleet-review-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "809bda2f8842e2840f2d4d65f2adc29354801219",
+    "subjects": [
+      "809bda2f fix(fleet): 후속 예약과 입력 폼의 상한 보강",
+      "1c4304f8 chore: internal source snapshot for audit wave fleet-review"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr5-session-drafts-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "78371a7f0b51531160810ae5bc71dc93ee277f81",
+    "subjects": [
+      "78371a7f fix(composer): 세션별 초안 복구와 전송 전 저장 및 메모리 제한",
+      "1aa5e622 chore: internal source snapshot for audit wave 5-pipeline"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr6-image-budgets-20261004",
+    "main_only": 109,
+    "branch_only": 1,
+    "head": "1234ed9c550adedbcdbc88aa220bc0f96cd9f795",
+    "subjects": [
+      "1234ed9c fix(markdown): bound async image loading and reuse"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr7-cloud-history-worker-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "63e3cbece98168a827d4670f5bcbb31e893893b6",
+    "subjects": [
+      "63e3cbec chore: internal source snapshot for audit wave 2"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr7-cloud-history-worker-wave2-coherent-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "b889969101ebdd637c7c59b06c922ebe837adf81",
+    "subjects": [
+      "b8899691 fix(cloud): move durable history to bounded worker",
+      "ed2c9163 chore: internal source snapshot for audit wave 2-coherent"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr8-batch-wake-logs-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "6aba90515e64a5cbca71d45f96562d0520732fe5",
+    "subjects": [
+      "6aba9051 perf: bound batch retries and session log writes",
+      "30a57a53 chore: internal source snapshot for audit wave 8-pipeline"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr8r-log-error-cap-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "3cfe880c88e0a781a3d173458792d9361c518876",
+    "subjects": [
+      "3cfe880c fix(storage): PR8 로그 오류 경로의 상한 복구",
+      "ae967f8c chore: internal source snapshot for audit wave 8-review"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr9-remote-paste-20261004",
+    "main_only": 110,
+    "branch_only": 2,
+    "head": "e2cd2c8243372e806a0357f257fb1ddbf83740e4",
+    "subjects": [
+      "e2cd2c82 feat(mcp): 원래 세션에 검증된 명시적 붙여넣기 추가",
+      "38ee3bec chore: internal source snapshot for audit wave 9-pipeline"
+    ]
+  },
+  {
+    "branch": "fix/audit-pr9r-grant-revoke-20261004",
+    "main_only": 110,
+    "branch_only": 1,
+    "head": "0f7d45dd572b389d2ed599ac205a9e529bb4f6a7",
+    "subjects": [
+      "0f7d45dd chore: internal source snapshot for audit wave grant-review"
+    ]
+  },
+  {
+    "branch": "fix/cjk-cell-fallback-main",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "1c0630580634b844efc9aa0a0c45e93911d85aa1",
+    "subjects": []
+  },
+  {
+    "branch": "fix/cloud-agent-ended-sessions",
+    "main_only": 110,
+    "branch_only": 0,
+    "head": "166f8daeb1054cf09a07194fa83bf0a4a19d93ce",
+    "subjects": []
+  },
+  {
+    "branch": "fix/document-confirm-per-tab",
+    "main_only": 442,
+    "branch_only": 0,
+    "head": "17b6009666f6b45210d982fc457d5948fa7bf148",
+    "subjects": []
+  },
+  {
+    "branch": "fix/environment-api-context-integration",
+    "main_only": 169,
+    "branch_only": 0,
+    "head": "2a1583d170ee54111b46b7c6ce76117ae832ef1e",
+    "subjects": []
+  },
+  {
+    "branch": "fix/environment-file-consistency",
+    "main_only": 232,
+    "branch_only": 0,
+    "head": "49ad36fb433b5f9bc996e898399533121be8be77",
+    "subjects": []
+  },
+  {
+    "branch": "fix/environment-review-followup",
+    "main_only": 212,
+    "branch_only": 0,
+    "head": "c767f5fb46b61fcdb90aed0212407d633c3c421f",
+    "subjects": []
+  },
+  {
+    "branch": "fix/environment-snapshot-state",
+    "main_only": 233,
+    "branch_only": 0,
+    "head": "44076d69ff2f8378c9454b3677bbe678d52ebe67",
+    "subjects": []
+  },
+  {
+    "branch": "fix/gui-stack-036-20260907",
+    "main_only": 317,
+    "branch_only": 5,
+    "head": "c7e1c9cef0854bdafee84f41bbd0ad8d9384fea9",
+    "subjects": [
+      "c7e1c9ce docs: GUI 착지와 동일 커밋의 Linux 사후 검증을 기록한다",
+      "6f525136 docs: GUI 이관 검증과 대체 PR 완료를 기록한다",
+      "a62f7bf1 build: GUI 0.36과 IME·파일 드롭 호환성을 함께 이관한다",
+      "d1a0f704 Merge remote-tracking branch 'origin/main' into fix/gui-stack-036-20260907",
+      "f5e2bf8a docs: GUI 의존성 통합 이관 설계와 실행 계획을 기록한다"
+    ]
+  },
+  {
+    "branch": "fix/keychain-noninteractive-main",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "a6b7b4349c9462341174a1dc728f7365e86b5232",
+    "subjects": []
+  },
+  {
+    "branch": "fix/keychain-startup-lazy",
+    "main_only": 311,
+    "branch_only": 0,
+    "head": "9d2934930c8cd796af291183bba9fa1fed4592c9",
+    "subjects": []
+  },
+  {
+    "branch": "fix/korean-ime-20260906",
+    "main_only": 324,
+    "branch_only": 2,
+    "head": "e9600046a4b60a9e23ff46afe838ff4fb129dae5",
+    "subjects": [
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/md-drop-render-isolation",
+    "main_only": 312,
+    "branch_only": 0,
+    "head": "4f3bf5d78d1a3e47402217925f1acd5616d46e2c",
+    "subjects": []
+  },
+  {
+    "branch": "fix/preserve-terminal-layout",
+    "main_only": 324,
+    "branch_only": 6,
+    "head": "320d9067bfffa19134dc468b4f7cbbf2c6508167",
+    "subjects": [
+      "320d9067 docs: 레이아웃 보존 PR과 검증 대기 상태 인계",
+      "16e642af fix(ui): 기존 터미널 형태를 유지하며 창 너비에 맞춘다",
+      "50d195f3 fix(ui): 창 리사이즈의 중간 크기 전송과 빈 화면 노출을 막는다",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/preserve-terminal-layout-main",
+    "main_only": 312,
+    "branch_only": 0,
+    "head": "99346a515eaa75d73ac173a2e338918f556c1319",
+    "subjects": []
+  },
+  {
+    "branch": "fix/relay-channel-concurrency-20260906",
+    "main_only": 324,
+    "branch_only": 2,
+    "head": "e9600046a4b60a9e23ff46afe838ff4fb129dae5",
+    "subjects": [
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/resize-applied-generation",
+    "main_only": 300,
+    "branch_only": 0,
+    "head": "e66952db282f7f1fb3075d7e1f9bd0e0ff43dd9f",
+    "subjects": []
+  },
+  {
+    "branch": "fix/resize-flicker-20260906",
+    "main_only": 324,
+    "branch_only": 2,
+    "head": "e9600046a4b60a9e23ff46afe838ff4fb129dae5",
+    "subjects": [
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/session-agent-isolation",
+    "main_only": 324,
+    "branch_only": 12,
+    "head": "c4f4d8078ce1465803ee9f19dd9bbf4e6918b97b",
+    "subjects": [
+      "c4f4d807 fix: 세션 간 에이전트 바인딩과 자동 이어가기 격리",
+      "331b78b3 docs: 재실행 규칙과 작업 시안을 기록한다",
+      "4bbc7056 docs: 재빌드 차단 원인과 최신 실행 소스를 기록한다",
+      "75bf2c90 docs: Relay 재접속 전달 결과와 중단한 검사를 기록한다",
+      "215c276e feat(relay): 알려진 기기의 영속 재접속 인증을 구현한다",
+      "595d23d1 docs: main 착지와 브랜치 정리를 기록한다",
+      "3f519423 docs: main 착지와 남은 개발 범위를 기록한다",
+      "525d192e docs: 별도 레이아웃 PR 완료와 재실행 대기 상태 기록",
+      "2e1dc089 docs: 병렬 PR 검증 결과와 레이아웃 후속 조사 인계",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/session-agent-isolation-clean",
+    "main_only": 324,
+    "branch_only": 12,
+    "head": "315b9a1b38818a2168f6dd4e2e072e37541b9959",
+    "subjects": [
+      "315b9a1b docs: 세션 격리 수정 인계 상태 갱신",
+      "287a69b6 fix: 세션 간 에이전트 바인딩과 자동 이어가기 격리",
+      "4bbc7056 docs: 재빌드 차단 원인과 최신 실행 소스를 기록한다",
+      "75bf2c90 docs: Relay 재접속 전달 결과와 중단한 검사를 기록한다",
+      "215c276e feat(relay): 알려진 기기의 영속 재접속 인증을 구현한다",
+      "595d23d1 docs: main 착지와 브랜치 정리를 기록한다",
+      "3f519423 docs: main 착지와 남은 개발 범위를 기록한다",
+      "525d192e docs: 별도 레이아웃 PR 완료와 재실행 대기 상태 기록",
+      "2e1dc089 docs: 병렬 PR 검증 결과와 레이아웃 후속 조사 인계",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/session-name-stable",
+    "main_only": 495,
+    "branch_only": 2,
+    "head": "a6f64bb131cb39e5ff8eb884693717bd0f55b226",
+    "subjects": [
+      "a6f64bb1 docs: 세션 이름 고정 수정 기록",
+      "567ea1e5 fix(app): 사이드바 세션 이름 헤드라인을 고정한다"
+    ]
+  },
+  {
+    "branch": "fix/settings-copy-session-background",
+    "main_only": 235,
+    "branch_only": 0,
+    "head": "ea587b65981b415e2db9c403c28c75dcdff97c60",
+    "subjects": []
+  },
+  {
+    "branch": "fix/ssh-screen-stays-visible",
+    "main_only": 169,
+    "branch_only": 7,
+    "head": "33116e7bf4d60b71bc6318ab2ac37b5943dd84d4",
+    "subjects": [
+      "33116e7b Preserve visible restored screens during cache trimming",
+      "60a20885 Reveal exited shell output and preserve wide cell boundaries",
+      "5c7756c9 Account for restored terminal viewport in cache budget",
+      "140556b9 fix(session): show fresh prompt when restored screen is empty",
+      "96a06d8e fix(session): restore held screen after resize round trip",
+      "39bbf9f8 fix(session): keep bottom of restored screen on shrink",
+      "0d56aff7 Keep restored SSH shell screen visible until input"
+    ]
+  },
+  {
+    "branch": "fix/terminal-toolbar-icon-size",
+    "main_only": 209,
+    "branch_only": 3,
+    "head": "78e72ee2e98515108e4d97b0d60a67ca0b0f0419",
+    "subjects": [
+      "78e72ee2 Merge remote-tracking branch 'origin/main' into fix/terminal-toolbar-icon-size",
+      "d7a35786 docs: 터미널 아이콘 PR 인계 기록",
+      "5f0bbc12 style: 터미널 상단 도구 아이콘 확대"
+    ]
+  },
+  {
+    "branch": "fix/warp-terminal-resize",
+    "main_only": 315,
+    "branch_only": 6,
+    "head": "aca3ffbaf5be9c908085ca939ff6ff5cd3488ae3",
+    "subjects": [
+      "aca3ffba fix(ui): 터미널 세로 여백을 3pt로 줄인다",
+      "55936ebe fix(terminal): IME 조합 셀 좌표를 완성한다",
+      "6369b0c1 Merge remote-tracking branch 'origin/main' into fix/warp-terminal-resize",
+      "b38cafd1 fix(terminal): 자간과 IME 셀 좌표를 맞춘다",
+      "25581f87 Merge remote-tracking branch 'origin/main' into fix/warp-terminal-resize",
+      "b7756501 fix(ui): Warp 방식으로 터미널 pane을 채운다"
+    ]
+  },
+  {
+    "branch": "fix/window-resize-flicker",
+    "main_only": 324,
+    "branch_only": 4,
+    "head": "50d195f35cb78293c7d858c1eaf2f8e68816de2e",
+    "subjects": [
+      "50d195f3 fix(ui): 창 리사이즈의 중간 크기 전송과 빈 화면 노출을 막는다",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "fix/workspace-open-intent",
+    "main_only": 312,
+    "branch_only": 0,
+    "head": "d6ac7f013c0e7796a27ec7eb8d65e68339df5836",
+    "subjects": []
+  },
+  {
+    "branch": "fix/workspace-session-menu-md-drop",
+    "main_only": 315,
+    "branch_only": 10,
+    "head": "4fb675d063ecf3429ca3187f9947fe5354316925",
+    "subjects": [
+      "4fb675d0 docs: record numeric precision verification",
+      "7584847e fix(settings): preserve typed decimal precision",
+      "6dd9b306 docs: 워크스페이스 UI 작업 인계 갱신",
+      "f0bd3427 fix(ui): 현재 세션만 선택 배경을 표시한다",
+      "6ec83770 feat(app): 워크스페이스 세션 열기와 문서 렌더 격리",
+      "d06f11a9 docs: 숫자 입력 구현 결과 기록",
+      "2fa30527 feat(settings): 숫자 직접 입력 지원",
+      "4ccb9897 test(settings): 숫자 입력 범위 계약 추가",
+      "b12d382f docs: 설정 숫자 입력 구현 계획",
+      "cb679330 docs: 설정 숫자 직접 입력 동작 설계"
+    ]
+  },
+  {
+    "branch": "integrate/environment-ui-main-20260909",
+    "main_only": 223,
+    "branch_only": 0,
+    "head": "d534652642adfd9a3fff486cc99606fb1f715e12",
+    "subjects": []
+  },
+  {
+    "branch": "integrate/ready-prs-20260909",
+    "main_only": 238,
+    "branch_only": 0,
+    "head": "cd9c97f29b91d9bf1557c9fc5251cb037e0504b3",
+    "subjects": []
+  },
+  {
+    "branch": "integrate/reviewed-main-20261015",
+    "main_only": 0,
+    "branch_only": 23,
+    "head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+    "subjects": [
+      "d8826f0b fix(input): inspect live editor while terminal is scrolled",
+      "6a06d319 docs(cloud): record design parity review and native UI evidence",
+      "2fd73a5b fix(cloud): match permission column sizing and checkbox hit areas",
+      "51b23890 feat(cloud): align agent settings with approved tabbed design",
+      "70380aea docs(qa): record residual cloud fixes and regression evidence",
+      "7e02a46d fix(pwa): report observed cloud navigation completion and failures",
+      "8c5e0db4 fix(cloud): refresh cached display masking after credential changes",
+      "5fff2264 fix(cloud): retire input consent when continuity clocks are unavailable",
+      "bf13eb48 docs(cloud): record seven review fixes and executed verification",
+      "a3843d99 fix(cloud): preserve input continuity and reliable result navigation",
+      "18491c2e fix(mcp): retain approved OAuth connection names across refresh",
+      "cd614286 fix(cloud): redact obfuscated run data before storage and display",
+      "fcf237f7 docs(cloud): PR 1–6 수용 검증과 완료 기록을 남긴다",
+      "9d0ed76b feat(cloud): 연결별 권한과 작업 관리·이력·복구를 통합한다",
+      "1dd6d16d fix(runtime): 연결별 내부 작업 ID를 입력 수신증에 허용한다",
+      "2fdf4a4d fix(secret): 클라우드 출력의 줄바꿈과 부분 비밀을 안전하게 가린다",
+      "1878a449 feat(pwa): 클라우드 작업 결과와 권한별 관리 화면을 연결한다",
+      "35e8a264 fix(cloud): 서버 준비 상태와 연결 안내를 정확히 표시한다",
+      "19fa8df3 docs(cloud): 연결 관리 개선안과 병렬 구현 계약을 기록한다",
+      "3ac1f61f chore(release): 0.12.1",
+      "6bf56f53 docs: 우클릭 메뉴 감사 캡처를 새 폭·간격으로 갱신한다",
+      "5cdafd3f fix(ui): 우클릭 메뉴 폭을 항목에 맞추고 행 간격과 모서리를 넓힌다",
+      "e32a1353 chore(release): 0.12.0"
+    ]
+  },
+  {
+    "branch": "investigate/agent-wait-classification",
+    "main_only": 203,
+    "branch_only": 0,
+    "head": "8bd2fc773f6718fdf1d7326184ebf745fe8e57e4",
+    "subjects": []
+  },
+  {
+    "branch": "main",
+    "main_only": 207,
+    "branch_only": 0,
+    "head": "9432d33d65290046db517fb49a0c3a48a6305434",
+    "subjects": []
+  },
+  {
+    "branch": "perf/dotenv-shell-spawn-main",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "8ad906d2a99ff5336088133cb7e66358f32a0225",
+    "subjects": []
+  },
+  {
+    "branch": "perf/mcp-history-answer-index",
+    "main_only": 122,
+    "branch_only": 0,
+    "head": "a7dac9a311d7655595e0834ec788bf6e69d92a3f",
+    "subjects": []
+  },
+  {
+    "branch": "perf/mcp-screen-buffer-reuse",
+    "main_only": 125,
+    "branch_only": 0,
+    "head": "f67e12904d5996db517041633dd2bdab83250901",
+    "subjects": []
+  },
+  {
+    "branch": "perf/mcp-tunnel-event-waits",
+    "main_only": 126,
+    "branch_only": 0,
+    "head": "76b326dfbce24de907b83187c9de48ece401df6b",
+    "subjects": []
+  },
+  {
+    "branch": "perf/seven-history-storage",
+    "main_only": 158,
+    "branch_only": 2,
+    "head": "69b97f51751553946b4a93a1b5d1b29281701c09",
+    "subjects": [
+      "69b97f51 perf: 압축 행 복원 버퍼를 재사용한다",
+      "7553ebf9 perf: 압축 히스토리 메모리 집계를 증분 갱신한다"
+    ]
+  },
+  {
+    "branch": "perf/seven-render-ime",
+    "main_only": 158,
+    "branch_only": 18,
+    "head": "99d48bbb02320708b163854c9353974ef4542f9b",
+    "subjects": [
+      "99d48bbb docs: IME 자동 포커스 리뷰 수정의 실제 소유권 검증을 기록한다",
+      "433d66dd test: 명시적 pane 클릭과 TextEdit 후보창 소유권을 검증한다",
+      "8ddff8fd fix: TextEdit IME 배치 동안 터미널 자동 포커스를 보류한다",
+      "de7a8e23 docs: 렌더 IME 독립 리뷰 수정과 추가 회귀 결과를 기록한다",
+      "e419417a fix: IME 표시 투영을 실제 입력 소유권으로 제한한다",
+      "ba54b774 fix: IME 커서 범위가 없을 때 조합 끝과 후보창 기준점을 보존한다",
+      "1ef0a5cc docs: 병렬 렌더와 IME 작업의 검증 결과를 기록한다",
+      "108a1309 refactor: 터미널 렌더와 workspace를 12바이트 셀 API로 전환한다",
+      "9c39604e perf: 스냅샷 셀을 12바이트로 줄이고 기존 직렬화 계약을 유지한다",
+      "094bef61 fix: 웹 미러도 결합 문자 경계와 터미널 셀 간격을 보존한다",
+      "fc7f73b8 fix: IME 후보창을 짧아진 pane 안에 유지한다",
+      "448a2321 fix: 사이드바 세션 요약의 결합 문자 경계를 보존한다",
+      "b14f4449 test: 앱 스냅샷 fixture에 희소 문자 상태를 반영한다",
+      "3789d643 fix: 희소 결합 문자를 렌더와 선택 복사에 연결한다",
+      "266f47e6 fix: 터미널 다중 결합 문자를 희소 스냅샷과 원격 델타에 보존한다",
+      "10503d9c fix: IME 문자 범위와 같은 pass의 조합 커서를 보존한다",
+      "e7da014a perf: CJK 병합에서 이모지 폴백 run 경계를 보존한다",
+      "53319650 perf: 한글 wide 글리프를 동일 스타일 run으로 병합한다"
+    ]
+  },
+  {
+    "branch": "perf/seven-snapshot-model",
+    "main_only": 158,
+    "branch_only": 6,
+    "head": "ffaa80932f96a00ef20d7c0485a3ef769c3dae9a",
+    "subjects": [
+      "ffaa8093 fix: 선택 Ghostty 백엔드를 현재 타입 API에 맞춘다",
+      "7f1abbcc fix: 원격 희소 문자의 셀 폭을 검증하고 네이티브 폭 0 문자는 보존한다",
+      "a86d1782 fix: 클라우드 에이전트 화면 읽기에도 결합 문자 전체를 전달한다",
+      "87d21333 perf: 스냅샷 셀을 12바이트로 줄이고 기존 직렬화 계약을 유지한다",
+      "17c06928 fix: 웹 미러도 결합 문자 경계와 터미널 셀 간격을 보존한다",
+      "8c6c4a5b fix: 터미널 다중 결합 문자를 희소 스냅샷과 원격 델타에 보존한다"
+    ]
+  },
+  {
+    "branch": "perf/seven-visible-rows",
+    "main_only": 143,
+    "branch_only": 1,
+    "head": "32a4abea376d594582cf036375aabe6643df2688",
+    "subjects": [
+      "32a4abea perf: 변경된 가시 행만 복사해 터미널 스냅샷을 공유한다"
+    ]
+  },
+  {
+    "branch": "perf/terminal-streaming-reflow",
+    "main_only": 313,
+    "branch_only": 0,
+    "head": "18a06f1a15df555ddbd22569d2d4cf7042db2b21",
+    "subjects": []
+  },
+  {
+    "branch": "preview/warp-relay-20260907",
+    "main_only": 315,
+    "branch_only": 16,
+    "head": "dbac54e7cecd392c491f1596a4031f6cbfbd78eb",
+    "subjects": [
+      "dbac54e7 fix(ui): 터미널 세로 여백을 3pt로 줄인다",
+      "c3033dd6 Merge remote-tracking branch 'origin/feat/fleet-one-list-and-relay-wip' into preview/warp-relay-20260907",
+      "55936ebe fix(terminal): IME 조합 셀 좌표를 완성한다",
+      "75bf2c90 docs: Relay 재접속 전달 결과와 중단한 검사를 기록한다",
+      "215c276e feat(relay): 알려진 기기의 영속 재접속 인증을 구현한다",
+      "6369b0c1 Merge remote-tracking branch 'origin/main' into fix/warp-terminal-resize",
+      "b38cafd1 fix(terminal): 자간과 IME 셀 좌표를 맞춘다",
+      "25581f87 Merge remote-tracking branch 'origin/main' into fix/warp-terminal-resize",
+      "b7756501 fix(ui): Warp 방식으로 터미널 pane을 채운다",
+      "595d23d1 docs: main 착지와 브랜치 정리를 기록한다",
+      "3f519423 docs: main 착지와 남은 개발 범위를 기록한다",
+      "525d192e docs: 별도 레이아웃 PR 완료와 재실행 대기 상태 기록",
+      "2e1dc089 docs: 병렬 PR 검증 결과와 레이아웃 후속 조사 인계",
+      "3db49521 fix(relay): 암호 채널 순서와 셸 배포 검증을 보강한다",
+      "e9600046 docs: 다음 에이전트 인계 문서와 프롬프트 추가",
+      "53f2a314 feat(ui,relay): 작업 화면 한 목록 개편과 진행 중이던 Relay 작업"
+    ]
+  },
+  {
+    "branch": "tmp/cherry-glyph",
+    "main_only": 597,
+    "branch_only": 1,
+    "head": "bbe85f182216a95e5eb280534665a24538c0b684",
+    "subjects": [
+      "bbe85f18 refactor(ui): provider 로고 글리프를 홈과 런처가 공유하게 뽑는다"
+    ]
+  }
+]

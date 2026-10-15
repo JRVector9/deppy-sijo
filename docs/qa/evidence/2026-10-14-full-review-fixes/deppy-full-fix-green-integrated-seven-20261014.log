@@ -1,0 +1,76 @@
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling rusqlite v0.40.2
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+error[E0425]: cannot find function `enqueue_input_with` in module `input_queue`
+    --> crates/pty/src/lib.rs:1896:22
+     |
+1896 |           input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+     |                        ^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/pty/src/input_queue.rs:149:1
+     |
+ 149 | / pub(crate) fn enqueue_input_batch(
+ 150 | |     tx: &SyncSender<Vec<u8>>,
+ 151 | |     queue: &PtyInputQueueState,
+ 152 | |     parts: &[&[u8]],
+...    |
+ 262 | |     Ok(PtyInputEnqueueResult::Accepted)
+ 263 | | }
+     | |_- similarly named function `enqueue_input_batch` defined here
+     |
+help: a function with a similar name exists
+     |
+1896 -         input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+1896 +         input_queue::enqueue_input_batch(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+     |
+
+error[E0425]: cannot find function `enqueue_input_with` in module `input_queue`
+    --> crates/pty/src/lib.rs:1923:22
+     |
+1923 |           input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+     |                        ^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/pty/src/input_queue.rs:149:1
+     |
+ 149 | / pub(crate) fn enqueue_input_batch(
+ 150 | |     tx: &SyncSender<Vec<u8>>,
+ 151 | |     queue: &PtyInputQueueState,
+ 152 | |     parts: &[&[u8]],
+...    |
+ 262 | |     Ok(PtyInputEnqueueResult::Accepted)
+ 263 | | }
+     | |_- similarly named function `enqueue_input_batch` defined here
+     |
+help: a function with a similar name exists
+     |
+1923 -         input_queue::enqueue_input_with(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+1923 +         input_queue::enqueue_input_batch(tx, &self.input_queue, &[bytes], |bytes| InputMessage {
+     |
+
+error[E0425]: cannot find function `enqueue_input_with` in module `input_queue`
+    --> crates/pty/src/lib.rs:1934:22
+     |
+1934 |           input_queue::enqueue_input_with(tx, &self.input_queue, parts, |bytes| InputMessage {
+     |                        ^^^^^^^^^^^^^^^^^^
+     |
+    ::: crates/pty/src/input_queue.rs:149:1
+     |
+ 149 | / pub(crate) fn enqueue_input_batch(
+ 150 | |     tx: &SyncSender<Vec<u8>>,
+ 151 | |     queue: &PtyInputQueueState,
+ 152 | |     parts: &[&[u8]],
+...    |
+ 262 | |     Ok(PtyInputEnqueueResult::Accepted)
+ 263 | | }
+     | |_- similarly named function `enqueue_input_batch` defined here
+     |
+help: a function with a similar name exists
+     |
+1934 -         input_queue::enqueue_input_with(tx, &self.input_queue, parts, |bytes| InputMessage {
+1934 +         input_queue::enqueue_input_batch(tx, &self.input_queue, parts, |bytes| InputMessage {
+     |
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `pty` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

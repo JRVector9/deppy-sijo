@@ -1,0 +1,9 @@
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-review-worktree-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.20s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-92b62424000a532a)
+
+running 1 test
+test in_process::tests::full_review_20261014_late_agent_query_cannot_reach_fallback_shell ... late_query_output="\u{1b}[6nREADY           1b  5b  31  3b  31  52                                        \r\n\r\n"
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 396 filtered out; finished in 0.88s

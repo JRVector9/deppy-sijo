@@ -1,0 +1,30 @@
+{
+  "compile_command": [
+    "rustc",
+    "--edition=2024",
+    "/private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.rs",
+    "-L",
+    "dependency=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps",
+    "--extern",
+    "pty=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libpty-fb1d2f4cebc01214.rlib",
+    "--extern",
+    "libc=/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/liblibc-e8b4ceaeb7c818d7.rlib",
+    "-o",
+    "/private/tmp/deppy-cloud-fix-root-20261015/pty_nonfrozen_green"
+  ],
+  "compile_exit": 0,
+  "sources": {
+    "/private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.rs": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3",
+    "/private/tmp/deppy-cloud-review-perf-20261015/owned-workload.py": "8c3c99a57bdb3d19a6075aa2aba377d16fab55840fbbe1870cb9dbd1e724eb84",
+    "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty/src/lib.rs": "4f6fd68c25f3d9ba411f8483ee46918deb5a87d50c033d98a051d5a796bc644b",
+    "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty/src/workload_signal.rs": "82030bd78708fe5d42728ef80a44c14b2d14090bf2345874ce905d3e0769d78c",
+    "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libpty-fb1d2f4cebc01214.rlib": "ed313b523fce3261efacc0189528f3f651c09daa5275fa5bd7c9dd0e7a07c90d",
+    "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/liblibc-e8b4ceaeb7c818d7.rlib": "13e2a425384b2adb41b44d4aa0cd149418625cfb30c1f4c76fef78de145f374c"
+  },
+  "pty_rlib_mtime": 1792017353.3281887,
+  "run_exit": 0,
+  "run_command": [
+    "/private/tmp/deppy-cloud-fix-root-20261015/pty_nonfrozen_green"
+  ],
+  "binary_sha256": "c67ffbd498cdb02e08514b997255c0c3a115c413c54696a35c136aea22e96eda"
+}

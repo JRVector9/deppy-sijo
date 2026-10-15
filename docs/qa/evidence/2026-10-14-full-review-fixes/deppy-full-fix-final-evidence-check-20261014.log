@@ -1,0 +1,7 @@
+tracked diff: exit 0
+incremental patch reverse: exit 0
+Evidence manifest: 73 stored hashes PASS (gzip original hashes also PASS)
+Current source snapshot: 422 SHA256 PASS
+Six prior product files: preserved PASS
+Text whitespace/newlines: 72 files PASS
+Markdown local links: 30 PASS

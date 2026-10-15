@@ -1,0 +1,224 @@
+[
+  {
+    "log": "secret-pty-green.log",
+    "targets": [
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/pty-2cb6fe6d1ccaea41)",
+        "result": {
+          "status": "ok",
+          "passed": 64,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/secret-393c939ef4dbd8e0)",
+        "result": {
+          "status": "ok",
+          "passed": 80,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Doc-tests pty",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Doc-tests secret",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      }
+    ],
+    "totals": {
+      "passed": 144,
+      "failed": 0,
+      "ignored": 1
+    },
+    "nested_results_excluded": 0
+  },
+  {
+    "log": "web-green.log",
+    "targets": [
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/web_remote-e87460d57d8c6d0a)",
+        "result": {
+          "status": "ok",
+          "passed": 392,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-06cf2f154103a67a)",
+        "result": {
+          "status": "ok",
+          "passed": 1,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-0a881186a79520a2)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-eb29d75d034ec6b2)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-5a82efed40c6c9d0)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-7611b7aac3c9ded9)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 2
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-bc33080f5318426a)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-43dac7a59567d410)",
+        "result": {
+          "status": "ok",
+          "passed": 10,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-daf0bd9e5678083a)",
+        "result": {
+          "status": "ok",
+          "passed": 4,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/transport_independence.rs (target/debug/deps/transport_independence-df7651c7ee46f19b)",
+        "result": {
+          "status": "ok",
+          "passed": 5,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-e2a2c1f0cc7cc661)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-726ace26869f4040)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-0e2f40a313a26f98)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-2018994c8ee4885e)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-70d3b676eca1f6cb)",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 1
+        },
+        "nested_results_excluded": 0
+      },
+      {
+        "target": "Doc-tests web_remote",
+        "result": {
+          "status": "ok",
+          "passed": 0,
+          "failed": 0,
+          "ignored": 0
+        },
+        "nested_results_excluded": 0
+      }
+    ],
+    "totals": {
+      "passed": 412,
+      "failed": 0,
+      "ignored": 13
+    },
+    "nested_results_excluded": 0
+  }
+]

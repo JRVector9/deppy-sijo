@@ -1,0 +1,105 @@
+--- a/crates/pty/src/foreground_teardown_tests.rs
++++ b/crates/pty/src/foreground_teardown_tests.rs
+@@ -27,6 +27,10 @@
+ 
+ impl Fixture {
+     fn spawn(mode: &str) -> Self {
++        Self::spawn_with_shell_exit(mode, false)
++    }
++
++    fn spawn_with_shell_exit(mode: &str, shell_exits: bool) -> Self {
+         static NEXT: AtomicU64 = AtomicU64::new(0);
+         let directory = std::env::temp_dir().join(format!(
+             "deppy-pty-foreground-{}-{}",
+@@ -58,10 +62,19 @@
+             directory,
+         };
+         let session = fixture.session.as_mut().unwrap();
++        let shell = session.process_identity();
+         fixture.output = session.take_output();
+         // WORKLOAD contains no single quotes. Paths/modes are environment values, never shell code.
+-        let command =
+-            format!("python3 -c '{WORKLOAD}' \"$DEPPY_FIXTURE_PID\" \"$DEPPY_FIXTURE_MODE\"\n");
++        let invocation =
++            format!("python3 -c '{WORKLOAD}' \"$DEPPY_FIXTURE_PID\" \"$DEPPY_FIXTURE_MODE\"");
++        let command = if shell_exits {
++            // Disable job control to reproduce the existing same-shell-group descendant contract.
++            format!(
++                "set +m; {invocation} & while [ ! -s \"$DEPPY_FIXTURE_PID\" ]; do /bin/sleep 0.005; done; exit\n"
++            )
++        } else {
++            format!("{invocation}\n")
++        };
+         assert!(
+             session
+                 .write_input(command.as_bytes())
+@@ -88,15 +101,30 @@
+         assert_eq!(process.group, fields[1]);
+         assert_eq!(process.session, fields[2]);
+         assert!(!process.zombie_for_test());
+-        assert_eq!(
+-            session.foreground_process_group(),
+-            Some(process.group as u32)
+-        );
+-        assert_ne!(
+-            session.process_identity().process_group,
+-            Some(process.group as u32),
+-            "fixture must run in a real job-control group separate from its shell"
+-        );
++        if shell_exits {
++            assert_eq!(shell.process_group, Some(process.group as u32));
++            // Let the actual reaper consume the shell. Do not use try_exit_code in this wait:
++            // the later Drop/kill must recover its authority from the pre-reap member snapshot.
++            let deadline = Instant::now() + Duration::from_secs(3);
++            while workload_signal::inspect(shell.pid.unwrap() as i32).is_some() {
++                assert!(Instant::now() < deadline, "fixture shell was not reaped");
++                std::thread::sleep(Duration::from_millis(5));
++            }
++            assert!(
++                fixture.same_process_alive(),
++                "descendant must outlive its shell"
++            );
++        } else {
++            assert_eq!(
++                session.foreground_process_group(),
++                Some(process.group as u32)
++            );
++            assert_ne!(
++                shell.process_group,
++                Some(process.group as u32),
++                "fixture must run in a real job-control group separate from its shell"
++            );
++        }
+         fixture
+     }
+ 
+@@ -188,3 +216,29 @@
+ fn frozen_foreground_control_exits_on_drop() {
+     foreground_teardown("ignore-hup-term", false, true);
+ }
++
++fn descendant_after_shell_exit_teardown(use_kill: bool) {
++    let mut fixture = Fixture::spawn_with_shell_exit("ignore-hup", true);
++    if use_kill {
++        fixture.session.as_mut().unwrap().kill().unwrap();
++    } else {
++        drop(fixture.session.take());
++    }
++    let gone_without_rescue = fixture.wait_for_exit(Duration::from_millis(500));
++    let process = fixture.process.unwrap();
++    drop(fixture);
++    assert!(
++        gone_without_rescue,
++        "captured same-group descendant survived after shell reap: kill={use_kill} identity={process:?}"
++    );
++}
++
++#[test]
++fn samegroup_descendant_after_shell_reap_exits_on_drop() {
++    descendant_after_shell_exit_teardown(false);
++}
++
++#[test]
++fn samegroup_descendant_after_shell_reap_exits_on_kill() {
++    descendant_after_shell_exit_teardown(true);
++}

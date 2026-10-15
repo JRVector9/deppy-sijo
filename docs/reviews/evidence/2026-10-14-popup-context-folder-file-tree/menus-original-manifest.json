@@ -1,0 +1,42 @@
+{
+  "/private/tmp/deppy-file-rename-probe-20261014.rs": {
+    "sha256": "3b78965aef4070c9bdf7adc55b284ef747ed1357c2f197fae1a6608494e0dd55",
+    "bytes": 2669
+  },
+  "/private/tmp/deppy-file-rename-probe-20261014.log": {
+    "sha256": "1150332f2998b6200f83d80fa04fbd3c777fb9f87a0b12788ff2f1bf4de88d0e",
+    "bytes": 1013
+  },
+  "/private/tmp/deppy-tree-focus-probe-20261014.rs": {
+    "sha256": "621407e19d79012cc7dc62d43f0770bde137ced4037fbe35f03870847e4d9a63",
+    "bytes": 3068
+  },
+  "/private/tmp/deppy-tree-focus-probe-20261014.log": {
+    "sha256": "cced80ebd1d93ee720e5cd9243ba4ee63e4c92079cead7f2d57652350d9e3e7d",
+    "bytes": 707
+  },
+  "/private/tmp/deppy-file-rename-row-id-probe-20261014.rs": {
+    "sha256": "e236e7e9d16f643eca98593665582d242b1a8113ce25b4f1212ce1807d319880",
+    "bytes": 2307
+  },
+  "/private/tmp/deppy-file-rename-row-id-probe-20261014.log": {
+    "sha256": "ff63f8db29c7a5f69d8bb223f03b5560a09619bd7a471a7315a34f4a79d8b941",
+    "bytes": 914
+  },
+  "/private/tmp/deppy-workspace-secondary-drag-probe-20261014.rs": {
+    "sha256": "a25b3c39ee95413cdaec9f094a41089dc65edddbe19d848c51d44ccd08685baa",
+    "bytes": 3554
+  },
+  "/private/tmp/deppy-workspace-secondary-drag-probe-20261014.log": {
+    "sha256": "3e486aa9ef248b026190155df537428f6d12c2f7a1b492a9efc90a06be2c4313",
+    "bytes": 718
+  },
+  "/private/tmp/deppy-context-close-probe-20261014.rs": {
+    "sha256": "1ae3aeb59ee9448454a628c70aaf0374630a28e982fbb3f9665c5ea69515005f",
+    "bytes": 3088
+  },
+  "/private/tmp/deppy-context-close-probe-20261014.log": {
+    "sha256": "410944e6790373f59056b6d387529ff0c6d0b4fc4ab0637171bf36762b68eb38",
+    "bytes": 708
+  }
+}

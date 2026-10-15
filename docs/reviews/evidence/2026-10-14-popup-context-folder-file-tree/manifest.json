@@ -1,0 +1,281 @@
+{
+  "date": "2026-10-14",
+  "repository": "/Users/jr/Desktop/projects/deppy-sijo-performance",
+  "commit": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "version": "0.12.1",
+  "review_mode": "read-only product review, three gpt-6.1-sol / xhigh subagents plus root verification",
+  "confirmed_findings": 10,
+  "high": 2,
+  "medium": 7,
+  "low": 1,
+  "existing_tests": {
+    "groups": {
+      "popup": {
+        "unique_pass": 58,
+        "unique_ignored": 10,
+        "summaries": [
+          "test result: ok. 58 passed; 0 failed; 10 ignored; 0 measured; 3123 filtered out; finished in 0.31s"
+        ]
+      },
+      "context-menu": {
+        "unique_pass": 9,
+        "unique_ignored": 5,
+        "summaries": [
+          "test result: ok. 9 passed; 0 failed; 5 ignored; 0 measured; 3177 filtered out; finished in 0.11s"
+        ]
+      },
+      "file-tree": {
+        "unique_pass": 195,
+        "unique_ignored": 3,
+        "summaries": [
+          "test result: ok. 195 passed; 0 failed; 3 ignored; 0 measured; 2993 filtered out; finished in 3.35s"
+        ]
+      },
+      "workspace": {
+        "unique_pass": 578,
+        "unique_ignored": 4,
+        "summaries": [
+          "test result: ok. 578 passed; 0 failed; 4 ignored; 0 measured; 2609 filtered out; finished in 0.66s"
+        ]
+      },
+      "picker": {
+        "unique_pass": 6,
+        "unique_ignored": 0,
+        "summaries": [
+          "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 3185 filtered out; finished in 0.09s"
+        ]
+      },
+      "connector-ui": {
+        "unique_pass": 26,
+        "unique_ignored": 0,
+        "summaries": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 25 filtered out; finished in 0.08s",
+          "test result: ok. 26 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.28s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ]
+      }
+    },
+    "deduplicated_pass": 838,
+    "deduplicated_ignored": 15,
+    "all_selected_commands_exit": 0,
+    "full_app_suite_executed": false
+  },
+  "expected_behavior_red": {
+    "scratch_compile_success": true,
+    "scratch_pass": 0,
+    "scratch_fail": 6,
+    "scratch_exit": 101,
+    "standalone_probes": 5,
+    "standalone_exit": 101,
+    "control_probes": 1,
+    "control_exit": 0
+  },
+  "canonical_product_diff_unchanged": true,
+  "product_diff_sha256": "a5d019af353e8156c9d4a20ebb458e484fd8267ab1bd495b5a2cf94da3ea8da8",
+  "files": {
+    "existing-popup.log": {
+      "source": "/private/tmp/deppy-popup-review-popup-20261014.log",
+      "original_sha256": "69b0ced30abdd0cf15064178aaee128cb268572b5c98ec55e46b4bb0718cc1a9",
+      "sha256": "cccd1c53a3a4a486f83fb683e231390e5c7ecfad62c91792ee789848e30747a3",
+      "bytes": 7401,
+      "normalization": "trailing whitespace only"
+    },
+    "existing-context-menu.log": {
+      "source": "/private/tmp/deppy-popup-review-context-menu-20261014.log",
+      "original_sha256": "139806a6dd628da0d75513d4614c3d80dcb874f321629023910bd412e33ba48c",
+      "sha256": "ac3f4f721ba104800588f7c76b30c4b4e4e433039df39cf184faa74843c899bc",
+      "bytes": 1672,
+      "normalization": "trailing whitespace only"
+    },
+    "existing-file-tree.log": {
+      "source": "/private/tmp/deppy-popup-review-file-tree-20261014.log",
+      "original_sha256": "c0250acbb420404cbef03f5bee543a092406a1df0dcd592c46e58a38642da048",
+      "sha256": "ce6e957875dbb78fd9d2ae03efdca97810f88a19ab25a1a211b2cfdb73a45493",
+      "bytes": 20193,
+      "normalization": "trailing whitespace only"
+    },
+    "existing-workspace.log": {
+      "source": "/private/tmp/deppy-popup-review-workspace-20261014.log",
+      "original_sha256": "65fc0d337098f50300f4e17af7bd2d47b515d2c31d9b3f670ef935dbfc0da454",
+      "sha256": "fc5c255b3905b9ea7f3a22ad39e37da94e5a4a0cef005db1c055f54671ee86a5",
+      "bytes": 59267,
+      "normalization": "trailing whitespace only"
+    },
+    "existing-picker.log": {
+      "source": "/private/tmp/deppy-popup-review-picker-20261014.log",
+      "original_sha256": "d3e71f9bf23a4f3d8724848dc1d5d5dff22443c5e69e30898da5411dbb5812bc",
+      "sha256": "d6e4cca7443798b149db5e975082b21dd11451d128b99a68698fbc402801e303",
+      "bytes": 858,
+      "normalization": "trailing whitespace only"
+    },
+    "existing-connector-ui.log": {
+      "source": "/private/tmp/deppy-popup-review-connector-ui-20261014.log",
+      "original_sha256": "1abd35995cc47d55c65a067433d633541d7883e0761331eb90e582b446b61710",
+      "sha256": "cfe8b35278c71cb75c80fddf01d7cd8123028f77db5d2ed6fb8ede2e33a4ef02",
+      "bytes": 2990,
+      "normalization": "trailing whitespace only"
+    },
+    "folders-scratch-red.log": {
+      "source": "/private/tmp/deppy-popup-review-scratch-probes-20261014.log",
+      "original_sha256": "d7d5f4e8ed53a66de2b98da39a7ca423c674be5e162ba3a0ffe862b5d0494781",
+      "sha256": "d7d5f4e8ed53a66de2b98da39a7ca423c674be5e162ba3a0ffe862b5d0494781",
+      "bytes": 7031,
+      "normalization": "none"
+    },
+    "file-rename.rs": {
+      "source": "/private/tmp/deppy-file-rename-probe-20261014.rs",
+      "original_sha256": "3b78965aef4070c9bdf7adc55b284ef747ed1357c2f197fae1a6608494e0dd55",
+      "sha256": "3b78965aef4070c9bdf7adc55b284ef747ed1357c2f197fae1a6608494e0dd55",
+      "bytes": 2669,
+      "normalization": "none"
+    },
+    "file-rename.log": {
+      "source": "/private/tmp/deppy-file-rename-probe-20261014.log",
+      "original_sha256": "1150332f2998b6200f83d80fa04fbd3c777fb9f87a0b12788ff2f1bf4de88d0e",
+      "sha256": "1150332f2998b6200f83d80fa04fbd3c777fb9f87a0b12788ff2f1bf4de88d0e",
+      "bytes": 1013,
+      "normalization": "none"
+    },
+    "tree-focus.rs": {
+      "source": "/private/tmp/deppy-tree-focus-probe-20261014.rs",
+      "original_sha256": "621407e19d79012cc7dc62d43f0770bde137ced4037fbe35f03870847e4d9a63",
+      "sha256": "49aa02ae08ce9b2b7365d574ab6c81f06e91d7e1c33aabcc79bf66aa420d008c",
+      "bytes": 3069,
+      "normalization": "trailing whitespace only"
+    },
+    "tree-focus.log": {
+      "source": "/private/tmp/deppy-tree-focus-probe-20261014.log",
+      "original_sha256": "cced80ebd1d93ee720e5cd9243ba4ee63e4c92079cead7f2d57652350d9e3e7d",
+      "sha256": "cced80ebd1d93ee720e5cd9243ba4ee63e4c92079cead7f2d57652350d9e3e7d",
+      "bytes": 707,
+      "normalization": "none"
+    },
+    "file-rename-row-id.rs": {
+      "source": "/private/tmp/deppy-file-rename-row-id-probe-20261014.rs",
+      "original_sha256": "e236e7e9d16f643eca98593665582d242b1a8113ce25b4f1212ce1807d319880",
+      "sha256": "1bb4498d84ecc69c05ff7f39a43fcda99e720cce0190117f58416c0a7ba2ffb7",
+      "bytes": 2308,
+      "normalization": "trailing whitespace only"
+    },
+    "file-rename-row-id.log": {
+      "source": "/private/tmp/deppy-file-rename-row-id-probe-20261014.log",
+      "original_sha256": "ff63f8db29c7a5f69d8bb223f03b5560a09619bd7a471a7315a34f4a79d8b941",
+      "sha256": "ff63f8db29c7a5f69d8bb223f03b5560a09619bd7a471a7315a34f4a79d8b941",
+      "bytes": 914,
+      "normalization": "none"
+    },
+    "workspace-secondary-drag.rs": {
+      "source": "/private/tmp/deppy-workspace-secondary-drag-probe-20261014.rs",
+      "original_sha256": "a25b3c39ee95413cdaec9f094a41089dc65edddbe19d848c51d44ccd08685baa",
+      "sha256": "941c02e6f55a4815aaedbc3b7f9e85b3d62b0d495d5685bc50a6b4b40e6127a0",
+      "bytes": 3555,
+      "normalization": "trailing whitespace only"
+    },
+    "workspace-secondary-drag.log": {
+      "source": "/private/tmp/deppy-workspace-secondary-drag-probe-20261014.log",
+      "original_sha256": "3e486aa9ef248b026190155df537428f6d12c2f7a1b492a9efc90a06be2c4313",
+      "sha256": "3e486aa9ef248b026190155df537428f6d12c2f7a1b492a9efc90a06be2c4313",
+      "bytes": 718,
+      "normalization": "none"
+    },
+    "context-close.rs": {
+      "source": "/private/tmp/deppy-context-close-probe-20261014.rs",
+      "original_sha256": "1ae3aeb59ee9448454a628c70aaf0374630a28e982fbb3f9665c5ea69515005f",
+      "sha256": "cbc53e628dee4896cf4bf96f8594faded7d69e227ef3698076095411969dcf8a",
+      "bytes": 3089,
+      "normalization": "trailing whitespace only"
+    },
+    "context-close.log": {
+      "source": "/private/tmp/deppy-context-close-probe-20261014.log",
+      "original_sha256": "410944e6790373f59056b6d387529ff0c6d0b4fc4ab0637171bf36762b68eb38",
+      "sha256": "410944e6790373f59056b6d387529ff0c6d0b4fc4ab0637171bf36762b68eb38",
+      "bytes": 708,
+      "normalization": "none"
+    },
+    "folders-probes.patch": {
+      "source": "/private/tmp/deppy-popup-review-folders-probes-20261014.patch",
+      "original_sha256": "1576826bd0567252d251cb277457855656e04e5ff3004809c6bcc7d6b8faf100",
+      "sha256": "1576826bd0567252d251cb277457855656e04e5ff3004809c6bcc7d6b8faf100",
+      "bytes": 13978,
+      "normalization": "none"
+    },
+    "folders-escape.patch": {
+      "source": "/private/tmp/deppy-popup-review-folders-escape-20261014.patch",
+      "original_sha256": "d029826b3e3a616ef018dd7cc27e94db38ecc92d087cee0cca999e9b494ef5fb",
+      "sha256": "d029826b3e3a616ef018dd7cc27e94db38ecc92d087cee0cca999e9b494ef5fb",
+      "bytes": 3428,
+      "normalization": "none"
+    },
+    "reviewed-working-tree.patch": {
+      "source": "/private/tmp/deppy-popup-review-products-before-20261014.patch",
+      "original_sha256": "a5d019af353e8156c9d4a20ebb458e484fd8267ab1bd495b5a2cf94da3ea8da8",
+      "sha256": "a5d019af353e8156c9d4a20ebb458e484fd8267ab1bd495b5a2cf94da3ea8da8",
+      "bytes": 7091,
+      "normalization": "none"
+    },
+    "menus-reviewer.md": {
+      "source": "/private/tmp/deppy-menu-tree-review-20261014.md",
+      "original_sha256": "b0c56df2d7a901a323148f16618a2adbbcec64f3ba4f3b937b767cfbaedd23de",
+      "sha256": "b0c56df2d7a901a323148f16618a2adbbcec64f3ba4f3b937b767cfbaedd23de",
+      "bytes": 7351,
+      "normalization": "none"
+    },
+    "menus-original-manifest.json": {
+      "source": "/private/tmp/deppy-menu-tree-review-20261014-manifest.json",
+      "original_sha256": "631c179d1ae09b1a1e187fd44e7a2094843e6e80b6230562f6d67f890147facc",
+      "sha256": "631c179d1ae09b1a1e187fd44e7a2094843e6e80b6230562f6d67f890147facc",
+      "bytes": 1656,
+      "normalization": "none"
+    },
+    "connector-secret-undo.rs": {
+      "source": "/private/tmp/deppy-popup-review-probes-20261014/connector_secret_undo.rs",
+      "original_sha256": "30bb304329b65bce6606e0ed35cba0e72cd273fc1dbb998298124189c45c5204",
+      "sha256": "30bb304329b65bce6606e0ed35cba0e72cd273fc1dbb998298124189c45c5204",
+      "bytes": 3093,
+      "normalization": "none"
+    },
+    "connector-secret-undo-red.log": {
+      "source": "/private/tmp/deppy-popup-review-probes-20261014/connector-secret-undo-result.log",
+      "original_sha256": "90763cdb3b1f24bac66b9cfaef713417a82ce735126e6fd34fdb4d53a5049459",
+      "sha256": "90763cdb3b1f24bac66b9cfaef713417a82ce735126e6fd34fdb4d53a5049459",
+      "bytes": 631,
+      "normalization": "none"
+    },
+    "connector-secret-undo-compile.log": {
+      "source": "/private/tmp/deppy-popup-review-probes-20261014/connector_secret_undo-compile.log",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "normalization": "none"
+    },
+    "connector-secret-undo-build-command.json": {
+      "source": "/private/tmp/deppy-popup-review-probes-20261014/connector_secret_undo-build-command.json",
+      "original_sha256": "f7941bccd632ac0f4a5dcd13e7c35905b630c640a21ae8af33f290c85981a09c",
+      "sha256": "f7941bccd632ac0f4a5dcd13e7c35905b630c640a21ae8af33f290c85981a09c",
+      "bytes": 957,
+      "normalization": "none"
+    },
+    "connector-secret-original-manifest.json": {
+      "source": "/private/tmp/deppy-popup-review-probes-20261014/secret-undo-evidence-manifest.json",
+      "original_sha256": "4a69fb240038766b9503edf46c223ac0f87eb8bfc7fa8da6decc552c25e4359a",
+      "sha256": "4a69fb240038766b9503edf46c223ac0f87eb8bfc7fa8da6decc552c25e4359a",
+      "bytes": 961,
+      "normalization": "none"
+    },
+    "root-independent-reruns.json": {
+      "source": "/private/tmp/deppy-popup-review-root-reruns-20261014.json",
+      "original_sha256": "eb7558bdbd784915ef4ba0bb71955b0127861db9d2daa259835be12337fbda11",
+      "sha256": "eb7558bdbd784915ef4ba0bb71955b0127861db9d2daa259835be12337fbda11",
+      "bytes": 5790,
+      "normalization": "none"
+    }
+  },
+  "limits": [
+    "No running app GUI E2E",
+    "No real provider or real credential",
+    "No user DB, clipboard or data mutation",
+    "Menu probes source-derived egui, connector probe actual ConnectorUi",
+    "Scratch tests-only worktree with production workers and native filesystem/watcher",
+    "Partial-copy stale listing requires missing or failing watcher"
+  ]
+}

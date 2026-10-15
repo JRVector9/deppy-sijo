@@ -1,0 +1,101 @@
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.68s
+     Running unittests src/lib.rs (target/debug/deps/pty-2cb6fe6d1ccaea41)
+
+running 67 tests
+test foreground_teardown_tests::frozen_foreground_control_exits_on_drop ... ok
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_drop ... ok
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_kill ... ok
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop ... ok
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill ... ok
+test foreground_teardown_tests::normal_foreground_hup_control_exits_on_drop ... ok
+test foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_drop ... 
+thread 'foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_drop' (55811713) panicked at crates/pty/src/foreground_teardown_tests.rs:230:5:
+captured same-group descendant survived after shell reap: kill=false identity=Process { pid: 95263, birth: (1792019535, 386309), group: 95251, session: 95251, stopped: false, zombie: false }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_kill ... 
+thread 'foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_kill' (55812603) panicked at crates/pty/src/foreground_teardown_tests.rs:230:5:
+captured same-group descendant survived after shell reap: kill=true identity=Process { pid: 95818, birth: (1792019535, 952349), group: 95817, session: 95817, stopped: false, zombie: false }
+FAILED
+test input_queue::tests::backpressure_boundary_recovers_after_complete ... ok
+test input_queue::tests::chunk_count_over_message_budget_is_rejected_not_backpressured ... ok
+test input_queue::tests::closed_queue_rejects_with_session_closed ... ok
+test input_queue::tests::disconnected_writer_rejects_and_closes_queue ... ok
+test input_queue::tests::empty_input_is_accepted_without_reserving_budget ... ok
+test input_queue::tests::large_paste_is_chunked_and_accepted ... ok
+test input_queue::tests::oversized_payload_is_rejected ... ok
+test input_queue::tests::pr1_batch_keeps_body_submit_boundaries_and_order ... ok
+test input_queue::tests::pr1_default_queue_no_cr_after_body_refusal ... ok
+test input_queue::tests::pr1_default_queue_reserves_paste_body_and_submit_together ... ok
+test input_queue::tests::pr1_partial_writer_failure_is_unknown_never_a_retryable_queue_refusal ... ok
+test input_queue::tests::queue_accepts_within_budget ... ok
+test input_queue::tests::queue_reports_backpressure_without_blocking ... ok
+test query_fence::tests::exit_file_retires_old_owner_without_reader_and_survives_consumption ... ok
+test query_fence::tests::exit_probe_does_not_follow_links_or_block_on_a_fifo ... ok
+test query_fence::tests::previous_pid_execution_file_does_not_retire_a_new_live_owner ... ok
+test query_fence::tests::sentinel_directory_matches_shell_empty_relative_and_latest_tmpdir ... ok
+test query_fence::tests::split_marker_separates_old_and_new_query_owners ... ok
+test query_fence::tests::unrelated_marker_and_regular_shell_queries_are_preserved ... ok
+test tests::apple_bcp47_locale을_posix_utf8로_정규화한다 ... ok
+test tests::bench_bulk_read_throughput ... ignored, throughput benchmark — run manually with --nocapture
+test tests::bounded_output_wait는_receiver_capacity와_cancel로만_깨어난다 ... ok
+test tests::ctrl_c로_종료 ... ok
+test tests::drop은_sighup_무시_자손까지_정리한다 ... ok
+test tests::embedded_pty는_malloc_stack_logging을_제거한다 ... ok
+test tests::embedded_pty는_no_color를_제거하고_truecolor_capability를_고정한다 ... ok
+test tests::explicit_kill은_한번만_시도하고_실패해도_reap후_원래_error를_반환한다 ... ok
+test tests::finder처럼_lang가_비면_pty는_utf8_locale을_주입한다 ... ok
+test tests::freeze는_프로세스를_정지시키고_resume이_되살린다 ... 
+thread 'tests::freeze는_프로세스를_정지시키고_resume이_되살린다' (55816513) panicked at crates/pty/src/lib.rs:3421:26:
+called `Result::unwrap()` on an `Err` value: PTY child exit identity mismatch
+FAILED
+test tests::full_fix_lifecycle_freeze_handles_a_job_whose_group_leader_exited ... 
+thread 'tests::full_fix_lifecycle_freeze_handles_a_job_whose_group_leader_exited' (55816535) panicked at crates/pty/src/lib.rs:3593:9:
+Err(PTY child exit identity mismatch)
+FAILED
+test tests::full_fix_lifecycle_freeze_rejects_an_unrelated_session_group ... ok
+test tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_drop ... ok
+test tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill ... ok
+test tests::full_pty에_막힌_writer도_cancel후_join된다 ... ok
+test tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell ... 
+thread 'tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell' (55818435) panicked at crates/pty/src/lib.rs:3512:26:
+called `Result::unwrap()` on an `Err` value: PTY child exit identity mismatch
+FAILED
+test tests::kill로_종료 ... ok
+test tests::output_chunk가_채널에_들어오면_worker_wake를_호출한다 ... ok
+test tests::pr13_bounded_receive_leaves_whole_over_budget_chunk_and_reports_backlog ... ok
+test tests::process_identity_exposes_redacted_pid_metadata ... ok
+test tests::pty_signal_probe_helper ... ok
+test tests::windows_discard_mode는_full_sender를_깨우고_추가_output을_보관하지_않는다 ... ok
+test tests::worker_teardown_source_law는_joinhandle과_event_cancel을_강제한다 ... ok
+test tests::writer_thread_spawn_실패는_이미_시작한_reader를_join한다 ... ok
+test tests::고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다 ... ok
+test tests::대량_출력은_coalesce_wait을_1ms로_낮춰도_소수_청크로_뭉친다 ... ok
+test tests::동시_spawn은_openpty_경합에도_전부_성공한다 ... ok
+test tests::반복_kill과_drop은_worker를_남기지_않는다 ... ok
+test tests::부모_에이전트_세션_마커는_pane에_상속되지_않는다 ... ok
+test tests::빠르게_종료되는_자식의_꼬리_출력은_유실되지_않는다 ... ok
+test tests::사용자가_명시한_lang는_덮어쓰지_않는다 ... ok
+test tests::스크럽_목록은_사용자_설정을_건드리지_않는다 ... ok
+test tests::이미_사라진_그룹만_경고에서_내린다 ... ok
+test tests::입력_echo_roundtrip ... ok
+test tests::자기_프로세스_그룹에는_신호를_보내지_않는다 ... ok
+test tests::정상_종료한_세션의_그룹은_esrch를_돌려준다 ... ok
+test tests::출력_폭주중_대량_입력이_블록되지_않는다 ... ok
+test tests::출력과_종료코드 ... ok
+test workload_signal::tests::captured_signals_skip_changed_birth_group_and_session ... ok
+test workload_signal::tests::failed_stop_verification_rolls_back_a_same_session_fork ... ok
+
+failures:
+
+failures:
+    foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_drop
+    foreground_teardown_tests::samegroup_descendant_after_shell_reap_exits_on_kill
+    tests::freeze는_프로세스를_정지시키고_resume이_되살린다
+    tests::full_fix_lifecycle_freeze_handles_a_job_whose_group_leader_exited
+    tests::full_review_20261014_freeze_stops_foreground_job_not_only_shell
+
+test result: FAILED. 61 passed; 5 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.08s
+
+error: test failed, to rerun pass `-p pty --lib`

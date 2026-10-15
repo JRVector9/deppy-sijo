@@ -1,0 +1,46 @@
+   Compiling connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 35.81s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 21 tests
+test app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor ... missing-picked-folder: reported_success=false, before=WorkspaceFolderAnchor { dev: 16777232, ino: 577399426 }, after=Some((16777232, 577399426))
+ok
+test app::tests::popup_audit_20261014_native_trash_proof_only_survives_failed_unchanged_object ... ok
+test app::tests::popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach ... ok
+test app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events ... symlink-watch raw=["/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-61717-deadd294-2b25-4b48-8102-929707e43dba/physical/new.txt"], physical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-61717-deadd294-2b25-4b48-8102-929707e43dba/physical", logical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-61717-deadd294-2b25-4b48-8102-929707e43dba/alias", refresh_queued=true
+ok
+test app::tests::popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths ... ok
+test app::tests::popup_audit_20261014_unreadable_file_keeps_normal_native_trash_success ... ok
+test ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_inode_replacement ... ok
+test ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_parent_redirect ... ok
+test ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_root_replacement ... ok
+test ui::file_tree::tests::popup_audit_20261014_approved_delete_removes_original_file_directory_and_symlink ... ok
+test ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing ... restored child access: retry=true, inaccessible=false
+ok
+test ui::file_tree::tests::popup_audit_20261014_delete_boundary_replacement_is_restored ... ok
+test ui::file_tree::tests::popup_audit_20261014_delete_boundary_restore_conflict_preserves_both_new_files ... ok
+test ui::file_tree::tests::popup_audit_20261014_delete_cancellation_before_mutation_preserves_target ... ok
+test ui::file_tree::tests::popup_audit_20261014_delete_cleanup_failure_keeps_unexpected_file_and_reports_error ... ok
+test ui::file_tree::tests::popup_audit_20261014_delete_depth_budget_refuses_before_mutation ...
+thread 'ui::file_tree::tests::popup_audit_20261014_delete_depth_budget_refuses_before_mutation' (47055972) panicked at crates/app/src/ui/file_tree.rs:17786:62:
+called `Result::unwrap()` on an `Err` value: Os { code: 63, kind: InvalidFilename, message: "File name too long" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test ui::file_tree::tests::popup_audit_20261014_explicit_expand_retries_permission_denied_child ... ok
+test ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination ... partial-copy result: first_published=true, first_visible=true
+ok
+test ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent ... permanent-delete parent escape: root_refresh_retained_confirm=true, issued_delete=true, outside_survived=true, original_survived=true
+ok
+test ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation ... replaced-file confirmation: inode 577399685->577399686, retained=true, issued_delete=true, new_survived=true, original_survived=true
+ok
+test ui::file_tree::tests::popup_audit_20261014_synthetic_trash_failure_cannot_authorize_deletion ... ok
+
+failures:
+
+failures:
+    ui::file_tree::tests::popup_audit_20261014_delete_depth_budget_refuses_before_mutation
+
+test result: FAILED. 20 passed; 1 failed; 0 ignored; 0 measured; 3199 filtered out; finished in 6.03s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

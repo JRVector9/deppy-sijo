@@ -1,0 +1,9 @@
+frame=0 row_index=0 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(8714522455845931963) focused=true buffer=b.txt
+frame=1 row_index=0 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(8714522455845931963) focused=true buffer=b.txt
+frame=2 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt
+frame=3 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt
+frame=4 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt
+
+thread 'main' (45400492) panicked at /private/tmp/deppy-file-rename-row-id-probe-20261014.rs:18:20:
+watcher inserted preceding sibling: rename target remains visible but loses its input id/focus
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

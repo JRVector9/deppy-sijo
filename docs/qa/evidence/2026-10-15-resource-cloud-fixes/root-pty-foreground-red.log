@@ -1,0 +1,36 @@
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.71s
+     Running unittests src/lib.rs (target/debug/deps/pty-2cb6fe6d1ccaea41)
+
+running 6 tests
+test foreground_teardown_tests::frozen_foreground_control_exits_on_drop ... ok
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_drop ... 
+thread 'foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_drop' (53390795) panicked at crates/pty/src/foreground_teardown_tests.rs:152:5:
+same foreground execution survived: mode=ignore-hup kill=false frozen=false identity=Process { pid: 9851, birth: (1792017112, 468578), group: 9851, session: 9845, stopped: false, zombie: false } teardown=53.465416ms
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_kill ... 
+thread 'foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_kill' (53391120) panicked at crates/pty/src/foreground_teardown_tests.rs:152:5:
+same foreground execution survived: mode=ignore-hup kill=true frozen=false identity=Process { pid: 10042, birth: (1792017113, 63055), group: 10042, session: 10041, stopped: false, zombie: false } teardown=53.805333ms
+FAILED
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop ... 
+thread 'foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop' (53391152) panicked at crates/pty/src/foreground_teardown_tests.rs:152:5:
+same foreground execution survived: mode=ignore-hup-term kill=false frozen=false identity=Process { pid: 10052, birth: (1792017113, 653187), group: 10052, session: 10051, stopped: false, zombie: false } teardown=51.217542ms
+FAILED
+test foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill ... 
+thread 'foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill' (53391220) panicked at crates/pty/src/foreground_teardown_tests.rs:152:5:
+same foreground execution survived: mode=ignore-hup-term kill=true frozen=false identity=Process { pid: 10087, birth: (1792017114, 242655), group: 10087, session: 10086, stopped: false, zombie: false } teardown=53.130917ms
+FAILED
+test foreground_teardown_tests::normal_foreground_hup_control_exits_on_drop ... ok
+
+failures:
+
+failures:
+    foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_drop
+    foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_exits_on_kill
+    foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop
+    foreground_teardown_tests::nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill
+
+test result: FAILED. 2 passed; 4 failed; 0 ignored; 0 measured; 58 filtered out; finished in 2.70s
+
+error: test failed, to rerun pass `-p pty --lib`

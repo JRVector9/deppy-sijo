@@ -1,0 +1,49 @@
+{
+  "artifact_count": 117,
+  "source_count": 423,
+  "unchanged_baseline_files": 412,
+  "changed_existing": 10,
+  "added": [
+    "crates/pty/src/foreground_teardown_tests.rs"
+  ],
+  "verified_local_links": 46,
+  "diff_check": {
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "task_patch_reverse_check": {
+    "command": [
+      "git",
+      "apply",
+      "--reverse",
+      "--check",
+      "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/qa/evidence/2026-10-15-resource-cloud-fixes/root-final-task-changes.patch"
+    ],
+    "exit_code": 0,
+    "stdout": "",
+    "stderr": ""
+  },
+  "workspace_totals": {
+    "passed": 5732,
+    "failed": 0,
+    "ignored": 65
+  },
+  "workspace_nested_excluded": 3,
+  "integration_gates_exit0": [
+    "app-cloud",
+    "workspace",
+    "clippy",
+    "fmt",
+    "boundary",
+    "deps"
+  ],
+  "independent_pty_final_source_match": true,
+  "qualified_pty_red_and_green": true,
+  "result": "PASS"
+}

@@ -1,0 +1,66 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/core)
+   Compiling secret v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/secret)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/audit)
+   Compiling mux v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/mux)
+   Compiling persist v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/persist)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/terminal)
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/pty)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/storage-core)
+   Compiling mcp-store v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/mcp-store)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/session)
+   Compiling storage v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/storage)
+   Compiling http-client v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/http-client)
+   Compiling connector-contract v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/connector-contract)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/runtime)
+   Compiling relay-protocol v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/relay-protocol)
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/web-remote)
+   Compiling mcp v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/mcp)
+   Compiling auth v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/auth)
+   Compiling i18n v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/i18n)
+   Compiling connector-ui v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/connector-ui)
+   Compiling connector-service v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/connector-service)
+   Compiling agent-mcp v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/agent-mcp)
+   Compiling platform v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/platform)
+   Compiling deppy-sijo v0.12.1 (/private/tmp/deppy-full-fix-documents-20261014/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 57.80s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 21 tests
+test app::tests::full_fix_20261014_document_aggregate_editor_budget_counts_saved_copies ... ok
+test app::tests::full_fix_20261014_document_dead_owner_same_path_is_recoverable ... ok
+test app::tests::full_fix_20261014_document_poll_infrastructure_failures_cancel_scope_close ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancel_preserves_unrelated_confirmations ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancels_if_original_owner_is_gone_or_reused ... ok
+test app::tests::full_fix_20261014_document_scope_close_conflict_keeps_source_and_conflict_prompt ... ok
+test app::tests::full_fix_20261014_document_scope_close_guards_each_lifecycle_target ... ok
+test app::tests::full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff ...
+thread 'app::tests::full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff' (49141232) panicked at crates/app/src/app.rs:49570:9:
+queued close handoff must retain the original owner fence until final delivery
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test app::tests::full_fix_20261014_document_scope_close_save_failure_preserves_buffer ... ok
+test app::tests::full_fix_20261014_document_scope_close_waits_for_edits_made_during_save ... ok
+test app::tests::full_fix_20261014_document_worker_panic_cancels_close_before_later_manual_save ...
+thread 'document-save-panic-fixture' (49141239) panicked at crates/app/src/app.rs:49675:20:
+synthetic save executor failure
+ok
+test document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts ... ok
+test document_io::tests::full_fix_20261014_document_fifo_does_not_block_load_lane ... ok
+test document_io::tests::full_fix_20261014_document_symlink_save_preserves_loaded_target ... ok
+test folder_identity::tests::full_fix_20261014_document_portable_folder_validation_does_not_require_anchor ... ok
+test session_aux::tests::full_fix_20261014_document_explicit_recovery_excludes_live_owner ... ok
+test ui::document::tests::full_fix_20261014_document_editor_allows_replacement_within_byte_budget ... ok
+test ui::document::tests::full_fix_20261014_document_editor_budget_measures_utf8_bytes ... ok
+test ui::document::tests::full_fix_20261014_document_editor_ime_rejection_preserves_preedit_selection ... ok
+test ui::document::tests::full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo ... ok
+test ui::document::tests::full_fix_20261014_document_oversized_paste_preserves_selection ... oversized paste: retained=21 elapsed=1.007166ms
+ok
+
+failures:
+
+failures:
+    app::tests::full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff
+
+test result: FAILED. 20 passed; 1 failed; 0 ignored; 0 measured; 3219 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

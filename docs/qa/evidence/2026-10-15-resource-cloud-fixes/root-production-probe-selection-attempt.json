@@ -1,0 +1,8 @@
+{
+  "command": ["python3", "/private/tmp/deppy-cloud-fix-root-20261015/run-production-pty.py"],
+  "exit_code": 1,
+  "stage": "precondition before compile or execution",
+  "cause": "The first invocation retained an older fixed rlib path whose mtime preceded the corrected source. The freshness assertion rejected it.",
+  "correction": "Select the fresh canonical production cohort, verify deps.d, source hashes and mtime, then link a new binary. The later production identity artifact records actual compile0/run0.",
+  "product_test_failure": false
+}

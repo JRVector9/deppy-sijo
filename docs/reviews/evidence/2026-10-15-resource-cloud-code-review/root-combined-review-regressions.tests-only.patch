@@ -1,0 +1,281 @@
+diff --git a/crates/app/src/cloud_agent/bridge_tests.rs b/crates/app/src/cloud_agent/bridge_tests.rs
+--- a/crates/app/src/cloud_agent/bridge_tests.rs
++++ b/crates/app/src/cloud_agent/bridge_tests.rs
+@@ -614,3 +614,29 @@
+     assert!(clean.contains("[REDACTED]"));
+     assert!(clean.contains("before") && clean.contains("after"));
+ }
++
++
++#[test]
++fn review_20261015_list_sessions_redacts_known_secret_display_metadata() {
++    let (mut bridge, mut target) = setup();
++    let secret_value = "review-known-cloud-secret-access-token-20261015";
++    let secret = secret::SecretString::new(secret_value.into());
++    let _lease = bridge.redaction.acquire_rotating(&secret).unwrap();
++    target.title = format!("Terminal {secret_value}");
++    target.workspace_name = format!("Project {secret_value}");
++    bridge.set_targets(vec![target.clone()]);
++    let actor = client(&bridge, "Read-only reviewer");
++    bridge
++        .set_connection_access(&actor.id, &target, true, false)
++        .unwrap();
++    let (req, rx) = request(&bridge, &actor, "list_sessions", json!({}));
++    bridge.handle_and_drain(req, |_, _| panic!("listing must not dispatch input"));
++    let reply = rx.recv().unwrap().unwrap();
++    let row = &reply["sessions"][0];
++    assert_eq!(row["session_id"], target.id, "routing identity must be retained");
++    assert_eq!(row["generation"], target.generation);
++    assert_eq!(row["input_allowed"], false, "the recipient only has read consent");
++    assert_eq!(row["title"], "Terminal [REDACTED]", "known credential leaked through session display title");
++    assert_eq!(row["workspace_name"], "Project [REDACTED]", "known credential leaked through workspace display name");
++    assert!(!reply.to_string().contains(secret_value));
++}
+diff --git a/crates/app/src/cloud_agent/ui/management_tests.rs b/crates/app/src/cloud_agent/ui/management_tests.rs
+--- a/crates/app/src/cloud_agent/ui/management_tests.rs
++++ b/crates/app/src/cloud_agent/ui/management_tests.rs
+@@ -1316,3 +1316,36 @@
+     );
+     harness.get_by_label("Could not open the original session. It may have been closed; the report remains available.");
+ }
++
++
++#[test]
++fn review_20261015_owner_can_revoke_read_consent_after_session_exit() {
++    let (mut bridge, mut target, review, _, _) = connection_fixture();
++    bridge.set_connection_access(&review, &target, true, false).unwrap();
++    target.live = false;
++    bridge.set_targets(vec![target.clone()]);
++    assert!(bridge.connection_permission(&review, &target).read);
++    assert!(!bridge.connection_permission(&review, &target).input);
++    // The controller already accepts safe revocation on the retained exited target.
++    bridge.set_connection_access(&review, &target, false, false).unwrap();
++    assert!(!bridge.connection_permission(&review, &target).read);
++    bridge.set_connection_access(&review, &target, true, false).unwrap();
++    let mut harness = harness(bridge);
++    harness
++        .get_by_label("Review Bot · Credential issued · waiting for authentication")
++        .click();
++    harness.run();
++    harness.get_by_label("Access permissions").click();
++    harness.run();
++    harness
++        .get_by_role_and_label(
++            egui::accesskit::Role::CheckBox,
++            "Allow this connection to read · receive answers",
++        )
++        .click();
++    harness.run();
++    assert!(
++        !harness.state().connection_permission(&review, &target).read,
++        "the owner cannot withdraw retained read consent using the exited session's checkbox"
++    );
++}
+diff --git a/crates/app/src/cloud_agent/management.rs b/crates/app/src/cloud_agent/management.rs
+--- a/crates/app/src/cloud_agent/management.rs
++++ b/crates/app/src/cloud_agent/management.rs
+@@ -1840,4 +1840,162 @@
+             "omitted legacy artifacts must remain explicit"
+         );
+     }
++
++    #[test]
++    fn quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock() {
++        let directory = std::env::temp_dir().join(format!(
++            "deppy-quality-bootstrap-{}", uuid::Uuid::new_v4()
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let path = directory.join("history.db");
++        let db = agent_mcp::History::open(&path).unwrap();
++        let at = now() as i64;
++        let mut run = agent_mcp::CloudRun::new(
++            "saved-run", "actor", "Actor", "workspace", "session", "generation",
++            "Saved report", "", at,
++        ).unwrap();
++        db.save_run(&run).unwrap();
++        run.apply_report(&run.actor(), agent_mcp::RunUpdate {
++            state: agent_mcp::RunState::Running,
++            progress: None, message: String::new(), result: None, artifacts: vec![],
++        }, at).unwrap();
++        db.save_run(&run).unwrap();
++        run.apply_report(&run.actor(), agent_mcp::RunUpdate {
++            state: agent_mcp::RunState::Completed,
++            progress: Some(100), message: String::new(),
++            result: Some("Durable useful result".into()), artifacts: vec![],
++        }, at).unwrap();
++        db.save_run(&run).unwrap();
++        drop(db);
++
++        let mut bridge = CloudAgent::new(
++            &path, secret::RedactionService::new(), egui::Context::default(),
++        );
++        bridge.initialize_history();
++        let open = bridge.history.wait().unwrap();
++        bridge.complete_history(open, &mut |_, _| panic!("bootstrap must not type"), &mut vec![]);
++        assert!(bridge.history_ready);
++
++        let lock = rusqlite::Connection::open(&path).unwrap();
++        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
++        bridge.poll_management();
++        let bootstrap = bridge.history.wait().unwrap();
++        assert!(matches!(&bootstrap.result, ResultKind::ListRuns(Err(()))),
++            "the initial native run load must actually fail under the exclusive lock");
++        bridge.complete_history(bootstrap, &mut |_, _| panic!("bootstrap must not type"), &mut vec![]);
++        assert!(bridge.cloud_runs().is_empty());
++        lock.execute_batch("COMMIT").unwrap();
++        drop(lock);
++
++        // Qualify the failure: the same actor still works after the lock is released.
++        let probe = bridge.operation_token();
++        assert!(bridge.history.request(probe, Job::ListRuns {
++            query: RunQuery::default(),
++        }).is_ok());
++        let recovered = bridge.history.wait().unwrap();
++        match &recovered.result {
++            ResultKind::ListRuns(Ok(page)) => {
++                assert_eq!(page.runs.len(), 1);
++                assert_eq!(page.runs[0].id, "saved-run");
++            }
++            _ => panic!("the actor must serve the persisted run again after SQLite unlocks"),
++        }
++        drop(recovered);
++
++        bridge.drain_history(|_, _| panic!("history recovery must not type"));
++        let cached = bridge.cloud_runs();
++        drop(bridge);
++        std::fs::remove_dir_all(&directory).unwrap();
++        assert_eq!(cached.len(), 1,
++            "a transient failed bootstrap must retry and reveal the saved run after SQLite recovers");
++        assert_eq!(cached[0].id, "saved-run");
++        assert_eq!(cached[0].result.as_deref(), Some("Durable useful result"));
++    }
++
+ }
++
++
++
++#[cfg(test)]
++mod review_shutdown_20261015 {
++    use super::*;
++    use std::sync::atomic::{AtomicUsize, Ordering};
++    use std::time::Instant;
++
++    struct LockGuard(Option<rusqlite::Connection>);
++    impl LockGuard {
++        fn release(&mut self) {
++            if let Some(connection) = self.0.take() {
++                // Connection Drop also rolls back if this explicit release fails.
++                let _ = connection.execute_batch("ROLLBACK");
++            }
++        }
++    }
++    impl Drop for LockGuard {
++        fn drop(&mut self) { self.release(); }
++    }
++
++    fn stale_shutdown_fixture(hold_external_lock: bool) -> (bool, usize, u128) {
++        let dir = std::env::temp_dir().join(format!("deppy-review-stale-shutdown-{}", uuid::Uuid::new_v4()));
++        std::fs::create_dir(&dir).unwrap();
++        let path = dir.join("cloud.db");
++        let completions = Arc::new(AtomicUsize::new(0));
++        let observed = completions.clone();
++        let mut bridge = CloudAgent::with_worker(
++            crate::cloud_history_worker::HistoryWorker::new(Some(path.clone()), move || {
++                observed.fetch_add(1, Ordering::SeqCst);
++            }),
++            secret::RedactionService::new(),
++        );
++        bridge.drain_history(|_, _| panic!("shutdown fixture never types"));
++        assert!(bridge.history_ready);
++        let run = CloudRun::new(
++            "stale-run", agent_mcp::LEGACY_CONNECTION_ID, "Legacy", "workspace", "session", "g1", "Inspect", "", now() as i64 - 120,
++        ).unwrap();
++        let token = bridge.operation_token();
++        assert!(bridge.history.request(token, Job::SaveRun { run: run.clone() }).is_ok());
++        assert!(matches!(bridge.history.wait().unwrap().result, ResultKind::SaveRun(Ok(()))));
++        bridge.install_cloud_run(run);
++        assert!(bridge.management.pending.is_empty(), "no initial outstanding management jobs");
++        assert_eq!(bridge.history.retained_bytes(), 0, "no initial outstanding actor jobs");
++        assert!(bridge.management_poll_after().is_some());
++        let external = rusqlite::Connection::open(&path).unwrap();
++        let mut lock = if hold_external_lock {
++            external.execute_batch("BEGIN EXCLUSIVE").unwrap();
++            LockGuard(Some(external))
++        } else {
++            drop(external);
++            LockGuard(None)
++        };
++        let baseline_completions = completions.load(Ordering::SeqCst);
++        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
++        let started = Instant::now();
++        let worker = std::thread::spawn(move || {
++            bridge.shutdown();
++            let _ = done_tx.send(());
++        });
++        // Only one stale run exists, and its first GetRun has a 100ms SQLite
++        // busy timeout. Give finite draining seven times that budget. Always
++        // release the fixture lock and join before asserting on the baseline.
++        let ended_before_release = done_rx.recv_timeout(Duration::from_millis(700)).is_ok();
++        let completions_before_release = completions.load(Ordering::SeqCst).saturating_sub(baseline_completions);
++        lock.release();
++        worker.join().unwrap();
++        let elapsed_ms = started.elapsed().as_millis();
++        std::fs::remove_dir_all(&dir).unwrap();
++        eprintln!("stale-shutdown: lock={hold_external_lock}, ended_before_release={ended_before_release}, completions_before_release={completions_before_release}, total_elapsed_ms={elapsed_ms}");
++        (ended_before_release, completions_before_release, elapsed_ms)
++    }
++
++    #[test]
++    fn review_20261015_shutdown_unlocked_stale_run_finishes() {
++        let (ended, _, elapsed) = stale_shutdown_fixture(false);
++        assert!(ended, "unlocked control must finish within 700ms, elapsed={elapsed}ms");
++    }
++
++    #[test]
++    fn review_20261015_shutdown_does_not_reenqueue_failed_stale_reads_forever() {
++        let (ended, repeated_completions, _) = stale_shutdown_fixture(true);
++        assert!(ended, "shutdown kept creating failed stale read jobs after close began ({repeated_completions} completions while the external lock remained held)");
++    }
++}
+diff --git a/crates/web-remote/src/ws_api.rs b/crates/web-remote/src/ws_api.rs
+--- a/crates/web-remote/src/ws_api.rs
++++ b/crates/web-remote/src/ws_api.rs
+@@ -740,4 +740,37 @@
+         assert!(!ok, "stop 상태인데 인증이 성공/대기했다");
+         drop(client);
+     }
+-}
++    #[test]
++    fn review_20261015_auth_rejects_valid_message_completed_after_whole_deadline() {
++        use std::io::Write;
++        use std::net::TcpListener;
++        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
++        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (server, _) = listener.accept().unwrap();
++        server.set_read_timeout(Some(WS_TICK)).unwrap();
++        let mut ws = WebSocket::from_raw_socket(server, Role::Server, None);
++        let mut payload = format!(r#"{{"type":"auth","v":{},"token":"tok"}}"#, PROTOCOL_VERSION).into_bytes();
++        payload.extend(std::iter::repeat_n(b' ', 160));
++        assert!(matches!(ClientMsg::parse(std::str::from_utf8(&payload).unwrap()), Some(ClientMsg::Auth { .. })), "fixture must be a valid auth frame");
++        let mut frame = vec![0x81, 0xfe];
++        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
++        frame.extend_from_slice(&[0; 4]);
++        frame.extend_from_slice(&payload);
++        client.write_all(&frame[..10]).unwrap();
++        let writer = std::thread::spawn(move || {
++            for chunk in frame[10..].chunks(5) {
++                std::thread::sleep(Duration::from_millis(160));
++                if client.write_all(chunk).is_err() { break; }
++            }
++        });
++        let start = Instant::now();
++        let accepted = authenticate(&mut ws, "tok", &AtomicBool::new(false), AUTH_TIMEOUT);
++        let elapsed = start.elapsed();
++        drop(ws);
++        writer.join().unwrap();
++        eprintln!("auth whole deadline={:?}; elapsed={elapsed:?}; late valid message accepted={accepted}", AUTH_TIMEOUT);
++        assert!(!accepted, "a valid auth message completed after the whole deadline must be rejected");
++        assert!(elapsed <= AUTH_TIMEOUT + WS_TICK + Duration::from_millis(100), "auth whole deadline exceeded: {elapsed:?}");
++    }
++
++}

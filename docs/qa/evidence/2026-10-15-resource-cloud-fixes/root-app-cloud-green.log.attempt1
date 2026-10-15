@@ -1,0 +1,48 @@
+   Compiling secret v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling auth v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+error[E0599]: no method named `accesskit_node` found for struct `egui_kittest::Node<'tree>` in the current scope
+    --> crates/app/src/cloud_agent/ui/management_tests.rs:1369:18
+     |
+1369 |     assert!(read.accesskit_node().is_disabled());
+     |                  ^^^^^^^^^^^^^^ private field, not a method
+     |
+    ::: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/kittest-0.4.0/src/node.rs:11:8
+     |
+  11 |     fn accesskit_node(&self) -> AccessKitNode<'tree>;
+     |        -------------- the method is available for `egui_kittest::Node<'_>` here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: trait `NodeT` which provides `accesskit_node` is implemented but not in scope; perhaps you want to import it
+     |
+   1 + use egui_kittest::kittest::NodeT;
+     |
+
+error[E0599]: no method named `accesskit_node` found for struct `egui_kittest::Node<'tree>` in the current scope
+    --> crates/app/src/cloud_agent/ui/management_tests.rs:1377:19
+     |
+1377 |     assert!(input.accesskit_node().is_disabled());
+     |                   ^^^^^^^^^^^^^^ private field, not a method
+     |
+    ::: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/kittest-0.4.0/src/node.rs:11:8
+     |
+  11 |     fn accesskit_node(&self) -> AccessKitNode<'tree>;
+     |        -------------- the method is available for `egui_kittest::Node<'_>` here
+     |
+     = help: items from traits can only be used if the trait is in scope
+help: trait `NodeT` which provides `accesskit_node` is implemented but not in scope; perhaps you want to import it
+     |
+   1 + use egui_kittest::kittest::NodeT;
+     |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `deppy-sijo` (bin "deppy-sijo" test) due to 2 previous errors

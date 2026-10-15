@@ -1,0 +1,32 @@
+   Compiling connector-contract v0.12.1 (/private/tmp/deppy-popup-fix-secret-20261014/crates/connector-contract)
+   Compiling connector-ui v0.12.1 (/private/tmp/deppy-popup-fix-secret-20261014/crates/connector-ui)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10.66s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_ui-393ac8cf42b2180f)
+
+running 9 tests
+test oauth_secret_tests::oauth_secret_active_input_has_no_undo_history ... ok
+
+thread 'oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state' (46616401) panicked at crates/connector-ui/src/oauth_secret_tests.rs:216:5:
+assertion failed: shared.undoer().has_undo(&(cursor, String::new()))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state ... FAILED
+test oauth_secret_tests::oauth_secret_operation_switch_clears_undo ... ok
+test oauth_secret_tests::oauth_secret_revision_switch_clears_undo ... ok
+test oauth_secret_tests::oauth_secret_server_switch_clears_undo ... ok
+test oauth_secret_tests::oauth_secret_hidden_surface_clears_undo_without_rendering ... ok
+test oauth_secret_tests::oauth_secret_missing_snapshot_clears_undo ... ok
+
+thread 'oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits' (46616400) panicked at crates/connector-ui/src/oauth_secret_tests.rs:108:5:
+a previous OAuth client's secret must not re-enter a later submission through undo
+test oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits ... FAILED
+test oauth_secret_tests::oauth_secret_success_does_not_restore_the_submitted_value ... ok
+
+failures:
+
+failures:
+    oauth_secret_tests::oauth_secret_cancel_clears_undo_before_another_operation_submits
+    oauth_secret_tests::oauth_secret_clear_also_clears_cloned_undo_state
+
+test result: FAILED. 7 passed; 2 failed; 0 ignored; 0 measured; 26 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p connector-ui --lib`

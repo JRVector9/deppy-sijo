@@ -1,0 +1,62 @@
+[
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo",
+    "tracked_diff_sha256": "f182b6e014f8a8c6f7d409e2aaaa2a9f5f65faf1c65403937d8d39abaf42ff5c",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-agent-wait-audit",
+    "tracked_diff_sha256": "873f824633fe78b387decee50bfd1da527e94182299c28a2c047df55390ac9af",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-cloud-agent-mcp",
+    "tracked_diff_sha256": "3269c4b3b4fbb1c7abe15a95583b4cee402a8e86fbef0049fe9009884bdc94ab",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-env-api-preview",
+    "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-layout-20260906",
+    "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-perf-baseline",
+    "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-perf-model",
+    "tracked_diff_sha256": "fbc2096673d91bdfafe2dd01ce8304b4a04443fbb9e25dd888e6aa252ff73e43",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-perf-render",
+    "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-perf-storage",
+    "tracked_diff_sha256": "aa27f6052ce3016c992b7bd05db73c087c6a6ec2e9e23f8d9c93ccc0fb28f03c",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-performance",
+    "tracked_diff_sha256": "cc5f381a66abec10b8700fba29185ce2e9040cbbd0e628d4d940a5baebc5dbdd",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-project-keys",
+    "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "preserved": true
+  },
+  {
+    "worktree": "/Users/jr/Desktop/projects/deppy-sijo-pwa-reading-20261008",
+    "tracked_diff_sha256": "91982b5a0ff40d4c0cb7520860220c6154972558f7280457b9a8add55da64b76",
+    "preserved": true
+  }
+]

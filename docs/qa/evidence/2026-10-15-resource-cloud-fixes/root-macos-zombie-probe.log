@@ -1,0 +1,43 @@
+libc CLD_EXITED=1 CLD_KILLED=2 CLD_DUMPED=3 CLD_STOPPED=5 CLD_CONTINUED=6
+waitid WNOWAIT step=0 result=0 returned_pid=0 si_code=0 si_status=0
+pid=49625 result=136 status=2 birth=(1792019626, 365865) pgid=49625 getsid=49625 sid_error=Undefined error: 0 (os error 0)
+waitid WNOWAIT step=1 result=0 returned_pid=49625 si_code=5 si_status=17
+pid=49625 result=136 status=4 birth=(1792019626, 365865) pgid=49625 getsid=49625 sid_error=Operation timed out (os error 60)
+waitid WNOWAIT step=2 result=0 returned_pid=49625 si_code=5 si_status=17
+pid=49625 result=136 status=4 birth=(1792019626, 365865) pgid=49625 getsid=49625 sid_error=Operation timed out (os error 60)
+waitid WNOWAIT step=3 result=0 returned_pid=0 si_code=0 si_status=0
+pid=49625 result=136 status=2 birth=(1792019626, 365865) pgid=49625 getsid=49625 sid_error=Operation timed out (os error 60)
+waitid WNOWAIT step=4 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=5 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=6 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=7 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=8 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=9 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=10 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=11 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=12 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=13 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=14 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=15 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=16 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=17 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=18 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+waitid WNOWAIT step=19 result=0 returned_pid=49625 si_code=1 si_status=0
+pid=49625 result=0/136 error=No such process (os error 3) getsid=-1 sid_error=No such process (os error 3)
+owned child wait=Ok(ExitStatus(unix_wait_status(0)))
+after reap waitid=-1 error=No child processes (os error 10)

@@ -1,0 +1,22 @@
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/storage-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.11s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/storage_core-de24ae110c4c239a)
+
+running 1 test
+test tests::full_fix_20261014_backup_contains_committed_wal_rows_with_live_reader ... path=/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-backup-regression-93369-1791984456530480000 live_rows=2 backup_rows=1 migrated_version=2 backup_integrity=ok elapsed_ms=5380
+
+thread 'tests::full_fix_20261014_backup_contains_committed_wal_rows_with_live_reader' (48468459) panicked at crates/storage-core/src/lib.rs:191:9:
+assertion `left == right` failed: successful pre-migration backup omitted a committed row
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    tests::full_fix_20261014_backup_contains_committed_wal_rows_with_live_reader
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 5.39s
+
+error: test failed, to rerun pass `-p storage-core --lib`

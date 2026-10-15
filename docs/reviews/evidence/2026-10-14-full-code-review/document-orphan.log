@@ -1,0 +1,8 @@
+after_closed_owner: visible_document_ids=[]; reopen_same_path=None; retained_dirty=true; retained_source=unsaved edit
+only_after_explicit_dead_scope_switch=[DocumentTabId(1)]
+
+thread 'main' (47925569) panicked at /private/tmp/deppy-ui-session-review-20261014.rs:55:5:
+assertion `left == right` failed: explicit reopening from a live pane must recover the retained dirty document instead of creating another buffer
+  left: None
+ right: Some(DocumentTabId(1))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,16 @@
+before kind=normal action=drop freeze=false shell=ProcessIdentity { pid: Some(27329), process_group: Some(27329), source: PortablePty } workload=Identity { pid: 27333, group: 27333, session: 27329, birth: (1791993689, 941996), zombie: false } actual_foreground=Some(27333)
+after kind=normal action=drop freeze=false teardown_ms=54.405 same_live_workload_survives=false identity=None
+cleanup kind=normal action=drop freeze=false PASS
+before kind=ignore-hup action=drop freeze=false shell=ProcessIdentity { pid: Some(27419), process_group: Some(27419), source: PortablePty } workload=Identity { pid: 27420, group: 27420, session: 27419, birth: (1791993690, 331690), zombie: false } actual_foreground=Some(27420)
+after kind=ignore-hup action=drop freeze=false teardown_ms=51.173 same_live_workload_survives=true identity=Some(Identity { pid: 27420, group: 27420, session: 27419, birth: (1791993690, 331690), zombie: false })
+cleanup kind=ignore-hup action=drop freeze=false PASS
+before kind=ignore-hup action=kill freeze=false shell=ProcessIdentity { pid: Some(27421), process_group: Some(27421), source: PortablePty } workload=Identity { pid: 27422, group: 27422, session: 27421, birth: (1791993690, 727759), zombie: false } actual_foreground=Some(27422)
+after kind=ignore-hup action=kill freeze=false teardown_ms=53.343 same_live_workload_survives=true identity=Some(Identity { pid: 27422, group: 27422, session: 27421, birth: (1791993690, 727759), zombie: false })
+cleanup kind=ignore-hup action=kill freeze=false PASS
+before kind=ignore-hup action=drop freeze=true shell=ProcessIdentity { pid: Some(27427), process_group: Some(27427), source: PortablePty } workload=Identity { pid: 27428, group: 27428, session: 27427, birth: (1791993691, 122899), zombie: false } actual_foreground=Some(27428)
+after kind=ignore-hup action=drop freeze=true teardown_ms=234.957 same_live_workload_survives=false identity=None
+cleanup kind=ignore-hup action=drop freeze=true PASS
+
+thread 'main' (51627278) panicked at /private/tmp/deppy-cloud-review-perf-20261015/pty_nonfrozen.rs:32:308:
+non-frozen foreground escaped pane/session close
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

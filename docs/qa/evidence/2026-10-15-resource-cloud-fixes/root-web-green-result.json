@@ -1,0 +1,14 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "web-remote",
+    "--no-fail-fast",
+    "--",
+    "--test-threads=1"
+  ],
+  "exit_code": 0
+}

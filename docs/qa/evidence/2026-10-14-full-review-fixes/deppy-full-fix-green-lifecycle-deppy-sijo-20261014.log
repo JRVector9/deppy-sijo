@@ -1,0 +1,29 @@
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/pty)
+error: expected one of `,` or `>`, found `*`
+   --> crates/pty/src/workload_signal.rs:114:65
+    |
+114 |         anyhow::ensure!(bytes >= 0 && bytes as usize < capacity * std::mem::size_of::<libc::pid_t>(),
+    |                                                                 ^ expected one of `,` or `>`
+    |
+help: expressions must be enclosed in braces to be used as const generic arguments
+    |
+114 |         anyhow::ensure!(bytes >= 0 && bytes as usize < { capacity * std::mem::size_of::<libc::pid_t>() },
+    |                                                        +                                               +
+
+error: expected one of `,`, `.`, `>`, `?`, or an operator, found `<eof>`
+   --> crates/pty/src/workload_signal.rs:115:13
+    |
+115 |             "process group inspection incomplete");
+    |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected one of `,`, `.`, `>`, `?`, or an operator
+    |
+   ::: /Users/jr/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/anyhow-1.0.104/src/ensure.rs:913:6
+    |
+913 |     ($cond:expr $(,)?) => {
+    |      ---------- while parsing argument for this `expr` macro fragment
+    |
+help: you might have meant to end the type parameters here
+    |
+115 |             "process group inspection incomplete">);
+    |                                                  +
+
+error: could not compile `pty` (lib) due to 2 previous errors

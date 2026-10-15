@@ -1,0 +1,7 @@
+viewport_col=2 input_col=3 viewport_row=Placeholder input_row=Draft
+
+thread 'main' (37730425) panicked at /private/tmp/deppy-composer-review-20261014/wide_cursor_probe.rs:127:5:
+assertion `left == right` failed: wide spacer must preserve native placeholder readiness
+  left: Draft
+ right: Placeholder
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

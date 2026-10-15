@@ -1,0 +1,56 @@
+
+running 9 tests
+
+thread 'ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_inode_replacement' (46598799) panicked at crates/app/src/ui/file_tree.rs:17358:9:
+worker must reject replacement after UI approval
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_inode_replacement --- FAILED
+
+thread 'ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_parent_redirect' (46598800) panicked at crates/app/src/ui/file_tree.rs:17388:9:
+worker must reject parent escape after UI approval
+ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_parent_redirect --- FAILED
+
+thread 'ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_root_replacement' (46598801) panicked at crates/app/src/ui/file_tree.rs:17411:9:
+worker must reject changed root identity
+ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_root_replacement --- FAILED
+.restored child access: retry=false, inaccessible=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing' (46598829) panicked at crates/app/src/ui/file_tree.rs:17118:9:
+after access is restored, manual Refresh must retry the denied child and show its contents
+ 4/9
+ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing --- FAILED
+
+thread 'ui::file_tree::tests::popup_audit_20261014_explicit_expand_retries_permission_denied_child' (46598830) panicked at crates/app/src/ui/file_tree.rs:17480:9:
+explicit expand must retry and restore contents
+ui::file_tree::tests::popup_audit_20261014_explicit_expand_retries_permission_denied_child --- FAILED
+partial-copy result: first_published=true, first_visible=false
+
+thread 'ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination' (46598831) panicked at crates/app/src/ui/file_tree.rs:17179:9:
+a partially applied host failure must refresh the affected destination without depending on a healthy OS watcher
+ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination --- FAILED
+permanent-delete parent escape: root_refresh_retained_confirm=true, issued_delete=true, outside_survived=false, original_survived=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent' (46598832) panicked at crates/app/src/ui/file_tree.rs:17307:9:
+an old failed-trash confirmation must not permanently delete an unselected file outside the original tree after the parent is redirected
+ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent --- FAILED
+replaced-file confirmation: inode 577384160->577384161, retained=true, issued_delete=true, new_survived=false, original_survived=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation' (46598848) panicked at crates/app/src/ui/file_tree.rs:17238:9:
+an old failed-trash confirmation must not authorize permanent deletion of a different inode created by a subsequent checkout/build
+ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation --- FAILED
+
+failures:
+
+failures:
+    ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_inode_replacement
+    ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_parent_redirect
+    ui::file_tree::tests::popup_audit_20261014_approved_delete_rejects_worker_time_root_replacement
+    ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing
+    ui::file_tree::tests::popup_audit_20261014_explicit_expand_retries_permission_denied_child
+    ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination
+    ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent
+    ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation
+
+test result: FAILED. 1 passed; 8 failed; 0 ignored; 0 measured; 3191 filtered out; finished in 0.40s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

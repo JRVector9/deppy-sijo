@@ -1,0 +1,62 @@
+--- a/crates/app/src/ui/file_tree.rs
++++ b/crates/app/src/ui/file_tree.rs
+@@ -17036,6 +17036,59 @@
+         );
+     }
+ 
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_permanent_delete_rejects_redirected_parent() {
++        use egui_kittest::kittest::Queryable as _;
++        let base = temp_root("popup-audit-confirmation-parent-escape");
++        let root = base.join("tree");
++        let child = root.join("sub");
++        let outside = base.join("outside");
++        std::fs::create_dir_all(&child).unwrap();
++        std::fs::create_dir(&outside).unwrap();
++        let target = child.join("selected.txt");
++        let outside_target = outside.join("selected.txt");
++        std::fs::write(&target, b"original-selected-content").unwrap();
++        std::fs::write(&outside_target, b"unselected-outside-content").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(root.clone()));
++        drain_listings(&mut tree);
++        tree.toggle_dir(&child);
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget { path: target.clone(), label: "sub/selected.txt".into(), is_dir: false });
++        let failed_trash = tree.take_io_intent().unwrap();
++        tree.complete_io(FileTreeIoCompletion {
++            operation: failed_trash.operation, generation: failed_trash.generation,
++            result: Err(FileTreeIoErrorCode::TrashUnavailable),
++        });
++        assert!(tree.confirm_delete.is_some());
++        std::fs::rename(&child, root.join("original-sub-retained")).unwrap();
++        std::os::unix::fs::symlink(&outside, &child).unwrap();
++        tree.refresh();
++        drain_listings(&mut tree);
++        let retained = tree.confirm_delete.is_some();
++        assert!(outside_target.is_file(), "the outside file exists before the confirmation click");
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        let mut issued_delete = false;
++        if let Some(button) = harness.query_by_label(&catalog.t("file_tree.permanent_delete", &[])) {
++            button.click();
++            if let Some(intent) = (0..8).find_map(|_| { harness.step(); harness.state_mut().0.take_io_intent() }) {
++                issued_delete = true;
++                assert!(matches!(&intent.request, FileTreeIoRequest::DeletePermanently { target: payload } if payload.as_path() == target));
++                let result = crate::app::pr11_private_file_fixture_io(intent.request, &root);
++                assert_eq!(result, Ok(()));
++            }
++        }
++        let outside_survived = outside_target.exists();
++        let original_survived = std::fs::read(root.join("original-sub-retained/selected.txt")).unwrap() == b"original-selected-content";
++        println!("permanent-delete parent escape: root_refresh_retained_confirm={retained}, issued_delete={issued_delete}, outside_survived={outside_survived}, original_survived={original_survived}");
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(outside_survived, "an old failed-trash confirmation must not permanently delete an unselected file outside the original tree after the parent is redirected");
++    }
++
+     #[test]
+     fn popup_behavior_pending_delete_is_visible_when_file_list_is_hidden() {
+         use egui_kittest::kittest::Queryable;

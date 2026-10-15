@@ -1,0 +1,20 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.76s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 2 tests
+test app::tests::full_fix_20261014_host_completion_cancelled_owner_discards_payload ... ok
+test app::tests::full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once ...
+thread 'app::tests::full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once' (48680985) panicked at crates/app/src/app.rs:52135:31:
+queue-full must preserve the completed one-shot input
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    app::tests::full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 3223 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

@@ -1,0 +1,2708 @@
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling ureq v3.4.0
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling mux v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling peniko v0.6.1
+   Compiling persist v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling mcp-store v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling vello_common v0.1.0
+   Compiling harfrust v0.12.0
+   Compiling vello_cpu v0.1.0
+   Compiling vte v0.15.0
+   Compiling epaint v0.36.1
+   Compiling storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-performance/third_party/alacritty_terminal-0.26.0)
+   Compiling egui v0.36.1
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling terminal v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling rcgen v0.14.10
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling icu_normalizer v2.2.0
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling idna_adapter v1.2.2
+   Compiling matchers v0.2.0
+   Compiling idna v1.1.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling url v2.5.8
+   Compiling rand_chacha v0.3.1
+   Compiling chrono v0.4.45
+   Compiling rand v0.8.6
+   Compiling http-client v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/http-client)
+   Compiling oauth2 v5.0.0
+   Compiling mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling auth v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+   Compiling relay-server v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-server)
+   Compiling connector-contract v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-contract)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling platform v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/platform)
+   Compiling xtask v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/xtask)
+   Compiling mcp-proxy v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-proxy)
+   Compiling relay-protocol v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-protocol)
+   Compiling storage-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 00s
+     Running unittests src/lib.rs (target/debug/deps/agent_mcp-3dc20f27d78c8b76)
+
+running 68 tests
+test history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones ... ok
+test history::efficiency_tests::cloud_management_migration_adds_durable_tables_without_rewriting_claims ... ok
+test history::efficiency_tests::legacy_history_reopen_preserves_tombstones_and_bounds_answers ... ok
+test history::efficiency_tests::measure_history_completion_and_cleanup_scaling ... ignored, measures real History completion, recent reads, SQL steps and index footprint
+test history::management_tests::cloud_review_small_snapshot_returns_a_page_with_explicit_truncation ... ok
+test history::management_tests::cloud_review_valid_newline_answers_fit_retained_memory_snapshot_budget ... ok
+test history::management_tests::durable_run_pages_support_reused_ids_and_do_not_skip_byte_limited_rows ... ok
+test history::management_tests::durable_runs_reject_late_saves_and_restore_unfinished_as_unknown ... ok
+test history::management_tests::durable_save_requires_existing_cancel_request_and_terminal_result_is_immutable ... ok
+test history::management_tests::exact_actor_scoped_get_run_retrieves_beyond_first_page ... ok
+test history::management_tests::history_pages_filter_actor_and_generation_with_bounded_cursor ... ok
+test history::management_tests::legacy_scoped_claim_obeys_existing_tombstone_and_new_scope_binds_target ... ok
+test history::management_tests::query_rejects_oversized_external_rows_before_materialization ... ok
+test history::management_tests::same_external_id_is_independent_and_receipts_are_connection_scoped ... ok
+test history::management_tests::targeted_receipt_lookup_cannot_borrow_another_session_or_generation_permission ... ok
+test management::tests::cancel_request_is_distinct_from_same_actor_acknowledgment ... ok
+test management::tests::cloud_review_failed_recovery_cannot_claim_successful_stale_transition ... ok
+test management::tests::cloud_review_rejects_reports_without_recovery_metadata_headroom ... ok
+test management::tests::heartbeat_preserves_unknown_status_and_rejects_wrong_actor_or_older_reports ... ok
+test management::tests::queued_receipt_cannot_complete_a_run_and_terminal_runs_reject_late_reports ... ok
+test management::tests::run_and_artifact_bounds_fail_without_partial_mutation ... ok
+test management::tests::scoped_key_is_deterministic_disjoint_and_legacy_compatible ... ok
+test management::tests::stale_and_restored_runs_require_resume_before_completion ... ok
+test management::tests::wrong_actor_session_and_generation_cannot_mutate_original_run ... ok
+test oauth::tests::approval_near_deadline_denial_and_registration_flood_remain_bounded ... ok
+test oauth::tests::cloud_management_oauth_names_follow_approved_clients_and_refresh ... ok
+test oauth::tests::cloud_management_oauth_revoke_one_grant_keeps_other_grants_and_rejects_refresh ... ok
+test oauth::tests::failed_secret_registration_preserves_code_refresh_and_existing_access ... ok
+test oauth::tests::late_authorize_preserves_registration_and_denial_redirect_grace ... ok
+test oauth::tests::oauth_requires_owner_consent_pkce_binding_single_use_refresh_and_expiry ... ok
+test oauth::tests::redirect_bounds_reject_before_consent_and_allow_encoded_state ... ok
+test oauth::tests::refresh_replaces_its_access_slot_at_full_capacity ... ok
+test oauth::tests::refresh_scope_order_and_subset_preserve_original_refresh_grant ... ok
+test oauth::tests::refresh_scope_rejects_expansion_and_unknown_without_consuming_grant ... ok
+test server::deadline_tests::dripping_bytes_do_not_extend_total_read_deadline ... ok
+test server::hostname_tests::dedicated_funnel_port_is_allowed_but_urls_and_bad_domains_are_rejected ... ok
+test server::hostname_tests::generated_hostname_updates_real_host_checks_and_oauth_resource_once ... ok
+test server::oauth_lock_tests::oauth_wake_can_read_auth_without_deadlock ...
+running 1 test
+test server::oauth_lock_tests::oauth_wake_can_read_auth_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.00s
+
+ok
+test server::registry_tests::cloud_management_oauth_sync_preserves_last_verified_authentication ... ok
+test tests::actual_http_auth_origin_initialize_and_answer_tool_discovery ... ok
+test tests::answer_retention_uses_completion_order ... ok
+test tests::claimed_operations_survive_restart_and_cannot_be_reexecuted ... ok
+test tests::cloud_management_code_like_private_errors_and_structured_errors_are_safe ... ok
+test tests::cloud_management_fixed_management_errors_reach_live_http_without_authority_changes ... ok
+test tests::cloud_management_http_activity_uses_credential_identity_only ... ok
+test tests::cloud_management_live_http_old_and_new_tool_dispatch_remains_additive ... ok
+test tests::cloud_management_manual_identity_revocation_is_per_connection ... ok
+test tests::cloud_management_optional_public_port_preserves_exact_host_and_oauth_resource ... ok
+test tests::cloud_management_poll_contention_does_not_block_another_connection ... ok
+test tests::cloud_management_private_diagnostics_do_not_leave_as_tool_errors ... ok
+test tests::cloud_management_revoked_manual_credentials_do_not_exhaust_registry ... ok
+test tests::cloud_management_tools_are_additive_and_run_linkage_is_optional ... ok
+test tests::cloud_management_unknown_input_error_has_safe_retry_and_effect_fields ... ok
+test tests::cloud_management_wire_auth_kind_and_history_schema_are_canonical ... ok
+test tests::credential_revocation_waits_for_queue_admission_and_blocks_later_writes ... ok
+test tests::credentials_expire_and_rotate_without_reusing_authority ... ok
+test tests::fragmented_http_request_waits_for_remaining_bytes ... ok
+test tests::history_database_symlinks_are_rejected ... ok
+test tests::legacy_answer_database_migrates_and_prunes_on_open ... ok
+test tests::notifications_and_responses_use_202_without_a_body ... ok
+test tests::notified_answers_survive_input_audit_churn_and_expire_with_newer_answers ... ok
+test tests::oauth_http_discovery_and_challenge_are_available_without_a_token ... ok
+test tests::persisted_answers_are_durable_and_exact_retries_return_receipt ... ok
+test tests::plain_text_cannot_execute_without_submit ... ok
+test tests::pr9_actual_http_dispatch_preserves_paste_args_and_envelope_budget ... ok
+test tests::pr9_explicit_paste_is_discovered_with_no_implicit_submit ... ok
+test tests::pr9_paste_utf8_controls_and_legacy_limits_remain_explicit ... ok
+test tests::queued_oauth_request_is_invalid_after_access_refresh ... ok
+
+test result: ok. 67 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.22s
+
+     Running unittests src/lib.rs (target/debug/deps/audit-e324d2fb55a90664)
+
+running 65 tests
+test crypto::tests::rotation_옛_blob은_옛_key_id로_복호 ... ok
+test crypto::tests::roundtrip_원문_복원 ... ok
+test crypto::tests::구버전_0_10이_만든_blob을_그대로_복호화한다 ... ok
+test crypto::tests::위변조_감지 ... ok
+test log::tests::audit_operation은_prepared에서_한번만_완료된다 ... ok
+test log::tests::audit_record_debug는_subject_target_input_identifier를_숨긴다 ... ok
+test log::tests::authorization_grant는_exact_server_tool_input_bytes에_한번만_결합된다 ... ok
+test log::tests::authorization_proof는_exact_plan_binding과만_결합된다 ... ok
+test log::tests::authorization_proof는_같은_allowedness의_다른_decision을_거부한다 ... ok
+test log::tests::authorization_subject는_plan_proof_grant_persisted_record에_exact하게_결합된다 ... ok
+test log::tests::borrowed_owned_operation은_commit전에_exact_plan으로검증된다 ... ok
+test log::tests::debug_출력에_input_평문이_없다 ... ok
+test log::tests::delivery_unknown은_prepared에서_한번만_unknown으로_종결되고_retry를_막는다 ... ok
+test log::tests::denied_preflight는_external_call_grant를_만들지_않는다 ... ok
+test log::tests::denied는_종결되고_invalid_json은_행을_만들지_않는다 ... ok
+test log::tests::encryptor_failure_diagnostic은_static_fields만기록한다 ... ok
+test log::tests::encryptor_없으면_blob_null ... ok
+test log::tests::encryptor_있으면_원본이_암호화_저장되고_복호된다 ... ok
+test log::tests::grant와_bound_call_debug는_identifiers_schema_input을_숨긴다 ... ok
+test log::tests::json_escape된_secret_변형도_치환된다 ... ok
+test log::tests::json이_아닌_input은_본문_대신_gap_marker만_저장 ... ok
+test log::tests::legacy_completion은_owner_scoped_prepared를_종결할수없다 ... ok
+test log::tests::lifecycle_migration은_legacy_audit을_succeeded로_보존한다 ... ok
+test log::tests::sanitized_preview는_key_pattern과_utf8_char상한을_지킨다 ... ok
+test log::tests::shared_input_validator는_size_json_object를_pre_io에서_강제한다 ... ok
+test log::tests::등록되지_않은_secret도_민감_key면_마스킹된다 ... ok
+test log::tests::민감_key_표기_변형도_마스킹된다 ... ok
+test log::tests::실패_outcome에는_low_cardinality_error_code만_허용한다 ... ok
+test log::tests::컬럼_저장_roundtrip ... ok
+test log::tests::평문_secret은_감사_로그에_남지_않는다 ... ok
+test log::tests::헤더류_name_value_쌍의_secret이_마스킹된다 ... ok
+test policy::tests::allow_always_이후_같은_스키마는_자동_허용 ... ok
+test policy::tests::authorization_plan은_global_호환을_유지하고_subject를_정확히_한번만_bind한다 ... ok
+test policy::tests::authorization_subject는_owned_bounded_nul_free이고_debug가_id를_숨긴다 ... ok
+test policy::tests::debug_출력에_input_평문이_없다 ... ok
+test policy::tests::decision_문자열과_허용_여부 ... ok
+test policy::tests::deny_always는_승인_이력을_무효화한다 ... ok
+test policy::tests::deny_규칙은_즉시_거부 ... ok
+test policy::tests::load_rule은_규칙과_승인이력을_복원한다 ... ok
+test policy::tests::once_계열은_상태를_바꾸지_않는다 ... ok
+test policy::tests::plan_debug는_식별자와_schema를_숨긴다 ... ok
+test policy::tests::plan은_shared_evaluation또는_opaque_pending_resolve로만_생성된다 ... ok
+test policy::tests::shared_evaluation은_모든_rule에서_유효한_live_hash를_요구한다 ... ok
+test policy::tests::규칙_변경은_승인_이력을_무효화하고_같은_규칙_재지정은_유지한다 ... ok
+test policy::tests::규칙은_서버와_tool_이름_쌍_단위 ... ok
+test policy::tests::기본값은_ask ... ok
+test policy::tests::기형_schema_hash는_영구_승인이_되지_않는다 ... ok
+test policy::tests::스키마_변경_시_재승인 ... ok
+test policy::tests::직접_지정한_allow는_첫_사용에_승인_필요 ... ok
+test retention::tests::age_limit_prunes_even_when_item_and_byte_limits_have_room ... ok
+test retention::tests::caller_owned_transaction_can_commit_transition_and_prune_atomically ... ok
+test retention::tests::delete_failure_rolls_back_without_touching_prepared_or_finalized_rows ... ok
+test retention::tests::foreground_oversize_fails_closed_and_bounded_batches_make_progress ... ok
+test retention::tests::item_limit_plus_one_prunes_oldest_deterministically ... ok
+test retention::tests::logical_byte_limit_plus_one_prunes_whole_oldest_trace ... ok
+test retention::tests::policy_cannot_exceed_production_ceilings ... ok
+test retention::tests::prepared_is_never_pruned_but_recovered_unknown_is_eligible ... ok
+test retention::tests::production_api_exposes_only_caller_owned_retention_operations ... ok
+test retention::tests::retention_window_uses_partial_ordering_index_without_temp_sort ... ok
+test tests::json이_아니면_원문_해시로_결정성_유지 ... ok
+test tests::같은_스키마는_키순서_공백_무관하게_같은_해시 ... ok
+test tests::다른_스키마는_다른_해시 ... ok
+test tests::유니코드_이스케이프_표기_차이도_같은_해시 ... ok
+test tests::중첩_배열과_null_bool_숫자_정규화 ... ok
+test tests::해시는_sha256_hex_64자 ... ok
+
+test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/lib.rs (target/debug/deps/auth-64c010c75db28ba9)
+
+running 105 tests
+test browser::tests::reaped_launcher_error_never_contains_url_argument ... ok
+test browser::tests::reaped_launcher_maps_success_and_nonzero_status ... ok
+test browser::tests::reaped_launcher_start_error_never_contains_url_argument ... ok
+test callback::tests::callback_debug는_code와_state를_숨긴다 ... ok
+test callback::tests::callback_denial_error_contains_no_provider_detail ... ok
+test callback::tests::callback_request_line_accepts_exact_limit_and_rejects_plus_one ... ok
+test callback::tests::error_파라미터는_거부로_끝난다 ... ok
+test callback::tests::malformed_request_line_is_rejected_before_url_parsing ... ok
+test callback::tests::고정_callback_bind는_bind전에_취소를_결정적으로_확인한다 ... ok
+test callback::tests::고정_포트_점유_시_임의_포트로_폴백 ... ok
+test callback::tests::대기_시간_초과 ... ok
+test callback::tests::등록용_redirect_uri는_고정_포트와_포트_생략_병기 ... ok
+test callback::tests::취소하면_callback_listener를_즉시_해제한다 ... ok
+test callback::tests::콜백_왕복과_다른_경로_무시 ... ok
+test discovery::tests::as_issuer_불일치는_거부하고_기본_endpoint로_폴백하지_않는다 ... ok
+test discovery::tests::as_issuer는_trailing_slash_정규화_후_일치 ... ok
+test discovery::tests::as_발견_oauth_authorization_server_path_insertion ... ok
+test discovery::tests::as_발견_openid_configuration_path_insertion_폴백 ... ok
+test discovery::tests::as_발견_path_addition_폴백 ... ok
+test discovery::tests::as_발견_루트_url은_중복_후보를_제거한다 ... ok
+test discovery::tests::as_발견_전부_실패하면_기본_endpoint_폴백 ... ok
+test discovery::tests::as_발견은_redirect를_따라가지_않고_기본_endpoint_폴백 ... ok
+test discovery::tests::path_insertion_well_known_경로로_발견 ... ok
+test discovery::tests::path_insertion_실패_시_root로_폴백 ... ok
+test discovery::tests::prm_발견은_redirect를_따라가지_않고_거부 ... ok
+test discovery::tests::resource_불일치는_거부하고_종합_에러로_보고 ... ok
+test discovery::tests::resource는_trailing_slash_정규화_후_일치 ... ok
+test discovery::tests::비loopback_http_서버는_네트워크_없이_거부 ... ok
+test discovery::tests::챌린지의_resource_metadata_url을_먼저_쓴다 ... ok
+test discovery::tests::커스텀_헤더는_same_origin일_때만_부착 ... ok
+test flow::tests::authorize_url에_pkce와_state가_반드시_포함 ... ok
+test flow::tests::authorize_url에_provider_hint를_추가한다 ... ok
+test flow::tests::configured_short_timeout_bounds_stalled_exchange_without_retry ... ok
+test flow::tests::resource_파라미터가_authorize_url과_token_교환에_실린다 ... ok
+test flow::tests::state_불일치는_토큰_교환_없이_거부 ... ok
+test flow::tests::token_endpoint_redirect는_따라가지_않고_에러 ... ok
+test flow::tests::zero_timeout은_token_endpoint_접속_전에_거부 ... ok
+test flow::tests::비보안_redirect_uri는_begin에서_거부 ... ok
+test flow::tests::올바른_state와_code_verifier로_토큰_교환 ... ok
+test http::tests::error_formatting_contains_no_dynamic_data ... ok
+test http::tests::oauth_http_keeps_error_status_and_body_for_typed_parser ... ok
+test http::tests::response_body_accepts_exact_limit_and_rejects_plus_one ... ok
+test mcp_oauth::tests::auth_method_selection_rejects_basic_and_unknown_only ... ok
+test mcp_oauth::tests::discovery_and_challenge_debug_hide_raw_values ... ok
+test mcp_oauth::tests::discovery_checks_cancellation_before_network ... ok
+test mcp_oauth::tests::provider_config_consumes_secret_and_rejects_invalid_team ... ok
+test mcp_oauth::tests::scope_parser_accepts_exact_count_and_rejects_plus_one ... ok
+test mcp_oauth::tests::slack_resource_is_origin_and_generic_resource_is_exact_endpoint ... ok
+test metadata::tests::debug_is_redacted ... ok
+test metadata::tests::exact_server_and_normalized_url_binding_are_required ... ok
+test metadata::tests::legacy_bool_json_decodes_and_new_json_uses_typed_method ... ok
+test metadata::tests::scope_count_and_json_bytes_accept_exact_limit_and_reject_plus_one ... ok
+test metadata::tests::slack_binding_accepts_endpoint_trailing_slash_and_preserves_origin_resource ... ok
+test metadata::tests::unsafe_endpoints_and_unknown_or_basic_auth_methods_fail_closed ... ok
+test refresh::tests::active_id_상한은_257번째_work를_실행하기_전에_거부한다 ... ok
+test refresh::tests::invalid_grant면_토큰_폐기_후_재승인_필요 ... ok
+test refresh::tests::one_shot_exchange_provider_error_is_sanitized_and_not_retried ... ok
+test refresh::tests::one_shot_exchange_rejects_oversized_response_without_retry ... ok
+test refresh::tests::one_shot_exchange_succeeds_with_exactly_one_request ... ok
+test refresh::tests::one_shot_exchange_timeout_is_sanitized_and_not_retried ... ok
+test refresh::tests::one_shot_exchange_transport_failure_is_sanitized_and_not_retried ... ok
+test refresh::tests::oversized_id는_work를_실행하기_전에_거부한다 ... ok
+test refresh::tests::refresh_debug는_binding과_failure_detail을_숨긴다 ... ok
+test refresh::tests::refresh_failure와_panic은_slot을_evict하고_detail을_보존하지_않는다 ... ok
+test refresh::tests::refresh_token이_없으면_네트워크_없이_재승인_필요 ... ok
+test refresh::tests::refresh_성공_시_새_토큰을_keyring에_저장하고_resource를_싣는다 ... ok
+test refresh::tests::refresh는_redirect를_따라가지_않고_토큰을_보존한다 ... ok
+test refresh::tests::slot_arc_획득_뒤_deschedule된_waiter도_leader_결과를_공유한다 ... ok
+test refresh::tests::typed_refresh_publish실패는_waiter에게_성공으로_공유되지_않는다 ... ok
+test refresh::tests::typed_refresh_rejects_slot_from_another_logical_id_before_keyring_access ... ok
+test refresh::tests::typed_slot_refresh_token이_없으면_slot을_변경하지_않는다 ... ok
+test refresh::tests::같은_id_waiter는_winner_결과를_공유한_뒤_slot을_제거한다 ... ok
+test refresh::tests::동시_refresh는_한_번만_발사 ... ok
+test refresh::tests::만개의_distinct_sequential_refresh는_state를_남기지_않는다 ... ok
+test refresh::tests::만료_5분_전부터_선제_갱신_판정 ... ok
+test refresh::tests::응답에_refresh_token이_없으면_기존_것을_유지 ... ok
+test refresh::tests::일시_장애는_폐기하지_않고_에러 ... ok
+test registration::tests::authorization_code_미지원_as는_요청_없이_미지원 ... ok
+test registration::tests::endpoint_404는_미지원 ... ok
+test registration::tests::grant_목록_생략_시_기본_두_grant를_요청 ... ok
+test registration::tests::registration_endpoint_없으면_미지원 ... ok
+test registration::tests::registration_error_debug는_raw_detail을_숨긴다 ... ok
+test registration::tests::registration_rejection_body_is_bounded_and_formatting_is_sanitized ... ok
+test registration::tests::registration_success_body_accepts_exact_limit_and_rejects_plus_one ... ok
+test registration::tests::등록_거부는_에러_사유를_담는다 ... ok
+test registration::tests::등록_성공과_요청_본문_규약 ... ok
+test registration::tests::등록은_redirect를_따라가지_않고_에러 ... ok
+test slack::tests::debug_hides_workspace_identifiers ... ok
+test slack::tests::oversized_workspace_input_is_rejected_before_normalization_allocation ... ok
+test slack::tests::settings_link_is_canonical_or_absent ... ok
+test slack::tests::workspace_domain_and_team_validation_are_strict ... ok
+test slack::tests::workspace_html_is_bound_and_domain_bound ... ok
+test slack::tests::workspace_network_primitive_honors_preflight_cancellation ... ok
+test tests::access는_credential_id에_refresh는_별도_entry에 ... ok
+test tests::keyring_entry_id_규약 ... ok
+test tests::oauth_token과_dcr은_typed_physical_bundle로_stage된다 ... ok
+test tests::redirect_uri는_localhost_또는_https만 ... ok
+test www_authenticate::tests::bearer_챌린지의_resource_metadata와_scope_추출 ... ok
+test www_authenticate::tests::bearer가_뒤에_있어도_대소문자_무시로_찾는다 ... ok
+test www_authenticate::tests::challenge_debug는_url과_scope를_숨긴다 ... ok
+test www_authenticate::tests::quoted_string_안의_콤마는_분할하지_않는다 ... ok
+test www_authenticate::tests::rfc_7235_다중_챌린지_예제 ... ok
+test www_authenticate::tests::기형_입력은_panic_없이_무시 ... ok
+test www_authenticate::tests::파라미터_없는_챌린지와_따옴표_없는_값 ... ok
+test www_authenticate::tests::파라미터_키는_대소문자_무시로_조회 ... ok
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.14s
+
+     Running unittests src/lib.rs (target/debug/deps/connector_contract-98a74f89a8763ee7)
+
+running 8 tests
+test tests::configured_limits_can_only_be_lowered ... ok
+test tests::connector_intent_debug_never_exposes_user_or_provider_coordinates ... ok
+test tests::default_snapshot_has_no_interactive_or_import_backlog ... ok
+test tests::endpoint_display_debug_never_exposes_raw_url ... ok
+test tests::endpoint_fingerprint_requires_exact_sha256_hex_shape ... ok
+test tests::production_limits_match_the_frozen_ceiling ... ok
+test tests::sensitive_debug_is_always_redacted ... ok
+test tests::snapshot_is_latest_only_friendly ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/connector_service-94f6124470718bbc)
+
+running 82 tests
+test coordinator::tests::absent_to_persisted_ask_mutation_fails_preflight_before_external_call ... ok
+test coordinator::tests::accepted_remote_mcp_reuses_its_second_slot_while_one_job_is_active ... ok
+test coordinator::tests::accepted_remote_oauth_uses_its_exact_one_slot_and_releases_it ... ok
+test coordinator::tests::accepted_remote_pre_job_failure_releases_transferred_reservation ... ok
+test coordinator::tests::approval_preflight_failure_and_double_resolve_never_call ... ok
+test coordinator::tests::authorized_success_uses_exact_order_operation_and_durable_outcome ... ok
+test coordinator::tests::backend_panic_completes_and_releases_operation_capacity ... ok
+test coordinator::tests::cancelled_job_holds_capacity_until_backend_exits_then_is_removed ... ok
+test coordinator::tests::command_queue_is_exactly_eight_and_backpressures ... ok
+test coordinator::tests::config_change_immediately_drops_pending_without_audit_or_call ... ok
+test coordinator::tests::config_invalidation_finalizes_actual_pending_singletons_without_user_response ... ok
+test coordinator::tests::config_revision_change_discards_stale_discovery ... ok
+test coordinator::tests::diagnostic_transition_ring_evicts_the_65th_oldest_without_payload_retention ... ok
+test coordinator::tests::discovery_item_and_descriptor_byte_ceilings_are_inclusive ... ok
+test coordinator::tests::dispatched_cancel_is_visible_before_blocked_schema_completion ... ok
+test coordinator::tests::dispatched_config_mutation_is_visible_before_blocked_schema_completion ... ok
+test coordinator::tests::durable_denial_never_reaches_external_call ... ok
+test coordinator::tests::each_subject_dispatch_uses_only_the_current_workspace ... ok
+test coordinator::tests::empty_stdio_command_stops_before_persistence_schema_and_call ... ok
+test coordinator::tests::env_connector_discover_cancel_soak_is_bounded_at_every_checkpoint ... ignored, set DEPPY_CONNECTOR_SOAK_CYCLES and run this exact test explicitly
+test coordinator::tests::exact_input_grant_mismatch_is_failed_before_external_call ... ok
+test coordinator::tests::exact_self_authored_allow_always_revision_rebinds_only_inflight_call ... ok
+test coordinator::tests::fake_clock_expires_idle_worker_without_sleep_or_polling ... ok
+test coordinator::tests::generation_entries_are_pruned_after_server_churn ... ok
+test coordinator::tests::host_action_queue_drops_dynamic_urls_but_preserves_static_user_actions ... ok
+test coordinator::tests::host_import_is_single_exact_cancelable_and_double_completion_safe ... ok
+test coordinator::tests::idle_deadline_reaps_backend_lease_before_exit_without_second_ttl ... ok
+test coordinator::tests::idle_restart_resumes_latest_snapshot_and_opens_one_new_repository ... ok
+test coordinator::tests::import_bytes_and_server_count_are_bounded_before_persistence ... ok
+test coordinator::tests::import_omission_and_combined_report_limits_fail_before_persistence ... ok
+test coordinator::tests::invalid_http_url_stops_before_persistence_schema_and_call ... ok
+test coordinator::tests::invoke_subject_survives_remote_trust_and_oauth_refresh_resume ... ok
+test coordinator::tests::known_expiry_refresh_publishes_before_any_mcp_and_resumes_at_committed_revision ... ok
+test coordinator::tests::known_tool_error_is_failed_and_backend_is_not_retried ... ok
+test coordinator::tests::late_cancel_after_known_ok_persists_succeeded_and_never_retries ... ok
+test coordinator::tests::lazy_secret_migration_preserves_stale_rejection_for_other_writers ... ok
+test coordinator::tests::lazy_secret_migration_rechecks_the_first_discover_without_a_second_click ... ok
+test coordinator::tests::legacy_dispatch_binds_a_global_subject_and_remains_compatible ... ok
+test coordinator::tests::malformed_scalar_and_array_inputs_stop_before_all_authorization_work ... ok
+test coordinator::tests::mcp_two_and_oauth_one_are_hard_concurrency_caps ... ok
+test coordinator::tests::mismatched_live_tool_target_stops_before_permission_preflight_and_call ... ok
+test coordinator::tests::mismatched_repository_server_stops_before_schema_authorization_and_call ... ok
+test coordinator::tests::mixed_import_report_preserves_omitted_secret_counts_after_commit ... ok
+test coordinator::tests::pending_approval_idle_ttl_denies_without_call_and_releases_pinned_lease ... ok
+test coordinator::tests::pending_approval_preserves_its_workspace_subject_through_preflight_and_call ... ok
+test coordinator::tests::pending_approvals_retain_exactly_two_slots_and_cancel_drops_them ... ok
+test coordinator::tests::prepared_grant_for_another_workspace_fails_durably_before_external_call ... ok
+test coordinator::tests::queued_oauth_browser_url_is_removed_before_cancel_can_be_drained ... ok
+test coordinator::tests::queued_oauth_browser_url_is_removed_before_config_invalidation_can_be_drained ... ok
+test coordinator::tests::reactive_auth_failure_is_failed_and_backend_is_not_retried ... ok
+test coordinator::tests::remote_trust_stale_denied_and_cancel_each_release_exactly_once ... ok
+test coordinator::tests::repeated_discover_cancel_returns_every_service_resource_to_quiescence ... ok
+test coordinator::tests::repeated_oauth_stage_failure_deletes_exact_slot_and_acks_ledger ... ok
+test coordinator::tests::repeated_outcome_failure_retains_one_slot_and_fails_closed_until_recovery ... ok
+test coordinator::tests::seeded_overview_is_visible_without_worker_repository_open_or_wake ... ok
+test coordinator::tests::slack_config_invalidation_clears_transient_and_stale_result_cannot_restore_it ... ok
+test coordinator::tests::slack_failure_and_recovery_survive_reload_and_consume_exact_url_once ... ok
+test coordinator::tests::slack_transient_survives_unrelated_reload_and_cancel_restores_durable_state ... ok
+test coordinator::tests::slack_workspace_choice_survives_completion_reload_while_durable_status_wins ... ok
+test coordinator::tests::snapshot_reader_clones_only_after_revision_change ... ok
+test coordinator::tests::stale_and_failed_imports_preserve_candidate_counts_without_added_rows ... ok
+test coordinator::tests::stale_oauth_singleton_response_does_not_consume_current_continuation ... ok
+test coordinator::tests::system_operation_ids_are_unique_across_coordinator_instances ... ok
+test coordinator::tests::unknown_delivery_is_durable_unknown_and_backend_is_not_retried ... ok
+test coordinator::tests::unknown_oauth_publish_outcome_retains_staged_slot_for_reconciliation ... ok
+test coordinator::tests::unused_coordinator_has_zero_thread_and_repository_open ... ok
+test mcp_adapter::tests::cancelling_pinned_schema_releases_process_and_lease ... ok
+test mcp_adapter::tests::env_local_stdio_reap_soak_returns_threads_processes_and_leases_to_baseline ... ignored, set DEPPY_CONNECTOR_STDIO_SOAK_CYCLES and run this exact test explicitly
+test mcp_adapter::tests::live_schema_and_authorized_call_use_same_pinned_connection ... ok
+test mcp_adapter::tests::two_pinned_operations_backpressure_third_before_spawn ... ok
+test mcp_adapter::tests::warm_discovery_reuses_connection_without_second_keyring_read_and_ttl_reaps ... ok
+test oauth_adapter::tests::blocking_oauth_calls_check_cancellation_before_and_after_without_retry ... ok
+test oauth_adapter::tests::continuation_budget_counts_capacity_and_compaction_reclaims_spare_allocations ... ok
+test oauth_adapter::tests::dcr_origin_is_not_persisted_as_manual_and_hint_does_not_clone_full_token ... ok
+test oauth_adapter::tests::production_adapter_rejects_stdio_before_network_or_host_action ... ok
+test oauth_adapter::tests::production_continuation_debug_never_exposes_provider_state ... ok
+test ports::tests::credential_resolution_debug_redacts_physical_slot ... ok
+test ports::tests::every_public_oauth_result_debug_is_low_cardinality_and_redacted ... ok
+test ports::tests::generic_repository_debug_never_formats_payloads ... ok
+test ports::tests::invocation_context_is_bounded_and_debug_never_exposes_workspace ... ok
+test ports::tests::oauth_and_http_binding_debug_hide_all_user_provider_coordinates ... ok
+test ports::tests::workspace_grant_cannot_cross_subject_and_request_debug_hides_operation ... ok
+
+test result: ok. 80 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.85s
+
+     Running unittests src/lib.rs (target/debug/deps/deppy_core-5d981b71a1723f8c)
+
+running 15 tests
+test fs::tests::기록_후_내용이_교체되고_tmp가_남지_않는다 ... ok
+test fs::tests::파일명_없는_경로는_에러다 ... ok
+test fs::tests::확장자가_없는_파일명도_처리한다 ... ok
+test process_identity::tests::hook_ancestry_is_bounded_and_rejects_cycles_bad_identity_and_runtime ... ok
+test process_identity::tests::hook_execution_capture_contains_the_current_process_and_parent ... ok
+test process_identity::tests::linux_stat_birth_is_raw_ticks_with_parent_and_bounded_input ... ok
+test project_keys::tests::bounded_sources_reject_dotenv_path_traversal_and_duplicate_selection ... ok
+test project_keys::tests::github_targets_require_exact_scope ... ok
+test project_keys::tests::project_keys_github_secret_names_reject_reserved_prefix_case_insensitively ... ok
+test project_keys::tests::project_keys_validation_rejects_remote_only_local_values_and_wrong_delivery_scope ... ok
+test session_key_tests::mux_pane_uuid는_세션키가_아니다 ... ok
+test session_key_tests::워크스페이스와_세션번호를_나눈다 ... ok
+test session_key_tests::형식이_아니면_none ... ok
+test time::tests::civil_date가_알려진_날짜와_일치한다 ... ok
+test time::tests::시각이_합리적인_범위다 ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/http_client-78c820008733bfff)
+
+running 5 tests
+test tests::idle_budget_caps_an_unlimited_operation ... ok
+test tests::progressing_body_can_outlive_read_idle_budget ... ok
+test tests::shorter_deadline_and_its_reason_are_preserved ... ok
+test tests::silent_body_exits_on_read_idle_timeout ... ok
+test tests::wrapper_preserves_tls_buffers_and_applies_independent_io_budgets ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s
+
+     Running unittests src/lib.rs (target/debug/deps/i18n-4a8a6cc432bfc364)
+
+running 8 tests
+test tests::all_bundled_locales_match_fallback_order_and_placeholders ... ok
+test tests::catalog_uses_primary_then_fallback_and_args ... ok
+test tests::fallback_locale_normalizes_unknown_locale ... ok
+test tests::korean_launcher_keeps_provider_reasoning_terms_in_english ... ok
+test tests::layout_gate_core_ui_labels_fit_generous_budgets ... ok
+test tests::non_fallback_catalog_loads_current_and_fallback_only ... ok
+test tests::required_locales_have_complete_keys ... ok
+test tests::unsupported_locale_normalizes_to_fallback ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running unittests src/lib.rs (target/debug/deps/mcp-14f626c8f747a167)
+
+running 105 tests
+test http::tests::bearer는_에러와_debug에_비노출 ... ok
+test http::tests::cross_origin_redirect는_자격_헤더_소거 ... ok
+test http::tests::http_client_debug는_endpoint_server_session을_비노출 ... ok
+test http::tests::http_sensitive_body_zeroizes_on_success_error_and_detached_timeout ... ok
+test http::tests::http_traces_drop_hostile_event_type_method_and_payload ... ok
+test http::tests::initialize_4xx는_legacy_sse_힌트 ... ok
+test http::tests::initialize_jsonrpc_400은_legacy_sse로_오진하지_않는다 ... ok
+test http::tests::json_바디_드립은_deadline_배수_내_탈출 ... ok
+test http::tests::json_바디_상한_초과는_에러 ... ok
+test http::tests::json_왕복_세션과_헤더_부착 ... ok
+test http::tests::progressing_sse_outlives_the_request_idle_budget ... ok
+test http::tests::redirect_303은_get_전환 ... ok
+test http::tests::redirect_한도_초과는_에러 ... ok
+test http::tests::request에_202는_에러 ... ok
+test http::tests::same_origin_redirect는_자격_헤더_유지_상대경로_해석 ... ok
+test http::tests::server발_request는_32601_회신 ... ok
+test http::tests::sse_chunk_경계의_crlf도_한_종결자 ... ok
+test http::tests::sse_cr_lf_crlf_혼용과_comment_무시 ... ok
+test http::tests::sse_data_누적_상한_초과는_에러 ... ok
+test http::tests::sse_endpoint_이벤트는_legacy_sse_서버_에러 ... ok
+test http::tests::sse_idle_timeout은_read_timeout으로_탈출 ... ok
+test http::tests::sse_nul_포함_id는_무시_정상_id는_보관 ... ok
+test http::tests::sse_retry는_숫자만_유효 ... ok
+test http::tests::sse_라인_상한_초과는_에러 ... ok
+test http::tests::sse_멀티라인_data와_기본_이벤트_타입 ... ok
+test http::tests::sse_멀티이벤트_notification_섞임_멀티라인_data ... ok
+test http::tests::sse_미완성_이벤트는_eof에서_버림 ... ok
+test http::tests::sse_비json_data는_프로토콜_위반 ... ok
+test http::tests::sse_빈_data는_dispatch_없이_타입만_리셋 ... ok
+test http::tests::sse_스트림_누적_상한_초과는_에러 ... ok
+test http::tests::sse_요청하지_않은_id의_response는_위반 ... ok
+test http::tests::sse_이벤트_타입은_dispatch_후_리셋 ... ok
+test http::tests::timed_out_http_senders_keep_permits_and_reaper_is_bounded ... ok
+test http::tests::tools_call_accepted_without_outcome_is_unknown_and_not_retried ... ok
+test http::tests::tools_call_malformed_response_is_unknown_but_matching_server_error_is_known ... ok
+test http::tests::tools_call_redirect는_unknown이며_두번째_endpoint로_재전송하지_않는다 ... ok
+test http::tests::tools_call_세션_만료는_unknown이며_자동_재시도하지_않는다 ... ok
+test http::tests::ureq_three_typed_timeout_retains_idle_error_classification ... ok
+test http::tests::url_검증_https필수_http는_루프백만 ... ok
+test http::tests::검증_실패_url은_네트워크_없이_거부 ... ok
+test http::tests::미지원_content_type은_거부 ... ok
+test http::tests::비http_스킴과_비루프백_http_redirect_거부 ... ok
+test http::tests::세션_만료_400은_인증_에러로_분류되지_않는다 ... ok
+test http::tests::세션_만료_400은_재수립_후_정확히_1회_재시도 ... ok
+test http::tests::세션_재수립_후_재실패는_에러 ... ok
+test http::tests::이지원사_401은_www_authenticate와_함께_구조화_에러 ... ok
+test http::tests::인증_401의_www_authenticate에_에코된_bearer는_마스킹 ... ok
+test http::tests::인증_403도_구조화_헤더_없으면_none ... ok
+test http::tests::지원_목록_밖_버전은_http에서도_거부 ... ok
+test http::tests::진행_tick은_interval마다_호출되고_결과를_보존 ... ok
+test http::tests::헤더_드립은_deadline에서_탈출 ... ok
+test http::tests::협상_버전이_이후_요청_헤더에_실린다 ... ok
+test limits::tests::json_byte_limit_is_inclusive_and_counts_utf8_bytes ... ok
+test limits::tests::public_payload_ceilings_match_frozen_connector_contract ... ok
+test manager::tests::call_tool_왕복 ... ok
+test manager::tests::call_tool_큰_payload는_stdio_write전에_거부 ... ok
+test manager::tests::cloneable_cancel_interrupts_hung_stdio_request_and_reaps_resources ... ok
+test manager::tests::discovery_descriptor_bytes_and_cursor_cycles_fail_closed ... ok
+test manager::tests::discovery_limits_are_cumulative_across_pages ... ok
+test manager::tests::initialize_tools_list_왕복과_stderr_redaction ... ok
+test manager::tests::protocolversion_누락과_빈문자열도_거부 ... ok
+test manager::tests::scoped_env는_stdio_server에만_주입된다 ... ok
+test manager::tests::stdout_비json_라인은_프로토콜_위반으로_거부 ... ok
+test manager::tests::tools_list_cursor_페이지네이션 ... ok
+test manager::tests::서버_조기_종료는_에러 ... ok
+test manager::tests::요청_전에_선점된_미래_id_response는_위반 ... ok
+test manager::tests::요청하지_않은_id의_response는_위반 ... ok
+test manager::tests::유효한_notification_라인은_통과 ... ok
+test manager::tests::응답_없으면_timeout ... ok
+test manager::tests::지원_목록_밖_버전은_서버버전과_목록을_담아_거부 ... ok
+test manager::tests::지원_목록의_모든_버전으로_협상_성공 ... ok
+test proxy::tests::arguments_누락과_빈_object는_no_arg_tool로_정상_포워딩 ... ok
+test proxy::tests::authorized_input_limit_is_inclusive_and_plus_one_is_callback_zero ... ok
+test proxy::tests::authorized_input_zeroizes_during_executor_panic_unwind ... ok
+test proxy::tests::authorized_notification_is_callback_zero ... ok
+test proxy::tests::authorized_proxy_rejects_explicit_null_before_executor ... ok
+test proxy::tests::authorized_proxy_request_cap_is_exact_and_plus_one_fails_closed ... ok
+test proxy::tests::authorized_proxy_zeroizes_owned_input_for_allow_deny_and_error ... ok
+test proxy::tests::authorized_reader_wipes_shifted_tail_and_prechecks_limit ... ok
+test proxy::tests::explicit_null_arguments는_auth와_포워더_전에_거부 ... ok
+test proxy::tests::id_없는_notification은_무응답이고_포워딩_안함 ... ok
+test proxy::tests::initialize_list_call_허용_왕복 ... ok
+test proxy::tests::jsonrpc_envelope_위반은_invalid_request ... ok
+test proxy::tests::method_누락_또는_비문자열인데_id_있으면_invalid_request ... ok
+test proxy::tests::non_object_arguments는_invalid_params이고_포워딩_안함 ... ok
+test proxy::tests::sensitive_buffer_growth_wipes_old_allocation_before_replacement ... ok
+test proxy::tests::sensitive_tool_input_debug_and_json_value_cleanup_are_redacted ... ok
+test proxy::tests::tools_call_거부는_is_error_result이고_포워딩_안함 ... ok
+test proxy::tests::unknown_method는_method_not_found ... ok
+test proxy::tests::거대_라인은_loop를_멈추지_않고_종료 ... ok
+test proxy::tests::잘못된_id_타입은_invalid_request이고_null로_응답 ... ok
+test transport::tests::explicit_cancel_kills_reaps_and_joins_stdio_resources ... ok
+test transport::tests::jsonrpc_error_형태_검증 ... ok
+test transport::tests::jsonrpc_id_타입_검증 ... ok
+test transport::tests::jsonrpc_검증 ... ok
+test transport::tests::tools_call_eof_after_write_is_delivery_unknown ... ok
+test transport::tests::tools_call_external_cancel_after_write_is_delivery_unknown ... ok
+test transport::tests::tools_call_jsonrpc_error_is_known_failed_not_unknown ... ok
+test transport::tests::tools_call_partial_write_or_eof_is_delivery_unknown ... ok
+test transport::tests::tools_call_pre_io_size_rejection_stays_failed ... ok
+test transport::tests::tools_call_protocol_violation_after_write_is_delivery_unknown ... ok
+test transport::tests::tools_call_success_zeroizes_serialized_write_body ... ok
+test transport::tests::tools_call_timeout_after_write_is_delivery_unknown ... ok
+test transport::tests::unsolicited_trace는_hostile_method와_params를_기록하지_않는다 ... ok
+test transport::tests::라인_읽기와_상한 ... ok
+
+test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.39s
+
+     Running unittests src/main.rs (target/debug/deps/deppy_mcp_proxy-d05810ae71dc6201)
+
+running 109 tests
+test agent_attention::agent_status_harness::agent_status_harness_claude ... ok
+test agent_attention::agent_status_harness::agent_status_harness_codex ... ok
+test agent_attention::agent_status_harness::agent_status_harness_cursor ... ok
+test agent_attention::agent_status_harness::agent_status_harness_grok ... ok
+test agent_attention::agent_status_harness::agent_status_harness_inventory_has_unique_nonempty_named_cases ... ok
+test agent_attention::agent_status_harness::agent_status_harness_kimi ... ok
+test agent_attention::tests::agent_attention_세_질문_도구를_응답_필요로_정규화한다 ... ok
+test agent_attention::tests::agent_attention_유휴알림은_질문이나_승인으로_오인하지_않는다 ... ok
+test agent_attention::tests::agent_attention_질문_결과와_실패는_같은_요청만_해제한다 ... ok
+test agent_attention::tests::background_child_reconciled_result_does_not_reject_a_delayed_exit ... ok
+test agent_attention::tests::background_child_stop_preserves_a_resumed_parent_and_parent_question ... ok
+test agent_attention::tests::background_child_tool_results_do_not_finish_the_child_between_tools ... ok
+test agent_attention::tests::background_children_keep_session_running_until_the_last_child_stops ... ok
+test agent_attention::tests::background_duplicate_result_does_not_clear_a_new_untracked_permission ... ok
+test agent_attention::tests::background_first_permission_without_pretooluse_resolves_its_alias ... ok
+test agent_attention::tests::background_first_ungrouped_requests_keep_their_child_until_exit ... ok
+test agent_attention::tests::background_legacy_child_first_question_keeps_running_after_the_answer ... ok
+test agent_attention::tests::fix5_child_transcript_result_must_clear_permission_alias ... ok
+test agent_attention::tests::fix5_different_permissions_remain_independent_control ... ok
+test agent_attention::tests::fix5_identical_parallel_permissions_remain_independent ... ok
+test agent_attention::tests::fix5_large_question_result_is_reconciled_by_stop ... ok
+test agent_attention::tests::fix5_small_question_result_is_reconciled_control ... ok
+test agent_attention::tests::fix5_결과_뒤_저장된_과거_승인은_다시_열리지_않는다 ... ok
+test agent_attention::tests::fix5_동일_도구는_입력이_수정되어도_실행_그룹을_유지한다 ... ok
+test agent_attention::tests::fix5_부모의_다음_훅은_중단된_자식만_해제한다 ... ok
+test agent_attention::tests::fix5_응답한_승인의_알림도_다른_자동_호출과_분리한다 ... ok
+test agent_attention::tests::fix5_자동_승인된_다른_호출은_응답한_승인을_붙잡지_않는다 ... ok
+test agent_attention::tests::fix5_취소된_턴의_늦은_시작은_새_승인을_붙잡지_않는다 ... ok
+test agent_attention::tests::fix5_큰_훅_결과는_메타데이터를_유지한다 ... ok
+test agent_attention::tests::fix7_자식_도구의_수동_거절_배치는_승인_알림까지_해제한다 ... ok
+test agent_attention::tests::review_codex_실패_결과도_기록에서_요청_아이디로_해제한다 ... ok
+test agent_attention::tests::review_grok_완료는_최신_실제_턴의_성공_결과로만_확인한다 ... ok
+test agent_attention::tests::review_grok_유휴_알림은_성공_완료로_단정하지_않는다 ... ok
+test agent_attention::tests::review_서버가_다른_입력_요청을_한_요청으로_합치지_않는다 ... ok
+test agent_attention::tests::second_review_claude_과거_거절_결과는_정확한_요청만_닫는다 ... ok
+test agent_attention::tests::second_review_claude_실제_결과_경로는_부모와_자식을_분리한다 ... ok
+test agent_attention::tests::second_review_자식_승인은_추적하지만_부모의_완료로_취급하지_않는다 ... ok
+test approval_notify::tests::missing_socket_error는_path를_노출하지_않고_persistent_resource를_만들지_않는다 ... ok
+test approval_notify::tests::socket_path는_exact_limit만_accept하고_debug를_redact한다 ... ok
+test cli::tests::approval_notify_socket은_optional_bounded_local_path다 ... ok
+test cli::tests::poll_ms_0은_거부 ... ok
+test cli::tests::선택_인자_오버라이드 ... ok
+test cli::tests::알수없는_인자는_에러 ... ok
+test cli::tests::필수_인자_누락은_에러 ... ok
+test cli::tests::필수_인자_파싱과_기본값 ... ok
+test forwarder::tests::list_projection은_description과_schema를_보존한다 ... ok
+test forwarder::tests::malformed_schema는_빈_object로_축소하고_raw_error를_노출하지_않는다 ... ok
+test hook::tests::allow는_live_schema_permission_preflight_call_outcome을_정확히_한번씩_수행한다 ... ok
+test hook::tests::approval_timeout은_denied로_종결하고_external_call을_하지_않는다 ... ok
+test hook::tests::ask_allow_always는_preview를_redact하고_permission_audit_call을_원자완료한다 ... ok
+test hook::tests::ask는_durable_insert후_payload_free_wake를_정확히_한번씩_보낸다 ... ok
+test hook::tests::audit_row_lookup_helper는_absent를_none으로_읽는다 ... ok
+test hook::tests::backend_outcomes는_known_failed와_unknown을_구분하고_자동재시도하지_않는다 ... ok
+test hook::tests::deny는_durable_denied를_남기고_external_call을_하지_않는다 ... ok
+test hook::tests::dynamic_schema는_매_call_live조회하고_schema변경을_재승인한다 ... ok
+test hook::tests::executor_drop은_unresolved_prepared를_unknown으로_닫고_call을_재시도하지_않는다 ... ok
+test hook::tests::invalid_arguments는_authorization_audit_backend를_전부_건너뛴다 ... ok
+test hook::tests::list_failure_duplicate_or_missing_tool은_preflight와_call전에_fail_closed한다 ... ok
+test hook::tests::malformed_json_request는_approval_wake를_발생시키지_않는다 ... ok
+test hook::tests::missing_notify_socket은_pending을_deny하고_external_call을_막는다 ... ok
+test hook::tests::outcome_persistence_obligation은_한개만_보관하고_후속_call을_막은뒤_복구한다 ... ok
+test hook::tests::pending_insert_failure는_wake와_external_call을_모두_막는다 ... ok
+test hook::tests::permission이_evaluation후_deny로바뀌면_preflight와_external_call을_막는다 ... ok
+test hook::tests::policy_allow_preflight_failure는_wake와_external_call을_모두_막는다 ... ok
+test hook::tests::post_preflight_reparse실패는_failed로_닫고_external_call을_하지_않는다 ... ok
+test hook::tests::preflight_commit실패는_allow_always_permission과_call을_모두_rollback한다 ... ok
+test hook::tests::runtime_session_key는_validated_workspace_session_subject로만_분리된다 ... ok
+test hook_payload::tests::agent_status_harness_dual_input_aliases_match_and_conflicting_or_duplicate_keys_fail ... ok
+test hook_payload::tests::grok_완료_근거_경로를_찾을_cwd를_보존한다 ... ok
+test hook_payload::tests::사용자_입력_hook은_긴_본문에서_짧은_작업_미리보기만_남긴다 ... ok
+test hook_payload::tests::입력_해시는_객체_순서와_파싱_경로에_독립적이다 ... ok
+test hook_payload::tests::잘못된_json과_중복_식별자는_거부한다 ... ok
+test hook_payload::tests::큰_배치_결과와_입력은_버리고_모든_호출_id는_남긴다 ... ok
+test session::tests::backend_config_error는_server_controlled_marker를_보존하지_않는다 ... ok
+test session::tests::cold와_warm_path_latency를_clock_seam으로_분리계측한다 ... ok
+test session::tests::config_url_auth_revision_변경은_즉시_기존lease를_폐기한다 ... ok
+test session::tests::credential_resolve는_own_versioned_slot만_keyring에서_읽는다 ... ok
+test session::tests::credential은_cold_resolve때만_active_physical_slot을_읽고_lease로_보호된다 ... ok
+test session::tests::idle_ttl_reap은_stdio와_http_connection_resource를_회수한다 ... ok
+test session::tests::lazy_connect와_schema_call_same_connection_warm_reuse ... ok
+test session::tests::lru는_backend_lease를_두개로_제한한다 ... ok
+test session::tests::malformed_target은_active_secret_guard를_회수하고_수정후_lazy_reconnect한다 ... ok
+test session::tests::managed_target은_missing_disabled_malformed를_external_call전에_fail_closed한다 ... ok
+test session::tests::managed_target은_point_lookup으로_url변경을_교체하고_permission_reset을_관찰한다 ... ok
+test session::tests::od01_env_stdio_session_soak은_모든_cycle_boundary에서_baseline을_회복한다 ... ignored, env-gated OD01 stdio session soak
+test session::tests::physical_slot_rotation은_live_schema_version을_stale처리하고_call을_하지_않는다 ... ok
+test session::tests::redaction_lease_확보실패는_backend_connect전에_fail_closed된다 ... ok
+test session::tests::tool과_jsonrpc_error는_lease를_유지하고_protocol_unknown만_poison한다 ... ok
+test session::tests::ttl_15_30_60_model은_30초를_pareto_knee로_선택한다 ... ok
+test session::tests::반복_reuse_ttl_unknown_cycle은_현재_resource를_baseline으로_복귀한다 ... ok
+test session::tests::실제_http_schema_discovery와_call은_한_backend_session을_공유한다 ... ok
+test session::tests::실제_stdio_cold_warm_latency와_idle_process_reclaim을_측정한다 ... ok
+test session::tests::실제_stdio_schema_discovery와_call은_한_process_connection을_공유한다 ... ok
+test tests::agent_status_harness_binding_never_rebinds_parent_to_child ... ok
+test tests::agent_status_harness_cursor_observer_never_blocks_or_requests_permission ... ok
+test tests::agent_status_harness_legacy_anonymous_responses_keep_their_balance ... ok
+test tests::agent_status_harness_legacy_flags_keep_fresh_runtime_ownership_and_message ... ok
+test tests::agent_status_harness_legacy_notification_waits_for_owned_tools_only ... ok
+test tests::agent_status_harness_legacy_parallel_response_ids_are_independent ... ok
+test tests::agent_status_harness_legacy_permission_alias_resolves_without_tool_start ... ok
+test tests::agent_status_harness_legacy_result_clear_resolves_its_own_response ... ok
+test tests::agent_status_harness_legacy_tools_preserve_questions_and_release_capacity ... ok
+test tests::agent_status_harness_legacy_without_payload_preserves_other_question_and_child ... ok
+test tests::agent_status_harness_malformed_child_owner_never_rebinds_parent ... ok
+test tests::agent_status_harness_rejected_legacy_payload_cannot_clear_parent ... ok
+test tests::backend_target은_secret대신_logical_refs만_보관한다 ... ok
+test tests::concrete_keyring_store는_proxy_main_composition_root에만_존재한다 ... ok
+test tests::normal_proxy_exit_cleanup은_exact_session_pending만_deny한다 ... ok
+test tests::process_failure_debug_display_trace는_source_marker를_보존하지_않는다 ... ok
+
+test result: ok. 108 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.24s
+
+     Running tests/hook_task_prompt.rs (target/debug/deps/hook_task_prompt-b3908f061f030fbe)
+
+running 8 tests
+test independent_hook_titles_all_providers_update_path_free_native_prompt_events ... ok
+test independent_hook_titles_exact_path_free_prompt_revives_binding_ttl ... ok
+test independent_hook_titles_grok_native_camel_case_prompt_event ... ok
+test independent_hook_titles_kimi_path_free_binding_uses_isolated_native_index ... ok
+test independent_hook_titles_normalize_long_wrapped_korean_before_preview_budget ... ok
+test independent_hook_titles_path_free_prompts_require_exact_provider_and_native ... ok
+test independent_hook_titles_provider_path_mismatch_cannot_rebind_or_overwrite ... ok
+test independent_hook_titles_run_proxy_to_storage_projection_for_all_four_providers ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.83s
+
+     Running unittests src/lib.rs (target/debug/deps/mcp_store-6d180df74e1bf3c2)
+
+running 42 tests
+test tests::canonical_url_reconnect는_duplicate를_fail_closed하고_disabled_row를_변경하지_않는다 ... ok
+test tests::canonical_url_reconnect는_기존_disabled_row를_동일_transaction에서_enable한다 ... ok
+test tests::canonical_url_멱등등록은_기존_server를_재사용한다 ... ok
+test tests::canonical_url_멱등등록은_큰_inventory를_materialize하지_않고_point_lookup한다 ... ok
+test tests::full_server_save_중간실패는_row와_permission과_tools를_모두_rollback한다 ... ok
+test tests::full_server_save는_noop과_display_edit를_구분하고_transport_change만_신뢰를_초기화한다 ... ok
+test tests::full_server_save는_validation_실패시_기존_row를_수정하지_않는다 ... ok
+test tests::import_batch_중간실패는_앞선_insert도_rollback한다 ... ok
+test tests::pending_approval_batch_insert_roundtrip ... ok
+test tests::pending_approval_debug는_count와_presence외_식별자와본문을_노출하지_않는다 ... ok
+test tests::pending_batch는_field_duplicate_bytes와_sql_failure를_insert전에_rollback한다 ... ok
+test tests::pending_insert는_session과_global_256을_transaction에서_강제한다 ... ok
+test tests::pending_insert는_모든_text_nul을_write전에_거부하고_marker를_노출하지_않는다 ... ok
+test tests::pending_list는_limit_plus_one과_sql_byte_preflight로_legacy를_제한한다 ... ok
+test tests::permission_point는_materialize전에_sql_byte_preflight를_강제한다 ... ok
+test tests::prune_resolved_approvals는_pending을_보존하고_오래된_resolved만_삭제 ... ok
+test tests::replace_tools_두번째_insert_실패는_delete와_첫insert를_rollback한다 ... ok
+test tests::replace_tools는_기존을_지우고_교체 ... ok
+test tests::replace_tools의_server_id_불일치는_기존목록을_보존한다 ... ok
+test tests::server_args_database_url_assignment은_거부된다 ... ok
+test tests::server_args_secret_like_payload는_args_json에_저장되지_않는다 ... ok
+test tests::server_args_한줄_secret_flag와_database_url_flag를_거부한다 ... ok
+test tests::server_env_plain_secret_like_value는_저장하지_않는다 ... ok
+test tests::server_env_plain과_credential_id는_roundtrip된다 ... ok
+test tests::server_insert_list_roundtrip ... ok
+test tests::server_inventory는_exact_limit을_허용하고_plus_one을_감지한다 ... ok
+test tests::server_inventory는_sql_byte_preflight로_oversized_row를_거부한다 ... ok
+test tests::server_url_transaction_중간실패는_url과_신뢰상태를_모두_rollback한다 ... ok
+test tests::server_url_갱신은_allow와_tools를_같이_초기화하고_deny는_보존한다 ... ok
+test tests::startup_reconciliation_update_failure는_전체를_rollback한다 ... ok
+test tests::startup_reconciliation은_legacy_257에서_아무_row도_바꾸지_않는다 ... ok
+test tests::startup_reconciliation은_session_rows만_bounded_transaction으로_denied한다 ... ok
+test tests::tool_insert_list_roundtrip ... ok
+test tests::tool_name은_empty와_oversized_persisted_name을_fail_closed한다 ... ok
+test tests::tool_name은_server와_id_exact_match에서_name만_반환한다 ... ok
+test tests::tool_page_hard_cap은_total과_rows상한을_분리한다 ... ok
+test tests::tool_page는_same_snapshot_total과_ordered_permission_join을_bounded로_반환한다 ... ok
+test tests::tool_page는_schema를_읽지않고_summary_byte_preflight를_강제한다 ... ok
+test tests::transactional_server_delete_중간실패는_pending과모든metadata를_rollback한다 ... ok
+test tests::transactional_server_delete는_pending을_deny하고_live_metadata를_정리한다 ... ok
+test tests::승인은_pane_id를_그대로_반환하고_세션해석은_하지_않는다 ... ok
+test tests::없는_서버로_tool_insert는_fk_위반 ... ok
+
+test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s
+
+     Running unittests src/lib.rs (target/debug/deps/mux-b283456cd98e478b)
+
+running 10 tests
+test focus::tests::포커스_보정 ... ok
+test layout_tree::tests::contains ... ok
+test layout_tree::tests::remove시_형제가_승계 ... ok
+test layout_tree::tests::set_split_ratio는_path로_찾고_유효한_작은_비율을_보존한다 ... ok
+test layout_tree::tests::set_split_ratio는_유효_범위_밖만_경계로_clamp한다 ... ok
+test layout_tree::tests::split과_panes_순서 ... ok
+test layout_tree::tests::split은_중복_pane을_거부 ... ok
+test tab::tests::split_close_활성_전환 ... ok
+test tab::tests::비활성_pane_닫기는_활성_유지 ... ok
+test window::tests::tab_추가와_닫기_활성_전환 ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/persist-e4dc97bb096f46b1)
+
+running 29 tests
+test layout_json::tests::bounded_layout은_깊이_exact와_plus_one을_구분한다 ... ok
+test layout_json::tests::bounded_layout은_중복_pane_id를_거부한다 ... ok
+test layout_json::tests::단일_pane_round_trip ... ok
+test layout_json::tests::비정상_ratio_저장_거부 ... ok
+test layout_json::tests::손상_json_거부 ... ok
+test layout_json::tests::중첩_split_round_trip ... ok
+test recovery::tests::delete_workspace_data는_해당_workspace_세션만_지운다 ... ok
+test recovery::tests::lock_중복_획득_실패와_drop_해제 ... ok
+test recovery::tests::log_offset_partial_write_보정 ... ok
+test recovery::tests::reconcile은_exited가_아닌_모든_status를_orphan으로_본다 ... ok
+test recovery::tests::stale_lock은_내용과_무관하게_재획득 ... ok
+test recovery::tests::개행_탐색은_chunk_경계를_넘는다 ... ok
+test recovery::tests::비정상_종료_후_재시작_복원 ... ok
+test repo::tests::agent_session은_agent_id가_필수 ... ok
+test repo::tests::bounded_restore_args_exact와_plus_one ... ok
+test repo::tests::bounded_restore_empty_workspace는_빈_snapshot이다 ... ok
+test repo::tests::bounded_restore_tab_pane_exact와_plus_one ... ok
+test repo::tests::bounded_restore는_aggregate_retained_4mib를_넘지_않는다 ... ok
+test repo::tests::bounded_restore는_control_workspace_id를_query전에_거부한다 ... ok
+test repo::tests::bounded_restore는_created_at기준_canonical_window만_복원한다 ... ok
+test repo::tests::bounded_restore는_unreferenced_session을_보유하지_않는다 ... ok
+test repo::tests::bounded_restore는_대형_또는_잘못된_sqlite_row를_할당_전에_거부한다 ... ok
+test repo::tests::bounded_restore는_한_read_snapshot만_사용한다 ... ok
+test repo::tests::load_workspace_restore_bounded는_session_cwd를_pane_state에_join한다 ... ok
+test repo::tests::session_metadata_round_trip과_upsert ... ok
+test repo::tests::window_layout_저장_복원_round_trip ... ok
+test repo::tests::손상_layout_json은_tab_단위_skip ... ok
+test repo::tests::어긋난_상태는_저장_거부 ... ok
+test repo::tests::재저장은_기존_상태를_대체한다 ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running unittests src/lib.rs (target/debug/deps/platform-a2fd1cb9034388dc)
+
+running 2 tests
+test tests::applescript_quote는_따옴표와_백슬래시를_이스케이프 ... ok
+test tests::process_cwd는_자기_프로세스의_cwd를_찾는다 ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/pty-22c3b99e562011f3)
+
+running 46 tests
+test input_queue::tests::backpressure_boundary_recovers_after_complete ... ok
+test input_queue::tests::chunk_count_over_message_budget_is_rejected_not_backpressured ... ok
+test input_queue::tests::closed_queue_rejects_with_session_closed ... ok
+test input_queue::tests::disconnected_writer_rejects_and_closes_queue ... ok
+test input_queue::tests::empty_input_is_accepted_without_reserving_budget ... ok
+test input_queue::tests::large_paste_is_chunked_and_accepted ... ok
+test input_queue::tests::oversized_payload_is_rejected ... ok
+test input_queue::tests::pr1_batch_keeps_body_submit_boundaries_and_order ... ok
+test input_queue::tests::pr1_default_queue_no_cr_after_body_refusal ... ok
+test input_queue::tests::pr1_default_queue_reserves_paste_body_and_submit_together ... ok
+test input_queue::tests::pr1_partial_writer_failure_is_unknown_never_a_retryable_queue_refusal ... ok
+test input_queue::tests::queue_accepts_within_budget ... ok
+test input_queue::tests::queue_reports_backpressure_without_blocking ... ok
+test tests::apple_bcp47_locale을_posix_utf8로_정규화한다 ... ok
+test tests::bench_bulk_read_throughput ... ignored, throughput benchmark — run manually with --nocapture
+test tests::bounded_output_wait는_receiver_capacity와_cancel로만_깨어난다 ... ok
+test tests::ctrl_c로_종료 ... ok
+test tests::drop은_sighup_무시_자손까지_정리한다 ... ok
+test tests::embedded_pty는_malloc_stack_logging을_제거한다 ... ok
+test tests::embedded_pty는_no_color를_제거하고_truecolor_capability를_고정한다 ... ok
+test tests::explicit_kill은_한번만_시도하고_실패해도_reap후_원래_error를_반환한다 ... ok
+test tests::finder처럼_lang가_비면_pty는_utf8_locale을_주입한다 ... ok
+test tests::freeze는_프로세스를_정지시키고_resume이_되살린다 ... ok
+test tests::full_pty에_막힌_writer도_cancel후_join된다 ... ok
+test tests::kill로_종료 ... ok
+test tests::output_chunk가_채널에_들어오면_worker_wake를_호출한다 ... ok
+test tests::pr13_bounded_receive_leaves_whole_over_budget_chunk_and_reports_backlog ... ok
+test tests::process_identity_exposes_redacted_pid_metadata ... ok
+test tests::pty_signal_probe_helper ... ok
+test tests::windows_discard_mode는_full_sender를_깨우고_추가_output을_보관하지_않는다 ... ok
+test tests::worker_teardown_source_law는_joinhandle과_event_cancel을_강제한다 ... ok
+test tests::writer_thread_spawn_실패는_이미_시작한_reader를_join한다 ... ok
+test tests::고립된_1바이트_echo는_coalesce_대기_전체를_지불하지_않는다 ... ok
+test tests::대량_출력은_coalesce_wait을_1ms로_낮춰도_소수_청크로_뭉친다 ... ok
+test tests::동시_spawn은_openpty_경합에도_전부_성공한다 ... ok
+test tests::반복_kill과_drop은_worker를_남기지_않는다 ... ok
+test tests::부모_에이전트_세션_마커는_pane에_상속되지_않는다 ... ok
+test tests::빠르게_종료되는_자식의_꼬리_출력은_유실되지_않는다 ... ok
+test tests::사용자가_명시한_lang는_덮어쓰지_않는다 ... ok
+test tests::스크럽_목록은_사용자_설정을_건드리지_않는다 ... ok
+test tests::이미_사라진_그룹만_경고에서_내린다 ... ok
+test tests::입력_echo_roundtrip ... ok
+test tests::자기_프로세스_그룹에는_신호를_보내지_않는다 ... ok
+test tests::정상_종료한_세션의_그룹은_esrch를_돌려준다 ... ok
+test tests::출력_폭주중_대량_입력이_블록되지_않는다 ... ok
+test tests::출력과_종료코드 ... ok
+
+test result: ok. 45 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.73s
+
+     Running unittests src/lib.rs (target/debug/deps/relay_protocol-279920e2e7f0aab3)
+
+running 13 tests
+test tests::a_short_buffer_is_incomplete_not_invalid ... ok
+test tests::admission_credentials_compare_in_constant_time ... ok
+test tests::an_oversized_declared_length_is_rejected_before_buffering ... ok
+test tests::close_and_rejection_carry_a_code_never_text ... ok
+test tests::decoding_borrows_the_payload_and_reports_consumed_bytes ... ok
+test tests::encoding_refuses_to_build_an_out_of_bounds_frame ... ok
+test tests::every_frame_type_has_one_fixed_payload_shape ... ok
+test tests::frames_iterate_and_stop_at_the_first_invalid_frame ... ok
+test tests::header_layout_is_fixed_big_endian ... ok
+test tests::magic_version_flags_and_frame_type_fail_closed ... ok
+test tests::opaque_ids_never_render_their_bytes ... ok
+test tests::reconnect_wire_accepts_only_the_new_fixed_record_sizes ... ok
+test tests::the_wire_contract_has_no_dependencies_and_no_application_vocabulary ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/relay_wire_vectors.rs (target/debug/deps/relay_wire_vectors-bc722a6c9962ab7c)
+
+running 5 tests
+test every_accepted_vector_encodes_and_decodes_byte_for_byte ... ok
+test every_rejected_vector_fails_with_the_recorded_reason ... ok
+test fixture_constants_match_the_compiled_contract ... ok
+test oversized_declarations_are_rejected_from_the_header_alone ... ok
+test the_fixture_carries_no_key_material_vocabulary ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/relay_server-6c479eadcee072c0)
+
+running 36 tests
+test core::tests::a_cascading_timeout_disconnects_each_connection_exactly_once ... ok
+test core::tests::a_device_ticket_is_single_use_and_expires ... ok
+test core::tests::a_dropped_peers_bytes_keep_counting_until_the_transport_confirms ... ok
+test core::tests::a_frame_for_another_route_or_connection_disconnects_the_sender ... ok
+test core::tests::a_full_scenario_leaves_no_application_bytes_in_relay_state_or_output ... ok
+test core::tests::a_revoked_ticket_stops_admitting_immediately ... ok
+test core::tests::a_route_admits_one_desktop_at_a_time ... ok
+test core::tests::a_second_device_cannot_join_an_occupied_route ... ok
+test core::tests::a_single_huge_backlog_is_bounded_by_bytes_not_only_by_frames ... ok
+test core::tests::a_slow_consumer_is_disconnected_instead_of_buffering_without_limit ... ok
+test core::tests::a_ticket_refused_because_the_route_is_busy_is_still_consumed ... ok
+test core::tests::an_all_zero_connection_id_is_refused_at_device_admission ... ok
+test core::tests::an_expired_ticket_is_refused_even_when_no_cleanup_tick_has_run ... ok
+test core::tests::an_idle_connection_times_out_and_heartbeats_keep_it_alive ... ok
+test core::tests::an_unadmitted_connection_may_only_present_admission ... ok
+test core::tests::an_unadmitted_connection_times_out_on_the_shorter_handshake_deadline ... ok
+test core::tests::capacity_is_bounded_per_ip_and_in_total ... ok
+test core::tests::closing_a_peer_notifies_the_other_side_and_releases_every_resource ... ok
+test core::tests::control_frames_reserve_queue_bytes_like_data_frames ... ok
+test core::tests::data_frames_are_forwarded_byte_for_byte_to_the_peer_only ... ok
+test core::tests::desktop_admission_requires_the_exact_credential_for_that_route ... ok
+test core::tests::only_the_desktop_may_publish_or_revoke_tickets ... ok
+test core::tests::reconnect_during_desktop_restoration_is_transient_not_revoked ... ok
+test core::tests::reconnect_grant_is_revoked_and_never_accepted_with_wrong_bytes ... ok
+test core::tests::reconnect_grant_survives_disconnect_but_not_expiry ... ok
+test core::tests::reconnect_pairing_link_without_route_resolves_only_its_one_shot_ticket ... ok
+test core::tests::reconnect_publication_cannot_extend_expiry_or_cross_authority ... ok
+test core::tests::reconnect_registry_has_an_independent_fixed_bound ... ok
+test core::tests::reconnect_route_free_pairing_rejects_ambiguous_tickets ... ok
+test core::tests::republishing_a_pending_ticket_is_not_fatal ... ok
+test core::tests::shutdown_closes_every_connection_once_and_drains_state ... ok
+test core::tests::the_device_chooses_the_connection_id_and_both_sides_are_told_the_same_one ... ok
+test core::tests::the_rate_limit_table_is_bounded_against_rotating_source_addresses ... ok
+test core::tests::the_server_links_no_secret_crypto_storage_or_ui_dependency ... ok
+test core::tests::the_total_queue_reservation_is_bounded_across_all_connections ... ok
+test core::tests::ticket_guessing_is_rate_limited_per_ip_without_touching_the_route ... ok
+
+test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running unittests src/main.rs (target/debug/deps/relay_server-12f36f67acb05339)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/deploy_manifests.rs (target/debug/deps/deploy_manifests-a51dbd4a14968beb)
+
+running 6 tests
+test every_environment_variable_the_server_reads_is_documented_in_both_environments ... ok
+test no_default_admission_credential_exists_anywhere ... ok
+test the_examples_carry_placeholders_and_never_real_coordinates ... ok
+test the_readme_records_every_unresolved_coordinate_as_blocked ... ok
+test the_units_run_least_privileged_and_never_pass_credentials_on_the_command_line ... ok
+test tls_termination_stays_an_edge_responsibility ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/shutdown.rs (target/debug/deps/shutdown-5a906aa471e91ae3)
+
+running 3 tests
+test fragmented_http_handshake_survives_the_accept_poll ... ok
+test malformed_admission_receives_a_rejection_before_eof ... ok
+test sigterm_stops_a_worker_receiving_a_slow_http_handshake ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.89s
+
+     Running tests/transport_contract.rs (target/debug/deps/transport_contract-1b97c0a0c07176a0)
+
+running 9 tests
+test a_departing_peers_backlog_is_discarded_rather_than_written ... ok
+test a_disconnect_closes_the_socket_so_a_pinned_read_returns ... ok
+test an_unadmitted_peer_can_only_make_us_buffer_one_admission_frame ... ok
+test both_directions_carry_a_deadline_so_a_stalled_peer_cannot_pin_a_worker ... ok
+test shutdown_signals_are_observed_by_a_non_blocking_accept_loop ... ok
+test the_core_lock_is_never_held_across_a_socket_write ... ok
+test the_full_frame_budget_is_granted_only_after_the_core_admits_the_connection ... ok
+test the_outbound_backlog_is_freed_before_the_core_is_told_the_connection_closed ... ok
+test worker_threads_are_capped_before_they_are_spawned ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/runtime-22c4ce4739e2fd59)
+
+running 395 tests
+test agent_wrapper::tests::저장된_래퍼만_지금_스크립트로_바꾼다 ... ok
+test agent_wrapper::tests::폴백_셸_env는_셸_통합_값만_전달_이름으로_넘긴다 ... ok
+test agent_wrapper::tests::폴백_셸만_셸_통합_env를_되살려_연다 ... ok
+test client::tests::durable_drain은_프레임_budget에서_멈추고_나머지를_보존한다 ... ok
+test client::tests::history_runtime_query_backlog_restore_keeps_newest_per_operation_and_order ... ok
+test command::tests::agent_right_split_preserves_launch_fields_and_wire_round_trips ... ok
+test command::tests::agent_right_split_validates_and_accounts_for_exact_target ... ok
+test command::tests::agent_status_harness_runtime_token_keeps_external_budget_and_rejects_duplicates ... ok
+test command::tests::canonicalization_removes_spare_capacity_before_long_lived_storage ... ok
+test command::tests::command_admission_accepts_exact_scalar_limits_and_rejects_plus_one ... ok
+test command::tests::command_admission_bounds_args_env_regex_and_seed_aggregates ... ok
+test command::tests::direct_terminal_input_is_bounded_retained_and_redacted_on_wire ... ok
+test command::tests::durable_event_barrier_requires_nonzero_correlation_and_retains_no_heap ... ok
+test command::tests::every_mux_id_variant_accepts_exact_and_rejects_plus_one_or_control ... ok
+test command::tests::history_runtime_query_validation_bounds_and_wire_roundtrip ... ok
+test command::tests::host_validation_bounds_opaque_agent_config_id ... ok
+test command::tests::internal_env_slot_preserves_exact_external_limit ... ok
+test command::tests::live_scrollback_명령은_설정범위와_세대번호를_검증한다 ... ok
+test command::tests::post_agent_shell_env_keeps_external_budget_and_bounds_its_own_count ... ok
+test command::tests::pr1_batch_input_validates_total_budget_identity_and_redacts_debug ... ok
+test command::tests::respawn_archived_agent_admission_bounds_dimensions_and_extra_args ... ok
+test command::tests::respawn_archived_agent_debug_hides_extra_args_content ... ok
+test command::tests::respawn_archived_agent_retention_counts_extra_args_and_canonicalizes ... ok
+test command::tests::respawn_relaunch_fields_are_validated ... ok
+test command::tests::restore_workspace_pane_debug_exposes_only_bounded_identifier ... ok
+test command::tests::retention_aggregate_uses_the_exact_runtime_queue_ceiling ... ok
+test command::tests::retention_preflight_accepts_a_maximum_valid_agent_command ... ok
+test command::tests::retention_preflight_validates_then_canonicalizes_then_measures_capacity ... ok
+test command::tests::runtime_command_debug는_spawn_agent와_input_payload를_숨긴다 ... ok
+test command::tests::runtime_command_variant_order_is_source_locked ... ok
+test command::tests::spawn_agent_postcard_golden_bytes_are_unchanged ... ok
+test command::tests::tracked_input_accepts_internal_namespaces_without_loosening_public_identity_bytes ... ok
+test command::tests::tracked_input_validates_operation_identity_and_preserves_wire_roundtrip ... ok
+test command::tests::unattached_session_commands_retain_no_heap_payload ... ok
+test dotenv::tests::bounded_parser_enforces_input_key_and_value_bytes ... ok
+test dotenv::tests::bounded_parser_enforces_occurrence_budget_before_push ... ok
+test dotenv::tests::bounded_parser_rejects_invalid_caller_budget ... ok
+test dotenv::tests::bounded_reader_accepts_exact_aggregate_and_rejects_one_byte_over ... ok
+test dotenv::tests::bounded_reader_shares_occurrence_budget_across_both_files ... ok
+test dotenv::tests::legacy_parser_behavior_remains_tolerant_and_compatible ... ok
+test event::tests::agent_spawn_correlation_debug_hides_raw_id_and_roundtrips ... ok
+test event::tests::legacy_agent_spawned_postcard_bytes_are_unchanged ... ok
+test event::tests::runtime_event_variant_order_is_source_locked ... ok
+test event::tests::spawn_failed_payload_roundtrips_through_postcard ... ok
+test event::tests::spawn_failed_payload_uses_stable_message_id_and_args ... ok
+test event::tests::unattached_session_events_have_only_fixed_count_payloads ... ok
+test event::tests::viewport_dirty_cap_keeps_the_last_row_for_single_column_grid ... ok
+test event::tests::슬롯_덮어쓰기는_미소비_dirty_델타를_합친다 ... ok
+test host::tests::factory_is_inert_and_host_rejects_invalid_correlation_before_enqueue ... ok
+test host::tests::host_config_is_fully_bounded_before_worker_construction ... ok
+test host::tests::live_scrollback_생성정책은_외부_첫명령보다_먼저_적용된다 ... ok
+test host::tests::runtime_secret_debug_is_always_redacted ... ok
+test host::tests::runtime_secret_transfers_the_original_plaintext_allocation ... ok
+test in_process::tests::agent_right_split_preserves_anchor_tab_even_when_another_tab_is_active ... ok
+test in_process::tests::agent_right_split_spawn_failure_keeps_original_layout_and_session ... ok
+test in_process::tests::agent_right_split_stale_target_rejects_before_secret_or_process_creation ... ok
+test in_process::tests::agent_status_harness_shell_inherits_one_stable_runtime_token ... ok
+test in_process::tests::ansi_replay_tail은_상한과_ansi_경계를_지킨다 ... ok
+test in_process::tests::archive_cache_revalidates_replaced_logs_root_before_incrementing ... ok
+test in_process::tests::archive_gc_failure_marks_cached_usage_unknown ... ok
+test in_process::tests::archive_limit_닫힌_pane의_memory_tail도_개수와_바이트_lru를_따른다 ... ok
+test in_process::tests::archive_limit_압축후_예산도_맞춰_새_archive가_즉시_축출되지_않는다 ... ok
+test in_process::tests::archive_limit_자동_exit도_disk가_없으면_memory_tail을_먼저_보존한다 ... ok
+test in_process::tests::archive_limit_자동_exit의_보존실패만_pane을_남기고_명시적_close는_폐기한다 ... ok
+test in_process::tests::archive_limit_초과한_100k_이력도_pane과_최신_tail을_보존한다 ... ok
+test in_process::tests::archived_restore_failed_rebind_leaves_no_runtime_marker ... ok
+test in_process::tests::archived_restore_invalid_metadata_preserves_persistent_row_for_fallback ... ok
+test in_process::tests::archived_restore_truncated_stream_preserves_persistent_row_for_fallback ... ok
+test in_process::tests::back_to_back_durable_event_barriers_preserve_fifo_and_exact_ids ... ok
+test in_process::tests::command_queue_byte_budget_accepts_exact_rejects_repeated_plus_one_and_recovers ... ok
+test in_process::tests::command_sink_rejects_invalid_agent_before_queue_or_secret_resolution ... ok
+test in_process::tests::command_sink이_살아있어도_shutdown이_완료된다 ... ok
+test in_process::tests::composer_codex_placeholder_accepts_multiline_prompt_in_owned_pty ... ok
+test in_process::tests::composer_explicit_prompt_accepts_redrawn_empty_editor_after_cleared_native_draft ... ok
+test in_process::tests::composer_ready_hint_still_protects_current_question_and_accepted_draft ... ok
+test in_process::tests::composer_ready_prompt_is_not_vetoed_by_previous_stream_status ... ok
+test in_process::tests::composer_scrollback_still_protects_live_drafts_and_choice_dialogs ... ok
+test in_process::tests::composer_scrollback_submit_uses_live_editor_and_preserves_viewport ... ok
+test in_process::tests::composer_wide_cursor_still_protects_drafts_and_automatic_input ... ok
+test in_process::tests::composer_wide_placeholder_accepts_input_without_moving_viewport ... ok
+test in_process::tests::credential_env_새_셸과_agent는_api연결을_주입하고_launch가_우선한다 ... ok
+test in_process::tests::credential_env_실제_agent_프로세스에_연결한_키를_전달한다 ... ok
+test in_process::tests::credential_env_키를_읽지못하면_agent_환경을_부분반환하지_않는다 ... ok
+test in_process::tests::default_env_and_cwd_are_canonicalized_before_worker_storage ... ok
+test in_process::tests::direct_input_mode_refresh_is_bounded_and_flood_keeps_interrupt_keys_available ... ok
+test in_process::tests::direct_input_refreshes_queued_mode_changes_without_viewport_wait ... ok
+test in_process::tests::direct_mux_query_before_cold_restore_preserves_persisted_panes ... ok
+test in_process::tests::direct_terminal_input_reads_live_modes_before_pty_write ... ok
+test in_process::tests::durable_event_queue_포화는_구독자를_degraded로_표시한다 ... ok
+test in_process::tests::emergency_persist_flush는_워커를_막지_않는다 ... ok
+test in_process::tests::environment_application_버전은_실제_spawn_성공에만_붙는다 ... ok
+test in_process::tests::environment_application_캡처후_비밀회전은_이전버전_spawn을_막는다 ... ok
+test in_process::tests::every_runtime_sender_uses_shared_preparation_and_nonclone_byte_reservation ... ok
+test in_process::tests::exit_sentinel은_폴백_셸이_살아있어도_에이전트의_진짜_종료코드를_즉시_반영한다 ... ok
+test in_process::tests::exited_archive_cap ... ok
+test in_process::tests::exited_archive_global_budget는_visible을_보존한다 ... ok
+test in_process::tests::exit시_scrollback_아카이브가_디스크에_기록된다 ... ok
+test in_process::tests::extract_last_output는_마지막_명령_출력을_돌려준다 ... ok
+test in_process::tests::factory_resolves_complete_secret_set_before_spawn_and_fails_closed_on_redaction_rejection ... ok
+test in_process::tests::factory_retains_checked_redaction_lease_for_session_lifetime ... ok
+test in_process::tests::failed_memory_archive_inflate_retains_no_partial_state ... ok
+test in_process::tests::fleet_review_fix_submission_event_requires_real_admission_and_no_paste_newline ... ok
+test in_process::tests::followup_codex_effort_keys_do_not_block_next_step_or_prompt ... ok
+test in_process::tests::freeze_resume는_결과_이벤트를_회신한다 ... ok
+test in_process::tests::gc_evicted_triggering_archive_does_not_leave_disk_marker ... ok
+test in_process::tests::history_runtime_query_is_correlated_pure_and_independent_of_native_scroll ... ok
+test in_process::tests::history_runtime_query_replies_are_bounded_without_durable_or_native_wakes ... ok
+test in_process::tests::in_process_command_queue_full은_err로_surface된다 ... ok
+test in_process::tests::input_pressure_events_are_coalesced_per_session ... ok
+test in_process::tests::input_reply_is_bounded_and_close_stops_capture ... ok
+test in_process::tests::inspect_unattached_excludes_mux_and_remote_viewed_sessions ... ok
+test in_process::tests::inspect_unattached_treats_zero_ttl_remote_lease_as_expired_in_same_burst ... ok
+test in_process::tests::invalid_legacy_spawn_is_rejected_before_enqueue_or_secret_resolution ... ok
+test in_process::tests::kill_unattached_recomputes_after_a_session_becomes_attached ... ok
+test in_process::tests::kill_unattached_removes_only_current_local_candidates ... ok
+test in_process::tests::kill_unattached_treats_expired_remote_lease_as_candidate_without_pump ... ok
+test in_process::tests::kill된_세션의_lease는_정리되고_stale_커맨드는_무시된다 ... ok
+test in_process::tests::lease_갱신은_스냅샷을_재push하지_않는다 ... ok
+test in_process::tests::live_scrollback_검토_세션편입마다_전역_예산을_확인한다 ... ok
+test in_process::tests::live_scrollback_낡은세대와_동일세대_충돌을_무시한다 ... ok
+test in_process::tests::live_scrollback_독립로그는_재시작시_현재설정으로_재생하며_영속삭제를_약속하지_않는다 ... ok
+test in_process::tests::live_scrollback_새_spawn은_최신값을_쓰고_pending_identity만_낮은값을_유지한다 ... ok
+test in_process::tests::live_scrollback_세션삭제는_동일세대_ack_집계를_갱신한다 ... ok
+test in_process::tests::live_scrollback_시작시_한도로_복원하고_증가후_새출력을_보존한다 ... ok
+test in_process::tests::live_scrollback_증가후_새세션의_archive를_이전최소값으로_자르지_않는다 ... ok
+test in_process::tests::live_scrollback_현재_세션에_적용한_뒤_ack한다 ... ok
+test in_process::tests::memory_archive_inflate_accepts_exact_cap_and_rejects_plus_one ... ok
+test in_process::tests::newly_over_limit_archive_scan_rolls_back_the_triggering_write ... ok
+test in_process::tests::note_turn_start는_latch된_error를_해제한다 ... ok
+test in_process::tests::oversized_archive_dump_is_rejected_before_redaction ... ok
+test in_process::tests::oversized_input_is_rejected_before_the_pty_queue ... ok
+test in_process::tests::pane_restore_dotenv_accepts_exact_limits_and_rejects_over_limit_without_partial_env ... ok
+test in_process::tests::pane_title_storage_canonicalizes_256_huge_spare_allocations ... ok
+test in_process::tests::pr10_owned_sender_returns_original_body_on_channel_and_byte_pressure ... ok
+test in_process::tests::pr13_deferred_log_sink_allows_revocation_while_disk_work_is_delayed ... ok
+test in_process::tests::pr13_exit_teardown_releases_authorization_before_revocation_handshake ... ok
+test in_process::tests::pr13_final_watched_output_survives_paced_fast_exit ... ok
+test in_process::tests::pr13_flood_stops_at_strict_budget_without_replaying_output_or_input ... ok
+test in_process::tests::pr13_guard_refreshes_output_arriving_during_authorization_wait ... ok
+test in_process::tests::pr13_guard_refreshes_queued_choice_prompt_before_admission ... ok
+test in_process::tests::pr13_guard_refreshes_queued_dec2004_off_before_admission ... ok
+test in_process::tests::pr13_ordinary_keyboard_does_not_drain_or_wait_for_output ... ok
+test in_process::tests::pr18_secret_store_resolver_uses_only_its_injected_fixture ... ok
+test in_process::tests::pr1_guarded_batch_has_one_permission_check_and_correlated_acceptance ... ok
+test in_process::tests::pr1_stale_session_batch_is_correlated_rejection_without_submission ... ok
+test in_process::tests::pr2_actual_admission_preserves_existing_tui_draft_and_dialog ... ok
+test in_process::tests::pr2_automatic_unknown_and_wrong_foreground_fail_closed_but_explicit_other_is_useful ... ok
+test in_process::tests::pr8_measure_real_log_writer_batch_five_samples ... ok
+test in_process::tests::pr8_partial_log_batch_failure_is_not_replayed ... ok
+test in_process::tests::pr8_pump_log_batch_limits_small_chunk_writes_without_losing_order ... ok
+test in_process::tests::pr9_actual_paste_admission_rechecks_dec2004_at_queue_boundary ... ok
+test in_process::tests::production_runtime_diagnostics_never_format_raw_error_chains ... ok
+test in_process::tests::project_keys_managed_defaults_scrub_fallback_and_reach_actual_shell ... ok
+test in_process::tests::pty_output_wake는_긴_fallback_batch보다_먼저_viewport를_보낸다 ... ok
+test in_process::tests::resource_targets_are_collected_only_once_at_each_exact_due_deadline ... ok
+test in_process::tests::resource_usage는_session_child_usage를_포함한다 ... ok
+test in_process::tests::resource_usage는_드레인_없이도_slot_하나로_코얼레싱된다 ... ok
+test in_process::tests::respawn_archived_agent_failure_preserves_previous_archived_state ... ok
+test in_process::tests::respawn_archived_agent_ignores_non_archived_targets ... ok
+test in_process::tests::respawn_archived_agent_reuses_pane_persistent_id_and_appends_extra_args ... ok
+test in_process::tests::respawn_archived_agent는_바꾼_명령으로_띄우고_세션_행은_그대로_둔다 ... ok
+test in_process::tests::respawn_archived_agent는_앱이_넘긴_실행_env를_쓴다 ... ok
+test in_process::tests::respawn_archived_agent는_저장된_error_regex로_상태를_감지한다 ... ok
+test in_process::tests::restore_cwd_uses_persisted_session_cwd_for_shell_spawn ... ok
+test in_process::tests::restore_workspace_pane_agent_is_archived_without_agent_start_event ... ok
+test in_process::tests::restore_workspace_pane_closed_skeleton_is_not_materialized_by_full_restore ... ok
+test in_process::tests::restore_workspace_pane_durable_event_barrier_follows_requested_mux_result ... ok
+test in_process::tests::restore_workspace_pane_full_failure_preserves_remaining_association_for_restart ... ok
+test in_process::tests::restore_workspace_pane_materializes_only_requested_panes_and_reuses_catalog ... ok
+test in_process::tests::restore_workspace_pane_pending_close_survives_restart ... ok
+test in_process::tests::restore_workspace_pane_pending_tab_close_survives_restart ... ok
+test in_process::tests::restore_workspace_pane_spawn_failure_preserves_persisted_association ... ok
+test in_process::tests::restore_workspace_pane_then_full_restore_materializes_remaining_once ... ok
+test in_process::tests::restore_workspace_pane_unknown_target_creates_no_partial_session ... ok
+test in_process::tests::restore는_세션이_있으면_skip한다 ... ok
+test in_process::tests::runtime_cache_share_accepts_values_below_global_32mib_minimum ... ok
+test in_process::tests::runtime_failure_trace_uses_only_static_low_cardinality_fields ... ok
+test in_process::tests::scroll_to_prompt는_프롬프트_마크_사이를_오간다 ... ok
+test in_process::tests::scroll은_lease_세션의_viewport를_흐르게_한다 ... ok
+test in_process::tests::select_next_live_trim_target은_floor아래로_안내려간다 ... ok
+test in_process::tests::select_next_live_trim은_hidden을_heaviest순으로_먼저_고른다 ... ok
+test in_process::tests::select_next_live_trim은_hidden이_전부_floor면_visible을_최후수단으로 ... ok
+test in_process::tests::select_next_live_trim은_예산이내면_none ... ok
+test in_process::tests::select_next_live_trim은_전부_floor면_초과여도_none ... ok
+test in_process::tests::select_tab과_close_tab_흐름 ... ok
+test in_process::tests::session_257_is_rejected_before_id_secret_or_spawn ... ok
+test in_process::tests::shell_right_split_reveals_anchor_tab_when_another_tab_became_active ... ok
+test in_process::tests::spawn_agent_resolve_실패시_spawn_안함 ... ok
+test in_process::tests::spawn_agent_secret_env_주입 ... ok
+test in_process::tests::spawn_agent는_workspace_기본_env를_병합하고_launch값을_우선한다 ... ok
+test in_process::tests::spawn_agent의_transient_args는_실행에만_붙고_세션_행에는_남지_않는다 ... ok
+test in_process::tests::spawn_실패_이벤트 ... ok
+test in_process::tests::spawn_출력_종료_이벤트_흐름 ... ok
+test in_process::tests::split과_close_pane_mux_흐름 ... ok
+test in_process::tests::stale_mux_can_precede_restore_while_durable_event_barrier_stays_after_requested_result ... ok
+test in_process::tests::status_done과_exit_반영 ... ok
+test in_process::tests::status_stream_regex_감지 ... ok
+test in_process::tests::status_화면_패턴_hidden에서_snapshot_없이_감지 ... ok
+test in_process::tests::subscribe_with_wake는_상태이벤트에_깨운다 ... ok
+test in_process::tests::suspended_이후_spawn은_거부된다 ... ok
+test in_process::tests::suspended_이후_split은_거부된다 ... ok
+test in_process::tests::terminal_control_defers_native_geometry_and_restores_latest_real_pty_target_once ... ok
+test in_process::tests::terminal_control_expiry_has_its_own_wakeup_with_maximum_fallback_batch ... ok
+test in_process::tests::terminal_control_expiry_restores_legacy_native_want_and_late_renew_cannot_reacquire ... ok
+test in_process::tests::terminal_control_mobile_geometry_never_overwrites_persisted_desktop_preference ... ok
+test in_process::tests::terminal_control_real_pty_reports_mobile_and_restored_native_geometry ... ok
+test in_process::tests::terminal_control_review_failed_restore_retains_desktop_want_across_reacquire ... ok
+test in_process::tests::terminal_control_review_rechecks_target_expiry_after_other_restore_before_renew_or_resize ... ok
+test in_process::tests::terminal_control_review_retryable_tracked_restore_reacquire_resize_release_keeps_latest_token ... ok
+test in_process::tests::terminal_control_single_owner_revisions_geometry_bounds_and_stale_release ... ok
+test in_process::tests::terminal_restore_production_reads_remain_bounded ... ok
+test in_process::tests::terminal_restore_rejects_symlink_and_nonregular_input ... ok
+test in_process::tests::terminal_tail_snapshot_ignores_append_and_rejects_short_read ... ok
+test in_process::tests::title_suffix_파싱 ... ok
+test in_process::tests::tracked_input_reports_actual_pty_queue_pressure ... ok
+test in_process::tests::tracked_input_reports_real_pty_admission_rejection_and_output ... ok
+test in_process::tests::tracked_resize_worker는_실제크기_ack과_멱등_stamp를_반환한다 ... ok
+test in_process::tests::tracked_resize는_적용한_세션의_화면만_다시_보낸다 ... ok
+test in_process::tests::unknown_archive_usage_blocks_new_writes_and_makes_gc_progress ... ok
+test in_process::tests::user_status_override는_status_view_event로_surface된다 ... ok
+test in_process::tests::valid_spawn_agent_emits_legacy_then_exact_correlation_once ... ok
+test in_process::tests::valid_spawn_failure_emits_legacy_then_exact_correlation_once ... ok
+test in_process::tests::warm에서_viewport_중단_active복귀시_재개 ... ok
+test in_process::tests::worker_defensively_rejects_invalid_agent_and_resolves_correlation_without_secret ... ok
+test in_process::tests::workspace_sources_복원은_pane_cwd보다_프로젝트_선택파일을_사용한다 ... ok
+test in_process::tests::가시성_전이_후_세션_렌더_유지 ... ok
+test in_process::tests::구버전_zsh_ansi에서_마지막_terminal_너비를_복구한다 ... ok
+test in_process::tests::다중_구독자 ... ok
+test in_process::tests::다중_세션_동시_생존과_독립_입출력 ... ok
+test in_process::tests::로그_secret_scan_평문_없음 ... ok
+test in_process::tests::복원된_archived_agent_pane도_scroll로_스크롤백을_볼_수_있다 ... ok
+test in_process::tests::복원된_archived_agent_pane은_시간이_지나도_자동으로_닫히지_않는다 ... ok
+test in_process::tests::비활성_pane은_viewport_push_안됨 ... ok
+test in_process::tests::세션과_layout이_영속된다 ... ok
+test in_process::tests::셸_exit시_pane_자동_닫힘_agent도_동일하게_닫힌다 ... ok
+test in_process::tests::원격_시청_lease는_hidden_세션_viewport를_흐르게_하고_해제시_멈춘다 ... ok
+test in_process::tests::원격_시청은_warm에서도_생성되고_ttl_만료로_중단된다 ... ok
+test in_process::tests::원격_전용_viewport는_render_bound_구독자를_깨우지_않는다 ... ok
+test in_process::tests::입력과_kill ... ok
+test in_process::tests::재시작시_agent_pane은_열람전용으로_복원된다 ... ok
+test in_process::tests::재시작시_alt_screen이었던_셸_pane도_화면이_보존된다 ... ok
+test in_process::tests::재시작시_ansi_scrollback과_color가_복원된다 ... ok
+test in_process::tests::재시작시_저장된_layout이_복원된다 ... ok
+test in_process::tests::증분_캐시는_스캔없이_예산초과만_gc를_요구한다 ... ok
+test in_process::tests::터미널_제목은_이벤트로_나가고_action_required는_승인_필요다 ... ok
+test input_admission::tests::claude_empty_cursor_row_does_not_hide_multiline_draft ... ok
+test input_admission::tests::pr2_supported_cursor_row_requires_empty_prompt_for_automation ... ok
+test known_hosts::tests::atomic_replace_실패는_memory를_rollback하고_temp를_정리한다 ... ok
+test known_hosts::tests::duplicate는_last_wins이고_업데이트는_보유byte를_교체한다 ... ok
+test known_hosts::tests::forget후_재tofu_가능하고_회계가_감소한다 ... ok
+test known_hosts::tests::invalid_utf8과_제어문자_필드는_fail_closed ... ok
+test known_hosts::tests::pin은_저장되고_재로드_후_match_불일치는_mismatch ... ok
+test known_hosts::tests::post_create_operation_실패는_자신의_temp를_정리한다 ... ok
+test known_hosts::tests::production_source는_unbounded_read와_raw_diagnostic을_금지한다 ... ok
+test known_hosts::tests::replacement_growth_shrink는_snapshot_load를_거부한다 ... ok
+test known_hosts::tests::symlink_fifo_directory는_즉시_fail_closed한다 ... ok
+test known_hosts::tests::temp_create_collision은_기존파일을_삭제하지_않는다 ... ok
+test known_hosts::tests::반복_save는_healthy_process에서_temp를_누적하지_않는다 ... ok
+test known_hosts::tests::손상_라인은_스킵하고_나머지는_로드 ... ok
+test known_hosts::tests::없는_파일은_빈_저장소이고_first_use ... ok
+test known_hosts::tests::엔트리수_exact는_허용하고_plus_one은_거부한다 ... ok
+test known_hosts::tests::저장파일은_owner_only_권한이다 ... ok
+test known_hosts::tests::총보유byte_exact는_허용하고_plus_one은_거부한다 ... ok
+test known_hosts::tests::파일크기_exact는_허용하고_plus_one은_거부한다 ... ok
+test known_hosts::tests::필드크기_exact는_허용하고_plus_one은_거부한다 ... ok
+test memory_release_hook_tests::등록된_훅이_signal마다_호출된다 ... ok
+test persistence::tests::persist_pipe는_drop시_pending_batch를_flush한다 ... ok
+test persistence::tests::persist_pipe는_status와_log_offset을_batch_writer로_보낸다 ... ok
+test persistence::tests::session_respawned은_같은_uuid를_새_session_id로_옮기고_args는_보존한다 ... ok
+test persistence::tests::session_row은_소비하지_않고_반복_조회_가능하다 ... ok
+test persistence::tests::비상_플러시는_drop_없이_배치를_커밋한다 ... ok
+test protocol::tests::compact_cell_keeps_six_field_wire_bytes_and_json ... ok
+test protocol::tests::protocol_version_tracks_live_scrollback_wire_variants ... ok
+test protocol::tests::tracked_resize_append_preserves_legacy_command_event_and_envelope_bytes ... ok
+test remote::liveness::tests::liveness_tracker_client_timeout_is_three_heartbeat_intervals ... ok
+test remote::liveness::tests::liveness_tracker_expires_at_exact_timeout_boundary ... ok
+test remote::liveness::tests::liveness_tracker_observed_frame_resets_timeout_window ... ok
+test remote::liveness::tests::liveness_tracker_stays_alive_just_before_timeout_boundary ... ok
+test remote::liveness::tests::outbound_heartbeat_is_due_despite_inbound_only_progress ... ok
+test remote::tests::alt_screen_토글은_keyframe ... ok
+test remote::tests::attach_명령_이벤트_왕복 ... ok
+test remote::tests::client_liveness_idle_poll_at_deadline_requests_disconnect ... ok
+test remote::tests::client_liveness_observes_empty_heartbeat_frame ... ok
+test remote::tests::client_liveness_observes_ordinary_event_frame ... ok
+test remote::tests::connect_timeout_is_applied_by_connector_helper ... ok
+test remote::tests::delta_gap_복구 ... ok
+test remote::tests::delta_왕복_등가성 ... ok
+test remote::tests::durable_event_barrier_crosses_remote_runtime_transport ... ok
+test remote::tests::durable_event_barrier_explicitly_does_not_fence_viewport_slots ... ok
+test remote::tests::durable_event_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads ... ok
+test remote::tests::frame_decoder_reports_idle_after_partial_progress_is_exhausted ... ok
+test remote::tests::frame_decoder_treats_timed_out_like_pending ... ok
+test remote::tests::frame_decoder_yields_partial_after_incomplete_successful_read ... ok
+test remote::tests::gap시_request_keyframe_송신 ... ok
+test remote::tests::grapheme_only_delta_roundtrip_and_removal ... ok
+test remote::tests::heavy_repaint는_keyframe_폴백 ... ok
+test remote::tests::history_runtime_query_forwarder_is_bounded_and_fair_under_viewport_flood ... ok
+test remote::tests::history_runtime_query_metadata_survives_equal_cell_delta_and_reply_wire ... ok
+test remote::tests::malformed_delta_grapheme_is_rejected_without_mutating_baseline ... ok
+test remote::tests::malformed_graphemes_are_rejected_before_event_publish ... ok
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_delta ... ok
+test remote::tests::multiple_spacing_graphemes_are_rejected_in_keyframe ... ok
+test remote::tests::muxupdated는_서버_last_sent를_visible_set으로_prune ... ok
+test remote::tests::muxupdated는_클라_recon을_visible_set으로_prune ... ok
+test remote::tests::outbound_queue는_durable_overflow를_silent_drop하지_않는다 ... ok
+test remote::tests::outbound_queue는_viewport를_coalesce하고_status_lifecycle을_보존 ... ok
+test remote::tests::plain_client_drop_joins_reader_liveness_thread ... ok
+test remote::tests::plain_server_disconnect_closes_event_subscription ... ok
+test remote::tests::plain_코덱은_기존_postcard와_바이트_동일 ... ok
+test remote::tests::receiver_drain은_additive_local_events를_wire에서_필터링한다 ... ok
+test remote::tests::receiver_drain은_durable_cap에서_멈춘다 ... ok
+test remote::tests::remote_outbound_preserves_stale_and_requested_mux_before_durable_event_barrier ... ok
+test remote::tests::session_exited는_서버_last_sent_정리 ... ok
+test remote::tests::session_exited는_클라_recon_정리 ... ok
+test remote::tests::subscribing_after_plain_disconnect_is_immediately_closed ... ok
+test remote::tests::tls_attach_명령_이벤트_왕복 ... ok
+test remote::tests::tls_client_drop_joins_io_liveness_thread ... ok
+test remote::tests::tls_event_disconnect_is_published_after_command_channel_closes ... ok
+test remote::tests::tls_idle_sleep_is_skipped_after_partial_frame_progress ... ok
+test remote::tests::tls_send_command는_큐포화와_스레드종료를_err로_surface ... ok
+test remote::tests::tls_server_disconnect_closes_event_subscription ... ok
+test remote::tests::tls_느린_소비자에도_명령이_처리된다 ... ok
+test remote::tests::tls_명령_폭주에도_이벤트_수신_지속 ... ok
+test remote::tests::tls_유휴후에도_접속_유지 ... ok
+test remote::tests::tls_이벤트_폭주중에도_클라_명령이_도달 ... ok
+test remote::tests::tls_잘못된_토큰은_거부 ... ok
+test remote::tests::tls_지문_불일치는_거부되고_서버는_생존 ... ok
+test remote::tests::tls_초과크기_명령은_err_접속은_생존 ... ok
+test remote::tests::tofu_first_use핀_재접속검증_지문변경거부_forget복구 ... ok
+test remote::tests::tracked_resize_delta의_stamp가_기준선과_다르면_한번만_재동기화한다 ... ok
+test remote::tests::tracked_resize_plain_delta_왕복은_stamp를_그대로_보존한다 ... ok
+test remote::tests::tracked_resize_stamp가_달라지면_같은크기여도_keyframe이다 ... ok
+test remote::tests::try_apply_delta_기형은_err ... ok
+test remote::tests::unattached_session_event_names_and_remote_codecs_roundtrip ... ok
+test remote::tests::v12_v13_peer_is_rejected_at_hello_before_event_decode ... ok
+test remote::tests::v2_핸드셰이크_성공_및_기능_협상 ... ok
+test remote::tests::구버전_첫_프레임은_hang없이_거부 ... ok
+test remote::tests::기형_delta는_패닉없이_keyframe재동기화 ... ok
+test remote::tests::다중_접속_유지_중_shutdown ... ok
+test remote::tests::동시_두_클라이언트_모두_이벤트_수신 ... ok
+test remote::tests::리사이즈는_keyframe_폴백 ... ok
+test remote::tests::무토큰_접속은_붙잡아두지_못한다 ... ok
+test remote::tests::비loopback_attach는_거부 ... ok
+test remote::tests::비loopback_bind는_optin_없이_거부 ... ok
+test remote::tests::서버가_미요청_feature_ack하면_거부 ... ok
+test remote::tests::서버는_loopback에만_bind ... ok
+test remote::tests::와이어_검증_규칙 ... ok
+test remote::tests::유휴_접속은_heartbeat_또는_valid_event로_liveness_확인 ... ok
+test remote::tests::잘못된_명령_라인은_접속_종료 ... ok
+test remote::tests::잘못된_토큰은_거부 ... ok
+test remote::tests::접속_유지_중_shutdown ... ok
+test remote::tests::접속_종료_후_목록에서_정리된다 ... ok
+test remote::tests::종료_배치의_trailing_viewport는_baseline_되살리지_않는다 ... ok
+test remote::tests::타이핑_delta가_keyframe보다_작다 ... ok
+test resize::tests::tracked_resize_retry는_기존_실제적용_결과를_그대로_반환한다 ... ok
+test resize::tests::tracked_resize는_백번_owner_교체와_늦은_이전_epoch를_유계상태로_판정한다 ... ok
+test resize::tests::tracked_resize는_이전세대와_같은세대_다른크기를_거부한다 ... ok
+test resize::tests::tracked_resize의_부분실패는_같은_token으로_재적용할_수_있다 ... ok
+test resource_monitor::tests::aggregate는_주입된_rss_조회자로_합산한다 ... ok
+test resource_monitor::tests::capture_accepts_exact_stdout_and_stderr_and_rejects_plus_one ... ok
+test resource_monitor::tests::capture_timeout_kills_group_and_inherited_descendant_pipe_does_not_block ... ok
+test resource_monitor::tests::descendant_bfs_is_bounded_by_process_row_limit ... ok
+test resource_monitor::tests::first_sample_has_no_cpu_baseline ... ok
+test resource_monitor::tests::high_rss_warning_uses_threshold ... ok
+test resource_monitor::tests::macos_phys_footprint는_실행중_자식_pid에_성공한다 ... ok
+test resource_monitor::tests::macos_reap된_pid는_footprint_조회가_실패해_ps_rss로_폴백한다 ... ok
+test resource_monitor::tests::macos_자식_다수의_footprint_합은_ps_rss_합보다_작다 ... ok
+test resource_monitor::tests::process_rows_accept_exact_row_and_line_limits_and_reject_plus_one ... ok
+test resource_monitor::tests::production_source_has_no_unbounded_capture_or_raw_diagnostics ... ok
+test resource_monitor::tests::repeated_capture_cycles_leave_no_reader_growth ... ok
+test resource_monitor::tests::session_usage_aggregates_process_group ... ok
+test resource_monitor::tests::session_usage_falls_back_to_pid_descendants ... ok
+test resource_monitor::tests::session_usage_unions_process_group_and_pid_descendants ... ok
+test resource_monitor::tests::변화_게이트는_idle에서_재발행하지_않는다 ... ok
+test resource_monitor::tests::캡처_실패_빈_행은_마지막_발행_세션_usage를_유지한다 ... ok
+test terminal_input::tests::direct_keys_follow_live_cursor_modes_and_modifier_whitelist ... ok
+test terminal_input::tests::direct_text_preserves_unicode_spaces_and_only_paste_controls ... ok
+test test_secret_store::pr18_runtime_test_helpers_never_select_native_keyring_backend ... ok
+test test_secret_store::pr18_test_store_is_private_per_fixture_and_shared_only_by_arc ... ok
+test test_secret_store::pr18_test_store_prefix_inventory_matches_secret_store_contract ... ok
+test test_secret_store::pr18_test_store_preserves_overwrite_missing_and_idempotent_delete ... ok
+test tls_identity::tests::cert_size_zero_exact_plus_one_contract ... ok
+test tls_identity::tests::cert_파일이_사라지면_쌍으로_재생성돼_지문이_바뀐다 ... ok
+test tls_identity::tests::identity_debug는_cert_fingerprint_key를_노출하지_않는다 ... ok
+test tls_identity::tests::keyring_오류는_부재로_오판하지_않고_실패한다 ... ok
+test tls_identity::tests::lock_symlink_fifo_directory는_block없이_fail_closed한다 ... ok
+test tls_identity::tests::malformed_der는_fail_closed한다 ... ok
+test tls_identity::tests::production_source_has_bounded_nofollow_reads_and_sanitized_diagnostics ... ok
+test tls_identity::tests::replacement_growth_shrink는_stable_read를_실패시킨다 ... ok
+test tls_identity::tests::symlink와_special_file은_부재로_오인하지_않는다 ... ok
+test tls_identity::tests::반복_reload는_cert_buffer를_상한내에서_매번_반환하고_보유하지_않는다 ... ok
+test tls_identity::tests::손상된_비ascii_keyring값은_패닉없이_err ... ok
+test tls_identity::tests::재호출은_같은_신원을_돌려준다 ... ok
+test tls_identity::tests::최초_생성은_키와_cert를_만들고_지문형식이_맞다 ... ok
+test tls_identity::tests::키만_사라지면_stale_cert를_지우고_쌍_재생성 ... ok
+
+test result: ok. 395 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.48s
+
+     Running unittests src/lib.rs (target/debug/deps/secret-961a6ea91d3ed321)
+
+running 79 tests
+test bundle::tests::bounded_slot_inventory_accepts_zero_and_exact_slot_and_entry_ceilings ... ok
+test bundle::tests::bundle_suffix_duplicates_and_malformed_double_suffixes_collapse_to_one_slot ... ok
+test bundle::tests::complete_bundle_is_staged_read_and_deleted_as_one_typed_slot ... ok
+test bundle::tests::every_public_bundle_debug_surface_is_redacted_or_low_cardinality ... ok
+test bundle::tests::hostile_store_errors_are_replaced_on_every_public_bundle_boundary ... ok
+test bundle::tests::logical_id_and_physical_slot_cannot_be_confused ... ok
+test bundle::tests::malformed_prefix_flood_at_entry_limit_is_bounded_and_ignored ... ok
+test bundle::tests::one_hundred_rotations_leave_one_slot_and_three_entries ... ok
+test bundle::tests::public_validation_errors_never_echo_identifier_or_version_material ... ok
+test bundle::tests::reconciliation_fails_closed_before_delete_when_prefix_probe_overflows ... ok
+test bundle::tests::reconciliation_rejects_oversized_referenced_set_before_inventory_or_delete ... ok
+test bundle::tests::redaction_changes_do_not_change_accessors_clone_or_owned_secret_transfer ... ok
+test bundle::tests::slot_limit_plus_one_fails_without_retaining_the_extra_slot ... ok
+test bundle::tests::stage_failure_rolls_back_every_entry_written_in_new_slot ... ok
+test bundle::tests::stage_plan_rejects_previous_slot_from_another_logical_credential ... ok
+test bundle::tests::startup_reconciliation_keeps_referenced_and_deletes_all_orphan_versions ... ok
+test bundle::tests::write_then_error_is_also_rolled_back_from_new_slot ... ok
+test diagnostic_scan::tests::common_provider_prefix_families_are_recognized_without_raw_values ... ok
+test diagnostic_scan::tests::detects_each_supported_secret_like_category ... ok
+test diagnostic_scan::tests::exact_key_boundaries_and_safe_placeholders_avoid_common_false_positives ... ok
+test diagnostic_scan::tests::finding_count_is_bounded_and_limit_plus_one_marks_truncated ... ok
+test diagnostic_scan::tests::invalid_utf8_is_scanned_without_materializing_source_text ... ok
+test diagnostic_scan::tests::key_normalization_accepts_case_and_hyphen_but_not_embedded_names ... ok
+test diagnostic_scan::tests::oversized_input_is_rejected_before_scanning_and_fails_closed ... ok
+test diagnostic_scan::tests::provider_prefix_requires_a_token_boundary_and_minimum_length ... ok
+test diagnostic_scan::tests::report_debug_never_contains_source_text_or_location ... ok
+test hex::tests::비ascii_손상_값도_패닉_없이_에러다 ... ok
+test hex::tests::비hex_문자는_에러다 ... ok
+test hex::tests::왕복_인코딩이_원본을_보존한다 ... ok
+test hex::tests::홀수_길이는_에러다 ... ok
+test macos::tests::every_operation_fails_instead_of_requesting_authentication_ui ... ok
+test macos::tests::existing_login_keychain_and_service_account_are_preserved ... ok
+test macos::tests::interaction_denied_is_never_classified_as_missing ... ok
+test redaction::tests::ansi_escape_삽입_우회_차단 ... ok
+test redaction::tests::base64와_url_변형_치환 ... ok
+test redaction::tests::chunk_경계_분할_대응 ... ok
+test redaction::tests::corpus_capacity_failure_blocks_secret_backed_execution_without_partial_registration ... ok
+test redaction::tests::empty_safe_corpus_bypasses_pattern_and_ansi_work ... ok
+test redaction::tests::grace_prune_scans_only_when_the_earliest_expiry_is_due ... ok
+test redaction::tests::hostile_json_is_rejected_atomically_before_corpus_growth ... ok
+test redaction::tests::json_blob의_문자열_필드도_개별_등록 ... ok
+test redaction::tests::json_execution_lease_redacts_nested_values_then_releases_them_after_grace ... ok
+test redaction::tests::legacy_capacity_failure_marks_service_fail_closed_and_redacts_whole_output ... ok
+test redaction::tests::many_secrets_keep_temporary_variants_bounded_and_never_partially_register ... ok
+test redaction::tests::non_json_checked_lease_matches_normal_execution_lease ... ok
+test redaction::tests::one_hundred_token_rotations_have_zero_item_and_byte_growth ... ok
+test redaction::tests::osc_payload_안의_secret도_치환 ... ok
+test redaction::tests::oversized_legacy_json_registration_fails_closed_before_parse ... ok
+test redaction::tests::redaction_corpus_변형_fixture ... ok
+test redaction::tests::rotating_lease_refcount와_grace_expiry는_match시_prune된다 ... ok
+test redaction::tests::too_short_execution_secret_fails_closed ... ok
+test redaction::tests::wrapped_fragment_covers_middle_pages_and_tiny_fragments ... ok
+test redaction::tests::wrapped_fragment_malformed_ansi_never_splits_original_unicode_scalars ... ok
+test redaction::tests::wrapped_fragment_two_pages_cannot_reconstruct_a_registered_secret ... ok
+test redaction::tests::wrapped_fragment_unicode_ansi_edges_preserve_unrelated_rows ... ok
+test redaction::tests::wrapped_review_compacted_literal_newline_secret_inside_single_line_is_redacted ... ok
+test redaction::tests::wrapped_review_production_overlap_corpus_stays_within_linear_matching_work ... ok
+test redaction::tests::wrapped_terminal_secret_is_not_reconstructible_after_redaction ... ok
+test redaction::tests::wrapped_text_input_limit_fails_closed_without_changing_normal_streams ... ok
+test redaction::tests::wrapped_text_matches_registered_encoded_variants ... ok
+test redaction::tests::wrapped_text_merges_overlapping_patterns_and_self_overlaps ... ok
+test redaction::tests::wrapped_text_newline_only_patterns_are_safe_and_exact_matches_remain_redacted ... ok
+test redaction::tests::wrapped_text_preserves_unrelated_unicode_rows_and_uses_ansi_mapping ... ok
+test redaction::tests::wrapped_text_retains_exact_patterns_with_literal_newlines ... ok
+test redaction::tests::wrapped_text_uses_active_and_retired_leases_and_fails_closed ... ok
+test redaction::tests::단순_치환 ... ok
+test redaction::tests::등록_전_출력은_그대로_이후_출력만_치환 ... ok
+test redaction::tests::여러_출현과_겹침_병합 ... ok
+test redaction::tests::짧은_secret은_미등록 ... ok
+test tests::bounded_inventory_accepts_zero_and_exact_fixed_limit ... ok
+test tests::bounded_inventory_probes_only_limit_plus_one_then_fails_closed ... ok
+test tests::debug_출력은_redacted ... ok
+test tests::into_string은_평문_allocation을_복사없이_호출자에게_이전한다 ... ok
+test tests::keyring_inventory는_service와_prefix로_제한된다 ... ok
+test tests::keyring_roundtrip ... ok
+test tests::masked_hint는_평문을_노출하지_않는다 ... ok
+test tests::secret_string_drop은_평문_buffer를_계속_zeroize한다 ... ok
+test tests::없는_entry_삭제는_성공 ... ok
+test token::tests::토큰은_hex_64자이고_매번_다르다 ... ok
+
+test result: ok. 79 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.78s
+
+     Running unittests src/lib.rs (target/debug/deps/session-83e6d0e1b5839510)
+
+running 81 tests
+test prompt_marks::tests::alt_screen의_lf는_라인을_세지_않는다 ... ok
+test prompt_marks::tests::c_d_마크는_출력_경계로_기록되고_점프_마크는_무변경이다 ... ok
+test prompt_marks::tests::chunk_경계에_걸친_마크도_인식한다 ... ok
+test prompt_marks::tests::d가_없으면_현재_라인까지가_출력_범위다 ... ok
+test prompt_marks::tests::개행_없는_마지막_출력은_d_라인을_포함하고_char_수로_자른다 ... ok
+test prompt_marks::tests::마지막_출력_범위는_c부터_d_직전_라인까지다 ... ok
+test prompt_marks::tests::마크_상한을_넘으면_오래된_것부터_버린다 ... ok
+test prompt_marks::tests::마크가_없거나_출력이_없으면_범위도_없다 ... ok
+test prompt_marks::tests::마크는_bel과_st_양_종결을_모두_인식한다 ... ok
+test prompt_marks::tests::비_133_osc와_다른_133_동작은_무시한다 ... ok
+test prompt_marks::tests::점프_델타는_검색_스크롤_수식과_동치다 ... ok
+test prompt_marks::tests::출력_마크도_상한을_넘으면_오래된_것부터_버린다 ... ok
+test prompt_marks::tests::트림으로_사라진_마크는_조회_시_제거된다 ... ok
+test session::tests::ansi_replay_경계는_alt_screen을_끝내고_fresh_출력을_새줄에_둔다 ... ok
+test session::tests::ansi_replay는_글자와_truecolor를_복원한다 ... ok
+test session::tests::archive_limit_이력만_줄이고_최신_화면을_보존한다 ... ok
+test session::tests::archive_limit_화면만_초과하면_화면을_삭제하지_않는다 ... ok
+test session::tests::cache_class_숨김_전환은_삭제없이_압축한다 ... ok
+test session::tests::dirty_rows를_cell_range로_coalesce한다 ... ok
+test session::tests::input_guard_reads_live_screen_without_moving_or_consuming_scrolled_view ... ok
+test session::tests::lifecycle_running에서_exited로 ... ok
+test session::tests::live_scrollback_검토_새pty는_이전_압박상한을_이어받지_않는다 ... ok
+test session::tests::live_scrollback_새pty에_이전_backend를_복사없이_이어준다 ... ok
+test session::tests::live_scrollback_설정은_추가출력없이_full_dirty를_발행한다 ... ok
+test session::tests::pr13_guard_detaches_exited_writer_before_deferred_drop ... ok
+test session::tests::prompt_jump_metadata_does_not_create_snapshot ... ok
+test session::tests::replay_metadata_does_not_create_snapshot_and_preserves_alt_screen ... ok
+test session::tests::resize_checked는_hidden에서_실제_크기를_확인하고_full_dirty를_유지한다 ... ok
+test session::tests::resize_checked는_pty_실패를_적용성공으로_반환하지_않는다 ... ok
+test session::tests::resize_checked는_유효하지_않은_크기를_적용하지_않는다 ... ok
+test session::tests::scroll_to_bottom은_라이브_화면으로_복귀한다 ... ok
+test session::tests::scroll은_전체_dirty_range로_무효화한다 ... ok
+test session::tests::snapshot_dirty_ranges는_변경된_행만_전달하고_소거한다 ... ok
+test session::tests::개행_없이_끝난_마지막_출력도_추출된다 ... ok
+test session::tests::마지막_출력_추출은_상한_초과_시_뒤쪽을_남긴다 ... ok
+test session::tests::마지막_출력을_추출한다 ... ok
+test session::tests::빠른_종료_명령의_출력이_유실되지_않는다 ... ok
+test session::tests::아카이브_복원_세션은_스크롤백을_보존한다 ... ok
+test session::tests::입력_출력_roundtrip과_snapshot_dirty ... ok
+test session::tests::프롬프트_마크로_점프하고_복귀한다 ... ok
+test status::tests::action_required_표시만_사용자_조치로_본다 ... ok
+test status::tests::builtin_패턴이_claude_승인_프롬프트를_감지 ... ok
+test status::tests::builtin_패턴이_codex_승인_푸터를_감지 ... ok
+test status::tests::codex_제목의_action_required는_표시가_있는_동안_승인_필요다 ... ok
+test status::tests::ctrl_t_does_not_create_a_phantom_draft_or_clear_real_text ... ok
+test status::tests::exit_sentinel_상태는_idle_휴리스틱에_덮이지_않는다 ... ok
+test status::tests::exit_sentinel_상태도_입력으로_해제된다 ... ok
+test status::tests::exit_sentinel은_종료코드로_done_error를_latch한다 ... ok
+test status::tests::fix7_여러_줄_붙여넣기는_실제_enter_전까지_제출이_아니다 ... ok
+test status::tests::fleet_review_fix_choice_submit_reports_input_without_consuming_choice_status ... ok
+test status::tests::fleet_review_fix_only_real_submit_is_reported_outside_split_bracketed_paste ... ok
+test status::tests::idle_heuristic ... ok
+test status::tests::latch된_결과_상태는_턴_시작으로도_해제된다 ... ok
+test status::tests::pr2_draft_evidence_survives_redraw_turn_hook_and_bracketed_newlines ... ok
+test status::tests::pr2_navigation_and_empty_split_paste_do_not_create_a_phantom_draft ... ok
+test status::tests::regex_없는_detector도_builtin_위해_화면을_스캔한다 ... ok
+test status::tests::review_단순_enter_안내는_응답_후_스크롤백에_남아도_해제한다 ... ok
+test status::tests::second_review_한_줄_질문은_답변_후_이전_출력에_남아도_해제한다 ... ok
+test status::tests::sentinel_경로는_temp_dir와_pid로_결정된다 ... ok
+test status::tests::status_view는_source_confidence_override를_담는다 ... ok
+test status::tests::stream_line_감지와_chunk_경계 ... ok
+test status::tests::utf8_문자가_chunk_경계에_걸려도_매칭 ... ok
+test status::tests::같은_상태의_다른_프롬프트는_소비와_무관하게_재감지 ... ok
+test status::tests::같은_프롬프트의_새_복사본은_재감지 ... ok
+test status::tests::개행_없는_스트림에서_line_buf를_재스캔하지_않는다 ... ok
+test status::tests::나중_stream_매치가_이전_상태를_대체 ... ok
+test status::tests::매치는_후속_출력에_유실되지_않고_입력으로_해제 ... ok
+test status::tests::우선순위_error_우선 ... ok
+test status::tests::응답대기_계획_선택창은_긴_푸터에도_질문으로_감지한다 ... ok
+test status::tests::응답대기_방향키와_작성중인_문자는_대기를_소비하지_않는다 ... ok
+test status::tests::입력은_미완_라인과_idle_타이머를_리셋 ... ok
+test status::tests::입력은_화면_재스캔을_예약 ... ok
+test status::tests::잘못된_regex는_무시 ... ok
+test status::tests::제목_스피너가_멈추면_완료이고_입력이나_다음_턴에_해제된다 ... ok
+test status::tests::제목_완료는_늦게_그려진_질문_화면에_밀리고_종료_뒤엔_되돌리지_않는다 ... ok
+test status::tests::프롬프트_잔존시_유지_입력으로_소비 ... ok
+test status::tests::화면_유래_결과상태는_소멸해도_유지 ... ok
+test status::tests::화면_유래_대기를_같은상태_stream이_latch ... ok
+test status::tests::화면_텍스트_패턴_감지 ... ok
+test status::tests::화면_패턴_앵커는_라인_기준 ... ok
+test status::tests::화면_프롬프트_소멸시_해제 ... ok
+
+test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.51s
+
+     Running unittests src/lib.rs (target/debug/deps/storage-2b0d3948b795c866)
+
+running 479 tests
+test db::agent_attention::tests::agent_attention_도구_아이디가_없는_승인은_관련_도구들이_끝난_뒤_해제한다 ... ok
+test db::agent_attention::tests::agent_attention_오래된_질문시작과_이전_세션_결과는_무시한다 ... ok
+test db::agent_attention::tests::agent_attention_이전_완료_확인은_같은_초의_새_완료를_지우지_않는다 ... ok
+test db::agent_attention::tests::agent_attention_질문과_승인은_독립적이고_취소는_해당_턴만_해제한다 ... ok
+test db::agent_attention::tests::agent_attention_질문은_다른_도구와_완료에도_남고_같은_응답만_해제한다 ... ok
+test db::agent_attention::tests::agent_status_harness_runtime_projection_rejects_legacy_and_foreign_incarnations ... ok
+test db::agent_attention::tests::background_child_delayed_exit_keeps_the_later_parent_completion_clock ... ok
+test db::agent_attention::tests::background_child_lifecycle_survives_long_tools_in_global_projection ... ok
+test db::agent_attention::tests::background_child_question_capacity_rejects_an_extra_owner_without_poisoning_cleanup ... ok
+test db::agent_attention::tests::background_child_question_resumption_ignores_an_old_exit ... ok
+test db::agent_attention::tests::background_legacy_child_tools_keep_lifetime_after_a_result ... ok
+test db::agent_attention::tests::fix5_정리된_익명_결과는_새_질문을_상쇄하지_않는다 ... ok
+test db::agent_attention::tests::fix5_취소_후_늦은_익명_결과가_다음_질문을_삼키지_않는다 ... ok
+test db::agent_attention::tests::fix7_여러_익명_서버를_오래_써도_기록_한도로_갱신이_막히지_않는다 ... ok
+test db::agent_attention::tests::fix7_익명_질문을_새_턴에서_재사용한_후에도_취소할_수_있다 ... ok
+test db::agent_attention::tests::fix7_자식의_도구와_승인_알림을_해제하고_자식_종료_후_완료한다 ... ok
+test db::agent_attention::tests::fleet_review_fix_child_hook_permutations_keep_only_proven_resolution_boundary ... ok
+test db::agent_attention::tests::fleet_review_fix_child_resolution_before_delayed_parent_completion_is_order_independent ... ok
+test db::agent_attention::tests::fleet_review_fix_clock_rollback_does_not_block_other_sessions_attention ... ok
+test db::agent_attention::tests::fleet_review_fix_delayed_parent_work_preserves_newer_child_resolution ... ok
+test db::agent_attention::tests::fleet_review_fix_delayed_question_recovers_matching_child_resolution ... ok
+test db::agent_attention::tests::fleet_review_fix_quiet_observation_does_not_shift_delayed_resolution_idle_time ... ok
+test db::agent_attention::tests::fleet_review_fix_resolution_boundary_is_distinct_from_notification_generation ... ok
+test db::agent_attention::tests::fleet_review_fix_reverse_question_resolutions_keep_the_last_actual_boundary ... ok
+test db::agent_attention::tests::fleet_wait_acknowledged_completion_survives_db_reopen ... ok
+test db::agent_attention::tests::fleet_wait_completion_clock_is_seconds_and_survives_alert_ack ... ok
+test db::agent_attention::tests::fleet_wait_migrated_unknown_clock_is_not_forged_by_an_idle_observation ... ok
+test db::agent_attention::tests::fleet_wait_question_resolution_starts_a_fresh_clock_and_idle_alone_is_unknown ... ok
+test db::agent_attention::tests::fleet_wait_same_second_snapshot_retains_distinct_completion_generations ... ok
+test db::agent_attention::tests::review_stop_뒤_재개된_작업의_최종_완료를_보존한다 ... ok
+test db::agent_attention::tests::review_늦은_취소가_다시_열린_요청을_해제하지_않는다 ... ok
+test db::agent_attention::tests::review_아이디_없는_동일_서버_질문도_남은_개수를_보존한다 ... ok
+test db::agent_attention::tests::review_유휴_알림은_동일_완료_세대를_갱신하지_않는다 ... ok
+test db::agent_attention::tests::review_이전_턴의_늦은_취소와_완료는_현재_작업을_바꾸지_않는다 ... ok
+test db::agent_attention::tests::review_재사용된_승인_별칭은_새_턴에서_취소할_수_있다 ... ok
+test db::agent_attention::tests::review_정착_알림은_정상_턴만_완료하고_취소된_턴은_완료하지_않는다 ... ok
+test db::agent_attention::tests::second_review_익명_질문의_모든_저장_순서와_재전송을_견딘다 ... ok
+test db::agent_attention::tests::second_review_자식_질문과_부모_종료를_섞지_않는다 ... ok
+test db::agent_attention::tests::second_review_질문과_승인으로_재개한_턴도_최종_완료를_남긴다 ... ok
+test db::agent_attention::tests::second_review_취소_전_발생한_질문이_늦게_저장되어도_부활하지_않는다 ... ok
+test db::agent_attention::tests::새_사용자_턴은_이전_부모_승인을_닫고_자식_요청은_보존한다 ... ok
+test db::agent_attention::tests::턴_id가_없는_중복_시작은_현재_승인을_임의로_해제하지_않는다 ... ok
+test db::project_keys::tests::project_keys_abandoned_receipts_recover_exact_owner_without_touching_active_or_unknown ... ok
+test db::project_keys::tests::project_keys_append_only_migration_preserves_legacy_database ... ok
+test db::project_keys::tests::project_keys_auth_choices_include_explicit_shared_and_reject_foreign_or_oauth ... ok
+test db::project_keys::tests::project_keys_build_receipt_snapshot_is_immutable_and_scoped ... ok
+test db::project_keys::tests::project_keys_change_history_is_ordered_bounded_scoped_value_free_and_saved_time_survives ... ok
+test db::project_keys::tests::project_keys_credential_references_block_cleanup_and_owner_moves ... ok
+test db::project_keys::tests::project_keys_delete_legacy_env_row_preserves_other_alias_and_fences_changed_binding ... ok
+test db::project_keys::tests::project_keys_delete_removes_only_selected_legacy_binding_and_retires_unused_owned_value ... ok
+test db::project_keys::tests::project_keys_deleted_source_names_survive_restart_and_explicit_import_is_scoped ... ok
+test db::project_keys::tests::project_keys_detached_env_reference_updates_only_selected_row_and_preserves_build_scope ... ok
+test db::project_keys::tests::project_keys_detached_legacy_agent_replace_updates_only_selected_binding_atomically ... ok
+test db::project_keys::tests::project_keys_distinct_sources_keep_duplicate_names_visible_with_explicit_precedence ... ok
+test db::project_keys::tests::project_keys_environment_ownership_duplicates_and_cas_are_enforced ... ok
+test db::project_keys::tests::project_keys_file_journal_preflights_and_pins_recovery_until_atomic_publication ... ok
+test db::project_keys::tests::project_keys_github_pre_send_check_fences_expiry_and_new_generation ... ok
+test db::project_keys::tests::project_keys_last_good_survives_missing_empty_failure_and_conflict ... ok
+test db::project_keys::tests::project_keys_late_dotenv_writer_cannot_replace_or_prune_managed_publication ... ok
+test db::project_keys::tests::project_keys_legacy_introduction_keeps_override_rows_and_never_reads_plaintext ... ok
+test db::project_keys::tests::project_keys_legacy_plain_configuration_worker_read_and_enrollment_are_scoped ... ok
+test db::project_keys::tests::project_keys_legacy_plain_delete_fences_old_read_and_allows_fresh_metadata_cleanup ... ok
+test db::project_keys::tests::project_keys_legacy_profile_delete_advances_its_plain_key_generation ... ok
+test db::project_keys::tests::project_keys_legacy_reconciliation_tracks_advanced_names_disconnects_and_new_rows ... ok
+test db::project_keys::tests::project_keys_linked_legacy_projection_is_managed_before_value_publication ... ok
+test db::project_keys::tests::project_keys_metadata_keep_claim_is_durable_and_failed_cas_never_claims ... ok
+test db::project_keys::tests::project_keys_metadata_schema_serialization_and_debug_have_no_secret_value_field ... ok
+test db::project_keys::tests::project_keys_new_legacy_agent_values_and_source_order_preserve_environment_scope ... ok
+test db::project_keys::tests::project_keys_old_credential_publication_advances_value_generation_and_fences_old_sends ... ok
+test db::project_keys::tests::project_keys_outbox_coalesces_and_fences_old_ack_and_external_change ... ok
+test db::project_keys::tests::project_keys_outbox_retry_and_expired_claim_survive_restart ... ok
+test db::project_keys::tests::project_keys_post_enrollment_legacy_plain_and_secret_edits_pin_fresh_source_generation ... ok
+test db::project_keys::tests::project_keys_remote_observation_cas_fences_own_send_ack_scope_and_cancels_external_work ... ok
+test db::project_keys::tests::project_keys_remote_observer_cursor_includes_inactive_scopes_and_remote_only_without_values ... ok
+test db::project_keys::tests::project_keys_remote_only_metadata_can_be_created_before_linking_without_local_value ... ok
+test db::project_keys::tests::project_keys_review_auth_choices_exclude_managed_values_and_page_real_tokens ... ok
+test db::project_keys::tests::project_keys_review_full_capacity_allows_existing_updates_and_remote_ack ... ok
+test db::project_keys::tests::project_keys_review_invalid_auth_recovery_does_not_block_healthy_projects_and_repairs ... ok
+test db::project_keys::tests::project_keys_review_managed_auth_tokens_are_environment_scoped_in_choices_lookup_and_save ... ok
+test db::project_keys::tests::project_keys_review_managed_production_is_not_imported_to_development ... ok
+test db::project_keys::tests::project_keys_review_recovery_promotes_valid_unchanged_last_good_for_sending ... ok
+test db::project_keys::tests::project_keys_review_stale_save_cannot_clear_external_change_or_lose_sent_metadata ... ok
+test db::project_keys::tests::project_keys_selected_legacy_profile_coordinate_is_current_owned_and_metadata_only ... ok
+test db::project_keys::tests::project_keys_settings_are_independent_and_bounded ... ok
+test db::project_keys::tests::project_keys_shared_legacy_credential_bindings_remain_project_scoped ... ok
+test db::project_keys::tests::project_keys_unowned_dotenv_projection_keeps_update_prune_and_secret_retirement ... ok
+test db::project_keys::tests::project_keys_value_publication_and_metadata_rollback_together ... ok
+test db::project_keys::tests::project_keys_watch_cursor_visits_every_scope_without_silent_truncation ... ok
+test db::project_keys::tests::project_keys_workspace_identity_first_enrollment_is_path_cas_and_never_rebinds ... ok
+test db::tests::activity_panes는_현재_mux_layout의_pane만_반환한다 ... ok
+test db::tests::agent_args_secret_like_payload는_args_json에_저장되지_않는다 ... ok
+test db::tests::agent_args_한줄_secret_flag와_database_url_flag를_거부한다 ... ok
+test db::tests::agent_config_crud와_args_array ... ok
+test db::tests::agent_config_mcp_config_flag_roundtrip ... ok
+test db::tests::agent_config_mcp_proxy_필드_roundtrip ... ok
+test db::tests::agent_needs_input_message_저장과_clear시_소거 ... ok
+test db::tests::agent_needs_input_set_clear_list ... ok
+test db::tests::agent_session_workspace_cap은_256_exact만_admit한다 ... ok
+test db::tests::agent_sessions_upsert_list_delete_roundtrip ... ok
+test db::tests::agent_state_activity_actual_byte_failure는_exact_mutation을_rollback한다 ... ok
+test db::tests::agent_state_activity_catalog는_opt_in으로같은_snapshot에포함된다 ... ok
+test db::tests::agent_state_activity_preflight_failure는_exact_mutation을_rollback한다 ... ok
+test db::tests::agent_state_attention_omission은_corrupt_rows를조회하거나할당하지않는다 ... ok
+test db::tests::agent_state_binding_omission은_corrupt_rows를조회하거나할당하지않는다 ... ok
+test db::tests::agent_state_binding_reconcile은_exact_256과_plus_one을_검증한다 ... ok
+test db::tests::agent_state_catalog_workspace_scope는_1에서_256까지로_제한된다 ... ok
+test db::tests::agent_state_catalog는_여러_workspace를_한_snapshot으로_투영한다 ... ok
+test db::tests::agent_state_catalog의_4mib상한은_workspace합계에_적용되고_rollback한다 ... ok
+test db::tests::agent_state_catalog의_500_row상한은_workspace합계에_적용되고_rollback한다 ... ok
+test db::tests::agent_state_exact_cas는_새_binding과_새_turn을_지우지_않는다 ... ok
+test db::tests::agent_state_global_agent_sessions는_다른_워크스페이스의_pane도_담는다 ... ok
+test db::tests::agent_state_global_agent_sessions는_실제_resume명령이_없는_kind를_제외한다 ... ok
+test db::tests::agent_state_global_agent_sessions는_합법적인_쓰기를_거부하지_않는다 ... ok
+test db::tests::agent_state_global_binding_omission은_corrupt_rows를조회하거나할당하지않는다 ... ok
+test db::tests::agent_state_hook_status_omission은_corrupt_rows를조회하거나할당하지않는다 ... ok
+test db::tests::agent_state_job은_mutation뒤_complete_projection을_한_transaction에서_반환한다 ... ok
+test db::tests::agent_state_projection_legacy_default는_기존section을모두요청한다 ... ok
+test db::tests::agent_state_projection_preflight실패는_앞선_mutation도_rollback한다 ... ok
+test db::tests::agent_state_public_dto_debug는_hostile_marker를_노출하지_않는다 ... ok
+test db::tests::agent_state_retention_preflight는_plus_one을변경전거부하고overflow를닫는다 ... ok
+test db::tests::agent_state_retention_preflight는_validate후_capacity를정규화한다 ... ok
+test db::tests::agent_state_selective_projection실패는_omitted_section_mutation도rollback한다 ... ok
+test db::tests::agent_state_selective_projection은_omitted_section_mutation도원자commit한다 ... ok
+test db::tests::agent_state_snapshot_byte_ceiling은_exact_zero_plus_one과_custom_rollback을_보장한다 ... ok
+test db::tests::agent_state_structured_batch는_item_byte상한과_atomic_rollback을_보장한다 ... ok
+test db::tests::agent_state_structured_mutation은_requested_catalog_scope안의_multi_workspace를_허용한다 ... ok
+test db::tests::agent_state_structured_mutation의_out_of_scope는_첫_write전에_fail_closed된다 ... ok
+test db::tests::agent_state_structured_omission은_corrupt_rows를조회하거나할당하지않는다 ... ok
+test db::tests::agent_turn_done_set_clear_및_needs_input과_상호리셋 ... ok
+test db::tests::agent_work_history_accepts_bounded_future_provider_id ... ok
+test db::tests::agent_work_history_batch_bounds_and_atomic_rejection ... ok
+test db::tests::agent_work_history_debug_redacts_content ... ok
+test db::tests::agent_work_history_is_workspace_isolated_stably_ordered_and_pruned ... ok
+test db::tests::agent_work_history_query_enforces_row_and_snapshot_limits ... ok
+test db::tests::agent_work_history_rejects_oversized_row_and_aggregate ... ok
+test db::tests::agent_work_history_upsert_is_idempotent_by_turn_key ... ok
+test db::tests::agent_work_history_v35_migrates_and_reopens ... ok
+test db::tests::agent_work_turn_messages_json은_같은_초의_빈_값에_덮이지_않는다 ... ok
+test db::tests::agent_work_turn_messages_json은_기존_행에서_null이다 ... ok
+test db::tests::agent_work_turn_messages_json은_상한_초과와_nul이면_컬럼만_none으로_떨어진다 ... ok
+test db::tests::agent_work_turn_messages_json은_왕복한다 ... ok
+test db::tests::agent_working_은_clear가_켜고_needs_input과_turn_done이_끈다 ... ok
+test db::tests::allow_always_permission과_audit은_같이_rollback된다 ... ok
+test db::tests::allow_always와_deny_always는_exact_fingerprint에서만_원자commit된다 ... ok
+test db::tests::archived_agent_resume_projection은_256행과_plus_one을_구분한다 ... ok
+test db::tests::archived_agent_resume_projection은_binding없이_agent_id를_보존하고_exact_token을_조인한다 ... ok
+test db::tests::atomic_path_replacement은_새_physical_identity를_얻는다 ... ok
+test db::tests::audit_lifecycle_source_laws_keep_steady_state_to_one_window_scan ... ok
+test db::tests::audit_retention_retry는동일문자열의비retention오류를재시도하지않는다 ... ok
+test db::tests::authorization_completion_retention_failure는transition과gc를함께rollback한다 ... ok
+test db::tests::authorization_lock_files는_256_stripe로_상한되고_collision은_직렬화된다 ... ok
+test db::tests::authorization_outcome은_모든종결상태에서_same_idempotent_conflict_rejected다 ... ok
+test db::tests::authorization_owner_graceful_close와_실패_fallback은_scope_run에_격리된다 ... ok
+test db::tests::authorization_owner는_db_identity에_묶이고_outcome은_멱등이다 ... ok
+test db::tests::authorization_owner는_live_scope를_배타화하고_drop후_same_scope만_unknown처리한다 ... ok
+test db::tests::authorization_preflight는_plan_subject를_same_transaction_audit에_영속한다 ... ok
+test db::tests::authorization_recovery_retention_failure는unknown전이를rollback하고lock을해제한다 ... ok
+test db::tests::authorization_revision_cas_failure는_permission_audit_revision을_rollback한다 ... ok
+test db::tests::authorization_revision_cas는_other_writer의_server_tool_credential변경을_거부한다 ... ok
+test db::tests::bounded_activity_panes는_aggregate_byte_budget을_넘기지_않는다 ... ok
+test db::tests::bounded_activity_panes는_corrupt_type을_materialize하지_않는다 ... ok
+test db::tests::bounded_activity_panes는_exact_limit과_plus_one을_구분한다 ... ok
+test db::tests::bounded_activity_panes는_pane_id_byte_limit을_검사한다 ... ok
+test db::tests::bounded_activity_panes는_text_byte_limit을_검사한다 ... ok
+test db::tests::bounded_env_projection은_4mib_exact와_plus_one을_구분한다 ... ok
+test db::tests::bounded_env_projection은_sql_filter_order와_limit_plus_one을_강제한다 ... ok
+test db::tests::bounded_projection_empty_snapshot은_zero_limit으로_완전하다 ... ok
+test db::tests::bounded_projection_sql_source_laws ... ok
+test db::tests::bounded_projection은_corrupt_sqlite_type과_huge_blob을_preflight에서_거부한다 ... ok
+test db::tests::bounded_web_push는_aggregate_byte_budget을_넘기지_않는다 ... ok
+test db::tests::bounded_web_push는_corrupt_type을_materialize하지_않는다 ... ok
+test db::tests::bounded_web_push는_exact_limit과_plus_one을_구분한다 ... ok
+test db::tests::builtin_agent_config_upsert는_고정_id를_갱신하고_soft_delete를_복구한다 ... ok
+test db::tests::cloud_ended_sessions_include_closed_panes_and_exclude_running_sessions ... ok
+test db::tests::cloud_ended_sessions_read_only_connection_reads_persisted_history ... ok
+test db::tests::connector_config_revision_overflow와_injected_failure는_writer전체를_rollback한다 ... ok
+test db::tests::connector_config_revision은_restart와_other_writer를_견디고_stale_writer를_거부한다 ... ok
+test db::tests::connector_config_revision은_모든_가시_mutation과_versioned_read를_추적한다 ... ok
+test db::tests::connector_repository_inventory와_tool_page는_bounded_complete_snapshot을_제공한다 ... ok
+test db::tests::corrupted_relay_pending_row_fails_closed_without_consumption ... ok
+test db::tests::credential_crud_roundtrip ... ok
+test db::tests::credential_env_연결은_워크스페이스별로_저장되고_사용중인_키는_삭제할수없다 ... ok
+test db::tests::credential_expected_pointer_delete는_mcp_secret_reference도_거부한다 ... ok
+test db::tests::credential_expected_pointer_delete는_stale과_reference를_noop처리하고_failure를_rollback한다 ... ok
+test db::tests::credential_oauth_메타는_json으로_왕복된다 ... ok
+test db::tests::credential_secret_location은_materialize전에_sql_byte_preflight를_강제한다 ... ok
+test db::tests::credential_secret_record_scan은_inclusive_limit과_full_pointer를_보존한다 ... ok
+test db::tests::credential_secret_record_scan은_sql_byte_preflight와_corrupt_text를_fail_closed한다 ... ok
+test db::tests::credential_slot_publish는_masked_hint_admission전에아무것도변경하지않는다 ... ok
+test db::tests::db_파일에_secret_평문이_없다 ... ok
+test db::tests::ddl_check가_secret_평문을_거부한다 ... ok
+test db::tests::delete_workspace가_agent_sessions도_정리 ... ok
+test db::tests::delete_workspace가_structured_threads도_정리 ... ok
+test db::tests::delete_workspace는_자식env와_workspace만_지운다 ... ok
+test db::tests::env_api_project_counts는_workspace별_집계를_한번에_반환한다 ... ok
+test db::tests::env_profile과_var_roundtrip ... ok
+test db::tests::env_value_debug는_plain과_credential_id를_숨긴다 ... ok
+test db::tests::env_var가_참조하는_credential은_삭제_거부 ... ok
+test db::tests::expire_pending은_오래된_행만_denied로_하고_멱등 ... ok
+test db::tests::first_publish_revision_cas는_other_writer_stale에서_staging을_보존한다 ... ok
+test db::tests::fleet_wait_migration_restores_only_proven_modern_completions ... ok
+test db::tests::fleet_wait_snapshot_keeps_acknowledged_clock_and_checks_bounds ... ok
+test db::tests::fleet_wait_startup_prune_retains_acknowledged_idle_under_existing_caps ... ok
+test db::tests::hardlink_alias는_같은_physical_db_lock_namespace를_사용한다 ... ok
+test db::tests::hook_prefix_bounded_reads는_percent와_underscore를_literal로_격리한다 ... ok
+test db::tests::hook_state_4097번째_write는_원자적으로_oldest를_evict한다 ... ok
+test db::tests::hook_state_prefix_257번째_write는_같은_workspace의_oldest만_evict한다 ... ok
+test db::tests::hook_state_prefix_eviction_실패는_insert까지_rollback한다 ... ok
+test db::tests::hook_state_writer는_bounded_workspace_prefix를_요구한다 ... ok
+test db::tests::idle후_64개초과expired_audit도첫lifecycle호출에서수렴한다 ... ok
+test db::tests::independent_hook_execution_migration_keeps_legacy_prompts_unverified_after_reopen ... ok
+test db::tests::independent_hook_execution_stamp_reads_reject_oversized_or_invalid_json ... ok
+test db::tests::independent_hook_execution_stamps_preserve_prompt_owner_and_count_retained_heap ... ok
+test db::tests::independent_hook_task_prompt_persists_each_provider_through_bounded_snapshot ... ok
+test db::tests::independent_hook_task_prompt_requires_exact_provider_native_and_pane ... ok
+test db::tests::independent_hook_task_prompt_updates_long_korean_at_utf8_byte_boundaries ... ok
+test db::tests::keychain개발판_v38은_canonical_relay_v38로_오인하지_않는다 ... ok
+test db::tests::keyring_좌표가_기록된다 ... ok
+test db::tests::legacy_audit_oversize는한번의lazy_retry에서bounded_batch로수렴한다 ... ok
+test db::tests::legacy_cleanup_marker_failpoint는_pointer_ledger_ack를_rollback한다 ... ok
+test db::tests::legacy_cleanup_marker는_publish와_atomic하고_crash후_exact_order로_수렴한다 ... ok
+test db::tests::legacy_marker_schema는_duplicate_invalid_transition과_corrupt_data를_fail_closed한다 ... ok
+test db::tests::legacy_publish_stale_cas는_live_pointer와_source를_보존하고_candidate를_orphan한다 ... ok
+test db::tests::list_pending은_pending만_오래된순으로 ... ok
+test db::tests::mcp_request_target_http는_zero_one_two_oauth_candidates를_같은_snapshot에서_반환한다 ... ok
+test db::tests::mcp_request_target_stdio는_credential_item과_aggregate_byte_exact_limit을_보존한다 ... ok
+test db::tests::mcp_request_target_stdio는_server_env_order와_single_snapshot_revision을_보존한다 ... ok
+test db::tests::mcp_request_target는_malformed_duplicate_cross_shape와_coordinate를_fail_closed한다 ... ok
+test db::tests::mcp_scoped_env가_참조하는_credential은_삭제_거부 ... ok
+test db::tests::oauth_metadata_json은_exact_byte_limit을_accept하고_plus_one을_preparse_reject한다 ... ok
+test db::tests::oauth_metadata에는_concrete_token을_저장하지_않는다 ... ok
+test db::tests::oauth_pointer_publish와_auth_reads는_같은_durable_revision을_공유한다 ... ok
+test db::tests::oauth_secret_slot_pointer와_metadata는_원자적으로_publish된다 ... ok
+test db::tests::oauth_secret_slot_publish_실패는_pointer와_metadata를_rollback한다 ... ok
+test db::tests::oauth_server_binding_lookup은_corrupt_json을_fail_closed한다 ... ok
+test db::tests::oauth_server_binding_lookup은_duplicate를_limit_two로_노출한다 ... ok
+test db::tests::oauth_server_binding_lookup은_exact_zero와_one을_구분하고_raw_metadata를_보존한다 ... ok
+test db::tests::oauth_server_binding_lookup은_sql_byte_preflight를_강제한다 ... ok
+test db::tests::oversized_hook_payload는_existing_row를_변경하지_않는다 ... ok
+test db::tests::owned_pending_approval_reconciliation_failure는_전체를_rollback한다 ... ok
+test db::tests::pane_task_prompt_survives_reconcile_and_clears_on_new_native_session ... ok
+test db::tests::pasted_transport_hook_stores_human_task_and_rejects_wrapped_internal_events ... ok
+test db::tests::pending_approval_insert_poll_resolve_라이프사이클 ... ok
+test db::tests::pending_approval_owner는_file_backed_db만_허용한다 ... ok
+test db::tests::pending_approval_owner는_physical_db별_배타적이고_drop후_해제된다 ... ok
+test db::tests::pending_approval_reconciliation_owner는_db_identity에_묶이고_max에서_멱등이다 ... ok
+test db::tests::pending_global_cap은_concurrent_immediate_writers에서_overshoot하지_않는다 ... ok
+test db::tests::permission_fingerprint변경은_preflight와_grant를_막는다 ... ok
+test db::tests::permission_tool_id_lookup과_write는_한_revision_cas로_직렬화된다 ... ok
+test db::tests::physical_slot_cas는_invalid_pointer와_storage_failure에서_no_mutation이다 ... ok
+test db::tests::physical_slot_cas는_success후_stale_expected를_noop처리한다 ... ok
+test db::tests::physical_slot_credential_insert는_cross_owner_corrupt_unversioned를_reject한다 ... ok
+test db::tests::physical_slot_credential_insert는_owned_pointer와_nullable_metadata만_publish한다 ... ok
+test db::tests::physical_slot_ledger는_crash_windows_restart와_exact_ack를_보존한다 ... ok
+test db::tests::physical_slot_ledger는_cross_owner_corrupt_state와_id_limits를_fail_closed한다 ... ok
+test db::tests::physical_slot_publish_failure는_ledger_pointer_revision을_전부_rollback한다 ... ok
+test db::tests::physical_slot_publish는_other_corrupt_unversioned_pointer를_fail_closed한다 ... ok
+test db::tests::physical_slot_reconciliation은_item_plus_one과_byte_budget을_preflight한다 ... ok
+test db::tests::physical_slot_validation은_oversized_borrowed_ids를_allocation전에_reject한다 ... ok
+test db::tests::poll_없는_id는_에러 ... ok
+test db::tests::popup_review_different_volume_cannot_reuse_even_equal_device_and_inode ... ok
+test db::tests::popup_review_explicit_same_path_rebind_releases_old_volume_proof ... ok
+test db::tests::popup_review_path_rebind_invalidates_old_volume_proof ... ok
+test db::tests::popup_review_unknown_volume_device_change_cannot_reuse_workspace ... ok
+test db::tests::popup_review_verified_volume_remount_keeps_workspace_identity ... ok
+test db::tests::popup_review_volume_identity_refresh_rolls_back_with_anchor ... ok
+test db::tests::production_audit_write는_finalized_n_plus_one을원자적으로정리한다 ... ok
+test db::tests::relay_approval_fails_closed_at_the_exact_pairing_deadline ... ok
+test db::tests::relay_approval_rejects_a_pending_row_that_changed_after_validation ... ok
+test db::tests::relay_approval_with_a_known_key_replaces_the_previous_device_row ... ok
+test db::tests::relay_authorization_epoch_survives_conflict_and_publish_rollback ... ok
+test db::tests::relay_device_list_uses_one_read_transaction_before_allocation ... ok
+test db::tests::relay_last_seen_updates_only_inside_the_device_window ... ok
+test db::tests::relay_pairing_window_and_device_expiry_are_independent ... ok
+test db::tests::relay_pending_retry_supersedes_and_partial_overlap_conflicts ... ok
+test db::tests::relay_pending_rows_are_purgeable_after_restart ... ok
+test db::tests::relay_reapproval_changes_authorization_without_clock_advance ... ok
+test db::tests::relay_reapproval_updates_one_device_and_clears_prior_revocation ... ok
+test db::tests::relay_reconnect_schema_stores_only_a_bounded_verifier ... ok
+test db::tests::relay_reconnect_verifier_persists_and_revocation_prevents_reregistration ... ok
+test db::tests::relay_recreated_device_does_not_reuse_its_authorization ... ok
+test db::tests::relay_repairing_the_same_phone_under_a_new_device_id_replaces_the_old_row ... ok
+test db::tests::relay_revocation_is_idempotent_and_keeps_the_first_timestamp ... ok
+test db::tests::relay_revoked_devices_do_not_hold_the_device_limit ... ok
+test db::tests::relay_row_limits_reject_deterministically_without_eviction ... ok
+test db::tests::relay_rows_accept_structurally_valid_off_curve_keys_for_adapter_rejection ... ok
+test db::tests::relay_v36_file_migrates_to_current_and_reopens ... ok
+test db::tests::relay_v38_epoch_backfill_preserves_approved_devices_and_reconnect_verifiers ... ok
+test db::tests::remembered_authorization은_permission과_audit의_committed_revision을_반환한다 ... ok
+test db::tests::resolve_approval은_오래된_resolved_rows를_prune한다 ... ok
+test db::tests::resolve_두번은_먼저_쓴_결정을_안_덮는다 ... ok
+test db::tests::secret_like_env_key는_plain_저장을_거부하고_secret은_허용한다 ... ok
+test db::tests::secret_like_env_value는_plain_value에_남지_않는다 ... ok
+test db::tests::secret_recovery_callback_failure_rolls_back_and_can_retry ... ok
+test db::tests::secret_recovery_generation_rejects_aba_and_newly_published_candidates ... ok
+test db::tests::secret_recovery_v39_backfill_preserves_slots_and_generation_on_reopen ... ok
+test db::tests::secret_var는_존재하는_credential만_참조한다 ... ok
+test db::tests::selected_server는_sql_byte_preflight에서_oversize를_거부한다 ... ok
+test db::tests::server_delete_failure는_pending_permission_tool_server를_모두_rollback한다 ... ok
+test db::tests::server_delete는_active_agent_reference를_거부하고_audit을_보존한다 ... ok
+test db::tests::session_cleanup_failure는_모든_pending을_rollback한다 ... ok
+test db::tests::session_cleanup은_exact_pending만_denied로_하고_멱등이다 ... ok
+test db::tests::session_cleanup은_key와_insert_candidate_count를_선할당없이_제한한다 ... ok
+test db::tests::session_cleanup은_restart후에도_terminal_state를_보존한다 ... ok
+test db::tests::session_cleanup은_없는_exact_session에서_zero다 ... ok
+test db::tests::session_regex_마이그레이션은_기존_v33_db를_보존한다 ... ok
+test db::tests::settings_agent_snapshot는_max_plus_one을_json_materialize전에_거부한다 ... ok
+test db::tests::settings_agent_snapshot는_oversized_json을_parse전에_거부한다 ... ok
+test db::tests::settings_agent_write는_logical_byte_plus_one을insert전에거부한다 ... ok
+test db::tests::settings_agent_write는_max_plus_one을거부한다 ... ok
+test db::tests::settings_agents_snapshot는_category합산_byte_cap을_materialize전에_거부한다 ... ok
+test db::tests::settings_bounded_snapshots는_workspace_rows만_한_snapshot으로_반환한다 ... ok
+test db::tests::settings_credential_write는_visible_inventory_max_plus_one을거부한다 ... ok
+test db::tests::settings_env_profile_write는_workspace_max_plus_one을거부한다 ... ok
+test db::tests::settings_env_var_upsert는_cap에서update를보존하고new만거부한다 ... ok
+test db::tests::settings_environment_snapshot는_env_max_plus_one을_materialize전에_거부한다 ... ok
+test db::tests::settings_global_write_admission은_workspace수에따른_query_loop가없다 ... ok
+test db::tests::settings_snapshot는_profile_credential_backend_cap_plus_one을_거부한다 ... ok
+test db::tests::settings_update_source_laws_require_pre_mutation_admission ... ok
+test db::tests::settings_workspace_concurrent_writers는하나만마지막slot을획득한다 ... ok
+test db::tests::settings_workspace_exact_path는_cap에서도_existing을반환하고_new만거부한다 ... ok
+test db::tests::settings_workspace_projection은_256행_exact를_허용하고_plus_one을_거부한다 ... ok
+test db::tests::settings_workspace_projection은_row와_aggregate_byte_exact_plus_one을_강제한다 ... ok
+test db::tests::settings_workspace_updates는_mutation전에aggregate_plus_one을거부한다 ... ok
+test db::tests::settings_workspace_write는_max_plus_one을_insert전에_거부한다 ... ok
+test db::tests::shared_native_panes_restore_distinct_task_prompts_after_db_reopen ... ok
+test db::tests::slack_reconnect_revision_cas는_duplicate_canonical_rows를_변경_전에_fail_closed한다 ... ok
+test db::tests::slack_reconnect_revision_cas는_stale을_거부하고_disabled_row를_원자적으로_enable한다 ... ok
+test db::tests::structured_thread_admission은_필드와_행_byte_상한의_exact만_허용한다 ... ok
+test db::tests::structured_thread_bounded_list는_aggregate_retained_budget을_넘지_않는다 ... ok
+test db::tests::structured_thread_bounded_list는_zero_small_limit과_corrupt_sqlite_type을_처리한다 ... ok
+test db::tests::structured_thread_bounded_list는_기존_tie_break_order를_보존한다 ... ok
+test db::tests::structured_thread_id는_로컬_세션과_일대일이다 ... ok
+test db::tests::structured_thread_query는_bounded_control_id를_clone전에_거부한다 ... ok
+test db::tests::structured_thread_selected_cte는_rowid만_materialize한다 ... ok
+test db::tests::structured_thread_upsert는_created_at을_보존하고_메타데이터를_갱신한다 ... ok
+test db::tests::structured_threads_crud와_archive_filter_roundtrip ... ok
+test db::tests::turn_done_sessions는_요청_workspace가_아닌_warm_세션도_전역으로_반환한다 ... ok
+test db::tests::user_selected_legacy_exact_path_rebinds_once_with_a_recorded_volume ... ok
+test db::tests::user_selection_cannot_override_known_volume_or_changed_inode ... ok
+test db::tests::v10에서_v11로_업그레이드된다 ... ok
+test db::tests::v11에서_v12로_업그레이드된다 ... ok
+test db::tests::v20에서_v21로_업그레이드된다 ... ok
+test db::tests::v22에서_structured_threads_마이그레이션이_적용된다 ... ok
+test db::tests::v27_physical_pointer는_v28_ledger에_published로_backfill되고_restart된다 ... ok
+test db::tests::v28_backfill은_duplicate_physical_slot_collision을_fail_closed한다 ... ok
+test db::tests::v28에서_v29_session_pending_index로_업그레이드된다 ... ok
+test db::tests::v29에서_v30_legacy_marker로_upgrade하고_ddl_failure는_version과_alter를_rollback한다 ... ok
+test db::tests::v8에서_v9로_업그레이드된다 ... ok
+test db::tests::v9에서_v10으로_업그레이드된다 ... ok
+test db::tests::waiting과_turn_done은_1시간이_지나도_24시간_안이면_유지된다 ... ok
+test db::tests::workspace_find_or_create_does_not_claim_legacy_path_owned_by_another_anchor_row ... ok
+test db::tests::workspace_find_or_create_exact_path는_duplicate를_fail_closed한다 ... ok
+test db::tests::workspace_find_or_create_exact_path는_insert_failure를_rollback한다 ... ok
+test db::tests::workspace_find_or_create_exact_path는_name_path_anchor를_한번에_생성하고_재사용한다 ... ok
+test db::tests::workspace_find_or_create_rebinds_same_folder_from_alias_path ... ok
+test db::tests::workspace_find_or_create_refreshes_remounted_device_at_same_path ... ok
+test db::tests::workspace_find_or_create_rejects_ambiguous_duplicate_folder_anchor ... ok
+test db::tests::workspace_find_or_create_rejects_replaced_folder_at_existing_path ... ok
+test db::tests::workspace_find_or_create_remount_does_not_claim_another_workspace_anchor ... ok
+test db::tests::workspace_find_or_create_remount_refresh_rolls_back_on_write_failure ... ok
+test db::tests::workspace_moved_path_cas는_path와_anchor_stale에_무변경이고_match만_갱신한다 ... ok
+test db::tests::workspace_notes_마이그레이션은_기존_v32_db를_보존한다 ... ok
+test db::tests::workspace_note는_상한을_넘으면_거부한다 ... ok
+test db::tests::workspace_note는_워크스페이스_삭제와_함께_사라진다 ... ok
+test db::tests::workspace_note는_원문_그대로_라운드트립한다 ... ok
+test db::tests::workspace_path_anchor_atomic은_exact_id의_pair만_갱신하고_partial을_거부한다 ... ok
+test db::tests::workspace_path_anchor_atomic은_injected_failure에서_path와_anchor를_rollback한다 ... ok
+test db::tests::workspace_path_anchor_atomic은_oversized_target을_update전에거부한다 ... ok
+test db::tests::workspace_path_설정_조회_roundtrip ... ok
+test db::tests::workspace_생성_목록_기본포함 ... ok
+test db::tests::같은_native_id를_공유해도_hook_작업_입력은_pane별로_분리된다 ... ok
+test db::tests::권한규칙_upsert_list_roundtrip ... ok
+test db::tests::내부_알림은_현재_pane의_작업_제목을_덮지_않는다 ... ok
+test db::tests::마이그레이션_전_백업이_생성된다 ... ok
+test db::tests::마이그레이션은_멱등 ... ok
+test db::tests::빈_workspace_note는_행을_지운다 ... ok
+test db::tests::없는_워크스페이스에는_note를_쓸_수_없다 ... ok
+test db::tests::웹푸시_구독_등록_갱신_삭제_왕복 ... ok
+test db::tests::전_버전_prefix_마이그레이션_스모크 ... ok
+test db::tests::최신_db_재오픈은_마이그레이션_noop ... ok
+test db::workspace_env::tests::credential_edit_원래_id를_유지하고_메타와_연결과_slot을_함께_변경한다 ... ok
+test db::workspace_env::tests::credential_edit_충돌과_다른_워크스페이스와_stale은_원본을_보존한다 ... ok
+test db::workspace_env::tests::credential_env_소유권과_이름충돌은_원래연결을_보존한다 ... ok
+test db::workspace_env::tests::credential_env_연결충돌은_신규_credential과_slot_공개를_롤백한다 ... ok
+test db::workspace_env::tests::workspace_sources_선택_테이블이_존재한다 ... ok
+test db::workspace_env::tests::workspace_sources_순서와_중지와_격리를_저장한다 ... ok
+test logs::tests::ansi_bounded_log는_lf가_없어도_최근_tail을_보존한다 ... ok
+test logs::tests::ansi_snapshot_boundary는_append를_읽지_않고_shrink를_거부한다 ... ok
+test logs::tests::ansi_tail은_csi_osc와_utf8_중간에서_시작하지_않는다 ... ok
+test logs::tests::bounded_gc_discards_cursor_after_logs_root_replacement ... ok
+test logs::tests::bounded_log_open과_gc는_symlink와_fifo를_block없이_거부한다 ... ok
+test logs::tests::bounded_log는_상한을_넘으면_최근_완전한_줄만_남긴다 ... ok
+test logs::tests::complete_gc_scan_compacts_oversized_logs_before_budget_check ... ok
+test logs::tests::escape가_chunk_경계에_걸려도_plain은_깨끗 ... ok
+test logs::tests::gc_errors_when_delete_failure_leaves_logs_over_budget ... ok
+test logs::tests::gc_rejects_session_directory_replacement_before_repin ... ok
+test logs::tests::gc_unlinks_from_pinned_directory_after_parent_swap ... ok
+test logs::tests::incomplete_gc_restarts_after_failed_batch_cleanup ... ok
+test logs::tests::log_and_terminal_writes_reject_symlinked_session_directory ... ok
+test logs::tests::log_and_terminal_writes_stay_in_pinned_directory_after_parent_swap ... ok
+test logs::tests::log_compaction은_snapshot뒤_append를_truncate하지_않는다 ... ok
+test logs::tests::non_log_entries_consume_bounded_scan_budget ... ok
+test logs::tests::over_limit_gc_makes_bounded_progress_until_recovered ... ok
+test logs::tests::over_limit_gc_removes_zero_byte_log_candidates ... ok
+test logs::tests::pr8_error_cap_repair_failure_preserves_both_errors_and_unknown_length ... ok
+test logs::tests::pr8_error_cap_repair_preserves_pinned_inode_and_tail_boundary ... ok
+test logs::tests::pr8_external_append_and_truncate_reconcile_same_handle ... ok
+test logs::tests::pr8_external_append_then_partial_write_error_repairs_file_cap ... ok
+test logs::tests::pr8_failed_giant_append_never_exceeds_file_cap ... ok
+test logs::tests::pr8_giant_tail_preserves_split_escape_utf8_and_pinned_inode ... ok
+test logs::tests::pr8_measure_append_fixture_five_samples ... ok
+test logs::tests::pr8_metadata_error_must_not_assume_empty_length_or_bypass_cap ... ok
+test logs::tests::pr8_partial_write_recovery_uses_actual_length_and_preserves_cap ... ok
+test logs::tests::pr8_position_error_repairs_actual_eof_and_keeps_original_error ... ok
+test logs::tests::pr8_repeated_log_append_reuses_writer_length_and_measures_io ... ok
+test logs::tests::production_log_restore와_compaction은_eof_following_read를_금지한다 ... ok
+test logs::tests::repeated_gc_advances_past_non_log_batches ... ok
+test logs::tests::scan_entry_limit_default_exact_boundary_succeeds ... ok
+test logs::tests::scan_entry_limit_default_rejects_limit_plus_one ... ok
+test logs::tests::scan_entry_limit_exact_boundary_succeeds ... ok
+test logs::tests::scan_entry_limit_rejects_limit_plus_one ... ok
+test logs::tests::scan_entry_limit_reports_incomplete_after_bounded_progress ... ok
+test logs::tests::session_log_scan_fails_closed_for_nonregular_subtree ... ok
+test logs::tests::session_log_total_overflow_is_explicit ... ok
+test logs::tests::strip_ansi_chunk_경계에_걸친_커서이동도_복원된다 ... ok
+test logs::tests::strip_ansi_cuf는_상대_전진만큼_띄운다 ... ok
+test logs::tests::strip_ansi_개행_후_열이_리셋된다 ... ok
+test logs::tests::strip_ansi_뒤로가는_cha는_공백을_넣지_않는다 ... ok
+test logs::tests::strip_ansi_커서이동을_공백으로_되돌린다 ... ok
+test logs::tests::strip_ansi_한글_뒤_열계산은_문자수_기준 ... ok
+test logs::tests::terminal_size_reader는_byte상한과_snapshot변경을_거부한다 ... ok
+test logs::tests::terminal_size_reader는_symlink와_fifo를_block없이_거부한다 ... ok
+test logs::tests::세_파일_생성과_append ... ok
+test logs::tests::영속_session_key는_ansi를_이어쓰고_경로탈출을_거부한다 ... ok
+test logs::tests::전체_gc는_오래된_세션_로그만_지우고_다른_리소스는_보존한다 ... ok
+test logs::tests::터미널_크기_sidecar를_저장하고_검증한다 ... ok
+test scrollback_archive::tests::archive_gc_rejects_session_directory_replacement_before_repin ... ok
+test scrollback_archive::tests::archive_scan_fails_closed_for_existing_nonregular_archive ... ok
+test scrollback_archive::tests::archive_total_overflow_is_explicit ... ok
+test scrollback_archive::tests::archive_write_does_not_replace_existing_archive ... ok
+test scrollback_archive::tests::archive_write_rejects_planted_atomic_temp_symlink ... ok
+test scrollback_archive::tests::archive_write_rejects_symlinked_session_directory ... ok
+test scrollback_archive::tests::bounded_gc_discards_cursor_after_logs_root_replacement ... ok
+test scrollback_archive::tests::corrupt_stream_discard_does_not_remove_replacement_archive ... ok
+test scrollback_archive::tests::exists_rejects_symlink_dangling_and_nonregular_archive_paths ... ok
+test scrollback_archive::tests::gc_errors_when_delete_failure_leaves_total_over_budget ... ok
+test scrollback_archive::tests::gc_subtracts_archive_that_disappears_before_unlink ... ok
+test scrollback_archive::tests::gc는_오래된_것부터_예산까지_제거하고_로그는_불가침 ... ok
+test scrollback_archive::tests::incomplete_gc_restarts_after_failed_batch_cleanup ... ok
+test scrollback_archive::tests::non_archive_directories_consume_bounded_scan_budget ... ok
+test scrollback_archive::tests::over_limit_gc_does_not_follow_symlinked_session_directories ... ok
+test scrollback_archive::tests::over_limit_gc_makes_bounded_progress_until_recovered ... ok
+test scrollback_archive::tests::over_limit_gc_removes_zero_byte_archive_candidates ... ok
+test scrollback_archive::tests::pinned_session_directory_prevents_parent_swap_from_redirecting_read ... ok
+test scrollback_archive::tests::pinned_session_directory_prevents_parent_swap_from_redirecting_remove ... ok
+test scrollback_archive::tests::pinned_session_directory_prevents_parent_swap_from_redirecting_write ... ok
+test scrollback_archive::tests::repeated_gc_advances_past_non_archive_batches ... ok
+test scrollback_archive::tests::restore_rejects_fifo_without_blocking ... ok
+test scrollback_archive::tests::restore_rejects_symlinked_archive_without_following_it ... ok
+test scrollback_archive::tests::scan_entry_limit_default_exact_boundary_succeeds ... ok
+test scrollback_archive::tests::scan_entry_limit_default_rejects_limit_plus_one ... ok
+test scrollback_archive::tests::scan_entry_limit_exact_boundary_succeeds ... ok
+test scrollback_archive::tests::scan_entry_limit_rejects_limit_plus_one ... ok
+test scrollback_archive::tests::scan_entry_limit_reports_incomplete_after_bounded_progress ... ok
+test scrollback_archive::tests::scan_total은_아카이브_크기_합만_세고_로그는_제외한다 ... ok
+test scrollback_archive::tests::write_receipt_rolls_back_original_inode_after_root_replacement ... ok
+test scrollback_archive::tests::경로_탈출_거부 ... ok
+test scrollback_archive::tests::라운드트립 ... ok
+test scrollback_archive::tests::손상_파일은_삭제_후_none ... ok
+test scrollback_archive::tests::파일_없음은_none ... ok
+test task_prompt::tests::pasted_transport_keeps_followup_after_closed_block ... ok
+test task_prompt::tests::pasted_transport_preserves_literal_code_and_rejects_empty_internal_or_malformed_metadata ... ok
+test task_prompt::tests::pasted_transport_unwraps_open_closed_nested_and_quoted_markers ... ok
+test tests::persisted_activity_pane_is_reexported_from_crate_root ... ok
+test write_worker::tests::pending_approval_insert는_batch된다 ... ok
+test write_worker::tests::pending_approval_queue_limit을_지킨다 ... ok
+test write_worker::tests::status와_log_offset은_session별로_coalesce된다 ... ok
+test write_worker::tests::worker_connection_keeps_wal_enabled ... ok
+
+test result: ok. 479 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 15.72s
+
+     Running tests/background_agent_lifecycle.rs (target/debug/deps/background_agent_lifecycle-ab21e62711573f8a)
+
+running 8 tests
+test a_new_parent_episode_discards_previous_child_exit_clocks_and_duplicates ... ok
+test completion_clock_is_independent_of_parent_and_child_exit_arrival_order ... ok
+test completion_uses_the_latest_child_exit_even_when_delivered_first ... ok
+test delayed_parent_activity_preserves_a_newer_child_exit_in_the_same_episode ... ok
+test first_child_approval_keeps_working_after_the_result ... ok
+test first_child_requests_reserve_capacity_atomically ... ok
+test first_child_ungrouped_question_keeps_working_after_the_answer ... ok
+test resolved_first_child_requests_do_not_reopen_a_lifetime ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.51s
+
+     Running unittests src/lib.rs (target/debug/deps/storage_core-dabef184e07e0b07)
+
+running 3 tests
+test tests::빈_db가_최신으로_올라간다 ... ok
+test tests::앞선_버전_db는_거부 ... ok
+test tests::이미_최신이면_noop ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/web_remote-76dacdf69bf47cea)
+
+running 384 tests
+test cloud::tests::answer_display_label_has_separate_budget_and_legacy_default ... ok
+test cloud::tests::cloud_artifacts_preserve_safe_links_and_reject_embedded_credentials ... ok
+test cloud::tests::cloud_control_mailbox_honors_deadline_and_checks_after_slow_revalidation ... ok
+test cloud::tests::cloud_control_mailbox_rechecks_guard_and_core_after_revalidation ... ok
+test cloud::tests::cloud_control_mailbox_rechecks_revocation_epoch_and_permissions_at_drain ... ok
+test cloud::tests::cloud_control_mailbox_rejects_dropped_origin_and_replaced_core ... ok
+test cloud::tests::cloud_control_mailbox_requires_current_origin_permission_and_device_expiry ... ok
+test cloud::tests::cloud_control_mailbox_requires_exact_permissions_and_intent_scope ... ok
+test cloud::tests::cloud_controls_are_bounded_explicit_intents_without_input_text ... ok
+test cloud::tests::cloud_projection_rejects_excess_rows_and_oversize_without_truncating_identity ... ok
+test cloud::tests::cloud_projection_retains_original_identity_and_exposes_no_auth_fields ... ok
+test cloud::tests::failed_publication_keeps_the_last_authoritative_snapshot ... ok
+test cloud::tests::local_execution_status_rejects_model_identity ... ok
+test cloud::tests::navigation_reply_reports_observed_completion_and_fences_old_origin ... ok
+test cloud::tests::read_only_projection_omits_connection_approvals ... ok
+test dashboard::tests::agent_status_harness_blocked_read_does_not_block_input_or_rebind_and_discards_old_owner ... ok
+test dashboard::tests::agent_status_harness_existing_user_override_survives_subscription_seed ... ok
+test dashboard::tests::agent_status_harness_fresh_runtime_does_not_inherit_persisted_question_without_new_hook ... ok
+test dashboard::tests::agent_status_harness_live_child_overrides_parent_done_in_pwa ... ok
+test dashboard::tests::agent_status_harness_real_repository_updates_without_gui_frames ... ok
+test dashboard::tests::agent_status_harness_request_error_override_and_exit_precedence ... ok
+test dashboard::tests::agent_status_harness_same_workspace_rebind_rejects_captured_old_generation ... ok
+test dashboard::tests::direct_binding_retries_dropped_initial_query_and_accepts_empty_mux_ack ... ok
+test dashboard::tests::direct_binding_switch_does_not_alias_ids_between_two_real_workers ... ok
+test dashboard::tests::direct_input_requires_current_connection_generation_and_exact_uuid ... ok
+test dashboard::tests::durable_event_barrier_is_not_dashboard_or_session_data ... ok
+test dashboard::tests::encode_input은_정규화_strip_wrap_submit을_정확히_한다 ... ok
+test dashboard::tests::exit는_완료_배지_mux에서_사라지면_목록에서_제거 ... ok
+test dashboard::tests::history_web_anchor_namespaces_reject_same_numeric_engine_after_binding_or_dashboard_restart ... ok
+test dashboard::tests::history_web_legacy_scroll_never_moves_native_terminal_display ... ok
+test dashboard::tests::history_web_native_generation_fences_pending_and_queued_connection_refreshes ... ok
+test dashboard::tests::history_web_native_positive_offset_requests_live_window_instead_of_publishing_mac_history ... ok
+test dashboard::tests::mux는_세션_소속을_만든다 ... ok
+test dashboard::tests::rebind_watch는_refcount_전이에서만_lease를_보낸다 ... ok
+test dashboard::tests::request_switch는_스위치_싱크로_워크스페이스_id를_넘긴다 ... ok
+test dashboard::tests::resize_control_real_worker_binding_cleanup_never_releases_same_numeric_id_on_new_worker ... ok
+test dashboard::tests::resize_control_real_worker_retries_dropped_enqueues_and_releases_at_zero_connections ... ok
+test dashboard::tests::resize_control_review_same_uuid_replacement_requires_fresh_watch_incarnation ... ok
+test dashboard::tests::resource_usage가_리소스뷰를_만든다 ... ok
+test dashboard::tests::saved_selection_identity_resolves_after_activation_without_title_or_local_id_matching ... ok
+test dashboard::tests::send_input은_시청_세션의_bracketed_모드를_반영한다 ... ok
+test dashboard::tests::status_문자열_매핑 ... ok
+test dashboard::tests::switch_싱크_미설정이면_request_switch가_무시된다 ... ok
+test dashboard::tests::viewport_wake만으로는_dashboard를_재구축하지_않는다 ... ok
+test dashboard::tests::갱신주기가_지난_시청만_갱신_대상이_된다 ... ok
+test dashboard::tests::모르는_uuid로는_시청도_입력도_나가지_않는다 ... ok
+test dashboard::tests::상태_이벤트가_세션_상태를_덮고_mux는_상태를_보존한다 ... ok
+test dashboard::tests::새_worker_구독은_시청을_정리하고_재선언하지_않는다 ... ok
+test dashboard::tests::승인의_세션키가_폰이_watch할_uuid로_해석된다 ... ok
+test dashboard::tests::시청_슬롯은_watch_중에만_쌓이고_해제되면_제거된다 ... ok
+test dashboard::tests::시청이_정리되면_입력_키_스크롤이_모두_차단된다 ... ok
+test dashboard::tests::표시_스냅샷_push는_런타임_상태를_되돌리지_않는다 ... ok
+test dashboard::tests::표시명은_앱_스냅샷에서_오고_비활성은_표시전용이다 ... ok
+test dashboard::tests::확장_키_화이트리스트는_시퀀스로_매핑되고_미지_키는_무시된다 ... ok
+test history::tests::history_web_binding_invalidation_cancels_old_sink_and_rejects_old_result ... ok
+test history::tests::history_web_expanded_live_refresh_is_bounded_per_connection_and_preserves_read_anchor ... ok
+test history::tests::history_web_expanded_refresh_rejects_old_generation_and_reconnect_results ... ok
+test history::tests::history_web_fresh_controllers_reject_late_same_session_old_answers ... ok
+test history::tests::history_web_new_native_live_frame_cancels_old_passive_and_reset_generation_requeries ... ok
+test history::tests::history_web_operation_exhaustion_fails_without_wrapping_or_reviving_canceled_reply ... ok
+test history::tests::history_web_query_capacity_and_invalid_anchor_fail_without_retaining_extra_frames ... ok
+test history::tests::history_web_retry_timeout_correlation_and_unwatch_keep_whole_socket_counter ... ok
+test history::tests::history_web_two_connections_and_latest_reset_discard_stale_answers_before_publication ... ok
+test http::tests::csp가_frame_ancestors로_iframe_임베드를_차단한다 ... ok
+test http::tests::head_도중_eof는_closed ... ok
+test http::tests::head_상한_초과는_toolarge ... ok
+test http::tests::lf단독_개행도_허용 ... ok
+test http::tests::기형_요청은_malformed ... ok
+test http::tests::요청_라인과_헤더를_파싱한다 ... ok
+test http::tests::응답은_보안_헤더와_content_length를_싣는다 ... ok
+test http::tests::쿼리_없는_경로는_빈_쿼리 ... ok
+test http::tests::헤더_개수_상한_초과는_toolarge ... ok
+test pairing::tests::keyring_오류는_부재로_오판하지_않고_실패한다 ... ok
+test pairing::tests::재발급은_새_토큰으로_교체한다 ... ok
+test pairing::tests::접속_url은_호스트명_유무로_https와_로컬을_가른다 ... ok
+test pairing::tests::최초_생성_후_재호출은_같은_토큰 ... ok
+test protocol::tests::auth_프레임을_파싱한다 ... ok
+test protocol::tests::baseline_없으면_keyframe_있으면_바뀐_행만_delta ... ok
+test protocol::tests::cells가_기하보다_짧으면_있는_행까지만_인코딩한다 ... ok
+test protocol::tests::dashboard_notice는_some일때만_실린다 ... ok
+test protocol::tests::direct_terminal_input_wire_accepts_explicit_text_and_keys ... ok
+test protocol::tests::history_web_source_window_change_forces_keyframe_but_live_metadata_alone_keeps_delta ... ok
+test protocol::tests::history_web_viewport_exposes_exact_source_identity_even_with_equal_cells ... ok
+test protocol::tests::history_web_wire_accepts_optional_anchor_absolute_reset_and_transient_full_reply ... ok
+test protocol::tests::input_pressure_프레임_직렬화 ... ok
+test protocol::tests::resize_control_wire_requires_nonzero_request_and_explicit_action ... ok
+test protocol::tests::resolve_프레임을_파싱한다 ... ok
+test protocol::tests::sparse_grapheme_survives_web_keyframe_and_delta ... ok
+test protocol::tests::switch_프레임을_파싱한다 ... ok
+test protocol::tests::viewport_프레임은_스크롤백_오프셋을_싣는다 ... ok
+test protocol::tests::watch_unwatch_프레임을_파싱한다 ... ok
+test protocol::tests::기형이나_미지_메시지는_none ... ok
+test protocol::tests::서버_프레임_직렬화는_type_태그를_싣는다 ... ok
+test protocol::tests::커서만_바뀐_delta는_빈_lines로_커서를_나른다 ... ok
+test protocol::tests::프레임_크기_실측_80x24 ... ok
+test protocol::tests::행_run은_스타일과_폭_전환에서_끊고_spacer를_건너뛴다 ... ok
+test protocol::tests::행_첫_셀이_spacer면_건너뛰고_시작_열이_정확하다 ... ok
+test push::tests::endpoint_origin_추출 ... ok
+test push::tests::endpoint_검증은_https_공인주소만_허용한다 ... ok
+test push::tests::gone_410_응답은_구독을_삭제한다 ... ok
+test push::tests::in_flight_session_job_clears_after_already_notified_skip ... ok
+test push::tests::in_flight_session_job_clears_after_retry_exhaustion ... ok
+test push::tests::in_flight_session_job_clears_after_successful_commit ... ok
+test push::tests::in_flight_session_job_clears_after_zero_subscription_skip ... ok
+test push::tests::in_flight_session_job_clears_before_retry_requeue ... ok
+test push::tests::native_http_transport_preserves_gone_response_status ... ok
+test push::tests::notified_status는_상한을_넘지_않고_오래된_키부터_버린다 ... ok
+test push::tests::push_stalled_failure_bounds_session_jobs_and_stops_after_retry_cap ... ok
+test push::tests::rfc8291_부록_고정벡터_왕복 ... ok
+test push::tests::route_push_비활성이면_404 ... ok
+test push::tests::route_subscribe_내부주소_endpoint는_400이고_저장되지_않는다 ... ok
+test push::tests::route_subscribe_등록은_201_그리고_db에_저장된다 ... ok
+test push::tests::route_vapid_공개키는_토큰_게이트_통과시_200 ... ok
+test push::tests::session_job_admission_bounds_unique_sessions_at_limit ... ok
+test push::tests::session_job_admission_coalesces_identical_session_to_one_job ... ok
+test push::tests::session_job_admission_done_retry_does_not_inherit_waiting_attempts ... ok
+test push::tests::session_job_admission_done_wins_over_waiting ... ok
+test push::tests::session_job_admission_fresh_duplicate_done_preserves_retry_attempts ... ok
+test push::tests::session_job_admission_rejects_committed_duplicate_without_eviction ... ok
+test push::tests::session_job_admission_rejects_in_flight_duplicate_without_eviction ... ok
+test push::tests::session_job_admission_retry_replaces_fresh_and_preserves_attempts ... ok
+test push::tests::vapid_authorization_헤더_형식 ... ok
+test push::tests::vapid_jwt는_공개키로_검증되고_클레임이_맞다 ... ok
+test push::tests::vapid_keyring_오류는_부재로_오판하지_않는다 ... ok
+test push::tests::vapid_키_keyring_라운드트립_같은_공개키 ... ok
+test push::tests::같은_승인은_중복_발송하지_않는다 ... ok
+test push::tests::구독0에서는_승인_폴링이_정지한다 ... ok
+test push::tests::구독_등록하면_즉시_폴링하고_승인_1건을_발송한다 ... ok
+test push::tests::구독_수_상한을_넘으면_등록을_거부한다 ... ok
+test push::tests::세션_알림_전량_실패는_마킹하지_않고_상한까지_재시도한다 ... ok
+test push::tests::세션_알림_페이로드는_딥링크용_세션_id를_싣는다 ... ok
+test push::tests::세션_완료_알림은_중복_억제된다 ... ok
+test push::tests::승인_발송이_부분_성공하면_마킹을_커밋한다 ... ok
+test push::tests::승인_발송이_전량_실패하면_다음_주기에_재시도한다 ... ok
+test push::tests::암호화는_무작위_임시키로도_유효한_구조를_만든다 ... ok
+test relay::contract::tests::relay_actions_map_to_exact_permission_grants ... ok
+test relay::contract::tests::relay_identifier_resource_bound_is_explicit ... ok
+test relay::contract::tests::relay_identifiers_are_distinct_opaque_types ... ok
+test relay::contract::tests::relay_permissions_default_to_view_only ... ok
+test relay::crypto::tests::admitted_device_channel은_저장된_신원과_취소_상태를_매번_다시_확인한다 ... ok
+test relay::crypto::tests::checked_in_webcrypto_fixture_matches_the_rust_contract ... ok
+test relay::crypto::tests::clear_envelope_header는_stable_identity_fingerprint를_노출하지_않는다 ... ok
+test relay::crypto::tests::close후에는_encrypt_decrypt를_모두_fail_closed한다 ... ok
+test relay::crypto::tests::crypto_key_schedule_dependencies_zeroize_on_drop ... ok
+test relay::crypto::tests::desktop_channel은_consumed_pairing_approval과_exact_transcript_binding을_요구한다 ... ok
+test relay::crypto::tests::directional_aes256gcm은_양방향_roundtrip하고_ciphertext에_plaintext가_없다 ... ok
+test relay::crypto::tests::envelope_aad는_version_connection_peer_direction_sequence를_모두_인증한다 ... ok
+test relay::crypto::tests::handshake의_선행_validation오류도_ephemeral_scalar를_erase한다 ... ok
+test relay::crypto::tests::hkdf는_connection과_peer를_묶어_다른_channel의_frame을_거부한다 ... ok
+test relay::crypto::tests::identity와_ephemeral_scalar입력은_성공과_오류에서_항상_erase된다 ... ok
+test relay::crypto::tests::local_offer는_identity와_ephemeral_key_reuse를_거부한다 ... ok
+test relay::crypto::tests::plaintext_ciphertext상한과_send_counter_wrap은_상태를_진전시키지_않는다 ... ok
+test relay::crypto::tests::prechannel_session_keys는_non_copy_zeroize_on_drop_wrapper로_소유된다 ... ok
+test relay::crypto::tests::print_relay_webcrypto_fixture_for_review ... ignored, fixture generation helper; the checked-in vector test is the release gate
+test relay::crypto::tests::production_identity_constructor는_호출자_scalar_buffer까지_erase한다 ... ok
+test relay::crypto::tests::receive_sequence는_정확히_단조증가하며_skip_duplicate_replay를_거부한다 ... ok
+test relay::crypto::tests::relay_identity와_ephemeral은_분리되고_private_debug은_redacted다 ... ok
+test relay::crypto::tests::signed_hello는_webcrypto_raw규격이고_양쪽_sas는_같은_6자리다 ... ok
+test relay::crypto::tests::signed_transcript는_version_role_connection_identity_ephemeral_signature를_모두_검증한다 ... ok
+test relay::crypto::tests::webcrypto_hello와_finish는_identity_ephemeral_key_reuse를_거부한다 ... ok
+test relay::pairing::tests::a_pairing_proof_verifies_only_against_the_binding_it_was_computed_for ... ok
+test relay::pairing::tests::a_wrong_pairing_proof_consumes_attempts_exactly_like_a_wrong_secret ... ok
+test relay::pairing::tests::every_terminal_transition_clears_the_stored_secret ... ok
+test relay::pairing::tests::expired_pairing_cannot_be_revived_by_clock_rollback ... ok
+test relay::pairing::tests::pairing_accepts_only_before_the_five_minute_deadline ... ok
+test relay::pairing::tests::pairing_debug_output_redacts_rendezvous_secret ... ok
+test relay::pairing::tests::pairing_fails_closed_when_clock_precedes_issue_or_last_observation ... ok
+test relay::pairing::tests::pairing_proof_is_deterministic_and_keyed_by_the_secret ... ok
+test relay::pairing::tests::pairing_proof_shares_the_terminal_decisions_of_the_secret_path ... ok
+test relay::pairing::tests::pairing_requires_verification_before_single_consume ... ok
+test relay::pairing::tests::pairing_resource_limits_are_explicit ... ok
+test relay::pairing::tests::pairing_secret_comparison_uses_constant_time_helper ... ok
+test relay::pairing::tests::pairing_secret_zeroizes_on_drop ... ok
+test relay::pairing::tests::pending_pairing_constructor_and_approval_are_not_publicly_reconstructible ... ok
+test relay::pairing::tests::production_pairing_secret_takes_and_erases_the_source_buffer ... ok
+test relay::pairing::tests::production_registry_issues_uncontrolled_id_and_secret_together ... ok
+test relay::pairing::tests::registry_bounds_active_and_tombstoned_pairing_records ... ok
+test relay::pairing::tests::registry_clock_rollback_rejects_new_ticket_creation ... ok
+test relay::pairing::tests::registry_clock_rollback_terminally_expires_the_target_pairing ... ok
+test relay::pairing::tests::registry_owns_creation_and_tombstone_blocks_pairing_id_reconstruction ... ok
+test relay::pairing::tests::registry_preserves_attempts_exhausted_as_a_tombstoned_terminal_state ... ok
+test relay::pairing::tests::rejected_pairing_cannot_be_revived ... ok
+test relay::pairing::tests::secret_verification_is_limited_to_five_attempts ... ok
+test relay::pairing::tests::successful_verification_clears_stored_secret_but_not_borrowed_candidate ... ok
+test relay::pairing::tests::verification_atomically_claims_the_exact_handshake_binding ... ok
+test relay::pairing::tests::verified_pairing_rejects_every_second_secret_verification ... ok
+test relay::pairing::tests::verified_pairing_still_expires_before_consume ... ok
+test relay::repository::tests::a_failed_compensating_revocation_is_reported_not_swallowed ... ok
+test relay::repository::tests::a_full_pending_table_rejects_the_ceremony_before_any_approval ... ok
+test relay::repository::tests::admission_requires_the_verified_approval_not_a_durable_row ... ok
+test relay::repository::tests::approval_after_the_pairing_deadline_admits_nothing ... ok
+test relay::repository::tests::concurrent_identity_creation_returns_one_persisted_identity ... ok
+test relay::repository::tests::confirmation_failure_after_approval_revokes_the_published_device ... ok
+test relay::repository::tests::corrupt_relay_identity_fails_closed_without_replacement ... ok
+test relay::repository::tests::off_curve_identity_keys_are_rejected_by_every_record_constructor ... ok
+test relay::repository::tests::pairing_deadline_and_device_expiry_are_independent_typed_fields ... ok
+test relay::repository::tests::pending_record_requires_verified_pairing_peer_identity ... ok
+test relay::repository::tests::records_are_bounded_and_default_to_view_only ... ok
+test relay::repository::tests::relay_identity_keychain_denial_is_a_relay_only_error ... ok
+test relay::repository::tests::relay_identity_uses_a_distinct_versioned_secret_and_survives_restart ... ok
+test relay::repository::tests::revocation_and_permission_downgrade_are_visible_to_admission_immediately ... ok
+test relay::repository::tests::the_repository_port_never_names_storage_or_secret_payloads ... ok
+test relay_client::adapter::tests::a_permission_downgrade_applies_to_the_same_open_channel ... ok
+test relay_client::adapter::tests::a_protocol_v3_auth_frame_is_never_accepted_over_relay ... ok
+test relay_client::adapter::tests::a_view_only_device_still_receives_dashboard_and_viewport_traffic ... ok
+test relay_client::adapter::tests::allowed_commands_do_not_consume_the_violation_budget ... ok
+test relay_client::adapter::tests::an_upload_admission_never_masquerades_as_a_client_command ... ok
+test relay_client::adapter::tests::approvals_never_reach_a_view_only_device_at_any_point ... ok
+test relay_client::adapter::tests::direct_terminal_messages_require_the_existing_input_grant ... ok
+test relay_client::adapter::tests::forged_privileged_commands_are_denied_without_touching_any_sink ... ok
+test relay_client::adapter::tests::granting_input_never_implies_upload ... ok
+test relay_client::adapter::tests::read_only_cloud_controls_never_cross_device_gate ... ok
+test relay_client::adapter::tests::repeated_forbidden_commands_close_the_channel_at_a_bounded_count ... ok
+test relay_client::adapter::tests::revocation_takes_effect_on_the_live_channel_immediately ... ok
+test relay_client::adapter::tests::the_adapter_never_reaches_into_the_loopback_authentication_path ... ok
+test relay_client::adapter::tests::the_single_input_grant_deliberately_covers_key_scroll_and_switch ... ok
+test relay_client::handshake::tests::a_claim_before_authentication_and_a_malformed_record_are_fatal ... ok
+test relay_client::handshake::tests::a_device_hello_with_a_different_identity_than_its_offer_is_unauthenticated ... ok
+test relay_client::handshake::tests::a_frame_from_another_connection_is_rejected ... ok
+test relay_client::handshake::tests::a_known_device_activates_without_a_ticket_when_the_stored_record_admits_it ... ok
+test relay_client::handshake::tests::a_new_pairing_reaches_an_active_channel_only_after_a_verified_proof ... ok
+test relay_client::handshake::tests::a_new_session_starts_from_scratch ... ok
+test relay_client::handshake::tests::a_rejection_ends_the_session_without_swallowing_a_queued_ticket_revoke ... ok
+test relay_client::handshake::tests::a_revoked_or_foreign_stored_record_never_activates ... ok
+test relay_client::handshake::tests::a_second_peer_or_a_peer_leaving_ends_the_session ... ok
+test relay_client::handshake::tests::a_signed_hello_before_an_offer_is_out_of_order ... ok
+test relay_client::handshake::tests::a_tampered_signature_is_unauthenticated ... ok
+test relay_client::handshake::tests::a_ticket_is_published_after_admission_and_again_on_every_new_session ... ok
+test relay_client::handshake::tests::a_wrong_pairing_proof_is_rejected_by_the_registry ... ok
+test relay_client::handshake::tests::an_offer_replay_after_the_desktop_answered_ends_the_session ... ok
+test relay_client::handshake::tests::an_unavailable_identity_never_leaks_an_offer_answer ... ok
+test relay_client::handshake::tests::every_record_has_exactly_one_shape_and_the_gate_never_parses_them ... ok
+test relay_client::handshake::tests::hello_before_admission_or_before_a_peer_joins_is_fatal ... ok
+test relay_client::handshake::tests::revoking_a_ticket_that_was_never_published_sends_nothing ... ok
+test relay_client::handshake::tests::the_handshake_deadline_ends_a_silent_session_but_not_an_approval_wait ... ok
+test relay_client::handshake::tests::the_idle_tick_keeps_the_session_alive_and_still_enforces_the_deadline ... ok
+test relay_client::handshake::tests::the_v1_hello_fixture_matches_this_implementation ... ok
+test relay_client::lifecycle::tests::a_connection_cannot_start_before_the_backoff_deadline ... ok
+test relay_client::lifecycle::tests::a_transport_failure_backs_off_and_a_success_resets_the_attempt_count ... ok
+test relay_client::lifecycle::tests::authentication_failure_and_revocation_never_reconnect_on_their_own ... ok
+test relay_client::lifecycle::tests::backoff_grows_geometrically_stays_capped_and_carries_jitter ... ok
+test relay_client::lifecycle::tests::disabling_stops_reconnection_immediately_even_mid_backoff ... ok
+test relay_client::lifecycle::tests::every_unsafe_endpoint_shape_is_refused ... ok
+test relay_client::lifecycle::tests::only_a_wss_dns_endpoint_passes_the_policy ... ok
+test relay_client::lifecycle::tests::relay_starts_disabled_and_opens_no_socket_until_enabled ... ok
+test relay_client::lifecycle::tests::shutdown_is_final_and_no_other_transition_revives_it ... ok
+test relay_client::lifecycle::tests::the_dev_override_is_policy_checked_and_never_persisted ... ok
+test relay_client::lifecycle::tests::the_endpoint_debug_output_shows_only_host_and_port ... ok
+test relay_client::lifecycle::tests::the_lifecycle_module_performs_no_io ... ok
+test relay_client::lifecycle::tests::there_is_no_default_production_endpoint_yet ... ok
+test relay_client::link::tests::a_link_round_trips_and_stays_inside_the_shell_fragment_limit ... ok
+test relay_client::link::tests::malformed_fragments_are_rejected ... ok
+test relay_client::link::tests::the_fragment_carries_exactly_the_three_one_shot_materials ... ok
+test relay_client::link::tests::the_shell_origin_is_policy_checked ... ok
+test relay_client::session::tests::a_forged_frame_on_an_active_channel_fails_authentication_and_closes ... ok
+test relay_client::session::tests::deactivation_closes_the_channel_and_is_idempotent ... ok
+test relay_client::session::tests::only_frames_sealed_by_the_peer_channel_become_plaintext ... ok
+test relay_client::session::tests::sealing_requires_an_active_channel_and_the_peer_opens_the_frame ... ok
+test relay_client::session::tests::server_control_frames_are_observed_and_close_ends_the_session ... ok
+test relay_client::session::tests::the_gate_never_parses_application_messages_itself ... ok
+test relay_client::session::tests::without_an_active_channel_no_bytes_become_a_command ... ok
+test relay_client::session::tests::wrong_route_or_connection_is_dropped_before_any_decryption ... ok
+test relay_client::tls::tests::a_completed_lookup_returns_its_slot ... ok
+test relay_client::tls::tests::abandoned_name_lookups_are_bounded_in_total_not_just_in_rate ... ok
+test relay_client::tls::tests::every_stage_of_the_connection_carries_a_deadline ... ok
+test relay_client::tls::tests::only_credential_rejections_map_to_a_non_retryable_error ... ok
+test relay_client::tls::tests::the_frame_ceiling_is_tied_to_both_the_e2ee_contract_and_the_wire_protocol ... ok
+test relay_client::tls::tests::the_manifest_pins_webpki_roots_only ... ok
+test relay_client::tls::tests::the_session_honours_the_receive_timeout_it_is_given ... ok
+test relay_client::tls::tests::the_transport_offers_no_alternative_trust_path ... ok
+test relay_client::worker::tests::a_poll_that_asks_to_close_ends_the_session_and_backs_off ... ok
+test relay_client::worker::tests::a_revocation_stops_all_further_attempts ... ok
+test relay_client::worker::tests::a_signal_that_arrives_before_the_wait_is_not_lost ... ok
+test relay_client::worker::tests::a_single_receive_never_blocks_longer_than_the_slice ... ok
+test relay_client::worker::tests::a_sink_that_asks_to_close_actually_ends_the_session ... ok
+test relay_client::worker::tests::a_worker_opens_no_connection_until_it_is_enabled ... ok
+test relay_client::worker::tests::an_authentication_rejection_stops_all_further_attempts ... ok
+test relay_client::worker::tests::disabling_stops_reconnection_promptly ... ok
+test relay_client::worker::tests::queued_outbound_frames_leave_on_an_idle_tick_without_any_inbound_frame ... ok
+test relay_client::worker::tests::re_enabling_after_a_halt_resumes_connecting ... ok
+test relay_client::worker::tests::shutdown_joins_the_owner_thread_promptly ... ok
+test relay_client::worker::tests::the_command_queue_is_bounded_and_rejects_instead_of_growing ... ok
+test relay_client::worker::tests::the_periodic_poll_runs_even_when_frames_never_stop_arriving ... ok
+test relay_client::worker::tests::transient_failures_are_retried_with_backoff ... ok
+test repository::tests::agent_status_harness_projection_is_workspace_scoped_and_request_aware ... ok
+test repository::tests::agent_status_harness_projection_stops_at_input_and_union_bounds ... ok
+test repository::tests::push_subscription_debug는_모든_인증좌표를_숨긴다 ... ok
+test repository::tests::storage_test_port는_구독상한을_원자적으로_적용한다 ... ok
+test resize_control::tests::resize_control_acquire_remains_view_only_until_worker_query_and_grant ... ok
+test resize_control::tests::resize_control_binding_cleanup_uses_captured_sink_and_bounded_cancel_capacity ... ok
+test resize_control::tests::resize_control_release_reacquire_correlates_latest_action_and_rejects_old_geometry ... ok
+test resize_control::tests::resize_control_retries_identical_query_acquire_resize_and_release_at_zero_connections ... ok
+test resize_control::tests::resize_control_review_attached_closing_deadline_publishes_timeout ... ok
+test resize_control::tests::resize_control_review_query_release_finishes_without_worker_ack ... ok
+test resize_control::tests::resize_control_timeout_cancels_predicted_grant_and_ignores_late_ack ... ok
+test resize_control::tests::resize_control_worker_busy_is_view_only_and_invalid_size_retains_confirmed_owner ... ok
+test session_core::tests::stop_push_detaches_the_sender_while_the_core_keeps_running ... ok
+test session_core::tests::the_core_module_names_no_socket_type ... ok
+test session_core::tests::the_core_stands_up_and_shuts_down_without_any_listener ... ok
+test static_srv::tests::fnv1a는_내용이_바뀌면_키가_바뀐다 ... ok
+test static_srv::tests::healthz는_토큰_없이_200_json ... ok
+test static_srv::tests::index는_버전_경로_자산을_참조하고_그_경로가_서빙된다 ... ok
+test static_srv::tests::manifest는_유효_json이고_아이콘이_서빙된다 ... ok
+test static_srv::tests::sw_js_shell_배열의_모든_경로가_서빙된다 ... ok
+test static_srv::tests::sw_js는_버전_자리표시자를_해시로_치환해_서빙 ... ok
+test static_srv::tests::공용_뷰어_모듈은_서빙_번들의_접두사이고_다이제스트가_일치한다 ... ok
+test static_srv::tests::공용_뷰어_코어는_인증과_쓰기경로를_모른다 ... ok
+test static_srv::tests::다른_파라미터_사이의_토큰도_찾는다 ... ok
+test static_srv::tests::무결성_매니페스트는_토큰_없이_200_json이고_두_다이제스트를_담는다 ... ok
+test static_srv::tests::상수시간_비교는_길이와_내용을_본다 ... ok
+test static_srv::tests::셸_문서들은_합성_번들을_es_모듈로_로드한다 ... ok
+test static_srv::tests::셸_버전키는_16진수_16자리 ... ok
+test static_srv::tests::앱셸은_대시보드와_전체화면_뷰어를_형제로_둔다 ... ok
+test static_srv::tests::전체화면_렌더러는_visual_viewport와_단일_frame_스케줄러를_사용한다 ... ok
+test static_srv::tests::전체화면_뷰어_css는_viewport와_safe_area_계약을_포함한다 ... ok
+test static_srv::tests::전체화면_뷰어_js는_단일_lifecycle과_back_계약을_포함한다 ... ok
+test static_srv::tests::전체화면_뷰어는_재연결_입력잠금과_privacy_계약을_포함한다 ... ok
+test static_srv::tests::토큰_불일치나_누락은_401_페어링_페이지 ... ok
+test static_srv::tests::토큰_일치는_앱셸_200 ... ok
+test static_srv::tests::프리캐시_셸은_모두_서빙되고_sw에_명시된다 ... ok
+test static_srv::tests::화이트리스트_밖_경로는_404 ... ok
+test static_srv::tests::화이트리스트_자산은_mime과_함께_200 ... ok
+test tests::cloud_control_queued_before_direct_server_stop_cannot_execute_on_shared_core ... ok
+test tests::cloud_navigation_completion_returns_only_to_requesting_websocket ... ok
+test tests::cloud_snapshot_and_controls_require_operator_authentication ... ok
+test tests::ensure_push는_키_없이_만들어진_코어를_나중에_보정한다 ... ok
+test tests::get_이외_메서드는_405 ... ok
+test tests::host_불일치는_403 ... ok
+test tests::host_허용_판정_단위 ... ok
+test tests::origin_검사는_허용_오리진과_부재만_통과시킨다 ... ok
+test tests::push_vapid_공개키_get은_200_json ... ok
+test tests::push_구독_등록_post는_201이고_db에_저장된다 ... ok
+test tests::push_본문_상한_초과는_413 ... ok
+test tests::push_비활성_서버는_구독_엔드포인트가_404 ... ok
+test tests::ws_history_real_worker_two_connections_preserve_native_offset_and_loaded_anchor ... ok
+test tests::ws_history_unavailable_restores_native_stream_after_explicit_and_passive_failures ... ok
+test tests::ws_input은_시청_중_세션에만_전달된다 ... ok
+test tests::ws_key는_시청_중_세션에만_writeinput을_보낸다 ... ok
+test tests::ws_origin_불일치는_403 ... ok
+test tests::ws_resize_control_real_worker_correlates_owner_and_actual_keyframes ... ok
+test tests::ws_scroll은_시청_중_세션에만_전달되고_캡된다 ... ok
+test tests::ws_viewport는_keyframe_delta_재동기화를_거친다 ... ok
+test tests::ws_watch_전환과_절단이_lease를_재바인딩한다 ... ok
+test tests::ws_대시보드는_전체_워크스페이스를_싣고_비활성은_표시전용이다 ... ok
+test tests::ws_상태_스트림_프레임에_주입_상태가_반영된다 ... ok
+test tests::ws_슬롯_상한_초과는_503으로_거부된다 ... ok
+test tests::ws_승인_목록_수신과_resolve_왕복 ... ok
+test tests::ws_시드_상태가_프레임에_반영되고_mux는_제목을_덮지_않는다 ... ok
+test tests::ws_인증_성공은_welcome_실패는_close ... ok
+test tests::ws_인증_전_비auth_첫프레임은_거부 ... ok
+test tests::ws_재시드는_옛_워크스페이스_세션을_교체한다 ... ok
+test tests::ws_종료_후_슬롯이_복원된다 ... ok
+test tests::ws_핸드셰이크는_101_키없는_업그레이드는_400 ... ok
+test tests::ws가_정적_슬롯을_모두_점유해도_정적_요청은_즉시_처리된다 ... ok
+test tests::공유_코어가_웹푸시를_소유하고_서버_종료에도_살아남는다 ... ok
+test tests::공유_코어에는_서버_소유_웹푸시_싱크를_붙일_수_없다 ... ok
+test tests::기형_요청은_400 ... ok
+test tests::동시_접속_상한_초과는_슬롯이_빌_때까지_대기 ... ok
+test tests::비_ws_경로_업그레이드는_정적_라우팅으로_흐른다 ... ok
+test tests::비루프백_평문_bind는_거부 ... ok
+test tests::설치_셸_자산과_sw_헤더 ... ok
+test tests::업로드_성공은_201과_파일_존재를_보장한다 ... ok
+test tests::업로드는_uploads_dir_미배선이면_404 ... ok
+test tests::업로드는_본문_상한_초과시_413 ... ok
+test tests::업로드는_빈_본문을_거부한다 ... ok
+test tests::업로드는_토큰_없으면_401 ... ok
+test tests::업로드는_토큰_틀리면_본문_읽기_전에_401한다 ... ok
+test tests::업로드는_화이트리스트_밖_타입은_415 ... ok
+test tests::접속_0에서는_승인_폴링이_정지한다 ... ok
+test tests::정적_자산은_200_화이트리스트_밖은_404 ... ok
+test tests::종료_후_리스너가_사라지고_포트가_풀린다 ... ok
+test tests::토큰_일치는_앱셸_불일치는_401 ... ok
+test tests::트리클_피어는_head_총_데드라인에서_컷된다 ... ok
+test upload::tests::content_type_화이트리스트_매칭 ... ok
+test upload::tests::gc는_예산_초과시_오래된_파일부터_제거한다 ... ok
+test upload::tests::gc는_오래된_tmp_잔재를_정리한다 ... ok
+test upload::tests::save_upload은_uuid_파일명으로_저장하고_절대경로를_돌려준다 ... ok
+test upload::tests::save_upload은_실행권한_없이_저장한다 ... ok
+test upload::tests::token_불일치는_거부 ... ok
+test upload::tests::예산_이내면_gc가_아무것도_지우지_않는다 ... ok
+test ws_api::tests::stop_신호는_인증을_즉시_중단시킨다 ... ok
+test ws_api::tests::upgrade_헤더를_대소문자_무시로_판별한다 ... ok
+test ws_api::tests::인증_데드라인_초과는_실패한다 ... ok
+test ws_api::tests::표준_accept_키_유도 ... ok
+
+test result: ok. 383 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 39.65s
+
+     Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-e18c71a4c1a26be7)
+
+running 1 test
+test fragmented_loopback_request_keeps_its_static_response ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+     Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-4aac07cf8d5c07a1)
+
+running 1 test
+test mobile_cloud_results_keep_source_identity_and_owner_controls ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-6c0142996637e59a)
+
+running 1 test
+test connected_mobile_shell_matches_workspace_and_terminal_flow ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-d896178fd1c36cc6)
+
+running 1 test
+test writable_mobile_terminal_usability ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-4f0698a5bb8167d0)
+
+running 2 tests
+test approved_mobile_design_continuous_bounded_history ... ignored, requires a locally installed Chromium-family browser
+test approved_mobile_design_unified_input_and_workspace_rows ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-02ded6d98c97ced1)
+
+running 1 test
+test the_production_shell_pairs_end_to_end_against_the_rust_vectors ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-4c3fbe21a73ec14f)
+
+running 10 tests
+test every_environment_variable_the_build_reads_is_documented_in_both_environments ... ok
+test the_examples_carry_placeholders_and_never_real_coordinates ... ok
+test the_header_csp_matches_the_policy_the_build_records_in_its_manifest ... ok
+test the_headers_forbid_caching_the_entry_document_and_service_worker ... ok
+test the_readme_records_every_unresolved_coordinate_as_blocked ... ok
+test the_release_workflow_refuses_to_publish_and_invents_no_coordinates ... ok
+test the_response_header_csp_names_only_its_own_relay_origin ... ok
+test the_shell_version_window_stays_tied_to_the_rust_wire_constant ... ok
+test the_trusted_shell_and_the_untrusted_relay_never_share_a_host ... ok
+test the_two_environments_stay_independently_rollbackable ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-102e793467a5c1b1)
+
+running 5 tests
+test browser_completion_marker_requires_an_executed_signature ... ok
+test envelope_fixtures_carry_the_sequence_the_browser_serializes ... ok
+test fixed_relay_vectors_match_real_browser_webcrypto ... ignored, requires a locally installed Chromium-family browser
+test fixture_separates_identity_signing_and_ephemeral_derivation_keys ... ok
+test the_vector_runner_imports_the_shipped_crypto_module_instead_of_copying_it ... ok
+
+test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transport_independence.rs (target/debug/deps/transport_independence-9506964471b33e57)
+
+running 5 tests
+test a_failed_server_start_does_not_disturb_a_shared_core ... ok
+test a_relay_only_arrangement_needs_no_loopback_listener ... ok
+test a_server_that_created_its_own_core_stops_it_on_shutdown ... ok
+test restarting_the_loopback_server_reuses_the_same_shared_core ... ok
+test stopping_the_loopback_server_leaves_a_shared_core_running ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.13s
+
+     Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-f02dc9872b03db74)
+
+running 1 test
+test the_shared_viewer_core_runs_its_contract_in_a_real_browser ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-9d492b542f412d09)
+
+running 1 test
+test browser_canvas_preserves_graphemes_and_cell_advances ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-d821391850616b79)
+
+running 1 test
+test browser_viewer_retains_history_and_resumes_matching_current_window ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-22a4d06c74f115c4)
+
+running 1 test
+test browser_viewer_preserves_readable_cells_and_local_positions ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-5bf3c7cb140d5529)
+
+running 1 test
+test browser_viewer_retains_selection_search_and_local_history ... ignored, requires a locally installed Chromium-family browser
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/xtask-660a09bf8586f927)
+
+running 16 tests
+test tests::authorization_capability는_단일_transaction_경로만_사용한다 ... ok
+test tests::authorization_identifier_scan은_midfile_cfg와_import_alias를_놓치지_않는다 ... ok
+test tests::composition_root_scan은_test_item을제외하고뒤production도검사한다 ... ok
+test tests::connector_crate_direct_dependency는_역할별_allowlist와_일치한다 ... ok
+test tests::key_coverage는_리터럴_키_누락은_잡고_동적_키와_test_모듈은_건너뛴다 ... ok
+test tests::leaf_semantic_boundary는_test_item을제외하고뒤production도검사한다 ... ok
+test tests::macos_package_gate는_공증_gatekeeper와_archive를검증한다 ... ok
+test tests::od01_failure_matrix는_contract_variant와_exact_one_to_one이다 ... ok
+test tests::od01_failure_matrix는_missing_duplicate_unknown을_거부한다 ... ok
+test tests::pr10_terminal_host_exception_rejects_broad_hidden_calls ... ok
+test tests::production_app_concrete_stores는_app_rs에만_존재한다 ... ok
+test tests::로컬_의존_그래프가_기대_edge를_담는다 ... ok
+test tests::합성_루트는_app_rs와_relay_repository_둘뿐이다 ... ok
+test tests::현재_boundary는_허용된_예외만_남는다 ... ok
+test tests::현재_i18n_key_coverage는_5개_로케일에_모두_있다 ... ok
+test tests::현재_그래프는_금지edge와_순환이_없다 ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.38s
+
+   Doc-tests agent_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests audit
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests auth
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests connector_contract
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests connector_service
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests deppy_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests http_client
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests i18n
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mcp_store
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests mux
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests persist
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests platform
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests pty
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests relay_protocol
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests relay_server
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests runtime
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests secret
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests session
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests storage
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests storage_core
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests web_remote
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

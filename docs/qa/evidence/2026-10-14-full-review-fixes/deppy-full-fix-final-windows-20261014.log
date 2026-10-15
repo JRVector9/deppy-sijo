@@ -1,0 +1,4 @@
+error: failed to download `curve25519-dalek-derive v0.1.1`
+
+Caused by:
+  attempting to make an HTTP request, but --offline was specified

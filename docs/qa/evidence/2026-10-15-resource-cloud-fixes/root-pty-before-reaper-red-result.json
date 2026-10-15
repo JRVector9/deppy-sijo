@@ -1,0 +1,17 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "pty",
+    "samegroup_descendant_before_reaper_poll",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit_code": 101,
+  "seconds": 7.896997928619385,
+  "log": "/private/tmp/deppy-cloud-fix-root-20261015/pty-before-reaper-red.log"
+}

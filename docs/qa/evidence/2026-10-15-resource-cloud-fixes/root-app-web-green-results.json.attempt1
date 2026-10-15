@@ -1,0 +1,21 @@
+[
+  {
+    "name": "app-cloud-green",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "cloud_agent::",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "exit_code": 101,
+    "log": "app-cloud-green.log"
+  }
+]

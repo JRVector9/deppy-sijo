@@ -1,0 +1,15 @@
+{
+  "status": "PASS",
+  "archived_artifact_sha_checks": 45,
+  "reviewed_source_sha_checks": 422,
+  "product_diff_bytes_unchanged": true,
+  "head_unchanged": true,
+  "local_links_checked": 43,
+  "finding_sections": {
+    "defects": 6,
+    "measured_bottlenecks": 1
+  },
+  "normal_test_reference_check": "21 concrete names all present in executed logs",
+  "fixture_qualification": "first WS auth shape excluded, final qualified valid auth log used",
+  "scope": "documentation/evidence consistency, not a new product test"
+}

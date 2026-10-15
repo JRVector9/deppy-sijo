@@ -1,0 +1,4 @@
+cargo fmt --all --check: exit0
+HTML inline JavaScript node --check: exit0
+git diff --check: exit0
+Evidence/source SHA and pre-existing terminal/runtime byte preservation: PASS

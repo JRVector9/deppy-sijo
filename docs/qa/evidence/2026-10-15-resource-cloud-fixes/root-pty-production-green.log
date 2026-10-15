@@ -1,0 +1,12 @@
+before kind=normal action=drop freeze=false shell=ProcessIdentity { pid: Some(42828), process_group: Some(42828), source: PortablePty } workload=Identity { pid: 42829, group: 42829, session: 42828, birth: (1792020879, 303387), zombie: false } actual_foreground=Some(42829)
+after kind=normal action=drop freeze=false teardown_ms=8.683 same_live_workload_survives=false identity=None
+cleanup kind=normal action=drop freeze=false PASS
+before kind=ignore-hup action=drop freeze=false shell=ProcessIdentity { pid: Some(42844), process_group: Some(42844), source: PortablePty } workload=Identity { pid: 42845, group: 42845, session: 42844, birth: (1792020879, 676239), zombie: false } actual_foreground=Some(42845)
+after kind=ignore-hup action=drop freeze=false teardown_ms=22.961 same_live_workload_survives=false identity=None
+cleanup kind=ignore-hup action=drop freeze=false PASS
+before kind=ignore-hup action=kill freeze=false shell=ProcessIdentity { pid: Some(42849), process_group: Some(42849), source: PortablePty } workload=Identity { pid: 42850, group: 42850, session: 42849, birth: (1792020880, 35409), zombie: false } actual_foreground=Some(42850)
+after kind=ignore-hup action=kill freeze=false teardown_ms=22.485 same_live_workload_survives=false identity=None
+cleanup kind=ignore-hup action=kill freeze=false PASS
+before kind=ignore-hup action=drop freeze=true shell=ProcessIdentity { pid: Some(42887), process_group: Some(42887), source: PortablePty } workload=Identity { pid: 42888, group: 42888, session: 42887, birth: (1792020880, 396196), zombie: false } actual_foreground=Some(42888)
+after kind=ignore-hup action=drop freeze=true teardown_ms=281.071 same_live_workload_survives=false identity=None
+cleanup kind=ignore-hup action=drop freeze=true PASS

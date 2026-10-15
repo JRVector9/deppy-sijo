@@ -1,0 +1,7 @@
+path=/private/tmp/deppy-backup-production-20261014-74268 live_rows=2 backup_rows=1 migrated_version=2 backup_integrity=ok elapsed_ms=5384
+
+thread 'main' (47912525) panicked at /private/tmp/deppy-all-review-remote-data-20261014/backup-production.rs:30:5:
+assertion `left == right` failed: successful pre-migration backup omitted a committed row
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

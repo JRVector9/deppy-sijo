@@ -1,0 +1,18 @@
+{
+  "command": [
+    "git",
+    "apply",
+    "--check",
+    "/private/tmp/deppy-cloud-review-root-20261015/combined-review-regressions.tests-only.patch"
+  ],
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": "",
+  "files": [
+    "crates/app/src/cloud_agent/bridge_tests.rs",
+    "crates/app/src/cloud_agent/ui/management_tests.rs",
+    "crates/app/src/cloud_agent/management.rs",
+    "crates/web-remote/src/ws_api.rs"
+  ],
+  "patch_sha256": "ebe671d4e3c220458ad5647e1f496dc9c651b0f3ed1e42ed2628ac853af79f95"
+}

@@ -1,0 +1,47 @@
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.84s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 32 tests
+test app::tests::full_fix_20261014_document_aggregate_editor_budget_counts_saved_copies ... ok
+test app::tests::full_fix_20261014_document_dead_owner_same_path_is_recoverable ... ok
+test app::tests::full_fix_20261014_document_poll_infrastructure_failures_cancel_scope_close ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancel_preserves_unrelated_confirmations ... ok
+test app::tests::full_fix_20261014_document_scope_close_cancels_if_original_owner_is_gone_or_reused ... ok
+test app::tests::full_fix_20261014_document_scope_close_conflict_keeps_source_and_conflict_prompt ... ok
+test app::tests::full_fix_20261014_document_scope_close_guards_each_lifecycle_target ... ok
+test app::tests::full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff ... ok
+test app::tests::full_fix_20261014_document_scope_close_save_failure_preserves_buffer ... ok
+test app::tests::full_fix_20261014_document_scope_close_waits_for_edits_made_during_save ... ok
+test app::tests::full_fix_20261014_document_submitted_close_cancel_conflict_failure_leave_tombstone ... ok
+test app::tests::full_fix_20261014_document_submitted_runtime_handoff_checks_same_owner_once ... ok
+test app::tests::full_fix_20261014_document_submitted_workspace_handoff_rejects_replacement_runtime ... ok
+test app::tests::full_fix_20261014_document_worker_panic_cancels_close_before_later_manual_save ...
+thread 'document-save-panic-fixture' (49349332) panicked at crates/app/src/app.rs:49973:20:
+synthetic save executor failure
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+ok
+test app::tests::full_fix_20261014_host_completion_cancelled_owner_discards_payload ... ok
+test app::tests::full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_cache_ages_from_original_snapshot_timestamp ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_pending_worker_never_waits_on_frame ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_regular_bounded_file ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_slow_missing_result_allows_cli_fallback ... ok
+test document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts ... ok
+test document_io::tests::full_fix_20261014_document_fifo_does_not_block_load_lane ... ok
+test document_io::tests::full_fix_20261014_document_symlink_save_preserves_loaded_target ... ok
+test folder_identity::tests::full_fix_20261014_document_portable_folder_validation_does_not_require_anchor ... ok
+test session_aux::tests::full_fix_20261014_document_explicit_recovery_excludes_live_owner ... ok
+test ui::document::tests::full_fix_20261014_document_editor_allows_replacement_within_byte_budget ... ok
+test ui::document::tests::full_fix_20261014_document_editor_budget_measures_utf8_bytes ... ok
+test ui::document::tests::full_fix_20261014_document_editor_ime_rejection_preserves_preedit_selection ... ok
+test ui::document::tests::full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo ... ok
+test ui::document::tests::full_fix_20261014_document_oversized_paste_preserves_selection ... oversized paste: retained=21 elapsed=1.00375ms
+ok
+test ui::workspace::tests::full_fix_20261014_document_resolved_close_admission_retries_after_queue_full ... ok
+
+test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 3221 filtered out; finished in 0.10s

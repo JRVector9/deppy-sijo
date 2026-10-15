@@ -1,0 +1,10 @@
+key=Enter has_focus=false lost_focus=true done=Some(true) text_edit_focused=false raw=[Key { key: Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }] events=[Key { key: Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]
+key=Enter terminal_active=true terminal_accepts=true PTY_BYTES=[13]
+key=Escape has_focus=false lost_focus=true done=Some(false) text_edit_focused=false raw=[Key { key: Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }] events=[Key { key: Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]
+key=Escape terminal_active=true terminal_accepts=true PTY_BYTES=[27]
+
+thread 'main' (45115653) panicked at /private/tmp/deppy-file-rename-probe-20261014.rs:38:10:
+assertion `left == right` failed: file rename submit/cancel key leaked into production PTY mapper
+  left: 2
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

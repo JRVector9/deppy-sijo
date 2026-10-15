@@ -1,0 +1,20 @@
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-review-worktree-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.30s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-92b62424000a532a)
+
+running 1 test
+test in_process::tests::full_review_20261014_late_agent_query_cannot_reach_fallback_shell ... late_query_output="\u{1b}[6nREADY           1b  5b  31  3b  31  52                                        \r\n\r\n"
+
+thread 'in_process::tests::full_review_20261014_late_agent_query_cannot_reach_fallback_shell' (48027760) panicked at crates/runtime/src/in_process.rs:18503:9:
+fallback shell received late CPR after production wrapper's time-0 drain: "\u{1b}[6nREADY           1b  5b  31  3b  31  52                                        \r\n\r\n"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    in_process::tests::full_review_20261014_late_agent_query_cannot_reach_fallback_shell
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 396 filtered out; finished in 0.30s
+
+error: test failed, to rerun pass `-p runtime --lib`

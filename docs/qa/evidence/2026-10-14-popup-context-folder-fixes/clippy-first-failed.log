@@ -1,0 +1,83 @@
+    Checking winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-performance/third_party/winit-0.30.13)
+    Checking connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+    Checking egui-wgpu v0.36.1
+    Checking accesskit_winit v0.32.2
+    Checking egui-winit v0.36.1
+    Checking egui_kittest v0.36.1
+    Checking eframe v0.36.1
+    Checking deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+error: all variants have the same prefix: `Before`
+  --> crates/app/src/file_delete.rs:21:1
+   |
+21 | / pub(crate) enum DeleteStage {
+22 | |     BeforeMove,
+23 | |     BeforeRestore,
+24 | |     BeforeCleanup,
+25 | | }
+   | |_^
+   |
+   = help: remove the prefixes and use full paths to the variants instead of glob imports
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#enum_variant_names
+   = note: `-D clippy::enum-variant-names` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::enum_variant_names)]`
+
+error: this `if` statement can be collapsed
+    --> crates/app/src/ui/file_tree.rs:2000:13
+     |
+2000 | /             if let Ok(relative) = row.path.strip_prefix(&root)
+2001 | |                 && let Some(node) = self
+2002 | |                     .children
+2003 | |                     .as_mut()
+...    |
+2011 | |             }
+     | |_____________^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#collapsible_if
+     = note: `-D clippy::collapsible-if` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::collapsible_if)]`
+help: collapse nested if block
+     |
+2004 ~                     .and_then(|children| node_mut(children, relative))
+2005 ~                 && (!node.expanded || node.children.is_none()) {
+2006 |                     node.expanded = true;
+2007 |                     node.children = Some(Vec::new());
+2008 |                     recovered_state_changed = true;
+2009 ~                 }
+     |
+
+error: could not compile `deppy-sijo` (bin "deppy-sijo") due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: using a non-octal value to set unix file permissions
+     --> crates/app/src/app.rs:59553:75
+      |
+59553 |         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0)).unwrap();
+      |                                                                           ^ help: consider using an octal literal instead: `0o0`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#non_octal_unix_permissions
+      = note: `#[deny(clippy::non_octal_unix_permissions)]` on by default
+
+error: using a non-octal value to set unix file permissions
+     --> crates/app/src/ui/file_tree.rs:17253:74
+      |
+17253 |         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
+      |                                                                          ^ help: consider using an octal literal instead: `0o0`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#non_octal_unix_permissions
+
+error: using a non-octal value to set unix file permissions
+     --> crates/app/src/ui/file_tree.rs:17305:75
+      |
+17305 |         std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
+      |                                                                           ^ help: consider using an octal literal instead: `0o0`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#non_octal_unix_permissions
+
+error: using a non-octal value to set unix file permissions
+     --> crates/app/src/ui/file_tree.rs:17628:74
+      |
+17628 |         std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
+      |                                                                          ^ help: consider using an octal literal instead: `0o0`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.96.0/index.html#non_octal_unix_permissions
+
+error: could not compile `deppy-sijo` (bin "deppy-sijo" test) due to 6 previous errors

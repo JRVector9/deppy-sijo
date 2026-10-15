@@ -1030,7 +1030,7 @@ fn process(
                         metadata.deferred = Some(stream);
                         return Response::plain(202, "");
                     }
-                    return tool_response(id, Err("completion_transport_closed_no_effect".into()));
+                    return tool_response(id, Err("outcome_unknown_do_not_retry_input".into()));
                 }
                 match rx.recv_timeout(Duration::from_millis(5)) {
                     Ok(result) => {
@@ -1046,7 +1046,7 @@ fn process(
                             }
                             return tool_response(
                                 id,
-                                Err("completion_transport_closed_no_effect".into()),
+                                Err("outcome_unknown_do_not_retry_input".into()),
                             );
                         }
                         break result;
@@ -1063,7 +1063,7 @@ fn process(
                             }
                             return tool_response(
                                 id,
-                                Err("completion_transport_closed_no_effect".into()),
+                                Err("outcome_unknown_do_not_retry_input".into()),
                             );
                         }
                         break Err("outcome_unknown_do_not_retry_input".into());

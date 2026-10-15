@@ -562,7 +562,15 @@ impl CompletionLane {
                     };
                     if let Some(result) = result {
                         stream.reply = None;
-                        stream.result = Some(result);
+                        // Keep the original bounded value for late redaction, but
+                        // never retain an oversized internal App reply for replay.
+                        let mut budget = ResultBudget(MAX_COMPLETION_EVENT_BYTES);
+                        stream.result =
+                            Some(if serde_json::to_writer(&mut budget, &result).is_ok() {
+                                result
+                            } else {
+                                Err("completion_result_too_large_unknown".into())
+                            });
                         stream.expires = crate::now() + COMPLETION_RECEIPT_TTL;
                         stream.state = CompletionDeliveryState::Ready;
                         stream.dirty = true;
@@ -668,6 +676,20 @@ impl CompletionLane {
             offset += written;
         }
         action.socket.flush()
+    }
+}
+
+struct ResultBudget(usize);
+impl Write for ResultBudget {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self
+            .0
+            .checked_sub(bytes.len())
+            .ok_or(std::io::ErrorKind::InvalidData)?;
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 

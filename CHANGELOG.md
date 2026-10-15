@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.13.0] - 2026-10-15
+
+### Added
+
+- Opt in per cloud connection and shared session to return verified local Codex turn completion through the original initialized MCP request. Input permissions and control leases remain separate.
+- Preserve bounded private completion receipts and reconnect only the original host session, with distinct local and delivery states. Providers without native completion evidence reject tracked submission before input.
+
+### Fixed
+
+- Fence completion against intervening input, runtime event loss, revoked read access, replaced sessions, expired watches, and late admission replies.
+- Bound deferred transport resources and redact newly registered secrets before each original response or replay.
+
 ## [0.12.3] - 2026-10-15
 
 ### Fixed

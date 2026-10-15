@@ -38,7 +38,8 @@ fn request(
     let header = format!("Bearer {}", client.bearer);
     let (reply, rx) = mpsc::sync_channel(1);
     (
-        Request { deferred: None,
+        Request {
+            deferred: None,
             epoch: auth.authenticate(&header, now()).unwrap(),
             principal: auth.authenticate_principal(&header, now()).unwrap(),
             access_key: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(client.bearer.as_bytes()))),
@@ -56,24 +57,44 @@ fn request(
 fn completion_opt_in_requires_original_transport_before_any_input_effect() {
     let (mut bridge, target) = setup();
     let named = client(&bridge, "Completion bot");
-    bridge.set_connection_access(&named.id, &target, true, true).unwrap();
-    let (req, rx) = request(&bridge, &named, "acquire_control", json!({
-        "session_id": target.id, "generation": target.generation,
-    }));
+    bridge
+        .set_connection_access(&named.id, &target, true, true)
+        .unwrap();
+    let (req, rx) = request(
+        &bridge,
+        &named,
+        "acquire_control",
+        json!({
+            "session_id": target.id, "generation": target.generation,
+        }),
+    );
     bridge.handle_and_drain(req, |_, _| panic!("a control lease cannot type"));
     assert_eq!(rx.recv().unwrap().unwrap()["control"], "acquired");
-    bridge.set_connection_local_completion(&named.id, &target, true).unwrap();
-    let (req, rx) = request(&bridge, &named, "send_text", json!({
-        "session_id": target.id, "generation": target.generation,
-        "operation_id": "completion-without-transport", "text": "own prompt", "submit": true,
-    }));
+    bridge
+        .set_connection_local_completion(&named.id, &target, true)
+        .unwrap();
+    let (req, rx) = request(
+        &bridge,
+        &named,
+        "send_text",
+        json!({
+            "session_id": target.id, "generation": target.generation,
+            "operation_id": "completion-without-transport", "text": "own prompt", "submit": true,
+        }),
+    );
     let mut effects = 0;
     bridge.handle_and_drain(req, |_, _| {
         effects += 1;
         Ok(())
     });
-    assert_eq!(effects, 0, "opted-in input requires an original initialized request stream");
-    assert_eq!(rx.try_recv().unwrap().unwrap_err(), "completion_transport_required_no_effect");
+    assert_eq!(
+        effects, 0,
+        "opted-in input requires an original initialized request stream"
+    );
+    assert_eq!(
+        rx.try_recv().unwrap().unwrap_err(),
+        "completion_transport_required_no_effect"
+    );
 }
 
 #[test]

@@ -1,3 +1,26 @@
+# 클라우드 완료 알림 — 앱 통합·회귀 검증 진행, 2026-10-15
+
+- 목표/권한: 사용자 `진행해` 승인 설계대로 원 initialized MCP 요청에 검증된 로컬 완료를 자동 반환. 신규 feature0.13.0 예정, 현재0.12.3. 앱 launch/restart 권한 없음. canonical `deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`; 기존 dirty worktree/사용자 DB 보존.
+- 실제 RED stage3b: compilePASS; agent-mcp12PASS1FAIL1ignored(중첩 routing-name 비밀값 redaction), runtime1PASS2FAIL(TrackedPrompt unknown editor허용/zero-session wire), storage8PASS2FAIL(TTL digest미삭제/현재proof1개 요청에256개 반환), storageintegration2PASS. `/private/tmp/deppy-completion-stage3b-red-20261015.log`.
+- 실제 RED stage4: agent-mcp12PASS2FAIL1ignored(위redaction+1KiB최대결과 reserve통과), app44PASS7FAIL(원transport없는입력발생, nullablebaseline, discard실패, UIcheckbox, HistoryWorker3개). `/private/tmp/deppy-completion-stage4-red-20261015.log`. 앞 stage3/isolated stage3compilefail은 RED로 세지 않는다: SQLite u64/usize conversion 및 RuntimeEvent Debug assertion을 좁게 수정.
+- GREEN후보 통합: selected native keys/Option digest/분당256 bounded cleanup/runtimeguard e7ad9c19; puretracker idle/rollback a33c19dc; realproxy subprocessfixture5974c050; originaltransport/privacy/replay6162671e+6369aae7; UI288a5d31; HistoryWorker0e9f26e8. 실제 GREEN은 다음실행 결과 확인 전까지 주장하지 않는다.
+- root 신규 `cloud_agent/completion_bridge.rs` 원reply/permit/own-input/native-proof/status/DBfinish통합, `cloud_agent.rs` tracked reserve→atomicclaim→guardeddispatch→입력접수→privatefinal, `access.rs` read/optout/revoke fence, `app.rs` selected Attention projection와 off-frame Codex rollout확인 연결. 현재 uncommitted integration이며 컴파일/교차리뷰 중이다.
+- 진행 Cargo sole root session20957: `cargo test --offline --locked --no-fail-fast -p deppy-sijo -p agent-mcp -p storage -p runtime -p mcp-proxy completion_ -- --test-threads=1 --nocapture`, shared performance target/jobs2. log `/private/tmp/deppy-completion-stage5-green-20261015.log`. Cargo가 끝나기 전 해당 source 수정 금지.
+- workers gpt-6.1-sol/xhigh: proof는 NEW completion_integration_tests.rs 실제 App+HTTP synthetic흐름, settings는 rootintegration readonly교차리뷰, transport는 raw malformed Appreply cache resource REDtest. root만 Cargo/최종통합/문서/version.
+- independent officialSDK1.32.1 private fixture `/private/tmp/deppy-completion-sdk-20261015.lrtkcP`; npm install95packages 완료, 실제SDK실행 아직 안함. root로 Cargo privatefixturebuild후 Node runner; 가능하면 `DEPPY_COMPLETION_LONG_DELAY_MS=61000` 실제default60s초과검증. 실cloudprovider호환증거로 과장하지 않는다.
+- 남은: stage5compile/behaviorfix, integrationtests 실제RED/GREEN, criticalpeerfindings수정, SDK+전체test/fmt/clippy/boundary/deps, 검증된PR/main/version0.13.0 bundle검증. 이전IME0.12.3 완료 증거는 아래보존.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015
+cat AGENTS.md
+head -n 35 docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+tail -n 100 /private/tmp/deppy-completion-stage5-green-20261015.log
+```
+
+---
+
 # 클라우드 로컬 완료 자동 반환 — 설계 승인·병렬 구현 시작, 2026-10-15
 
 - 사용자 `진행해`: 직전 제시한 원 제출 RPC SSE 자동 완료 반환 권장 설계를 승인했다. 별도 재확인 없이 구현한다. 앞 사용자 지시대로 모든 workers gpt-6.1-sol/xhigh/fork none.

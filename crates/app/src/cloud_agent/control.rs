@@ -96,12 +96,9 @@ impl ControlManager {
             read,
             input,
             local_completion: read
-                && self
-                    .permissions
-                    .get(&key)
-                    .is_some_and(|previous| {
-                        previous.generation == generation && previous.local_completion
-                    }),
+                && self.permissions.get(&key).is_some_and(|previous| {
+                    previous.generation == generation && previous.local_completion
+                }),
         };
         let changed = self.permissions.get(&key) != Some(&next);
         self.permissions.insert(key, next);
@@ -325,9 +322,15 @@ mod tests {
     fn completion_consent_requires_read_and_never_grants_input_or_a_lease() {
         let mut control = ControlManager::with_legacy_connection("legacy");
         assert!(!control.permission("legacy", "one", "g").local_completion);
-        assert!(control.set_local_completion("bot", "one", "g", true).is_err());
+        assert!(
+            control
+                .set_local_completion("bot", "one", "g", true)
+                .is_err()
+        );
         control.set_access("bot", "one", "g", true, false).unwrap();
-        control.set_local_completion("bot", "one", "g", true).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
         let permission = control.permission("bot", "one", "g");
         assert!(permission.read && permission.local_completion);
         assert!(!permission.input);
@@ -341,20 +344,33 @@ mod tests {
     fn completion_consent_survives_input_revoke_but_not_read_generation_or_rotation() {
         let mut control = ControlManager::with_legacy_connection("legacy");
         control.set_access("bot", "one", "g", true, true).unwrap();
-        control.set_local_completion("bot", "one", "g", true).unwrap();
-        let lease = control.acquire("bot", "one", "g", None, 10, 30).unwrap().lease;
-        control.set_local_completion("bot", "one", "g", false).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
+        let lease = control
+            .acquire("bot", "one", "g", None, 10, 30)
+            .unwrap()
+            .lease;
+        control
+            .set_local_completion("bot", "one", "g", false)
+            .unwrap();
         assert!(control.owns("bot", "one", "g", None, lease.epoch, 11));
-        control.set_local_completion("bot", "one", "g", true).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
         control.set_access("bot", "one", "g", true, false).unwrap();
         assert!(control.permission("bot", "one", "g").local_completion);
         control.set_access("bot", "one", "g", false, false).unwrap();
         control.set_access("bot", "one", "g", true, false).unwrap();
         assert!(!control.permission("bot", "one", "g").local_completion);
-        control.set_local_completion("bot", "one", "g", true).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
         control.set_access("bot", "one", "g2", true, false).unwrap();
         assert!(!control.permission("bot", "one", "g2").local_completion);
-        control.set_local_completion("legacy", "one", "g2", true).unwrap();
+        control
+            .set_local_completion("legacy", "one", "g2", true)
+            .unwrap();
         control.retire_auth_connections();
         assert!(!control.permission("legacy", "one", "g2").local_completion);
     }

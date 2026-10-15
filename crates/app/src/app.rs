@@ -227,7 +227,10 @@ struct AppProjectNameRequest {
 
 enum AppAgentStateProjectionKind {
     Hooks,
-    Attention,
+    Attention {
+        native_turn_keys: Vec<String>,
+        completion_keys: Vec<String>,
+    },
     Restore,
     BindingSync(storage::AgentSessionBindingReconcile),
     ResumeProbe {
@@ -258,7 +261,7 @@ impl std::fmt::Debug for AppAgentStateProjection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match &self.kind {
             AppAgentStateProjectionKind::Hooks => "hooks",
-            AppAgentStateProjectionKind::Attention => "attention",
+            AppAgentStateProjectionKind::Attention { .. } => "attention",
             AppAgentStateProjectionKind::Restore => "restore",
             AppAgentStateProjectionKind::BindingSync(_) => "binding_sync",
             AppAgentStateProjectionKind::ResumeProbe { .. } => "resume_probe",
@@ -611,10 +614,33 @@ impl AppAgentStateProjection {
     fn try_new(scope: Arc<AppAgentStateScope>, kind: AppAgentStateProjectionKind) -> Option<Self> {
         let payload_bytes = match &kind {
             AppAgentStateProjectionKind::Hooks
-            | AppAgentStateProjectionKind::Attention
             | AppAgentStateProjectionKind::Restore
             | AppAgentStateProjectionKind::Catalog
             | AppAgentStateProjectionKind::WorkHistory => 0,
+            AppAgentStateProjectionKind::Attention {
+                native_turn_keys,
+                completion_keys,
+            } => {
+                if native_turn_keys.len() > 256 || completion_keys.len() > 64 {
+                    return None;
+                }
+                native_turn_keys
+                    .capacity()
+                    .checked_add(completion_keys.capacity())?
+                    .checked_mul(std::mem::size_of::<String>())?
+                    .checked_add(native_turn_keys.iter().chain(completion_keys).try_fold(
+                        0usize,
+                        |total, key| {
+                            if key.is_empty()
+                                || key.len() > 1152
+                                || key.chars().any(char::is_control)
+                            {
+                                return None;
+                            }
+                            total.checked_add(key.capacity())
+                        },
+                    )?)?
+            }
             AppAgentStateProjectionKind::BindingSync(value) => {
                 retained_binding_reconcile_bytes(value)?
             }
@@ -796,6 +822,7 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
         storage_job.include_archived_threads = false;
         storage_job.include_work_history = false;
         let mut storage_needed = exact.is_some();
+        let mut completion_keys = Vec::new();
         if let Some(exact) = exact {
             match &exact.payload().kind {
                 AppAgentStateExactKind::TurnDoneClear(value) => {
@@ -838,8 +865,13 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                 }
                 (
                     crate::agent_state_worker::AgentStateSection::Attention,
-                    AppAgentStateProjectionKind::Attention,
+                    AppAgentStateProjectionKind::Attention {
+                        native_turn_keys,
+                        completion_keys: watched,
+                    },
                 ) => {
+                    storage_job.native_turn_keys.clone_from(native_turn_keys);
+                    completion_keys.clone_from(watched);
                     storage_job.include_attention = true;
                     storage_needed = true;
                 }
@@ -939,7 +971,7 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
         let reserved_bytes =
             app_agent_state_reserved_bytes(resume.as_ref(), project_names.as_ref())
                 .ok_or(crate::agent_state_worker::AgentStateErrorCode::ResourceLimit)?;
-        let storage =
+        let mut storage =
             if storage_needed {
                 storage_job.snapshot_bytes_max =
                     crate::agent_state_worker::checked_projection_result_remaining(reserved_bytes)?;
@@ -965,6 +997,16 @@ impl crate::agent_state_worker::AgentStateBackend for AppAgentStateBackend {
                 crate::agent_state_worker::check_projection_result_total(reserved_bytes)?;
                 None
             };
+        if let Some(snapshot) = &mut storage {
+            for proof in &mut snapshot.native_turns {
+                if proof.completed.is_some()
+                    && (!completion_keys.contains(&proof.session_key)
+                        || !crate::cloud_agent::completion::confirm_codex_rollout(proof))
+                {
+                    proof.completed = None;
+                }
+            }
+        }
         // `apply_agent_state_job` checks actual output capacity against the exact remaining
         // budget before commit. Therefore this sum is proven bounded on every successful return;
         // do not introduce a fallible post-commit branch that could misreport a durable exact.
@@ -19262,6 +19304,8 @@ impl App {
                 self.push_agent_display();
             }
             crate::agent_state_worker::AgentStateSection::Attention => {
+                self.cloud_agent
+                    .install_native_turns(snapshot.native_turns.clone());
                 // 턴 경계 판정용 직전 스냅샷 — "대기/완료였다가 작업 중"만 새 턴으로 본다
                 // (note_turn_starts 주석 참조). 아래에서 덮어쓰기 전에 떠 둔다.
                 let was_blocked: std::collections::HashSet<(String, runtime::SessionId)> = self
@@ -19793,7 +19837,10 @@ impl App {
                 );
                 self.stage_agent_state_projection(
                     crate::agent_state_worker::AgentStateSection::Attention,
-                    AppAgentStateProjectionKind::Attention,
+                    AppAgentStateProjectionKind::Attention {
+                        native_turn_keys: self.cloud_agent.native_turn_keys(),
+                        completion_keys: self.cloud_agent.completion_watch_keys(),
+                    },
                 );
                 self.stage_agent_state_projection(
                     crate::agent_state_worker::AgentStateSection::Restore,
@@ -20092,7 +20139,10 @@ impl App {
             self.agent_activity = activity;
             self.stage_agent_state_projection(
                 crate::agent_state_worker::AgentStateSection::Attention,
-                AppAgentStateProjectionKind::Attention,
+                AppAgentStateProjectionKind::Attention {
+                    native_turn_keys: self.cloud_agent.native_turn_keys(),
+                    completion_keys: self.cloud_agent.completion_watch_keys(),
+                },
             );
         }
         if let Some(turns) = latest_work_turns {
@@ -28367,6 +28417,17 @@ impl App {
             }
         }
         self.cloud_agent.set_targets(targets);
+        self.cloud_agent.poll_completions();
+        if self.cloud_agent.completion_projection_due() {
+            self.stage_agent_state_projection(
+                crate::agent_state_worker::AgentStateSection::Attention,
+                AppAgentStateProjectionKind::Attention {
+                    native_turn_keys: self.cloud_agent.native_turn_keys(),
+                    completion_keys: self.cloud_agent.completion_watch_keys(),
+                },
+            );
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        }
         // Completion is polled after exact runtime/pane projection, even after connection stop.
         let active = &self.active;
         let warm = &self.warm;

@@ -219,7 +219,8 @@ mod tests {
         if let Some(cursor) = cursor {
             args["cursor"] = json!(cursor);
         }
-        let req = Request { deferred: None,
+        let req = Request {
+            deferred: None,
             epoch: auth.authenticate(&header, now()).unwrap(),
             principal: auth.authenticate_principal(&header, now()).unwrap(),
             access_key: None,

@@ -90,6 +90,9 @@ impl CloudAgent {
         }) {
             return Err("session_changed_or_closed".into());
         }
+        if !read {
+            self.revoke_completions(Some(id), Some(&target.id));
+        }
         let opening_read = read && !self.grants.contains_key(&target.id);
         let opening_input = input && !self.grants.get(&target.id).is_some_and(|g| g.input);
         let legacy_permission = self.connection_permission(agent_mcp::LEGACY_CONNECTION_ID, target);
@@ -118,6 +121,7 @@ impl CloudAgent {
         Ok(())
     }
     pub fn revoke_connection(&mut self, id: &str) {
+        self.revoke_completions(Some(id), None);
         if let Some(server) = &self.server {
             server.auth.revoke_connection(id);
         }
@@ -132,27 +136,36 @@ impl CloudAgent {
         target: &Target,
         enabled: bool,
     ) -> Result<(), String> {
-        if !self.connection_infos().iter().any(|info| {
-            info.principal.id == id && info.state == ConnectionState::Active
-        }) {
+        if !self
+            .connection_infos()
+            .iter()
+            .any(|info| info.principal.id == id && info.state == ConnectionState::Active)
+        {
             return Err("connection_not_active".into());
         }
-        if !target.live || !self.targets.iter().any(|current| {
-            current.live
-                && current.id == target.id
-                && current.generation == target.generation
-                && current.workspace == target.workspace
-                && current.runtime == target.runtime
-                && current.runtime_token == target.runtime_token
-                && current.session == target.session
-                && current.pane == target.pane
-        }) {
+        if !target.live
+            || !self.targets.iter().any(|current| {
+                current.live
+                    && current.id == target.id
+                    && current.generation == target.generation
+                    && current.workspace == target.workspace
+                    && current.runtime == target.runtime
+                    && current.runtime_token == target.runtime_token
+                    && current.session == target.session
+                    && current.pane == target.pane
+            })
+        {
             return Err("session_changed_or_closed".into());
         }
         if enabled && !self.connection_permission(id, target).read {
             return Err("client_read_not_allowed".into());
         }
-        self.control.set_local_completion(id, &target.id, &target.generation, enabled)
+        self.control
+            .set_local_completion(id, &target.id, &target.generation, enabled)?;
+        if !enabled {
+            self.revoke_completions(Some(id), Some(&target.id));
+        }
+        Ok(())
     }
     pub fn take_session_control(&mut self, target: &Target) {
         self.allow_input(&target.id, false);

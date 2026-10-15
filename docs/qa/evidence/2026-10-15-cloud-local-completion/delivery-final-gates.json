@@ -1,0 +1,140 @@
+{
+  "source_head": "c7ba7f948cb9d2a9c97462e4141891ce92364d9d",
+  "version": "0.13.0",
+  "checks": [
+    {
+      "name": "wake-green",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "agent-mcp",
+        "completion_stream_final_delivery_publication_wakes_idle_consumer",
+        "--",
+        "--nocapture"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 6.987,
+      "log": "/private/tmp/deppy-completion-wake-green-20261015.log"
+    },
+    {
+      "name": "mcp-final",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "agent-mcp",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 8.993,
+      "log": "/private/tmp/deppy-completion-mcp-final-20261015.log"
+    },
+    {
+      "name": "app-completion-final",
+      "command": [
+        "cargo",
+        "test",
+        "--offline",
+        "--locked",
+        "-p",
+        "deppy-sijo",
+        "completion_",
+        "--",
+        "--test-threads=1"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 86.197,
+      "log": "/private/tmp/deppy-completion-app-completion-final-20261015.log"
+    },
+    {
+      "name": "delivery-clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--offline",
+        "--locked",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 18.732,
+      "log": "/private/tmp/deppy-completion-delivery-clippy-20261015.log"
+    },
+    {
+      "name": "delivery-fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 2.199,
+      "log": "/private/tmp/deppy-completion-delivery-fmt-20261015.log"
+    },
+    {
+      "name": "delivery-boundary",
+      "command": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "check-boundary"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 3.971,
+      "log": "/private/tmp/deppy-completion-delivery-boundary-20261015.log"
+    },
+    {
+      "name": "delivery-deps",
+      "command": [
+        "cargo",
+        "run",
+        "--offline",
+        "--locked",
+        "-p",
+        "xtask",
+        "--",
+        "check-deps"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 0.213,
+      "log": "/private/tmp/deppy-completion-delivery-deps-20261015.log"
+    },
+    {
+      "name": "sdk-delivery-build",
+      "command": [
+        "cargo",
+        "build",
+        "--offline",
+        "--manifest-path",
+        "/private/tmp/deppy-completion-sdk-20261015.lrtkcP/fixture/Cargo.toml"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 3.488,
+      "log": "/private/tmp/deppy-completion-sdk-delivery-build-20261015.log"
+    },
+    {
+      "name": "sdk-delivery-run",
+      "command": [
+        "node",
+        "/private/tmp/deppy-completion-sdk-20261015.lrtkcP/verify.mjs"
+      ],
+      "exit_code": 0,
+      "duration_seconds": 2.434
+    }
+  ]
+}

@@ -1,6 +1,6 @@
 # 클라우드 원 요청으로 로컬 작업 완료 반환
 
-승인된 설계: [native proof와 원 요청의 완료 반환](../superpowers/specs/2026-10-15-cloud-local-completion-design.md). 버전0.12.3에서0.13.0으로 신규 기능을 추가한다. 현재 최종 전체 검사와 패키지 검증은 진행 중이다.
+승인된 설계: [native proof와 원 요청의 완료 반환](../superpowers/specs/2026-10-15-cloud-local-completion-design.md). 버전0.12.3에서0.13.0으로 신규 기능을 추가한다. PR235를 main에 반영하고0.13.0 로컬 개발용 패키지 검증을 완료했다. 앱을 종료하거나 실행하지 않았다.
 
 ## 사용하는 방법
 
@@ -31,7 +31,9 @@ Dot/Meta Muse/Grok Bot 등 실제 클라우드 호스트의 요청 시한·재�
 - 영향 경로 검사(stage10): storage10PASS+integration2PASS, runtime3PASS, mcp-proxy parser1PASS+실제subprocess1PASS. App의 당시2실패는 input/transport permit 분리 뒤 오래된 테스트 조건을 바꿔 위 최종 집중 검사에서 재검증했다. 단계별 검사를 전체 합계에 중복 합산하지 않는다.
 - 공식 MCP SDK1.32.1: 원 POST 최종 응답, 명시 시한을 둔61초 대기, 강제 연결끊김 후 원 stream GET 재개, 입력 재전송0/별도조회0. 최신source0.13.0 quick검증도3요청/3완료/강제끊김1/오류0. 두 실행의 cohort와 한계는 [SDK 재현 자료](2026-10-15-cloud-completion-sdk.md)에 따로 기록한다.
 - source793b74f6 전체 workspace 실제5814PASS/0FAIL/65ignored,78harness. strict workspace all-target Clippy·fmt·경계·deps 모두exit0, 같은 head GitHub8checks 모두PASS.
-- 이후 MCP idle delivery publication의 wake 누락을 실제 HTTP/SSE 테스트로 재현(0PASS1FAIL)하고 기존 callback을 lock 밖에서 호출하는 최소 수정으로 같은 테스트1PASS를 확인했다. 이 최종 source의 MCP전체/App집중/strict gates/SDK quick/CI와 main·0.13.0 package는 진행중이며 이전 전체결과와 중복 합산하지 않는다.
+- 이후 MCP idle delivery publication의 wake 누락을 실제 HTTP/SSE 테스트로 재현(0PASS1FAIL)하고 기존 callback을 lock 밖에서 호출하는 최소 수정으로 같은 테스트1PASS를 확인했다. 최종 제품sourcec7ba7f94(문서만 추가된 PRheadfa2c2489)에서 MCP전체92PASS1ignored, App집중76PASS, strict workspace all-target Clippy·fmt·경계·deps 모두exit0. 공식 SDK 재빌드 후 quick3요청3완료/오류0(정상52ms·750ms설정지연782ms·끊김재개1033ms), 입력재전송/별도조회0. 이전 전체결과와 중복 합산하지 않는다.
+- PR235 finalheadfa2c2489 GitHub8checks 모두SUCCESS. CI nextest679+5136=5815최종PASS. 기존PTY kill test1개가 첫시도 `process group identity changed`로 실패한 뒤 설정된 재시도에서 통과했다. 같은 source의 별도 local5회는 모두 첫시도PASS였으며 원인미확정으로 기록한다. PTY source/검사정책은 바꾸지 않았다.
+- main0b54b888에 merge완료. 같은 제품tree로 release/package 실제exit0(96.766s). CLI `Deppy Sijo 0.13.0`, bundle `CFBundleShortVersionString`·`CFBundleVersion` 모두0.13.0, arm64, deep/strict서명·archive검증 모두PASS. `target/bundle-0.13.0/Deppy Sijo.app` 및ZIP에 보존했고 원본package와복사본hash일치, 기존0.12.3산출물hash불변도확인했다. Apple공증 배포가 아닌 로컬개발용 package다. 상세 source cohort와 원로그는 [검증 증거](evidence/2026-10-15-cloud-local-completion/)에 보존한다.
 
 ## 보존할 경계
 

@@ -1,0 +1,32 @@
+{
+  "pr": 235,
+  "head": "fa2c248908b2b029d8984e0a9f14328f2b3be663",
+  "run_id": 38726284997,
+  "summaries": [
+    {
+      "seconds": 28.835,
+      "run": 679,
+      "passed": 679,
+      "skipped": 4130,
+      "line": "Build, clippy, and test (macOS)\tAgent status ownership and provider replay\t2026-10-15T11:23:05.6232060Z      Summary [  28.835s] 679 tests run: 679 passed, 4130 skipped",
+      "flaky": 0
+    },
+    {
+      "seconds": 225.447,
+      "run": 5136,
+      "passed": 5136,
+      "skipped": 134,
+      "line": "Build, clippy, and test (macOS)\tcargo nextest run --workspace\t2026-10-15T11:26:54.2235750Z      Summary [ 225.447s] 5136 tests run: 5136 passed (1 flaky), 134 skipped",
+      "flaky": 1
+    }
+  ],
+  "passed_total": 5815,
+  "retry_lines": [
+    "Build, clippy, and test (macOS)\tcargo nextest run --workspace\t2026-10-15T11:25:31.3067930Z   TRY 2 PASS [   0.396s] (3952/5136) pty tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill",
+    "Build, clippy, and test (macOS)\tcargo nextest run --workspace\t2026-10-15T11:26:54.2236790Z    FLAKY 2/3 [   0.396s] (3952/5136) pty tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill"
+  ],
+  "all_eight_checks_success": true,
+  "skip_counts_not_summed": true,
+  "flaky_total": 1,
+  "followup": "Unchanged PTY kill test failed initial CI attempt with process group identity changed, passed automated retry and all five isolated local follow-ups. No safety check relaxed; intermittent identity transition cause not proven."
+}

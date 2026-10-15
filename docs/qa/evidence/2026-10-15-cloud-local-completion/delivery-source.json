@@ -1,0 +1,12 @@
+{
+  "invocation_head": "c7ba7f948cb9d2a9c97462e4141891ce92364d9d",
+  "source_equivalent_pr_head": "fa2c248908b2b029d8984e0a9f14328f2b3be663",
+  "statement": "Only documentation changed during final local affected gates and SDK build/run; no Rust/Cargo edits. Earlier 61s configured timeout is separate source cohort. This final SDK quick run uses 750ms delay.",
+  "sdk_fixture_binary_sha256": "7eac547f274ba16098dc49bb7c53b483cbe41b4858fd66f31375fa57b20c9cdc",
+  "source_sha256": {
+    "crates/agent-mcp/src/completion.rs": "b5f890fae2cde69c518f6f56229966fdcccc2870853b26a1e5821937907effee",
+    "crates/agent-mcp/src/server.rs": "4a0b1879c3b8e78afcaecc66dd87282f7513fdc3723155527a41b09f49efdd9d",
+    "crates/agent-mcp/src/protocol.rs": "acee1f2eeead5d5871c52113967ab5501f31e3616596f3f853be3d614fca4a70",
+    "crates/agent-mcp/src/history.rs": "973d0d03040cc751f86313e238adefb155a0d50ad18c62279d2e14c8c603f098"
+  }
+}

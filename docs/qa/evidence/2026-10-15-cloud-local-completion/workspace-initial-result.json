@@ -1,5 +1,4 @@
 {
-  "source_head": "80e19fc868802d5283a7d5b245917913fa5cfcd4",
   "exit_code": 101,
   "counting": "Last summary per Cargo Running/Doc-tests harness; nested subprocess summaries excluded",
   "harnesses": [
@@ -555,5 +554,9 @@
     "failed": 2,
     "ignored": 65
   },
-  "failure": "Two xtask tests reject the same test-only Fixture impl missing direct cfg(test) metadata; behavior suites passed."
+  "failure": "Two xtask tests reject the same test-only Fixture impl missing direct cfg(test) metadata; behavior suites passed.",
+  "invocation_head": "9ed6c277a53ea51df228744cd6efec7ebeb2466f",
+  "product_source_commit": "f9d7c8a7",
+  "source_equivalent_first_pr_head": "80e19fc868802d5283a7d5b245917913fa5cfcd4",
+  "cohort_note": "Only documentation changed during this first frozen Rust/Cargo source run. Product source equals the first PR head; final cleanup commit is tested separately."
 }

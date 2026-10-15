@@ -10,7 +10,9 @@
 4. 지원되는 로컬 Codex 실행의 새 native turn이 검증되면 같은 JSON-RPC 요청에 완료 결과가 반환된다. 별도 대기·조회 도구 호출은 필요 없다.
 5. 로컬 완료와 완료 반환 상태를 따로 확인한다. `반환됨 · 수신 확인 없음`은 에이전트 모델이 읽었다는 확인이 아니다.
 
-새 기능은 검증 가능한 Codex native hook·실행 신원·입력 접수 순서·완료 rollout을 요구한다. 필요한 증거가 없는 제공자는 입력 전에 미지원으로 거절한다. UI 제목, idle 배지, 작업 진행률100%, `update_run`은 완료 근거로 쓰지 않는다. 기능이 꺼진 기존14개 도구의 JSON/접수 응답은 유지한다.
+새 기능은 검증 가능한 Codex native hook·실행 신원·입력 접수 순서·완료 rollout을 요구한다. 해당 실행에서 이미 관찰한 genuine native proof와 accepted-input sequence가 사전 기준으로 필요하다. 처음 만든 세션이나 복원 직후 아직 이 기준이 없는 세션은 첫 추적 제출을 입력 전에 거절할 수 있다. 필요한 증거가 없는 제공자도 입력 전에 미지원으로 거절한다. UI 제목, idle 배지, 작업 진행률100%, `update_run`은 완료 근거로 쓰지 않는다. 기능이 꺼진 기존14개 도구의 JSON/접수 응답은 유지한다.
+
+기본 자동 주소의 Cloudflare Quick Tunnel은 SSE를 지원하지 않으므로 이 선택 기능에 사용할 수 없다. SSE가 가능한 별도 고정 터널이 필요하다. [Cloudflare 공식 제한](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)(2026-10-15 확인).
 
 Dot/Meta Muse/Grok Bot 등 실제 클라우드 호스트의 요청 시한·재연결 지원은 미확인이다. 호스트가 장시간 요청을 유지하거나 원 stream을 재개해야 한다. 공식 SDK 합성 검증을 실제 제공자 계정 호환으로 확대하지 않는다.
 
@@ -28,7 +30,8 @@ Dot/Meta Muse/Grok Bot 등 실제 클라우드 호스트의 요청 시한·재�
 - 최종 집중 검사: App76PASS, agent-mcp18PASS/1ignored, 실패0. `cargo test --offline --locked --no-fail-fast -p deppy-sijo -p agent-mcp completion_ -- --test-threads=1 --nocapture`.
 - 영향 경로 검사(stage10): storage10PASS+integration2PASS, runtime3PASS, mcp-proxy parser1PASS+실제subprocess1PASS. App의 당시2실패는 input/transport permit 분리 뒤 오래된 테스트 조건을 바꿔 위 최종 집중 검사에서 재검증했다. 단계별 검사를 전체 합계에 중복 합산하지 않는다.
 - 공식 MCP SDK1.32.1: 원 POST 최종 응답, 명시 시한을 둔61초 대기, 강제 연결끊김 후 원 stream GET 재개, 입력 재전송0/별도조회0. 최신source0.13.0 quick검증도3요청/3완료/강제끊김1/오류0. 두 실행의 cohort와 한계는 [SDK 재현 자료](2026-10-15-cloud-completion-sdk.md)에 따로 기록한다.
-- 전체 workspace, 엄격 Clippy, 경계/deps, exact-head GitHub CI, main 통합,0.13.0 binary/bundle/archive 검증은 아직 진행 중이다. 완료 후 실제 결과로 갱신한다.
+- source793b74f6 전체 workspace 실제5814PASS/0FAIL/65ignored,78harness. strict workspace all-target Clippy·fmt·경계·deps 모두exit0, 같은 head GitHub8checks 모두PASS.
+- 이후 MCP idle delivery publication의 wake 누락을 실제 HTTP/SSE 테스트로 재현(0PASS1FAIL)하고 기존 callback을 lock 밖에서 호출하는 최소 수정으로 같은 테스트1PASS를 확인했다. 이 최종 source의 MCP전체/App집중/strict gates/SDK quick/CI와 main·0.13.0 package는 진행중이며 이전 전체결과와 중복 합산하지 않는다.
 
 ## 보존할 경계
 

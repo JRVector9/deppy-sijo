@@ -1,0 +1,559 @@
+{
+  "source_head": "793b74f65dd4b43ec0b6454da7bc437c8cb47e1b",
+  "version": "0.13.0",
+  "exit_code": 0,
+  "counting": "Last summary per Cargo Running/Doc-tests harness; nested subprocess summaries excluded",
+  "harnesses": [
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_mcp-844c914b4ded434a)",
+      "status": "ok",
+      "passed": 91,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/audit-74f35264f4c20551)",
+      "status": "ok",
+      "passed": 65,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/auth-ebe2826210c03458)",
+      "status": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_contract-1680feb9147406e8)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_service-a9827b8f6d3e4463)",
+      "status": "ok",
+      "passed": 83,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_ui-241de05460285630)",
+      "status": "ok",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_core-069f9d987e05c88f)",
+      "status": "ok",
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-7a7e4e8c982adef2)",
+      "status": "ok",
+      "passed": 3277,
+      "failed": 0,
+      "ignored": 39
+    },
+    {
+      "harness": "Running tests/agent_state_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_state_boundary-28b11329d8206195)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/alloc_phys_footprint_release.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/alloc_phys_footprint_release-e89f7ff43bfd4412)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/dotenv_launch_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/dotenv_launch_boundary-ae30100b08b4fa30)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/lazy_bounded_worker.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/lazy_bounded_worker-0483eaccc915160b)",
+      "status": "ok",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/logging_policy.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/logging_policy-971cf2147a4ae1a0)",
+      "status": "ok",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/scrollback_rss_end_to_end.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/scrollback_rss_end_to_end-6630958c00fb8c51)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/http_client-08286015c759b14f)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/i18n-30f33c0fc75d7d06)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mcp-8a4c991102cb0201)",
+      "status": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_mcp_proxy-29a5da1323a52a07)",
+      "status": "ok",
+      "passed": 109,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/hook_task_prompt.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/hook_task_prompt-3905a15ab640c56b)",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mcp_store-b4e318619e5faa93)",
+      "status": "ok",
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mux-54f69123258ba623)",
+      "status": "ok",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/persist-27401a6b0867f1a3)",
+      "status": "ok",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/platform-674bd4e461848e0d)",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pty-1d622fde8e1703c8)",
+      "status": "ok",
+      "passed": 68,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_protocol-af0a12037e427b38)",
+      "status": "ok",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/relay_wire_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_wire_vectors-1c7ff82f32b31174)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_server-06e42f74a13b48a9)",
+      "status": "ok",
+      "passed": 36,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_server-c29c0caccc19b6af)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/deploy_manifests.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deploy_manifests-c9a9ea10dfb22bb8)",
+      "status": "ok",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/shutdown.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/shutdown-d779b4bf214fa22c)",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/transport_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/transport_contract-4598cdb10c06d3a1)",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-79637259fc3b01e8)",
+      "status": "ok",
+      "passed": 408,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/secret-1f4efc7e9e7b21e1)",
+      "status": "ok",
+      "passed": 80,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/session-b3bdd8ed0d6c0a10)",
+      "status": "ok",
+      "passed": 81,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/storage-aa01f4a1b0d930e2)",
+      "status": "ok",
+      "passed": 483,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/background_agent_lifecycle.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/background_agent_lifecycle-b5ebac3221bc5f85)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/storage_core-39914de22acfcb71)",
+      "status": "ok",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/terminal-0ccd4eb69cb2da3a)",
+      "status": "ok",
+      "passed": 138,
+      "failed": 0,
+      "ignored": 4
+    },
+    {
+      "harness": "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/web_remote-341c36c7a8ce63c0)",
+      "status": "ok",
+      "passed": 392,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/chrome_support_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/chrome_support_contract-e79b261f37e2533c)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/cloud_results_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/cloud_results_chrome-a3e3a30a6956ca1c)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/mobile_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mobile_shell_chrome-fe6b78a68ff0bd85)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/mobile_usability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mobile_usability_chrome-1f728ea224af61f6)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/pwa_unified_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pwa_unified_chrome-a7a776d137113aed)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "harness": "Running tests/relay_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_shell_chrome-59a3251b841e2786)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/relay_shell_deploy.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_shell_deploy-015a6ac7fd8150ee)",
+      "status": "ok",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/relay_webcrypto_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_webcrypto_vectors-fe1bcc6d4edfbf6b)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/transport_independence.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/transport_independence-1ebdfeae42f1fd2c)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Running tests/viewer_core_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_core_chrome-4b1b6dc643f2d372)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/viewer_grapheme_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_grapheme_chrome-9f8f6a67512312b0)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/viewer_history_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_history_chrome-832d52c55edcdb77)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/viewer_readability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_readability_chrome-a6e1d2d7e72713db)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running tests/viewer_reading_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_reading_chrome-e9d8830c36da5085)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/xtask-537ca765e9401a35)",
+      "status": "ok",
+      "passed": 16,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests agent_mcp",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests audit",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests auth",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests connector_contract",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests connector_service",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests connector_ui",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests deppy_core",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests http_client",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests i18n",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests mcp",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests mcp_store",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests mux",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests persist",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests platform",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests pty",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests relay_protocol",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests relay_server",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests runtime",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests secret",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests session",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests storage",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests storage_core",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests terminal",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "Doc-tests web_remote",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  ],
+  "totals": {
+    "passed": 5814,
+    "failed": 0,
+    "ignored": 65
+  }
+}

@@ -14,7 +14,7 @@
 
 ## HTTPS 터널
 
-공개 URL이 있어야 클라우드에서 로컬 Mac으로 접속할 수 있습니다. 기본 자동 모드는 포함된 도우미로 Cloudflare Quick Tunnel을 관리합니다. 임시 주소는 다시 연결하면 바뀔 수 있으므로 커넥터 URL도 갱신해야 합니다. Quick Tunnel은 가동 시간을 보장하지 않고 SSE를 지원하지 않습니다. 현재 Deppy의 POST JSON 응답에는 SSE가 필요하지 않습니다. [Cloudflare Quick Tunnel 안내](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+공개 URL이 있어야 클라우드에서 로컬 Mac으로 접속할 수 있습니다. 기본 자동 모드는 포함된 도우미로 Cloudflare Quick Tunnel을 관리합니다. 임시 주소는 다시 연결하면 바뀔 수 있으므로 커넥터 URL도 갱신해야 합니다. Quick Tunnel은 가동 시간을 보장하지 않고 SSE를 지원하지 않습니다. 기본 도구 호출의 POST JSON 응답에는 SSE가 필요하지 않습니다. **로컬 작업 완료 받기**를 켠 입력 요청은 원 POST의 SSE 응답과 연결끊김 후 원 stream의 GET 재개가 필요하므로 Quick Tunnel로 사용하지 않습니다. SSE를 전달하는 고정 터널과 장시간 요청·재연결을 지원하는 호스트를 준비하세요. 실제 인터넷 터널/호스트 호환 검증은 아직 완료되지 않았습니다. [완료 반환 설정과 검증 범위](qa/2026-10-15-cloud-local-completion.md). [Cloudflare Quick Tunnel 안내](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
 
 같은 주소를 계속 사용하려면 **고정 주소 직접 연결**을 선택합니다. `deppy.example.com` 또는 `mac.example.ts.net:8443`처럼 **호스트와 선택적 포트만** 입력하고 아래 방법 중 하나로 HTTPS 터널을 별도로 구성합니다. 이 모드에서 서버 시작은 로컬 수신만 확인합니다. 공개 터널의 도달 여부와 실제 커넥터 등록은 사용자가 확인해야 합니다. 고정 주소만으로 Mac의 잠자기·앱 종료를 해결하지는 않습니다.
 
@@ -31,7 +31,7 @@ ingress:
 
 Deppy의 공개 호스트는 `deppy.example.com`, 커넥터 주소는 `https://deppy.example.com/mcp`입니다. 브라우저 로그인 페이지를 요구하는 Cloudflare Access 정책은 봇의 Bearer 인증과 별도로 호환되는지 확인해야 합니다. [공식 Tunnel 안내](https://developers.cloudflare.com/cloudflare-one/networks/connectors/cloudflare-tunnel/)
 
-Named Tunnel의 공개 호스트와 Deppy에 입력한 호스트를 일치시킵니다. 이 구현은 POST JSON 응답을 사용하며 SSE를 요구하지 않습니다.
+Named Tunnel의 공개 호스트와 Deppy에 입력한 호스트를 일치시킵니다. 일반 호출은 POST JSON 응답을 사용합니다. 선택 기능인 로컬 완료 반환은 원 요청 SSE를 사용하므로 터널의 SSE 전달과 호스트의 장시간 요청·원 stream 재개 지원을 별도로 확인해야 합니다.
 
 ### Tailscale Funnel
 
@@ -156,4 +156,4 @@ cargo build -p deppy-sijo --release
 
 저장소의 테스트는 로컬 OAuth/HTTP→App→테스트 PTY 입력 수락→실행 출력→테스트 에이전트 자체 답변, 권한·중복 수신·보존·egui 표시를 대상으로 합니다. 이 문서의 명령 목록은 실행 결과 보고가 아닙니다. 해당 변경의 실제 실행 결과는 프로젝트 handoff에 기록합니다. 실제 제공자 계정 등록·인터넷 터널·봇의 도구 호출 준수 여부는 위 표의 별도 검증 대상입니다.
 
-현재 소스의 runtime wire 버전은30입니다(`crates/runtime/src/protocol.rs`). 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. MCP 도구·DB 스키마 버전은 runtime wire와 별도로 관리합니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.
+현재 소스의 runtime wire 버전은31입니다(`crates/runtime/src/protocol.rs`). 별도 runtime 피어를 사용한다면 같은 버전으로 빌드해야 하며, 이전 버전은 handshake에서 거부됩니다. MCP 도구·DB 스키마 버전은 runtime wire와 별도로 관리합니다. SSH 터미널 세션은 기존 로컬 runtime의 PTY를 계속 사용합니다.

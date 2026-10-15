@@ -192,7 +192,11 @@ fn redesign_native_geometry_and_reference_images() {
                 );
             }
             if tab == Tab::Permissions {
-                for key in ["cloud.connection_read", "cloud.connection_input"] {
+                for key in [
+                    "cloud.connection_read",
+                    "cloud.connection_input",
+                    "cloud.connection_local_completion",
+                ] {
                     let label = i18n::Catalog::load("ko-KR").unwrap().t(key, &[]);
                     let hit = harness
                         .get_by_role_and_label(egui::accesskit::Role::CheckBox, &label)

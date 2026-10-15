@@ -150,6 +150,248 @@ fn completion_ui_opt_in_is_visible_default_off_and_requires_read_consent() {
 }
 
 #[test]
+fn completion_ui_read_only_consent_enables_return_without_input_or_control() {
+    let (mut bridge, target, review, research, _) = connection_fixture();
+    bridge
+        .set_connection_access(&review, &target, true, false)
+        .unwrap();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    let completion = harness.get_by_role_and_label(
+        egui::accesskit::Role::CheckBox,
+        "Receive local task completion",
+    );
+    assert!(!completion.accesskit_node().is_disabled());
+    completion.click();
+    harness.run();
+    let permission = harness.state().connection_permission(&review, &target);
+    assert!(permission.read && permission.local_completion);
+    assert!(!permission.input);
+    assert!(harness.state().connection_lease(&target).is_none());
+    assert!(
+        !harness
+            .state()
+            .connection_permission(&research, &target)
+            .local_completion
+    );
+    harness.get_by_label("Host support for long requests and reconnection is unverified. Returning a response does not confirm that the agent received it.");
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Receive local task completion",
+        )
+        .click();
+    harness.run();
+    assert!(
+        !harness
+            .state()
+            .connection_permission(&review, &target)
+            .local_completion
+    );
+}
+
+#[test]
+fn completion_ui_opt_in_is_scoped_to_the_selected_connection_and_session() {
+    let (mut bridge, target, review, research, _) = connection_fixture();
+    let other = Target::fixture("other-session", "generation-2");
+    bridge.set_targets(vec![target.clone(), other.clone()]);
+    for (connection, session) in [(&review, &target), (&review, &other), (&research, &target)] {
+        bridge
+            .set_connection_access(connection, session, true, false)
+            .unwrap();
+    }
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    let choices = harness
+        .query_all_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Receive local task completion",
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(choices.len(), 2);
+    choices[0].click();
+    drop(choices);
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .connection_permission(&review, &target)
+            .local_completion
+    );
+    assert!(
+        !harness
+            .state()
+            .connection_permission(&review, &other)
+            .local_completion
+    );
+    assert!(
+        !harness
+            .state()
+            .connection_permission(&research, &target)
+            .local_completion
+    );
+}
+
+#[test]
+fn completion_ui_input_revoke_preserves_opt_in_and_read_revoke_clears_it() {
+    let (mut bridge, target, review, _, _) = connection_fixture();
+    bridge
+        .set_connection_access(&review, &target, true, true)
+        .unwrap();
+    bridge
+        .set_connection_local_completion(&review, &target, true)
+        .unwrap();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to input",
+        )
+        .click();
+    harness.run();
+    let permission = harness.state().connection_permission(&review, &target);
+    assert!(permission.read && permission.local_completion && !permission.input);
+    assert_eq!(
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::CheckBox,
+                "Receive local task completion",
+            )
+            .accesskit_node()
+            .toggled(),
+        Some(egui::accesskit::Toggled::True)
+    );
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .click();
+    harness.run();
+    let permission = harness.state().connection_permission(&review, &target);
+    assert!(!permission.read && !permission.local_completion && !permission.input);
+    assert!(
+        harness
+            .get_by_role_and_label(
+                egui::accesskit::Role::CheckBox,
+                "Receive local task completion",
+            )
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .click();
+    harness.run();
+    let permission = harness.state().connection_permission(&review, &target);
+    assert!(permission.read && !permission.local_completion && !permission.input);
+}
+
+#[test]
+fn completion_ui_ended_or_revoked_connection_cannot_enable_return() {
+    for revoked in [false, true] {
+        let (mut bridge, mut target, review, _, _) = connection_fixture();
+        bridge
+            .set_connection_access(&review, &target, true, false)
+            .unwrap();
+        if revoked {
+            bridge.revoke_connection(&review);
+        } else {
+            target.live = false;
+            bridge.set_targets(vec![target.clone()]);
+        }
+        let mut harness = harness(bridge);
+        harness
+            .get_by_label(if revoked {
+                "Review Bot · Revoked · re-authenticate"
+            } else {
+                "Review Bot · Credential issued · waiting for authentication"
+            })
+            .click();
+        harness.run();
+        harness.get_by_label("Access permissions").click();
+        harness.run();
+        let completion = harness.get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Receive local task completion",
+        );
+        assert!(completion.accesskit_node().is_disabled());
+        completion.click();
+        harness.run();
+        assert!(
+            !harness
+                .state()
+                .connection_permission(&review, &target)
+                .local_completion
+        );
+    }
+}
+
+#[test]
+fn completion_ui_local_completion_and_disconnected_return_are_separate_facts() {
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let status = crate::cloud_agent::CompletionStatusView {
+        local: crate::cloud_agent::completion::LocalCompletionState::Completed,
+        delivery: agent_mcp::CompletionDeliveryState::Disconnected,
+    };
+    let harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(710.0, 240.0))
+        .build_ui(move |ui| {
+            super::permissions::completion_status_facts(ui, &catalog, &status);
+        });
+    harness.get_by_label("Local task completion");
+    harness.get_by_label("Completed");
+    harness.get_by_label("Completion return");
+    harness.get_by_label("Disconnected");
+    assert!(
+        harness
+            .query_by_label("Returned · no acknowledgement")
+            .is_none()
+    );
+}
+
+#[test]
+fn completion_ui_returned_response_never_claims_agent_acknowledgement() {
+    for (locale, expected) in [
+        ("en-US", "Returned · no acknowledgement"),
+        ("ko-KR", "반환됨 · 수신 확인 없음"),
+    ] {
+        let catalog = i18n::Catalog::load(locale).unwrap();
+        let status = crate::cloud_agent::CompletionStatusView {
+            local: crate::cloud_agent::completion::LocalCompletionState::Completed,
+            delivery: agent_mcp::CompletionDeliveryState::ReturnedUnacknowledged,
+        };
+        let harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(710.0, 240.0))
+            .build_ui(move |ui| {
+                super::permissions::completion_status_facts(ui, &catalog, &status);
+            });
+        harness.get_by_label(expected);
+        assert!(harness.query_by_label("Acknowledged").is_none());
+        assert!(harness.query_by_label("수신 확인됨").is_none());
+    }
+}
+
+#[test]
 fn management_ui_permissions_and_revoke_affect_only_the_selected_connection() {
     let (bridge, target, review, research, _) = connection_fixture();
     let mut harness = harness(bridge);
@@ -1237,6 +1479,15 @@ fn management_ui_controls_fit_a_narrow_native_settings_pane() {
         )
         .rect();
     assert!(bounds.left() >= 0.0 && bounds.right() <= 720.0);
+    let bounds = harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Receive local task completion",
+        )
+        .rect();
+    assert!(bounds.left() >= 0.0 && bounds.right() <= 720.0);
+    assert!((bounds.width() - 34.0).abs() < 0.1);
+    assert!((bounds.height() - 34.0).abs() < 0.1);
     let path = std::env::temp_dir().join("deppy-cloud-settings-native-720-20261013.png");
     harness.render().unwrap().save(&path).unwrap();
 }

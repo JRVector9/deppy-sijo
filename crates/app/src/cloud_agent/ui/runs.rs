@@ -245,6 +245,15 @@ impl CloudAgent {
             .map(|target| target.local_status_label(catalog))
             .unwrap_or_else(|| catalog.t("cloud.run_original_unavailable", &[]));
         layout::fact(ui, &catalog.t("cloud.ui.local_terminal", &[]), &local);
+        if let Some(status) = self.completion_status_for_run(
+            &run.connection_id,
+            &run.session,
+            &run.generation,
+            &run.id,
+        ) {
+            super::permissions::completion_status_facts(ui, catalog, &status);
+            layout::hint(ui, catalog.t("cloud.completion_host_unverified", &[]));
+        }
         let origin = target
             .as_ref()
             .map(|target| self.redact(&format!("{} · {}", target.workspace_name, target.title)))

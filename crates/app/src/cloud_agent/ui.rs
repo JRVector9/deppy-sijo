@@ -14,6 +14,8 @@ const CLOUD_AGENT_INSTRUCTIONS: &str = concat!(
     "Do not send terminal input unless input_allowed is true. Use send_text for a single line without controls (maximum 8192 UTF-8 bytes); submit=false only types and submit=true sends Enter. ",
     "Use paste_text for multiline text or tabs only when paste_bracketed and paste_ai_confirmed are true. Its maximum is 32768 UTF-8 bytes; serialized arguments and the complete HTTP JSON body each have a 65536-byte limit, so JSON escaping can reject earlier. LF/CRLF and tabs are allowed with verified bracketed paste; standalone CR, ESC and other controls are rejected. submit defaults false; true admits the body and one separate Enter together. Respect existing AI drafts/dialogs and no-effect rejections; never bypass them. ",
     "Use send_ctrl_c only for an explicitly authorized interrupt. Use a unique operation_id per action; retry the exact same tool and arguments only with the same operation_id. A queued receipt confirms PTY queue admission, not command execution or task completion. If delivery is unknown, do not automatically replay input or create a new ID. ",
+    "Local completion return is off by default and requires separate owner consent for this connection and session plus existing read consent; enabling it grants no input permission. When enabled, eligible send_text/paste_text calls with submit=true keep the original request open as SSE until verified local task completion or an explicit terminal outcome. Other calls and opt-out calls retain the ordinary JSON/admission response. Unsupported tracking or exhausted capacity rejects before input. ",
+    "Keep the initialized MCP-Session-Id and the original SSE Last-Event-ID. After disconnection, resume only that original stream with GET and Last-Event-ID; never resubmit uncertain input to recover a response. The final tool result belongs to the original operation, session/generation and optional run_id. Returned means response bytes were written with no acknowledgement from the receiving agent. This host's long-request timeout and reconnect support remain unverified; do not promise automatic model receipt or wake-up. ",
     "After every completed analysis/task, call notify with YOUR OWN complete final answer (maximum 16384 UTF-8 bytes), including when no terminal input was sent. A stored receipt confirms the answer was saved. Keep the original session_id/generation for this answer. Limits count UTF-8 bytes, not characters. ",
     "New connection identities require explicit owner consent for reading and separately for input; authentication alone grants neither. Legacy tools remain available. For tracked work, call start_run with a unique run_id, title and optional instruction (8192 UTF-8 bytes); registration is not completion. Keep the exact original session_id/generation and run_id. Before input from a new connection, call acquire_control for the approved session with run_id when applicable and ttl_seconds of 1..120; check the lease and renew before it expires. Never invent a connection identity or borrow another connection's lease. Use release_control when finished. ",
     "Report work through update_run: queued/running/waiting/completed/failed/cancelled, optional progress 0..100, message (4096 UTF-8 bytes), result (16384 UTF-8 bytes), and up to 16 actually produced HTTP(S) artifact links. Progress is your report, not independent verification. Send heartbeat updates while working; missing updates become unknown, never automatically completed. Use get_run/list_runs to check cancellation requests, stop your own work and acknowledge with update_run state=cancelled. A cancellation request is not Ctrl+C or input permission revocation. Include run_id on input and notify when tracking work; still send your own final answer to the original session. ",
@@ -321,6 +323,12 @@ mod tests {
             "get_operation",
             "read_history",
             "explicit owner consent",
+            "Local completion return is off by default",
+            "SSE",
+            "MCP-Session-Id",
+            "Last-Event-ID",
+            "no acknowledgement",
+            "unverified",
         ] {
             assert!(
                 h.ctx

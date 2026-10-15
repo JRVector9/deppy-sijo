@@ -1,0 +1,26 @@
+   Compiling deppy-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/core)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/third_party/alacritty_terminal-0.26.0)
+   Compiling mux v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/mux)
+   Compiling rustls v0.23.46
+   Compiling secret v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/secret)
+   Compiling persist v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/persist)
+   Compiling pty v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/pty)
+   Compiling terminal v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/terminal)
+   Compiling audit v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/audit)
+   Compiling mcp-store v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/mcp-store)
+   Compiling storage-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/storage-core)
+   Compiling session v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/session)
+   Compiling storage v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/storage)
+   Compiling ureq v3.4.0
+   Compiling runtime v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/runtime)
+   Compiling tungstenite v0.30.0
+   Compiling web-remote v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/web-remote)
+   Compiling agent-mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/agent-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.25s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_mcp-56639ff6450b3c4c)
+
+running 1 test
+test tests::actual_http_auth_origin_initialize_and_answer_tool_discovery ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 67 filtered out; finished in 0.09s
+

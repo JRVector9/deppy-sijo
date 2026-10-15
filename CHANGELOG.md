@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.3] - 2026-10-15
+
+### Fixed
+
+- Preserve Hangul composition while a reserved terminal focus is applied, including delayed native commits.
+- Deliver MCP authentication and busy error responses before bounded unread-request cleanup closes the connection.
+- Make the document external-edit conflict regression deterministic without weakening conflict or cleanup checks.
+
 ## [0.12.2] - 2026-10-15
 
 ### Added

@@ -1,0 +1,26 @@
+   Compiling deppy-sijo v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 19.32s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-7d717183928c26c4)
+
+running 4 tests
+
+thread 'ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_recovers_after_cancelled_preedit' (70877837) panicked at crates/app/src/ui/workspace/tests/ime_input_harness.rs:253:5:
+an empty preedit alone can precede a delayed Commit
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_waits_for_commit_after_empty_preedit_and_return' (70877838) panicked at crates/app/src/ui/workspace/tests/ime_input_harness.rs:211:9:
+clearing the preview before Commit must not interrupt the native composition
+test ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_waits_for_commit_after_empty_preedit_and_return ... FAILED
+test ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_recovers_after_cancelled_preedit ... FAILED
+test ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_preserves_the_first_preedit_frame ... ok
+test ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_waits_through_recomposition_and_commit ... ok
+
+failures:
+
+failures:
+    ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_recovers_after_cancelled_preedit
+    ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_waits_for_commit_after_empty_preedit_and_return
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 3268 filtered out; finished in 0.04s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

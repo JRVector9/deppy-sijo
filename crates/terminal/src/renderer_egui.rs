@@ -472,6 +472,8 @@ fn paint_cell_lines(
 pub struct PreeditView<'a> {
     pub text: &'a str,
     pub active_range_chars: Option<&'a std::ops::Range<usize>>,
+    /// A cleared preview can still be waiting for the native Commit event.
+    pub awaiting_commit: bool,
 }
 
 /// snapshot을 그린다. preedit은 IME 조합 중 텍스트 — 커서 위치에 표시한다.
@@ -499,6 +501,7 @@ pub fn draw(
         preedit.map(|text| PreeditView {
             text,
             active_range_chars: None,
+            awaiting_commit: false,
         }),
         ime_active,
         selection,
@@ -594,7 +597,7 @@ pub fn draw_with_preedit_in_viewport(
     // `(true)`는 상태를 되돌리지 않아, 아직 조합을 들고 있는 macOS IM의 다음 커밋이
     // `Ime::Commit` 없이 원시 키로 새어 나간다. 이번 프레임 입력도 함께 본다.
     let continues_preedit = ime_active
-        && (preedit.is_some_and(|preedit| !preedit.text.is_empty())
+        && (preedit.is_some_and(|preedit| preedit.awaiting_commit || !preedit.text.is_empty())
             || frame_has_active_preedit(ui.ctx()));
     if ime_active && !continues_preedit && !ui.memory(|memory| memory.owns_ime_events(response.id))
     {

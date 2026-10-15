@@ -1,0 +1,26 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.16s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-7d717183928c26c4)
+
+running 19 tests
+test document_io::tests::atomic_replace_never_touches_target_when_source_is_missing ... ok
+test document_io::tests::bench_textedit_layout_10mb ... ignored, 측정용 벤치 — 수동 실행, 위 실행법 주석 참조
+test document_io::tests::bench_textedit_layout_1mb ... ignored, 측정용 벤치 — 수동 실행, 위 실행법 주석 참조
+test document_io::tests::bench_textedit_layout_4mb ... ignored, 측정용 벤치 — 수동 실행, 위 실행법 주석 참조
+test document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts ... ok
+test document_io::tests::full_fix_20261014_document_fifo_does_not_block_load_lane ... ok
+test document_io::tests::full_fix_20261014_document_symlink_save_preserves_loaded_target ... ok
+test document_io::tests::full_tier_at_exact_boundary ... ok
+test document_io::tests::missing_file_is_failed_not_found ... ok
+test document_io::tests::non_utf8_file_is_binary_tier_and_drops_content ... ok
+test document_io::tests::production_source_never_logs_path_or_content ... ok
+test document_io::tests::refuse_tier_just_above_refuse_boundary ... ok
+test document_io::tests::save_conflict_when_file_changed_externally_does_not_overwrite ... ok
+test document_io::tests::save_conflict_when_file_deleted_externally ... ok
+test document_io::tests::save_mid_failure_leaves_original_untouched ... ok
+test document_io::tests::save_succeeds_when_revision_matches_and_advances_revision ... ok
+test document_io::tests::view_only_tier_at_refuse_boundary ... ok
+test document_io::tests::view_only_tier_just_above_full_boundary ... ok
+test document_io::tests::zero_byte_file_is_full_tier ... ok
+
+test result: ok. 16 passed; 0 failed; 3 ignored; 0 measured; 3253 filtered out; finished in 0.04s
+

@@ -1,0 +1,6 @@
+{
+  "test": "document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts",
+  "iterations": 25,
+  "all_exit_zero": true,
+  "binary_sha256": "849624485518054dacf5921a82eebfd1ecfcd5368eee31ec33894e197f31dc94"
+}

@@ -78,23 +78,18 @@ fn pr9_actual_http_dispatch_preserves_paste_args_and_envelope_budget() {
 }
 
 fn http_call_addr(addr: std::net::SocketAddr, token: &str, body: Value) -> (u16, String) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
     let body = body.to_string();
     write!(stream, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
-    // An oversized declared body is refused before body reading; do not create a TCP reset by sending it.
+    // This size check needs only the header; unread-body delivery is tested separately.
     if body.len() <= 64 * 1024 {
         stream.write_all(body.as_bytes()).unwrap();
     }
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    (
-        response.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        response.split_once("\r\n\r\n").unwrap().1.to_owned(),
-    )
+    framed_http_response(&mut stream).unwrap()
 }
 
 #[test]
@@ -191,20 +186,151 @@ fn claimed_operations_survive_restart_and_cannot_be_reexecuted() {
 }
 
 fn http_call(server: &Server, token: &str, extra: &str, body: serde_json::Value) -> (u16, String) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
     let body = body.to_string();
     write!(stream,"POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",server.addr,token,body.len(),extra,body).unwrap();
+    framed_http_response(&mut stream).unwrap()
+}
+
+fn framed_http_response(reader: &mut impl std::io::Read) -> std::io::Result<(u16, String)> {
+    use std::io::{Error, ErrorKind};
+    let invalid = || Error::new(ErrorKind::InvalidData, "invalid_http_response");
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() == 8192 {
+            return Err(invalid());
+        }
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        head.push(byte[0]);
+    }
+    let head = std::str::from_utf8(&head).map_err(|_| invalid())?;
+    let status = head
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    let len: usize = head
+        .lines()
+        .find_map(|line| line.strip_prefix("Content-Length: "))
+        .ok_or_else(invalid)?
+        .parse()
+        .map_err(|_| invalid())?;
+    if len > 4 * 1024 * 1024 {
+        return Err(invalid());
+    }
+    let mut body = vec![0; len];
+    reader.read_exact(&mut body)?;
+    Ok((status, String::from_utf8(body).map_err(|_| invalid())?))
+}
+
+fn raw_http_post(
+    server: &Server,
+    token: &str,
+    extra: &str,
+    declared: usize,
+    body: &[u8],
+) -> std::net::TcpStream {
+    use std::io::Write;
+    let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    let mut wire = format!("POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {declared}\r\n{extra}\r\n", server.addr).into_bytes();
+    wire.extend_from_slice(body);
+    stream.write_all(&wire).unwrap();
+    stream
+}
+
+#[test]
+fn early_http_rejections_deliver_framed_errors_with_unread_large_body() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let body = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"},"padding":"x".repeat(60_000)}).to_string();
+    assert!(body.len() < 64 * 1024);
+    for (credential, extra, status) in [
+        ("bad", "", 401),
+        (token.as_str(), "Origin: https://evil.example\r\n", 403),
+        (token.as_str(), "Authorization: Bearer other\r\n", 401),
+        (token.as_str(), "MCP-Protocol-Version: invalid\r\n", 400),
+        (token.as_str(), "", 200),
+    ] {
+        let mut stream = raw_http_post(&server, credential, extra, body.len(), body.as_bytes());
+        let response = framed_http_response(&mut stream);
+        assert!(response.is_ok(), "status={status}, response={response:?}");
+        assert_eq!(response.unwrap().0, status);
+    }
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[test]
+fn busy_http_rejection_delivers_complete_error_with_unread_large_body() {
+    use std::io::{Read, Write};
+    let server = Server::start(0, "", || {}).unwrap();
+    let mut stalled = Vec::new();
+    for _ in 0..4 {
+        let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
+        stream.write_all(b"POST /mcp HTTP/1.1\r\n").unwrap();
+        stalled.push(stream);
+    }
+    let body = vec![b'x'; 60_000];
+    let mut stream = raw_http_post(&server, "bad", "", body.len(), &body);
     let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
-    (
-        status,
-        response.split_once("\r\n\r\n").unwrap().1.to_owned(),
-    )
+    let result = stream.read_to_string(&mut response);
+    assert!(result.is_ok(), "read={result:?}, response={response}");
+    let (status, body) = framed_http_response(&mut response.as_bytes()).unwrap();
+    assert_eq!(status, 503);
+    assert!(!body.is_empty());
+    drop(stalled);
+}
+
+#[test]
+fn rejected_http_body_cleanup_never_waits_for_declared_length_or_client_eof() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let mut rejected = Vec::new();
+    for _ in 0..4 {
+        let mut stream = raw_http_post(&server, "bad", "", usize::MAX, b"");
+        assert_eq!(framed_http_response(&mut stream).unwrap().0, 401);
+        rejected.push(stream);
+    }
+    let token = server.auth.token_for_user();
+    let init = json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}).to_string();
+    let started = std::time::Instant::now();
+    loop {
+        let mut stream = raw_http_post(&server, &token, "", init.len(), init.as_bytes());
+        let status = framed_http_response(&mut stream).unwrap().0;
+        if status == 200 {
+            break;
+        }
+        assert_eq!(status, 503);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::thread::yield_now();
+    }
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    drop(rejected);
+}
+
+#[test]
+fn framed_http_fixture_rejects_truncated_or_oversized_responses() {
+    for response in [
+        "HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabc",
+        "HTTP/1.1 200 OK\r\nContent-Length: 4194305\r\n\r\n",
+        "HTTP/1.1 200 OK\r\n\r\n",
+    ] {
+        assert!(framed_http_response(&mut response.as_bytes()).is_err());
+    }
+    assert_eq!(
+        framed_http_response(
+            &mut b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcignored".as_slice()
+        )
+        .unwrap(),
+        (200, "abc".to_owned())
+    );
 }
 
 #[test]

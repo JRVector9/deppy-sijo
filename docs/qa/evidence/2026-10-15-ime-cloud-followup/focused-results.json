@@ -1,0 +1,54 @@
+[
+  {
+    "name": "document-green",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "document_io::tests",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-document-green-20261015.log"
+  },
+  {
+    "name": "mcp-http-red",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "agent-mcp",
+      "http_rejection",
+      "--",
+      "--test-threads=1",
+      "--nocapture"
+    ],
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-mcp-http-red-20261015.log"
+  },
+  {
+    "name": "terminal-green",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "terminal",
+      "--lib",
+      "renderer_egui::tests",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-terminal-green-20261015.log"
+  }
+]

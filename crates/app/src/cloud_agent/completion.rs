@@ -614,6 +614,48 @@ mod tests {
     }
 
     #[test]
+    fn completion_scrubbed_baseline_keeps_capability_but_cannot_bind_unhashed_new_turn() {
+        let (key, target, baseline) = fixture();
+        let mut value = serde_json::to_value(baseline).unwrap();
+        value["prompt_digest"] = serde_json::Value::Null;
+        let mut scrubbed: NativeTurnProof = serde_json::from_value(value)
+            .expect("expired temporary digest must preserve native capability evidence");
+        assert!(scrubbed.is_valid());
+        let mut tracker = Tracker::default();
+        tracker
+            .begin(
+                key.clone(),
+                target.clone(),
+                &scrubbed,
+                10,
+                "@internal:operation".into(),
+                storage::native_prompt_digest("own prompt"),
+                START,
+            )
+            .unwrap();
+        tracker.accepted_input(
+            target.runtime,
+            target.session,
+            11,
+            Some("@internal:operation"),
+            START + 1,
+        );
+        tracker.admit(&key, Ok(()));
+        scrubbed.turn_id = "unhashed-turn".into();
+        scrubbed.started_at_micros = START + 2;
+        scrubbed.completed = Some(NativeTurnCompletionProof {
+            at_micros: START + 3,
+            execution_stamp: scrubbed.start_execution_stamp.clone(),
+        });
+        scrubbed.completion_revision += 1;
+        assert_eq!(
+            tracker.observe(&target, &scrubbed, true, START + 4)[0].state,
+            LocalCompletionState::Unknown
+        );
+        assert_eq!(tracker.state(&key), Some(LocalCompletionState::Unknown));
+    }
+
+    #[test]
     fn completion_unclaimed_rollback_releases_capacity_and_allows_same_operation_retry() {
         let (key, target, baseline) = fixture();
         let mut tracker = Tracker::default();

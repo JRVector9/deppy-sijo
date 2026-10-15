@@ -255,6 +255,50 @@ fn completion_stream_waits_do_not_consume_http_or_actor_call_budgets() {
 }
 
 #[test]
+fn completion_stream_late_redaction_preserves_only_real_routing_identity() {
+    let redaction = secret::RedactionService::new();
+    let server = Server::start_with_redaction(0, "", redaction.clone(), || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let socket = post(&server, &token, &session, "late-redaction");
+    let req = next_request(&server);
+    let mut original_scope = scope("late-redaction");
+    let secret = "synthetic-late-completion-secret";
+    original_scope.session_id = secret.into();
+    let identity = req
+        .deferred
+        .as_ref()
+        .unwrap()
+        .reserve(original_scope, CompletionPermit::new())
+        .unwrap();
+    let mut reader = sse_head(socket);
+    event(&mut reader);
+    let mut expected = receipt(identity);
+    expected.outcome["display"] = json!({"operation_id":secret});
+    expected.validate().unwrap();
+    // Register after the original request/stream exists, immediately before send.
+    redaction.register(&secret::SecretString::new(secret.into()));
+    req.reply.try_send(Ok(expected.tool_result())).unwrap();
+    let wire = event(&mut reader);
+    let response: Value = serde_json::from_str(
+        wire.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap(),
+    )
+    .unwrap();
+    let payload: Value =
+        serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        payload["session_id"], secret,
+        "the real routing identity remains exact"
+    );
+    assert_ne!(
+        payload["local_completion"]["display"]["operation_id"], secret,
+        "a nested display object cannot bypass redaction by naming a field operation_id"
+    );
+}
+
+#[test]
 fn completion_ledger_atomic_claim_capacity_preserves_no_effect() {
     let db = History::open_memory().unwrap();
     for index in 0..MAX_COMPLETION_WATCHES {

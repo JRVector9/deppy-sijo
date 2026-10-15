@@ -220,6 +220,7 @@ pub(crate) struct CompletionLane {
     stop: Arc<AtomicBool>,
     redaction: secret::RedactionService,
     wake: SyncSender<()>,
+    consumer_wake: Arc<dyn Fn() + Send + Sync>,
     events: SyncSender<CompletionDeliveryEvent>,
 }
 
@@ -384,6 +385,7 @@ impl CompletionLane {
         auth: &Arc<Auth>,
         stop: Arc<AtomicBool>,
         redaction: secret::RedactionService,
+        consumer_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> (Arc<Self>, Receiver<CompletionDeliveryEvent>) {
         let (events, event_rx) = mpsc::sync_channel(128);
         let (wake, wake_rx) = mpsc::sync_channel(1);
@@ -395,6 +397,7 @@ impl CompletionLane {
             stop,
             redaction,
             wake,
+            consumer_wake,
             events,
         });
         let weak = Arc::downgrade(&lane);
@@ -525,6 +528,7 @@ impl CompletionLane {
     }
     fn maintain(&self) {
         let mut writes = Vec::new();
+        let mut published = false;
         {
             let Ok(mut registry) = self.registry.lock() else {
                 return;
@@ -586,6 +590,7 @@ impl CompletionLane {
                         .is_ok()
                 {
                     stream.dirty = false;
+                    published = true;
                 }
                 if !stream.closed
                     && let Some(socket) = stream.socket.take()
@@ -602,6 +607,9 @@ impl CompletionLane {
                     });
                 }
             }
+        }
+        if published {
+            (self.consumer_wake)();
         }
         for mut action in writes {
             let result = self.write_socket(&mut action);

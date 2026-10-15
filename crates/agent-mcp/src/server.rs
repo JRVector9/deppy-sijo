@@ -494,13 +494,15 @@ impl Server {
         let addr = listener.local_addr()?;
         let auth = Arc::new(Auth::with_redaction(now(), redaction));
         let stop = Arc::new(AtomicBool::new(false));
+        let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
         let (completion, delivery_events) = crate::completion::CompletionLane::new(
             &auth,
             stop.clone(),
             auth.0.lock().unwrap().redaction.clone(),
+            wake.clone(),
         );
         let (tx, requests) = mpsc::sync_channel(16);
-        let (a, s, w) = (auth.clone(), stop.clone(), Arc::new(wake));
+        let (a, s, w) = (auth.clone(), stop.clone(), wake);
         let host = Arc::new(std::sync::RwLock::new(public_host.to_owned()));
         let public_host = host.clone();
         let active = Arc::new(AtomicUsize::new(0));

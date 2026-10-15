@@ -253,15 +253,35 @@ impl DeferredTransport {
             .validate()
             .map_err(|_| "invalid_completion_identity_no_effect")?;
         let at = crate::now();
-        CompletionReceipt {
-            identity: identity.clone(),
-            event_id: identity.event_id(),
-            admission: json!({"status":"queued","admission":"pty_queue","completion":"not_confirmed"}),
-            outcome: json!({"status":"unknown","reason":"completion_not_confirmed"}),
-            created_at: at,
-            completed_at: None,
-            expires_at: at + COMPLETION_RECEIPT_TTL,
-        }.validate().map_err(|_| "completion_result_too_large_no_effect")?;
+        // Reserve the final framed RPC, including both nested JSON encodings and
+        // the original request ID. App outcomes use fixed codes of at most 64
+        // ASCII bytes; the all-fields envelopes also cover optional timestamps.
+        let code = "x".repeat(64);
+        let admissions = [
+            json!({"status":"queued","admission":"pty_queue","bytes":u64::MAX,"submit":false,"retry":false,"completion":"not_confirmed"}),
+            json!({"status":"unknown","error":code,"retry":false}),
+            json!({"status":"rejected","error":code,"retry":false}),
+        ];
+        let outcomes = [
+            json!({"status":"completed","local_turn_completed":true,"source":"verified_native_turn"}),
+            json!({"status":"unknown","local_turn_completed":false,"source":"verified_native_turn","reason":code,"observed_at":u64::MAX}),
+            json!({"status":"rejected","local_turn_completed":false,"source":"verified_native_turn","reason":code,"observed_at":u64::MAX}),
+        ];
+        for admission in &admissions {
+            for outcome in &outcomes {
+                CompletionReceipt {
+                    identity: identity.clone(),
+                    event_id: identity.event_id(),
+                    admission: admission.clone(),
+                    outcome: outcome.clone(),
+                    created_at: at,
+                    completed_at: None,
+                    expires_at: at + COMPLETION_RECEIPT_TTL,
+                }
+                .validate()
+                .map_err(|_| "completion_result_too_large_no_effect")?;
+            }
+        }
         if !permit.is_live() || !self.lane.authorized(&self.owner) {
             return Err("completion_revoked_no_effect".into());
         }

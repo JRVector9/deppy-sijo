@@ -1,0 +1,13 @@
+   Compiling rustls v0.23.46
+   Compiling ureq v3.4.0
+   Compiling http-client v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/http-client)
+   Compiling mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/mcp)
+   Compiling auth v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/auth)
+   Compiling tungstenite v0.30.0
+   Compiling runtime v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/runtime)
+   Compiling connector-service v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/connector-service)
+   Compiling web-remote v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/web-remote)
+   Compiling agent-mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/agent-mcp)
+   Compiling mcp-proxy v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/mcp-proxy)
+   Compiling deppy-sijo v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/crates/app)
+    Finished `release` profile [optimized] target(s) in 1m 29s

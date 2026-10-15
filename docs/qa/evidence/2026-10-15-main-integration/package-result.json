@@ -1,0 +1,22 @@
+{
+  "source_commit": "9ed5fba10fca796ed4b62f8638009e0b6dc42ecd",
+  "source_pr": 231,
+  "workspace_version_before": "0.12.1",
+  "previous_shipped_bundle_version": "0.11.0",
+  "version": "0.12.2",
+  "binary_reported_version": "Deppy Sijo 0.12.2",
+  "CFBundleVersion": "0.12.2",
+  "CFBundleShortVersionString": "0.12.2",
+  "package_exit_code": 0,
+  "package_verification": "passed local-development signature/architecture/plist/archive gate; not a notarized distribution release",
+  "app_launched_or_restarted": false,
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/target/bundle/Deppy Sijo.app",
+  "archive": "/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/target/bundle/Deppy Sijo.zip",
+  "binary_sha256": "e8b3018f8f26975d59848d7ec9331fcfafbd8bef3abab591b0bd9ffd74d485d1",
+  "archive_sha256": "f3d39bfb01d73c7d53c3ad0b57339d1d2ec4c91302a57bd4af86fb0e839f9854",
+  "archive_bytes": 40568520,
+  "architectures": "arm64",
+  "retained_bundle": "/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/target/bundle-0.12.2/Deppy Sijo.app",
+  "retained_archive": "/Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015/target/bundle-0.12.2/Deppy Sijo.zip",
+  "retained_copy_sha256_verified": true
+}

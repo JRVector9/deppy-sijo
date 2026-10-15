@@ -106,3 +106,16 @@ PR230의 GitGuardian은 과거 manifest의 `worker_patches.secret` SHA256을 gen
 PR231에서 RustSec의 최신 DB(2026-10-14)가 rustls0.23.45의 RUSTSEC-2026-0346/0347/0348/0349를 실제 검출해 실패했다. 공식 RustSec 4개 공지의 공통 patched 버전은0.23.46이다. root 최소버전과 lock의 rustls 1개만0.23.46으로 갱신한다. 다른156개 업데이트 후보와 GUI/Actions 변경은 적용하지 않는다. 변경 전 로컬5733PASS와 버전0.12.2 선행 release 컴파일은 이전 rustls cohort의 결과이며, 갱신 후 영향 검사와 CI 전체 결과를 별도로 기록한다. 이미 배포한 artifact는 없다.
 
 공식 근거: https://rustsec.org/advisories/RUSTSEC-2026-0346.html · https://rustsec.org/advisories/RUSTSEC-2026-0347.html · https://rustsec.org/advisories/RUSTSEC-2026-0348.html · https://rustsec.org/advisories/RUSTSEC-2026-0349.html
+
+## 최종 통합·빌드 결과
+
+- PR231은 최신 headd40d1bb5에서 GitHub8개 검사 모두 실제 SUCCESS 뒤 merge했다. main source commit은 `9ed5fba10fca796ed4b62f8638009e0b6dc42ecd`이며 검증한 제품 tree와 동일하다.
+- rustls0.23.46 후 로컬 영향 검사 실제567PASS/0FAIL/16ignored. 전체 최신 회귀/Clippy/에이전트 상태/보안/라이선스/Relay/형식 검사는 GitHub의 해당 source head에서 통과했다.
+- source0.12.1→0.12.2, 이전 shipped bundle0.11.0. main의 package 명령 exit0. 바이너리 `Deppy Sijo 0.12.2`, CFBundleVersion/CFBundleShortVersionString 모두0.12.2. signature/architecture/archive 검증 exit0. 로컬 개발용 산출물이며 공증 배포를 주장하지 않는다.
+- 보존 artifact: `target/bundle-0.12.2/Deppy Sijo.app`, `target/bundle-0.12.2/Deppy Sijo.zip`. SHA/arm64/실제 경로는 evidence package-result.json. 원래 bundle 출력과 보존 copy의 binary/archive SHA가 같다.
+- 제외 PR11개는 검토 때와 동일 HEAD인 것을 재확인한 뒤 closed. branch삭제 명령은 실행하지 않았다. PR230은 SHA 오탐 metadata 정리의 대체 PR231 때문에 closed. 현재 열린 PR0개를 확인했다.
+- 앱 stop/launch/restart 없음. 원본 작업 폴더 dirty 보존. main local ref 갱신은 삭제된 `/private/tmp/deppy-main-b698-test-20260911` worktree 등록 때문에 Git이 거절했다. 해당 경로가 없는 것을 확인했으며 force/prune하지 않았다. 실제 통합 checkout은 origin/main으로 정상 ff되어 빌드했다.
+
+## 최종 로그의 재시도 관찰
+
+최신 CI는 상태673PASS + 일반5060PASS로 총5733PASS다. 일반 묶음은 두 테스트가 첫 시도에 실패하고 두 번째에 통과했다. 이를 최초 시도 무실패라고 주장하지 않는다. `agent-mcp::tests::actual_http_auth_origin_initialize_and_answer_tool_discovery`는 tests.rs202에서 read-to-EOF 중 ConnectionReset, `document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts`는 document_io.rs712의 외부 수정 fixture 자격 실패였다. 해당 로그를 보존했고 후속 작업에서 원인 확인·안정화한다. 문서 fixture는 temp 파일 존재 관찰과 실제 외부 write 완료 사이 스케줄 경합이며, HTTP의 조기 거절/응답 framing 경계는 추가 확인이 필요하다.

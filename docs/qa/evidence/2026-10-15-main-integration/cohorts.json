@@ -1,0 +1,34 @@
+{
+  "workspace_full_local": {
+    "product_source_commit": "057048ac",
+    "rustls": "0.23.45",
+    "result": "5733 passed, 0 failed, 65 ignored",
+    "status": "Passed before security dependency patch"
+  },
+  "rustls_affected_local": {
+    "product_source_commit": "d40d1bb5",
+    "rustls": "0.23.46",
+    "result": "567 passed, 0 failed, 16 ignored",
+    "status": "Passed after patch"
+  },
+  "release_compile_patched": {
+    "source_commit": "d40d1bb5",
+    "rustls": "0.23.46",
+    "exit_code": 0,
+    "elapsed": "1m29s",
+    "launch": false
+  },
+  "final_ci": {
+    "head": "d40d1bb5",
+    "pr": 231,
+    "status": "all eight exact-head checks passed before main merge",
+    "build_test_run_id": 38688390215,
+    "security_run_id": 38688390218,
+    "agent_status_passed": 673,
+    "general_passed": 5060,
+    "retried_tests": [
+      "agent-mcp::tests::actual_http_auth_origin_initialize_and_answer_tool_discovery",
+      "deppy-sijo::document_io::tests::full_fix_20261014_document_external_edit_during_temp_write_conflicts"
+    ]
+  }
+}

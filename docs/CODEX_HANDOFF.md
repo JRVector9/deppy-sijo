@@ -1,9 +1,42 @@
+# Main 통합·0.12.2 빌드 — 완료, 2026-10-15
+
+## 완료 상태 / 실제 최종 확인
+
+- 원격 main: PR231 merge commit `9ed5fba10fca796ed4b62f8638009e0b6dc42ecd`. source head d40d1bb5에서 GitHub8 checks 전부 실제 SUCCESS 후 `--match-head-commit` merge. 실제 통합 worktree도 origin/main으로 ff, 동일 product tree 검증.
+- main 전체23개 기존 커밋+최근 안정화55파일+필수 rustls0.23.46 패치 반영. source0.12.1→0.12.2, 이전 shipped bundle0.11.0. 원본 tracked45/untracked361 snapshot과 다른 원본 worktree dirty는 보존.
+- 로컬 전체5733PASS/0FAIL/65ignored는 rustls0.23.45 cohort. 패치 후 연결 영향567PASS/0FAIL/16ignored와 최신 GitHub 전체/상태 회귀/Clippy/보안/라이선스/Linux/형식 경계 모두 PASS. Node16와 Chromium114/89/182/77 assertions PASS. 각 source/cohort를 evidence에서 분리 기록했다.
+- main package 실제 exit0. binary 및 CFBundleVersion/CFBundleShortVersionString 모두0.12.2, arm64, signature/archive 검증 PASS. `target/bundle-0.12.2/Deppy Sijo.app`와 zip에 원본 binary/archive SHA가 같은 copy 보존. 정확 source/SHA/path는 docs/qa/evidence/2026-10-15-main-integration/package-result.json. 공증 배포는 아님. 앱 종료·실행·재실행 없음.
+- 제외 PR11개 HEAD 재확인 후 closed; PR230은 SHA 오탐 기록 형식 정리로 PR231 대체 후 closed. branch 삭제/force push 없음. 현재 열린 PR0 확인.
+- local main ref 업데이트는 존재하지 않는 `/private/tmp/deppy-main-b698-test-20260911` worktree 등록 때문에 Git이 거절. 해당 stale metadata는 prune/강제갱신하지 않았다. 새 branch/worktree는 반드시 **origin/main**을 기준으로 생성한다. 실제 integration HEAD는 최신 main이다.
+
+## 최종 로그 추가 관찰
+
+- CI 전체합계673+5060=5733PASS, 단2 test가 TRY1FAIL→TRY2PASS: agent-mcp tests.rs202 actual_http_auth_origin_initialize_and_answer_tool_discovery(read-to-EOF ConnectionReset), app/document_io.rs712 full_fix_20261014_document_external_edit_during_temp_write_conflicts(temp 관찰→외부 write완료 경합 fixture 자격 실패). ci-final.log.gz 원로그. 최초 시도0FAIL이라고 주장하지 않는다. 후속 단계에서 원인 확인/안정화도 포함한다.
+
+## 다음 목표 / 사용자 추가 지시
+
+이 phase의 사용자 목표(검토·필요 변경 main merge·재빌드·root 최종 확인)는 완료했다. 이어 GPT-6.1-Sol/xhigh 서브에이전트 병렬로 (1) GitHub 유사 프로젝트의 한글 IME 초성 입력 원인/해결 비교와 수정, (2) 클라우드 에이전트의 원래 작업이 로컬에서 끝나면 자동 완료 알림을 받도록 구현한다. 각 agent는 별도 worktree/파일 영역, root가 충돌·코드리뷰·통합·검증을 담당한다. 새 작업도 app restart 권한을 주지 않는다. IME 주 재현 위치 질문은 async 대기 중이며 응답 없음은 선택으로 간주하지 않는다.
+
+- 완료 알림 신규 기능은 brainstorming SKILL을 읽었으며 design presentation+user approval HARD-GATE가 명시되어 있다. 아직 신규 기능 구현/서브에이전트 착수 없음. 먼저 현재 MCP/연결/완료 판정 구조를 조사해 구체 설계/대안을 제시한다. bug repair 독립 범위는 systematic-debugging/TDD로 조사한다. 현재 completion 문서 정리 후 후속 agents 시작 예정.
+- 과거 ship/review 필수 checklist.md 부재 workflow는 완료로 주장하지 않는다. 직접 리뷰/실제 저장소 검증을 사용했다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-main-integration-20261015
+head -n 55 docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff
+gh pr view 231 --repo JRVector9/deppy-sijo --json state,mergeCommit
+cat docs/qa/evidence/2026-10-15-main-integration/package-result.json
+```
+
+---
+
 # Main 통합 보안 gate 후속 — 진행 중, 2026-10-15
 
 - 현재 실제 branch `integrate/reviewed-main-clean-20261015`, HEAD51ae03da, PR231. 원래 PR230은 SHA256 오탐 표현을 정리한 대체 PR로 인해 closed; 원본 branch/commit1192cfcb 보존, force push 없음.
 - 제품057048ac에 대한 실제 전체검사5733PASS/0FAIL/65ignored, Clippy/fmt/경계/deps 모두0. release 선행 컴파일 exit0/2m22s, CLI `Deppy Sijo 0.12.2`. 아직 main merge와 최종 bundle 없음, 앱 launch/restart 없음.
 - PR231 GitGuardian/라이선스/Linux/형식·경계 PASS. macOS Clippy PASS, 상태 회귀 실행 중. RustSec는 실제4개 새 advisory(2026-10-14)로 FAIL: rustls0.23.45. 이를 무시하지 않고 root 최소버전/lock만0.23.46으로 갱신한다. GUI/Actions 일괄 업그레이드는 제외 유지.
-- root가 Cargo sole executor. 현재 패치 업데이트→연결 영향 검사→Clippy/CI 전체→release 재컴파일·main merge·최종 package/version 검증이 남았다. 현재 0.12.2는 미배포라 추가 version bump 불필요.
+- root가 Cargo sole executor. 현재 HEADd40d1bb5, rustls0.23.46. 연결 영향 검사 실제 exit0/567PASS/0FAIL/16ignored 완료; 최신 head RustSec/GitGuardian/라이선스/Linux/형식 경계 PASS. patched release 재컴파일 실제 exit0/1m29s 완료. macOS 전체 검사와 main merge·최종 package/version 검증이 남았다. 현재 0.12.2는 미배포라 추가 version bump 불필요.
 - 다음 추가 사용자 작업은 아래 대기 목록(한글 IME 초성 문제 GitHub 비교 수정+cloud 완료 알림)이며, 이 통합/빌드 최종 확인 뒤 GPT-6.1-Sol/xhigh 병렬로 시작한다. 아직 착수하지 않았다. IME 발생 위치 질문은 async 대기, 무응답은 선택으로 간주하지 않는다.
 
 # Main 통합 검토·재빌드 — 진행 중, 2026-10-15 (Codex)

@@ -406,6 +406,9 @@ fn atomic_write_document(
     let written_revision = DocumentRevision::from_file_metadata(&file, &written_metadata)?;
     drop(file);
 
+    #[cfg(test)]
+    tests::before_commit(path);
+
     // This checks after write+sync, when the expensive work is complete. Ordinary
     // filesystem rename has no compare-and-swap against an unrelated writer:
     // changes after this final check still require cooperation from that writer.
@@ -550,6 +553,38 @@ pub fn save_document(request: DocumentSaveRequest) -> DocumentSaveOutcome {
 mod tests {
     use super::*;
 
+    type BeforeCommit = Box<dyn FnOnce(&Path)>;
+    thread_local! {
+        static BEFORE_COMMIT: std::cell::RefCell<Option<BeforeCommit>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
+
+    struct BeforeCommitHook;
+
+    impl BeforeCommitHook {
+        fn install(hook: impl FnOnce(&Path) + 'static) -> Self {
+            BEFORE_COMMIT.with(|slot| {
+                assert!(slot.replace(Some(Box::new(hook))).is_none());
+            });
+            Self
+        }
+    }
+
+    impl Drop for BeforeCommitHook {
+        fn drop(&mut self) {
+            BEFORE_COMMIT.with(|slot| slot.borrow_mut().take());
+        }
+    }
+
+    pub(super) fn before_commit(path: &Path) {
+        // Take before invoking so nested operations cannot reuse this hook.
+        let hook = BEFORE_COMMIT.with(|slot| slot.borrow_mut().take());
+        if let Some(hook) = hook {
+            hook(path);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn full_fix_20261014_document_fifo_does_not_block_load_lane() {
@@ -659,7 +694,6 @@ mod tests {
 
     #[test]
     fn full_fix_20261014_document_external_edit_during_temp_write_conflicts() {
-        use std::time::{Duration, Instant};
         let dir = unique_dir("save-race");
         let target = write_file(&dir, "doc.md", b"original");
         let DocumentLoadOutcome::Loaded { revision, .. } = load_document(&DocumentLoadRequest {
@@ -667,50 +701,40 @@ mod tests {
         }) else {
             panic!("load failed");
         };
-        let observer_dir = dir.clone();
-        let observer_target = target.clone();
-        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let observer = std::thread::spawn(move || {
-            ready_tx.send(()).unwrap();
-            let until = Instant::now() + Duration::from_secs(2);
-            loop {
-                let has_temp = || {
-                    std::fs::read_dir(&observer_dir)
-                        .unwrap()
-                        .filter_map(Result::ok)
-                        .any(|entry| {
-                            entry
-                                .file_name()
-                                .to_string_lossy()
-                                .contains("deppy-doc-tmp")
-                        })
-                };
-                if has_temp() {
-                    std::fs::write(
-                        &observer_target,
-                        b"external edit after initial revision check",
-                    )
-                    .unwrap();
-                    return has_temp();
-                }
-                assert!(
-                    Instant::now() < until,
-                    "temp-write race fixture was not reached"
-                );
-                std::thread::yield_now();
-            }
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reached_at_commit = reached.clone();
+        let external_target = target.clone();
+        let _hook = BeforeCommitHook::install(move |commit_target| {
+            assert_eq!(commit_target, external_target.canonicalize().unwrap());
+            assert_eq!(current_revision(&external_target), Ok(revision));
+            assert!(
+                std::fs::read_dir(commit_target.parent().unwrap())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .any(|entry| entry
+                        .file_name()
+                        .to_string_lossy()
+                        .contains("deppy-doc-tmp"))
+            );
+            // Deterministically finish an unrelated write after temp sync but
+            // before the real save_document final revision check.
+            std::fs::write(
+                &external_target,
+                b"external edit after initial revision check",
+            )
+            .unwrap();
+            reached_at_commit.set(true);
         });
-        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         let outcome = save_document(DocumentSaveRequest {
             path: target.clone(),
-            contents: "n".repeat(DOCUMENT_REFUSE_BYTES_MAX as usize),
+            contents: "replacement source".into(),
             expected_revision: revision,
         });
-        let before_commit = observer.join().unwrap();
         let bytes = std::fs::read(&target).unwrap();
+        let remaining_files = std::fs::read_dir(&dir).unwrap().count();
         std::fs::remove_dir_all(&dir).unwrap();
         assert!(
-            before_commit,
+            reached.get(),
             "external edit must finish before commit for this regression"
         );
         assert!(
@@ -718,6 +742,10 @@ mod tests {
             "concurrent edit must return Conflict: {outcome:?}"
         );
         assert_eq!(bytes, b"external edit after initial revision check");
+        assert_eq!(
+            remaining_files, 1,
+            "conflicting save must remove its temp file"
+        );
     }
 
     fn unique_dir(label: &str) -> PathBuf {

@@ -1,3 +1,11 @@
+# Main 통합 보안 gate 후속 — 진행 중, 2026-10-15
+
+- 현재 실제 branch `integrate/reviewed-main-clean-20261015`, HEAD51ae03da, PR231. 원래 PR230은 SHA256 오탐 표현을 정리한 대체 PR로 인해 closed; 원본 branch/commit1192cfcb 보존, force push 없음.
+- 제품057048ac에 대한 실제 전체검사5733PASS/0FAIL/65ignored, Clippy/fmt/경계/deps 모두0. release 선행 컴파일 exit0/2m22s, CLI `Deppy Sijo 0.12.2`. 아직 main merge와 최종 bundle 없음, 앱 launch/restart 없음.
+- PR231 GitGuardian/라이선스/Linux/형식·경계 PASS. macOS Clippy PASS, 상태 회귀 실행 중. RustSec는 실제4개 새 advisory(2026-10-14)로 FAIL: rustls0.23.45. 이를 무시하지 않고 root 최소버전/lock만0.23.46으로 갱신한다. GUI/Actions 일괄 업그레이드는 제외 유지.
+- root가 Cargo sole executor. 현재 패치 업데이트→연결 영향 검사→Clippy/CI 전체→release 재컴파일·main merge·최종 package/version 검증이 남았다. 현재 0.12.2는 미배포라 추가 version bump 불필요.
+- 다음 추가 사용자 작업은 아래 대기 목록(한글 IME 초성 문제 GitHub 비교 수정+cloud 완료 알림)이며, 이 통합/빌드 최종 확인 뒤 GPT-6.1-Sol/xhigh 병렬로 시작한다. 아직 착수하지 않았다. IME 발생 위치 질문은 async 대기, 무응답은 선택으로 간주하지 않는다.
+
 # Main 통합 검토·재빌드 — 진행 중, 2026-10-15 (Codex)
 
 ## 현재 목표

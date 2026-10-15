@@ -96,7 +96,7 @@ chacha20poly1305 = "0.11"
 # remote 바이너리 프레이밍 (PR-19 v1+ — JSON Vec<u8> 팽창 해소)
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 # remote TLS (단계 C-2). ring provider 명시 — aws-lc-rs 회피(Windows NASM/CMake 마찰, 설계 §2.1).
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "std"] }
 rustls-pki-types = "1"
 # 모바일 PWA (v3.3 P1): QR 페어링 — 설정 UI가 접속 URL을 egui 텍스처로 렌더 (image 기능 불필요)
 qrcode = { version = "0.14", default-features = false }

@@ -7,6 +7,8 @@
 - Open cloud task results and permitted actions from the mobile PWA.
 
 ### Fixed
+
+- Upgrade rustls to 0.23.46 for RUSTSEC-2026-0346/0347/0348/0349.
 - Keep terminal input tied to the live editor while browsing scrollback; preserve wide character cursor alignment.
 - Bound app-server writes and shutdown, retire stale terminal query replies, and clean up owned foreground processes.
 - Preserve document ownership, unsaved buffers, save conflicts, symlinks, and popup input ownership.

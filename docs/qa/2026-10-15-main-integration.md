@@ -100,3 +100,9 @@ main에 없는 변경을 각각 대조하고 승인된 기능과 실제 결함 �
 ## GitGuardian 기록 오탐 처리
 
 PR230의 GitGuardian은 과거 manifest의 `worker_patches.secret` SHA256을 generic secret으로 판정했다. 실제 `/private/tmp/deppy-popup-fix-secret-20261014.patch` 파일 SHA256과 정확히 일치함을 검증했다. 작업자명과 `sha256` 필드를 분리해 메타데이터 표현만 정규화했다. 실제 credential이나 제품 변경은 없다. 기존 PR/commit을 보존하고 force push 없이 깨끗한 대체 integration branch/PR로 검사한다. 원본 manifest와 3개 digest 값은 보존된다.
+
+## 필수 rustls 보안 패치
+
+PR231에서 RustSec의 최신 DB(2026-10-14)가 rustls0.23.45의 RUSTSEC-2026-0346/0347/0348/0349를 실제 검출해 실패했다. 공식 RustSec 4개 공지의 공통 patched 버전은0.23.46이다. root 최소버전과 lock의 rustls 1개만0.23.46으로 갱신한다. 다른156개 업데이트 후보와 GUI/Actions 변경은 적용하지 않는다. 변경 전 로컬5733PASS와 버전0.12.2 선행 release 컴파일은 이전 rustls cohort의 결과이며, 갱신 후 영향 검사와 CI 전체 결과를 별도로 기록한다. 이미 배포한 artifact는 없다.
+
+공식 근거: https://rustsec.org/advisories/RUSTSEC-2026-0346.html · https://rustsec.org/advisories/RUSTSEC-2026-0347.html · https://rustsec.org/advisories/RUSTSEC-2026-0348.html · https://rustsec.org/advisories/RUSTSEC-2026-0349.html

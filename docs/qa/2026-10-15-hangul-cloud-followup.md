@@ -30,7 +30,9 @@ source4e89cb1b(0.12.3)의 `cargo test --offline --locked --workspace --no-fail-f
 
 그 뒤 a4631474에 실제72KiB cleanup cap 회귀1개만 추가했다. 해당 source의 `cargo test --offline --locked -p agent-mcp -- --test-threads=1`은 실제 **74PASS/0FAIL/1ignored**다. 이 수치를 앞의 전체 검사 합계에 더하지 않는다. 최종 `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `cargo run --offline --locked -p xtask -- check-boundary`, `cargo run --offline --locked -p xtask -- check-deps`도 각각 실제 exit0이다. [최종 gate 명령·종료 코드](evidence/2026-10-15-ime-cloud-followup/final-gates.json).
 
-root가 공용 target의 유일한 Cargo producer였고 jobs2를 유지했다. peer review 후 실제 검증 결과를 기준으로 main PR과 0.12.3 로컬 빌드를 준비한다. 아직 0.12.3 artifact는 없으며 앱은 종료·실행하지 않았다. 신규 클라우드 알림은 설계 검토 대기이므로 이 bugfix release에 구현됐다고 표시하지 않는다.
+root가 공용 target의 유일한 Cargo producer였고 jobs2를 유지했다. peer review 후 [PR233](https://github.com/JRVector9/deppy-sijo/pull/233)의 exact-head88b2a850 GitHub8checks 전부 실제 SUCCESS를 확인하고 main e101d64ff47c3d76afb1b04ba64632c61dd17de6에 merge했다. [검사 기록](evidence/2026-10-15-ime-cloud-followup/pr233-checks.json). CI nextest는 상태673PASS와 나머지5071PASS, 합계 **5744PASS/0FAIL**이며 TRY/FLAK 조짐 없이 첫 시도 통과했다. 서로 다른 필터의 skipped 값은 합산하지 않았다. [CI 집계](evidence/2026-10-15-ime-cloud-followup/pr233-ci-result.json), [CI 원로그](evidence/2026-10-15-ime-cloud-followup/pr233-ci.log.gz). main과 검증 head의 product tree 동일성을 확인하고 실제 main에서 package 스크립트를 실행했다. 버전 **0.12.2→0.12.3**. 실제 package exit0, CLI와 `CFBundleShortVersionString`/`CFBundleVersion` 모두0.12.3, arm64, signature와 ZIP 추출 무결성 PASS. 별도 `target/bundle-0.12.3/Deppy Sijo.app`와 ZIP에 같은 SHA의 복사본을 보존했다. [소스·버전·경로·SHA 결과](evidence/2026-10-15-ime-cloud-followup/package-result.json). 로컬 개발용 package이며 공증 배포를 했다고 주장하지 않는다. 앱 종료·실행·재실행 없음.
+
+신규 클라우드 알림은 설계 검토 대기이므로 이 bugfix release에 구현됐다고 표시하지 않는다.
 
 ## 클라우드 완료 알림 — 설계 검토 대기
 

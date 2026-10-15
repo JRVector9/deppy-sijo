@@ -1,0 +1,20 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--locked",
+    "--release",
+    "-p",
+    "deppy-sijo",
+    "-p",
+    "mcp-proxy"
+  ],
+  "exit_code": 0,
+  "source_commit": "88b2a85024a38a73d1e2b34b488c052f43df65a9",
+  "version": "Deppy Sijo 0.12.3",
+  "binary": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/release/deppy-sijo",
+  "binary_sha256_before_packaging": "951de139f7e29aaa13b7bdb27d646394f59898ba62e691d2a27a54ecffd76d72",
+  "app_launched": false,
+  "app_restarted": false
+}

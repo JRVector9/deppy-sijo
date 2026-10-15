@@ -1,0 +1,32 @@
+   Compiling deppy-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/core)
+   Compiling secret v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/secret)
+   Compiling audit v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/audit)
+   Compiling mux v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mux)
+   Compiling winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/winit-0.30.13)
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/alacritty_terminal-0.26.0)
+   Compiling persist v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/persist)
+   Compiling mcp-store v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-store)
+   Compiling storage-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage-core)
+   Compiling storage v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage)
+   Compiling terminal v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/terminal)
+   Compiling pty v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/pty)
+   Compiling session v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/session)
+   Compiling http-client v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/http-client)
+   Compiling mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp)
+   Compiling accesskit_winit v0.32.2
+   Compiling runtime v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/runtime)
+   Compiling auth v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/auth)
+   Compiling connector-contract v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-contract)
+   Compiling relay-protocol v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/relay-protocol)
+   Compiling web-remote v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/web-remote)
+   Compiling egui-winit v0.36.1
+   Compiling egui-wgpu v0.36.1
+   Compiling i18n v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/i18n)
+   Compiling eframe v0.36.1
+   Compiling connector-ui v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-ui)
+   Compiling agent-mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)
+   Compiling connector-service v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-service)
+   Compiling platform v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/platform)
+   Compiling mcp-proxy v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-proxy)
+   Compiling deppy-sijo v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/app)
+    Finished `release` profile [optimized] target(s) in 1m 55s

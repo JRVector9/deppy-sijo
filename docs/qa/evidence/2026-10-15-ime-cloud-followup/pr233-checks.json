@@ -1,0 +1,86 @@
+{
+  "baseRefOid": "8697496862837edbdefa4a326b77b93ac9fbb2c1",
+  "headRefOid": "88b2a85024a38a73d1e2b34b488c052f43df65a9",
+  "statusCheckRollup": [
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:15Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499798/job/116287791661",
+      "name": "Relay WebCrypto and reconnect",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Build and test"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:50:25Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499658/job/116287791344",
+      "name": "RustSec audit",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Dependency security"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:11Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499798/job/116287791545",
+      "name": "Detect code changes",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Build and test"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:48Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499658/job/116287790959",
+      "name": "Licenses, sources, and duplicate versions",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Dependency security"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:41Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499798/job/116287791639",
+      "name": "Format, boundary, and diff checks",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Build and test"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:31Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499798/job/116287791512",
+      "name": "Relay protocol and server (Linux)",
+      "startedAt": "2026-10-15T06:47:05Z",
+      "status": "COMPLETED",
+      "workflowName": "Build and test"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:56:30Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://github.com/JRVector9/deppy-sijo/actions/runs/38694499798/job/116287839186",
+      "name": "Build, clippy, and test (macOS)",
+      "startedAt": "2026-10-15T06:47:18Z",
+      "status": "COMPLETED",
+      "workflowName": "Build and test"
+    },
+    {
+      "__typename": "CheckRun",
+      "completedAt": "2026-10-15T06:47:06Z",
+      "conclusion": "SUCCESS",
+      "detailsUrl": "https://dashboard.gitguardian.com",
+      "name": "GitGuardian Security Checks",
+      "startedAt": "2026-10-15T06:47:06Z",
+      "status": "COMPLETED",
+      "workflowName": ""
+    }
+  ]
+}

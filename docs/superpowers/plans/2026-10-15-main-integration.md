@@ -17,6 +17,6 @@
 - [x] Choose version above all shipped bundles/branches; update workspace version, lockfile and CHANGELOG.
 - [x] Run cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1 with CARGO_BUILD_JOBS=2; actual exit and counts required.
 - [x] Run strict workspace Clippy, fmt, xtask boundary/deps, and relevant PWA checks.
-- [ ] Commit coherent source/docs changes, push integration branch, open reviewable PR and merge after required gates.
-- [ ] Build/package the merged main commit without launching; verify binary and both bundle versions.
-- [ ] Record source commit, version, included/excluded candidates, executed test logs, artifact path and remaining limitations.
+- [x] Commit coherent source/docs changes, push integration branch, open reviewable PR and merge after required gates.
+- [x] Build/package the merged main commit without launching; verify binary and both bundle versions.
+- [x] Record source commit, version, included/excluded candidates, executed test logs, artifact path and remaining limitations.

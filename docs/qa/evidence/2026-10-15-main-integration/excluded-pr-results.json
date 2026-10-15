@@ -1,0 +1,90 @@
+[
+  {
+    "headRefName": "dependabot/cargo/base64-0.23.1",
+    "headRefOid": "b2d672d4fda9f0ceafcce74b3c5983accd15c8d0",
+    "number": 190,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "fix/ssh-screen-stays-visible",
+    "headRefOid": "33116e7bf4d60b71bc6318ab2ac37b5943dd84d4",
+    "number": 191,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "feat/file-tree-typeahead",
+    "headRefOid": "c8821b3b40f729c5ff41147905543a3787de6b71",
+    "number": 192,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "feat/file-tree-search",
+    "headRefOid": "fcdea53b21bc44cc69b662b9ecb0f5d6bfca8822",
+    "number": 193,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "feat/file-tree-create-modal",
+    "headRefOid": "1a44ccea0a753ec87ba8e0105824e5da53326349",
+    "number": 194,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "feat/blank-tab-new-shell",
+    "headRefOid": "cdf0b0a796daa5ae3f7eb889cd1025b69206409e",
+    "number": 195,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "fix/session-agent-isolation-clean",
+    "headRefOid": "315b9a1b38818a2168f6dd4e2e072e37541b9959",
+    "number": 197,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "feat/file-tree-finder-clipboard",
+    "headRefOid": "60b6bda860dfbe39d17eda1e6e6576bd21d42de9",
+    "number": 198,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "dependabot/github_actions/actions/upload-artifact-7",
+    "headRefOid": "accbb5b2abf314419a15f850d12f9e656ed2ddf9",
+    "number": 206,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "dependabot/github_actions/actions/setup-node-7",
+    "headRefOid": "962f6104c706affb4e9977401b5c71e3cecd32ac",
+    "number": 207,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  },
+  {
+    "headRefName": "dependabot/cargo/rust-patch-and-minor-394a7633c3",
+    "headRefOid": "52b217a09f16c7cdc7d1a5005cd2b59715185008",
+    "number": 217,
+    "state": "OPEN",
+    "action": "closed without deleting branch",
+    "exit_code": 0
+  }
+]

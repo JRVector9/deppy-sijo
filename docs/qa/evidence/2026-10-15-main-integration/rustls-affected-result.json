@@ -1,0 +1,143 @@
+{
+  "source_commit": "d40d1bb5a4ca6c902b78c7728eaa597c034e5598",
+  "rustls": "0.23.46",
+  "command": "cargo test --locked -p agent-mcp -p web-remote -p connector-service -p http-client --no-fail-fast -- --test-threads=1",
+  "exit_code": 0,
+  "passed": 567,
+  "failed": 0,
+  "ignored": 16,
+  "harnesses": [
+    {
+      "harness": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_mcp-61caa151590f1a78)",
+      "passed": 67,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_service-85e6161ddf0f5a1b)",
+      "passed": 83,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "harness": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/http_client-0a50621ce3c7cad3)",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/web_remote-40441e8cb3456877)",
+      "passed": 392,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/chrome_support_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/chrome_support_contract-c78748906d5ccadb)",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "tests/cloud_results_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/cloud_results_chrome-27d4aba50836cb2d)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/mobile_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mobile_shell_chrome-1f14b5e8e3879b53)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/mobile_usability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/mobile_usability_chrome-07da485b69e83bcd)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/pwa_unified_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pwa_unified_chrome-71496f3a58136cda)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "harness": "tests/relay_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_shell_chrome-e0ee69857d160b67)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/relay_shell_deploy.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_shell_deploy-4b4f25fed659e78b)",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "tests/relay_webcrypto_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/relay_webcrypto_vectors-35fa183e2def7dff)",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/transport_independence.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/transport_independence-f81d949c8bbcda0f)",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "tests/viewer_core_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_core_chrome-3b1ec94a582123b8)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/viewer_grapheme_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_grapheme_chrome-f9da61f87d94d070)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/viewer_history_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_history_chrome-cfe70e8b832ca40b)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/viewer_readability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_readability_chrome-2f7bfc934c3d78c3)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "tests/viewer_reading_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/viewer_reading_chrome-112a5567293ea692)",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "harness": "agent_mcp",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "connector_service",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "http_client",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "harness": "web_remote",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  ]
+}

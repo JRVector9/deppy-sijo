@@ -3183,7 +3183,7 @@ mod tests {
         ] {
             assert!(
                 validate_event(&invalid).is_err(),
-                "invalid accepted input evidence: {invalid:?}"
+                "invalid accepted input evidence"
             );
         }
     }

@@ -36,6 +36,52 @@ fn receipt(identity: CompletionIdentity) -> CompletionReceipt {
         expires_at: at + COMPLETION_RECEIPT_TTL,
     }
 }
+
+#[test]
+fn completion_receipt_tool_result_is_canonical_for_admission_and_local_outcome() {
+    for (admission, effect) in [
+        ("queued", "queued"),
+        ("rejected", "none"),
+        ("unknown", "unknown"),
+    ] {
+        for local in ["completed", "rejected", "unknown"] {
+            let mut receipt = receipt(identity("canonical"));
+            receipt.admission = json!({"status":admission,"retry":false});
+            receipt.outcome = json!({"status":local,"local_turn_completed":local == "completed"});
+            let result = receipt.tool_result();
+            assert_eq!(
+                result,
+                crate::protocol::normalize_tool_payload(result.clone()),
+                "durable and wire results must match for admission={admission}, local={local}"
+            );
+            assert_eq!(
+                result["effect_state"], effect,
+                "local turn status cannot change the recorded input admission"
+            );
+            assert_eq!(result["retryable"], false);
+            assert_eq!(result["retry"], false);
+        }
+    }
+}
+
+#[test]
+fn completion_bridge_machine_errors_preserve_known_no_effect_without_retry() {
+    for code in [
+        "completion_native_proof_unsupported",
+        "completion_invalid_scope",
+        "completion_target_busy",
+        "completion_watch_capacity",
+        "completion_original_request_required_no_effect",
+    ] {
+        let payload = crate::protocol::error_payload(code);
+        assert_eq!(payload["error"], code);
+        assert_eq!(payload["code"], code);
+        assert_eq!(payload["effect_state"], "none");
+        assert_eq!(payload["retryable"], false);
+        assert!(payload.get("retry_after_ms").is_none());
+    }
+}
+
 fn post(server: &Server, token: &str, session: &str, operation: &str) -> TcpStream {
     let mut socket = TcpStream::connect(server.addr).unwrap();
     socket

@@ -139,6 +139,61 @@ fn resume(server: &Server, token: &str, session: &str, cursor: &str) -> TcpStrea
 }
 
 #[test]
+fn completion_stream_final_delivery_publication_wakes_idle_consumer() {
+    use std::sync::{Arc, Mutex, mpsc};
+    let delivery = Arc::new(Mutex::new(None::<mpsc::Receiver<CompletionDeliveryEvent>>));
+    let consumer = delivery.clone();
+    let (wakes, wake_rx) = mpsc::sync_channel(128);
+    let mut server = Server::start(0, "", move || {
+        // Model the idle App: it consumes published updates only when woken.
+        let updates = {
+            let receiver = consumer.lock().unwrap();
+            receiver
+                .as_ref()
+                .map(|receiver| receiver.try_iter().collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        let _ = wakes.try_send(updates);
+    })
+    .unwrap();
+    let (_, unused) = mpsc::sync_channel(1);
+    *delivery.lock().unwrap() = Some(std::mem::replace(&mut server.delivery_events, unused));
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let socket = post(&server, &token, &session, "delivery-wake");
+    let req = next_request(&server);
+    wake_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("ordinary request dispatch invokes the configured wake");
+    while wake_rx.try_recv().is_ok() {}
+    let identity = req
+        .deferred
+        .as_ref()
+        .unwrap()
+        .reserve(scope("delivery-wake"), CompletionPermit::new())
+        .unwrap();
+    let mut reader = sse_head(socket);
+    event(&mut reader);
+    req.reply
+        .try_send(Ok(receipt(identity.clone()).tool_result()))
+        .unwrap();
+    assert!(event(&mut reader).contains(&identity.event_id()));
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        let remaining = end.saturating_duration_since(Instant::now());
+        let updates = wake_rx.recv_timeout(remaining).expect(
+            "successful final delivery publication must wake the idle consumer after dispatch",
+        );
+        if updates.iter().any(|event| {
+            event.identity == identity
+                && event.state == CompletionDeliveryState::ReturnedUnacknowledged
+        }) {
+            break;
+        }
+    }
+}
+
+#[test]
 fn completion_stream_fast_final_uses_original_post_and_owned_replay() {
     let server = Server::start(0, "", || {}).unwrap();
     let token = server.auth.token_for_user();

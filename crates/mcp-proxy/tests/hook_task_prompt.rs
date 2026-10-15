@@ -95,6 +95,87 @@ fn prompt_payload(native: &str, transcript: &Path, prompt: &str) -> serde_json::
 }
 
 #[test]
+fn completion_codex_observer_preserves_actual_prompt_and_independent_execution_boundaries() {
+    let fixture = HookFixture::new();
+    let native = uuid::Uuid::new_v4().to_string();
+    let transcript = fixture.root.join(format!("rollout-fixture-{native}.jsonl"));
+    std::fs::write(
+        &transcript,
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":native}})
+        ),
+    )
+    .unwrap();
+    fixture.hook(
+        1,
+        "codex",
+        &json!({
+            "hook_event_name":"SessionStart", "session_id":native, "transcript_path":transcript,
+        }),
+    );
+    let prompt = format!(
+        "{}\r\n고유한 마지막 입력",
+        "same display prefix ".repeat(40)
+    );
+    let mut submit = prompt_payload(&native, &transcript, &prompt);
+    submit["turn_id"] = json!("actual-native-turn");
+    fixture.hook(1, "codex", &submit);
+    let db = storage::Db::open(&fixture.db_path).unwrap();
+    let key = format!("{}:1", fixture.workspace);
+    let mut job = storage::AgentStateJob::projection(&fixture.workspace);
+    job.native_turn_keys = vec![key.clone()];
+    let started = db
+        .apply_agent_state_job(&job)
+        .unwrap()
+        .native_turns
+        .remove(0);
+    assert!(started.is_valid());
+    assert_eq!(started.session_key, key);
+    assert_eq!(started.turn_id, "actual-native-turn");
+    assert_eq!(started.transcript_path, transcript.to_str().unwrap());
+    assert_eq!(
+        serde_json::to_value(&started).unwrap()["prompt_digest"],
+        storage::native_prompt_digest(&prompt)
+    );
+    assert!(started.completed.is_none());
+    let receiver_parent =
+        deppy_core::process_identity::ProcessIdentity::capture(std::process::id()).unwrap();
+    assert!(started.start_execution_stamp.contains(receiver_parent));
+    fixture.hook(
+        1,
+        "codex",
+        &json!({
+            "hook_event_name":"Stop", "session_id":native, "transcript_path":transcript,
+            "turn_id":"actual-native-turn", "stop_hook_active":false,
+        }),
+    );
+    let ended = db
+        .apply_agent_state_job(&job)
+        .unwrap()
+        .native_turns
+        .remove(0);
+    let end = ended.completed.as_ref().unwrap();
+    assert_eq!(ended.start_execution_stamp, started.start_execution_stamp);
+    assert!(end.execution_stamp.contains(receiver_parent));
+    assert_ne!(
+        end.execution_stamp.ancestors[0], started.start_execution_stamp.ancestors[0],
+        "the real start and Stop subprocesses must each capture their own receiver provenance"
+    );
+    assert!(end.at_micros >= ended.started_at_micros);
+    assert!(ended.completion_revision > started.completion_revision);
+    assert!(fixture.snapshot()[0].task_prompt.as_ref().unwrap().len() < prompt.len());
+    assert_eq!(
+        std::fs::read_to_string(&transcript).unwrap(),
+        format!(
+            "{}\n",
+            json!({"type":"session_meta","payload":{"id":native}})
+        ),
+        "hook ingestion must never rewrite the native transcript"
+    );
+}
+
+#[test]
 fn independent_hook_titles_run_proxy_to_storage_projection_for_all_four_providers() {
     let fixture = HookFixture::new();
     for (pane, provider) in [(1, "claude"), (2, "codex"), (3, "grok"), (4, "kimi-code")] {

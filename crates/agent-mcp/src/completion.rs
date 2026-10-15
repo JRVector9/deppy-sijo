@@ -130,7 +130,7 @@ impl CompletionReceipt {
         if let Some(status) = self.outcome.get("status") {
             value["status"] = status.clone();
         }
-        value
+        crate::protocol::normalize_tool_payload(value)
     }
 }
 

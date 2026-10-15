@@ -5757,6 +5757,7 @@ impl WorkspaceUi {
                 }
                 RuntimeEvent::EnvironmentApplied { .. }
                 | RuntimeEvent::InputAdmitted { .. }
+                | RuntimeEvent::SessionInputAccepted { .. }
                 | RuntimeEvent::TerminalHistoryResult { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,

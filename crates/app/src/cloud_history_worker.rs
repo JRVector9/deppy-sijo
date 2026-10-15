@@ -73,7 +73,7 @@ pub(crate) enum Job {
     },
     FinishCompletion {
         identity: CompletionIdentity,
-        receipt: CompletionReceipt,
+        receipt: Box<CompletionReceipt>,
     },
     #[cfg_attr(
         not(test),
@@ -637,7 +637,7 @@ mod tests {
             3,
             Job::FinishCompletion {
                 identity: identity.clone(),
-                receipt: receipt.clone(),
+                receipt: Box::new(receipt.clone()),
             },
         );
         assert!(matches!(
@@ -681,7 +681,10 @@ mod tests {
             tool: tool.into(),
             args,
         };
-        let finish = |identity, receipt| Job::FinishCompletion { identity, receipt };
+        let finish = |identity, receipt| Job::FinishCompletion {
+            identity,
+            receipt: Box::new(receipt),
+        };
         let mut invalid_identity = identity.clone();
         invalid_identity.auth_epoch = 0;
         let mut mismatched_receipt = receipt.clone();
@@ -744,7 +747,14 @@ mod tests {
         assert_eq!(worker.retained_bytes(), 0);
         let retained_finish =
             identity.encoded_len().unwrap() + serde_json::to_vec(&receipt).unwrap().len();
-        request(&mut worker, 2, Job::FinishCompletion { identity, receipt });
+        request(
+            &mut worker,
+            2,
+            Job::FinishCompletion {
+                identity,
+                receipt: Box::new(receipt),
+            },
+        );
         assert!(worker.retained_bytes() >= retained_finish);
         let result = worker.wait().unwrap();
         assert!(worker.retained_bytes() >= retained_finish);

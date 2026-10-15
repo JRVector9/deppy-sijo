@@ -437,10 +437,9 @@ impl CloudAgent {
             .statuses
             .iter_mut()
             .find(|s| s.identity == event.identity)
+            && status.view.delivery != CompletionDeliveryState::Closed
         {
-            if status.view.delivery != CompletionDeliveryState::Closed {
-                status.view.delivery = event.state;
-            }
+            status.view.delivery = event.state;
         }
     }
     pub(crate) fn poll_completions(&mut self) {
@@ -569,7 +568,7 @@ impl CloudAgent {
                 token,
                 Job::FinishCompletion {
                     identity: receipt.identity.clone(),
-                    receipt,
+                    receipt: Box::new(receipt),
                 },
             ));
         }

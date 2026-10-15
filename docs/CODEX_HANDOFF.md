@@ -1,6 +1,6 @@
 # 클라우드 완료 알림 — 마지막 경합 수정 및 전체 검증 준비, 2026-10-15
 
-- 현재 canonical `deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`, HEAD882cd848 + root 통합 수정. 사용자 `진행해` 승인 feature; source0.13.0 (기존 shipped0.12.3), Cargo.lock27 inherited packages 갱신, CHANGELOG 작성. 아직 release/package/merge 미완료. 앱 종료·실행 권한 없음.
+- 현재 canonical `deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`, HEADd0d336f3(제품f9d7c8a7) + root 최종 evidence 문서 수정. 사용자 `진행해` 승인 feature; source0.13.0 (기존 shipped0.12.3), Cargo.lock27 inherited packages 갱신, CHANGELOG 작성. 아직 release/package/merge 미완료. 앱 종료·실행 권한 없음.
 - stage5 실제: MCP14PASS1ignored/App57PASS/runtime3PASS/storage10PASS+integration2PASS/parser1PASS. proxy subprocess fixture가 private .codex/sessions 밖이라 실패하여 fixture경로만 교정.
 - stage6 실제: MCP14PASS2FAIL1ignored(과대 Appreply cache/posthandoff false-noeffect), App57PASS1FAIL(절대 만료). stage7에서 수정 검증: MCP16PASS1ignored, parser+realproxy1PASS씩. App60PASS7FAIL(늦은 admission/유실·순서 경합6개 + History::open fixture가 실행중 watch를 startup-recover하는 검사 오류1개). Fixture는 readonly SQL로 교정, 제품 startup 동작을 우회하지 않음.
 - stage8 실제 App70PASS2FAIL: Closed delivery를 DB완료가 Ready로 덮는 결함 + canonical durable/wire payload 차이. Closed는 transport event만 delivery authority로 수정. stage9 실제 MCP16PASS2FAIL1ignored(canonical payload/known machinecode), App72PASS4FAIL(activewatch status pruning, unadmitted-input fence, unrelatedruntime readiness, canonicalpayload 연계). 로그 `/private/tmp/deppy-completion-stage{6,7,8,9}-*-20261015.log`.
@@ -9,6 +9,10 @@
 - stage11 실제 GREEN: `cargo test --offline --locked --no-fail-fast -p deppy-sijo -p agent-mcp completion_ -- --test-threads=1 --nocapture` exit0, App76PASS/MCP18PASS1ignored/FAIL0. source b980eb3e와0.13.0버전 f9d7c8a7; SDK 최신 cohort 재빌드 및 workspace전체검사 다음.
 - stage10 실제 MCP18PASS1ignored/App74PASS2FAIL/runtime3PASS/storage10PASS+integration2PASS/proxy2PASS. App2개 실패는 입·출력 permit 분리 뒤에도 테스트가 input_permit을 read/transport권한으로 검사한 오래된 precondition이며 test-only transport permit getter로 교정했다. readonly교차리뷰는 추가로 is_disconnected가 이벤트를 prefetch하므로 backlog최종확인을 뒤로 옮길 것을 발견, active/warm 모두 수정했다. stage11 focused 재검증 중.
 - 최신source SDK 실제 build0/23.20s → Node quick0: 정상43ms/설정시한지연775ms/끊김복구1028ms,3제출3완료/입력재전송0/별도조회0/resumedGET1/errors0. result `/private/tmp/deppy-completion-sdk-final-result-20261015.json`, stderr empty. fmt/diff 실제exit0. 전체workspace 현재 session58740, log `/private/tmp/deppy-completion-workspace-20261015.log`. 문서 `docs/qa/2026-10-15-cloud-local-completion.md` 작성, 최종결과는 진행중으로 명시.
+- PR235 생성/푸시 완료: head80e19fc8, https://github.com/JRVector9/deppy-sijo/pull/235 . GitHub exact-head 검사는 실행 대기/진행 상태를 실제 조회한 뒤 판정한다. 원자적 feature PR + 최종 evidence docs PR로 main에 적용할 예정이며 구현 경계3개의 개별 reviewed commit은 보존한다. SDK docs/evidence108619db, 사용/검토guide80e19fc8. SDK worker는 root가 private lock을 교체하기 전0.12.3 snapshot을 실제로 보존했다(SHA ad450db6). 원본실행시점 lock equality까지 소급 주장하지 않도록 설명만 좁히는 후속 문서commit 대기 중이다. root가 currentprivate0.13lock과 혼동한 가정은 교정했다.
+- PR235 최초 head80e19fc8에서 실제 GitHub boundary FAIL: 새 test-only completion_integration_tests.rs의 impl Fixture가 parentcfg만 있고 top-level cfg metadata가 없어 production Db::open/storage::Db로 검사됨. src/test-only impl에 명시 #[cfg(test)]를 붙여 기존 strict boundary 유지할 예정(검사 예외 추가 금지). 전체workspace sourcecohort를 보존해 현재 실행 종료 후 수정하고 최종 headCI를 다시 확인한다. 원log `/private/tmp/deppy-completion-ci-boundary-failure-20261015.log`.
+- 같은 최초CIhead strictClippy 실제2FAIL: completion_bridge nestedif collapse, HistoryWorker FinishCompletion enum584byte(다음336byte). 기존경고무시 없이 조건을합치고 receipt만Box로 줄일 예정. 원log `/private/tmp/deppy-completion-ci-clippy-failure-20261015.log`. 최종source변경후 focused/Clippy/경계 재검증하고 exact-headCI 전체검사를 통과해야 merge한다.
+- 최초workspace 실제 종료101: 총계는 evidence/workspace-initial-result.json에 기록(각 Cargo harness 마지막summary만, nested중복제외). 동작suite PASS, xtask2FAIL은 위같은 test-only Fixture metadata 원인. full실행 종료후 #[cfg(test)]impl / nestedif / boxedFinishCompletion 최소수정 완료, warnings ignore/검사예외 추가 없음. 이제 최종head localClippy/fmt/boundary/deps/workspace + exact-headCI 재검증한다. SDK transport와 runtime source는 재검증 cohort 이후 변경 없음.
 - root만 Cargo/jobs2/shared performance target. workers gpt-6.1-sol/xhigh3명 별도 tree, 현재 최종 readonly 교차리뷰. 다음 stage10 focused → fullworkspace/fmt/clippy/boundary/deps → SDK quick → evidence/PR/CI/main →0.13.0 artifact CLI/plist2/arm64/signature/archive 검증. 사용자 DB/키/clipboard/실계정/실제입력 없음.
 
 ```sh
@@ -16,7 +20,7 @@ cd /Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015
 cat AGENTS.md
 git status --short --branch
 git diff --stat
-tail -n 100 /private/tmp/deppy-completion-stage10-green-20261015.log
+tail -n 100 /private/tmp/deppy-completion-workspace-20261015.log
 ```
 
 ---

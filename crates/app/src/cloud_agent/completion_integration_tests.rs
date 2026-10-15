@@ -91,6 +91,7 @@ fn payload(response: &Value) -> Value {
     serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap()).unwrap()
 }
 
+#[cfg(test)]
 impl Fixture {
     pub(super) fn new() -> Self {
         let root =

@@ -2,6 +2,7 @@
 mod access;
 #[cfg(test)]
 mod bridge_tests;
+pub(crate) mod completion;
 mod continuity;
 mod control;
 mod management;

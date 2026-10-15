@@ -19,7 +19,7 @@ pub use diagnostic_scan::{
 };
 pub use redaction::{
     RedactionCapacityError, RedactionClock, RedactionCorpusLimits, RedactionCorpusStats,
-    RedactionLease, RedactionService, StreamRedactor,
+    RedactionLease, RedactionService, RedactionSnapshot, StreamRedactor,
 };
 
 use anyhow::Context;

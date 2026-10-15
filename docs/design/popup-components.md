@@ -16,10 +16,11 @@
 | 09 | 환경 및 API 프로젝트 목록 닫기 | 공용 확인 팝업 · 세션 유지·대상별 입력 보호 | `crates/app/src/ui/environment_dialogs.rs` · 호출자 `app.rs` |
 | 10·11 | 리소스 세션·미연결 프로세스 종료 | 공용 확인 팝업 적용 | `crates/app/src/ui/resource_manager.rs` |
 | 12 | 포트 프로세스 종료 | 공용 확인 팝업 적용 | `crates/app/src/ui/ports.rs` |
-| 13 | 휴지통 실패 후 영구 삭제 | 공용 확인 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
+| 13 | 휴지통 실패 후 영구 삭제 | 공용 확인 · 원래 객체 증명·worker 재검증 | `crates/app/src/ui/file_tree.rs` |
 | 15 | 환경변수 정의 삭제 | 공용 팝업 · 36pt 원본 파일 선택·명시적 삭제 | `crates/app/src/ui/environment_dialogs.rs` · 호출자 `ui/env_profiles.rs` |
 | 18–20 | 다음 단계 예약·브로드캐스트·일괄 시작 | 공용 중앙 이동·크기 조절 창·고정 하단 버튼 | `crates/app/src/ui/fleet.rs` |
 | 22 | MCP 도구 직접 호출 | 공용 중앙 이동·크기 조절 입력 창 | `crates/connector-ui/src/lib.rs` |
+| 25 | OAuth 클라이언트 정보 | 기존 Window · 비밀값 마스크·종료 시 undo 정리 | `crates/connector-ui/src/lib.rs` |
 | 26 | 미저장 문서 닫기 | 공용 팝업 · 저장/버리기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 27 | 외부 수정 문서 다시 불러오기 | 공용 팝업 · 다시 불러오기/취소 | `crates/app/src/ui/document_dialogs.rs` |
 | 28 | 문서 탭 한도 | 공용 Info 팝업 | `crates/app/src/ui/document_dialogs.rs` |
@@ -120,6 +121,8 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 - 01번의 로컬 폴더 열기·Git 복제가 런타임 워크스페이스로 등록·전환되면 터미널 화면을 드러내고 전용 런처를 연다. 새 폴더·재선택·이미 활성인 폴더 모두 적용하며, 런처에서 선택하기 전 기본 셸을 자동 생성하지 않는다. 설정의 프로젝트 등록·저장 위치 선택은 해당 설정 작업을 수행한다. 전환 실패와 진행 중인 런처 실행 요청은 그대로 보존한다.
 - 워크스페이스 이름은 새 팝업을 열지 않고 해당 행에 커서를 둔다. 기존 세션 이름 편집 도우미를 재사용하고 처음 한 번만 포커스를 받는다. Enter 저장, Esc·행 밖 클릭·다른 화면 전환 취소이며, 실제 폴더·경로는 바꾸지 않는다. 빈 별칭은 폴더 이름으로 돌아간다. 완료/취소/대상 소멸 시 입력 상태를 해제한다.
 - 인라인 이름 편집의 Enter·Esc 처리 프레임은 포커스를 해제한 후에도 배경 입력을 막는다. 편집창이 소유한 egui 이벤트와 별도 native key batch를 함께 소비해, 붙여넣기·문장부호가 터미널로 다시 전달되지 않게 한다. 차단은 다음 pass에 해제된다.
+- 영구 삭제의 허가는 실제 휴지통 worker가 보존한 루트·부모·대상 descriptor와 dev/inode/type 증명에서만 나온다. 확인창은 증명을 전달하고 파일 I/O를 수행하지 않는다. 삭제 worker는 실제 작업 직전에 같은 객체·루트인지 검사하고, 대상을 별도 디렉터리로 원자적으로 옮긴 뒤 다시 검사한다. 바뀐 객체는 삭제하지 않고 덮어쓰기 없이 복원한다. 복원 충돌 시 양쪽 파일을 보존하고 실패로 보고한다.
+- OAuth 클라이언트 비밀값은 공용 마스크 입력으로 표시한다. 취소·전송·화면 숨김·작업/서버/설정 revision 변경 시 초안과 공유 undo 기록·위젯 상태·포커스를 정리한다. 새 인증 작업에서 이전 비밀값이 복원되지 않는다.
 - 휴지통 실패로 생긴 FileTree 영구 삭제 확인은 실제 표시 전에도 대기 모달이다. App은 worker 결과 처리 후 전역 단축키보다 먼저 이 상태를 입력 차단에 포함한다. 확인창은 파일 목록의 가시성과 분리해 패널을 접거나 메모 탭을 선택해도 표시·취소할 수 있게 한다.
 - MCP 승인창은 고정 Window Area를 유지하며 요청이 바뀔 때 두 고정 버튼 ID 묶음을 번갈아 사용한다. egui의 포커스 캐시에 요청마다 새로운 버튼 ID를 누적하지 않는다. 대상이 바뀌면 이전 포커스를 해제하고, 사용자가 새로 버튼을 선택한 뒤에만 Enter로 결정한다.
 - 레이블·버튼·안내문은 각 언어의 같은 키를 유지한다. 화면을 옮길 때 기존 키를 재사용하거나 모든 지원 언어에 새 키를 동시에 추가한다.
@@ -128,7 +131,7 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 
 `ui/document_dialogs.rs`는 지역화된 내용을 조합하고 선택 의도만 반환한다. 공용 `popup::show/body/footer/notice/action_button`을 사용하며 파일 I/O나 runtime 명령을 실행하지 않는다. App이 문서 큐 앞 항목의 ID, 저장 자격과 저장 후 닫기 continuation을 소유한다.
 
-- 26은480pt, 파일명과 버리기 경고·대기 문서 수·저장 상한 이유를 표시한다. Save는 `can_save_then_close` 자격을 그대로 전달하고 Secondary, Discard는 Danger, Cancel은 Ghost다. 저장 중 continuation 자격을 일반 `can_save`로 바꾸지 않는다.
+- 26은480pt, 파일명과 버리기 경고·대기 문서 수·저장 상한 이유를 표시한다. Save는 `can_save_then_close` 자격을 그대로 전달하고 Secondary, Discard는 Danger, Cancel은 Ghost다. 저장 중 continuation 자격을 일반 `can_save`로 바꾸지 않는다. 세션 pane/tab·워크스페이스·앱 닫기도 미저장/저장 중 문서를 이 확인으로 처리한다. 원래 runtime/pane/session만 이어서 닫고, 취소·충돌·저장 실패·대상 교체는 종료를 취소하며 내용을 보존한다.
 - 27은400pt, Reload는 Danger다. 미저장 내용이 사라진다는 경고와 대기 수를 유지한다. 28은420pt, Info notice와 Primary 닫기만 제공한다. 26·27·28의 X·바깥 클릭·Esc는 취소/안내 닫기이고, 기본 Enter는 위험 동작을 실행하지 않는다.
 - 26·27은 문서 탭 ID를 Modal 케이스 ID와 별도로 전달한다. Modal Area는 케이스별 고정 ID를 유지하고, 버튼은 대상 ID로 구분한다. 대상 변경 시 이전 focus를 해제하여 같은 파일명인 다음 문서에도 위험 동작을 승계하지 않는다.
 - 비동기 문서 결과는 전역 단축키보다 먼저 수신하고, 사이드바/상단 버튼이 확인창을 열면 검색·컴포저·주/부착 터미널보다 먼저 fence를 갱신한다. 예약된 세션 닫기도 예정 모달에 포함하며 입력 활성 여부와 독립적으로 먼저 표시한다.

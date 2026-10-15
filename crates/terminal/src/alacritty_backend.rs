@@ -802,7 +802,12 @@ impl TerminalBackend for AlacrittyBackend {
             }
         }
         // A navigation/vi cursor is not the editor cursor that will receive input.
-        let cursor = grid.cursor.point;
+        let mut cursor = grid.cursor.point;
+        // Match rendered cursor coordinates at a wide glyph's trailing cell,
+        // without moving the native editor cursor or the user's viewport.
+        if grid[cursor].flags.contains(Flags::WIDE_CHAR_SPACER) {
+            cursor.column -= 1;
+        }
         let (shape, shape_visible) = map_cursor_shape(self.term.cursor_style().shape);
         Some(TerminalViewportSnapshot {
             cols: cols as u16,
@@ -1561,6 +1566,41 @@ fn serialize_scrollback_bounded(
 mod tests {
     use super::*;
     use crate::backend::TerminalBackend;
+
+    #[test]
+    fn input_snapshot_normalizes_wide_cursor_without_moving_native_cursor() {
+        for hint in ["한글 힌트", "界面提示", "😀 hint"] {
+            for alternate in [false, true] {
+                let mut backend = AlacrittyBackend::new(80, 4, 100);
+                feed(&mut backend, "past output\r\n".repeat(20).as_bytes());
+                if alternate {
+                    feed(&mut backend, b"\x1b[?1049h");
+                }
+                feed(
+                    &mut backend,
+                    format!("\x1b[2J\x1b[H› \x1b[2m{hint}\x1b[0m\x1b[1;4H").as_bytes(),
+                );
+                let native = backend.term.grid().cursor.point;
+                assert_eq!(native.column.0, 3);
+                assert!(
+                    backend.term.grid()[native]
+                        .flags
+                        .contains(Flags::WIDE_CHAR_SPACER)
+                );
+                for offset in [0, 5] {
+                    backend.scroll(offset);
+                    let viewport = backend.viewport_snapshot().unwrap();
+                    let input = backend.input_snapshot().unwrap();
+                    assert_eq!(input.cursor.col, 2, "{hint}, alternate={alternate}");
+                    assert_eq!(input.cursor.row, 0);
+                    assert_eq!(input.scroll_offset, 0);
+                    assert_eq!(input.is_alt_screen, alternate);
+                    assert_eq!(backend.term.grid().cursor.point, native);
+                    assert_eq!(backend.viewport_snapshot().unwrap(), viewport);
+                }
+            }
+        }
+    }
 
     #[test]
     fn input_snapshot_uses_native_cursor_in_vi_mode_and_alternate_screen() {

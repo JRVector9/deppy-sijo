@@ -614,3 +614,103 @@ fn rendered_wrapped_credentials_are_redacted_before_cloud_snapshot_byte_limits()
     assert!(clean.contains("[REDACTED]"));
     assert!(clean.contains("before") && clean.contains("after"));
 }
+
+#[test]
+fn review_20261015_list_sessions_redacts_known_secret_display_metadata() {
+    let (mut bridge, mut target) = setup();
+    let secret_value = "review-known-cloud-secret-access-token-20261015";
+    let secret = secret::SecretString::new(secret_value.into());
+    let _lease = bridge.redaction.acquire_rotating(&secret).unwrap();
+    target.title = format!("Terminal {secret_value}");
+    target.workspace_name = format!("Project {secret_value}");
+    bridge.set_targets(vec![target.clone()]);
+    let actor = client(&bridge, "Read-only reviewer");
+    bridge
+        .set_connection_access(&actor.id, &target, true, false)
+        .unwrap();
+    let (req, rx) = request(&bridge, &actor, "list_sessions", json!({}));
+    bridge.handle_and_drain(req, |_, _| panic!("listing must not dispatch input"));
+    let reply = rx.recv().unwrap().unwrap();
+    let row = &reply["sessions"][0];
+    assert_eq!(
+        row["session_id"], target.id,
+        "routing identity must be retained"
+    );
+    assert_eq!(row["generation"], target.generation);
+    assert_eq!(
+        row["input_allowed"], false,
+        "the recipient only has read consent"
+    );
+    assert_eq!(
+        row["title"], "Terminal [REDACTED]",
+        "known credential leaked through session display title"
+    );
+    assert_eq!(
+        row["workspace_name"], "Project [REDACTED]",
+        "known credential leaked through workspace display name"
+    );
+    assert!(!reply.to_string().contains(secret_value));
+}
+
+#[test]
+fn full_fix_cloud_20261015_list_metadata_rescrubs_late_registered_wrapped_secret() {
+    let (mut bridge, mut target) = setup();
+    let value = "late-metadata-secret-token";
+    target.title = "Task late-metadata-\nsecret-token".into();
+    target.workspace_name = format!("Project {value}");
+    bridge.set_targets(vec![target.clone()]);
+    let actor = client(&bridge, "Read-only metadata viewer");
+    bridge
+        .set_connection_access(&actor.id, &target, true, false)
+        .unwrap();
+    let (req, rx) = request(&bridge, &actor, "list_sessions", json!({}));
+    bridge.handle_and_drain(req, |_, _| panic!("metadata cannot type"));
+    assert_eq!(
+        rx.recv().unwrap().unwrap()["sessions"][0]["workspace_name"],
+        target.workspace_name
+    );
+    let _lease = bridge
+        .redaction
+        .acquire_rotating(&secret::SecretString::new(value.into()))
+        .unwrap();
+    let (req, rx) = request(&bridge, &actor, "list_sessions", json!({}));
+    bridge.handle_and_drain(req, |_, _| panic!("metadata cannot type"));
+    let reply = rx.recv().unwrap().unwrap();
+    assert_eq!(reply["sessions"][0]["title"], "Task [REDACTED]");
+    assert_eq!(reply["sessions"][0]["workspace_name"], "Project [REDACTED]");
+    assert_eq!(reply["sessions"][0]["session_id"], target.id);
+    assert_eq!(reply["sessions"][0]["generation"], target.generation);
+    assert_eq!(
+        bridge.targets[0].title, target.title,
+        "source metadata remains raw for future corpus updates"
+    );
+}
+
+#[test]
+fn full_fix_cloud_20261015_list_metadata_is_bounded_after_redaction() {
+    let (mut bridge, mut target) = setup();
+    let value = "boundary-metadata-secret-token";
+    let _lease = bridge
+        .redaction
+        .acquire_rotating(&secret::SecretString::new(value.into()))
+        .unwrap();
+    target.title = format!("{}{value}", "한".repeat(168));
+    target.workspace_name = target.title.clone();
+    bridge.set_targets(vec![target.clone()]);
+    let actor = client(&bridge, "Bounded metadata viewer");
+    bridge
+        .set_connection_access(&actor.id, &target, true, false)
+        .unwrap();
+    let (req, rx) = request(&bridge, &actor, "list_sessions", json!({}));
+    bridge.handle_and_drain(req, |_, _| panic!("metadata cannot type"));
+    let reply = rx.recv().unwrap().unwrap();
+    for field in ["title", "workspace_name"] {
+        let display = reply["sessions"][0][field].as_str().unwrap();
+        assert!(display.len() <= 512);
+        assert!(display.starts_with(&"한".repeat(168)));
+        assert!(
+            !display.contains("boundary"),
+            "redact the complete secret before clipping"
+        );
+    }
+}

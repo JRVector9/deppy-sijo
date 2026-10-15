@@ -194,8 +194,11 @@ impl CloudAgent {
                         let permission = self.connection_permission(&info.principal.id, &target);
                         let mut read = active && permission.read;
                         let mut input = active && permission.input;
+                        // Ended targets retain their last screen and read consent.
+                        // Permit revocation without opening a new ended-target grant.
+                        let read_enabled = active && (target.live || permission.read);
                         let read_response = cells[2]
-                            .add_enabled_ui(active && target.live, |ui| {
+                            .add_enabled_ui(read_enabled, |ui| {
                                 ui.add_sized(
                                     egui::vec2(layout::CONTROL_HEIGHT, layout::CONTROL_HEIGHT),
                                     egui::Checkbox::without_text(&mut read),
@@ -205,7 +208,7 @@ impl CloudAgent {
                         read_response.widget_info(|| {
                             egui::WidgetInfo::selected(
                                 egui::WidgetType::Checkbox,
-                                active && target.live,
+                                read_enabled,
                                 read,
                                 catalog.t("cloud.connection_read", &[]),
                             )

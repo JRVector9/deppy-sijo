@@ -439,6 +439,7 @@ document.saved = 已保存
 document.dirty = 未保存
 document.loading = 加载中…
 document.limit.save_too_large = 编辑内容已保留 — 超过 8 MiB 时无法保存。减小内容后即可再次保存。
+document.limit.input_rejected = 输入超过单个文档8 MiB或全部文档24 MiB的上限，已被拒绝。原有内容已保留。
 document.limit.grew_past_full = 当前 {bytes} 字节 — 已超过 1 MiB 编辑上限，输入可能变慢
 document.limit.view_only = 只读 — {bytes} 字节(超过 1 MiB)
 document.limit.refused = 该文档超过 8 MiB({bytes} 字节),无法打开。请尝试用系统默认应用打开。

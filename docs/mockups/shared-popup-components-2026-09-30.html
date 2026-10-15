@@ -204,7 +204,7 @@
       batch_spawn: { width: 480, title: '에이전트 일괄 시작', subtitle: '선택한 에이전트의 세션을 여러 개 만듭니다.', body: `<div class="field"><label for="batch-agent">에이전트</label><select id="batch-agent"><option>Codex</option></select></div><div class="field"><label for="batch-count">개수</label><input id="batch-count" type="number" min="1" value="3"></div>`, footer: buttons('시작') },
       prompt_palette: { width: 560, title: '저장된 프롬프트', subtitle: '검색·삽입·편집을 한 창에서 처리합니다.', body: `<div class="field"><label for="prompt-search">프롬프트 검색</label><input id="prompt-search" placeholder="제목이나 태그 검색"></div><div class="menu"><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>테스트 실행 후 결과 요약</span></button><button class="menu-item" type="button" data-toast="프롬프트 선택"><span>코드 리뷰 요청</span></button></div>`, footer: buttons('새 프롬프트') },
       prompt_delete: confirm('저장된 프롬프트 삭제', '프롬프트 상세 화면 안에 확인 문구가 나타납니다.', '선택한 프롬프트를 삭제할까요?', '삭제'),
-      document_dirty: { width: 480, title: '저장하지 않은 변경 사항', subtitle: 'notes.md', body: `<div class="notice danger-note"><span class="symbol">!</span><span>저장하지 않은 내용을 버리면 복구할 수 없습니다. 여러 문서가 대기 중이면 차례로 확인합니다. 다음 문서에서는 이전 버리기 버튼의 키보드 초점을 해제합니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn" type="button" data-toast="저장 후 닫기를 시연합니다.">저장</button><button class="btn danger" type="button" data-toast="변경 내용을 버리고 닫기를 시연합니다.">버리기</button>` },
+      document_dirty: { width: 480, title: '저장하지 않은 변경 사항', subtitle: 'notes.md', body: `<div class="notice danger-note"><span class="symbol">!</span><span>저장하지 않은 내용을 버리면 복구할 수 없습니다. 여러 문서가 대기 중이면 차례로 확인합니다. 다음 문서에서는 이전 버리기 버튼의 키보드 초점을 해제합니다. 세션·워크스페이스·앱을 닫을 때도 이 확인을 거치며, 취소·저장 실패·충돌이면 내용과 원래 대상을 유지합니다.</span></div>`, footer: `<button class="btn ghost" type="button" data-close>취소</button><button class="btn" type="button" data-toast="저장 후 닫기를 시연합니다.">저장</button><button class="btn danger" type="button" data-toast="변경 내용을 버리고 닫기를 시연합니다.">버리기</button>` },
       document_conflict: confirm('파일이 외부에서 바뀌었습니다', 'notes.md · 다른 프로그램에서 변경됨', '다시 불러오면 Deppy에서 저장하지 않은 편집 내용이 사라집니다.', '다시 불러오기', 'danger'),
       document_cap: { ...info('문서 탭 한도', '', '열린 문서 탭이 모두 저장하지 않은 상태라 자리를 자동으로 만들 수 없습니다. 문서 하나를 저장하거나 닫은 뒤 다시 열어 주세요.'), footer: '<button class="btn primary" type="button" data-close>닫기</button>' },
       credential_delete: confirm('API 키 삭제', 'production 키', '키체인에 저장된 비밀 값도 함께 삭제됩니다.', 'API 키 삭제'),
@@ -258,7 +258,7 @@
         ['resource_kill', '리소스 관리자 세션 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/resource_manager.rs'],
         ['resource_unattached', '연결되지 않은 프로세스 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/resource_manager.rs'],
         ['port_kill', '포트 점유 프로세스 종료', '공용 확인 Modal 적용', 'crates/app/src/ui/ports.rs'],
-        ['delete', '휴지통 실패 후 영구 삭제', '공용 확인 Modal · 목록 숨김에도 표시·입력 보호', 'crates/app/src/ui/file_tree.rs'],
+        ['delete', '휴지통 실패 후 영구 삭제', '공용 확인 Modal · 원래 객체 증명·worker 재검증·입력 보호', 'crates/app/src/ui/file_tree.rs'],
         ['credential_delete', 'API 키 삭제', 'Window', 'crates/app/src/ui/credentials.rs:763'],
         ['env_delete', '환경변수 정의 삭제', '공용 Modal · 원본 파일 선택·취소', 'crates/app/src/ui/environment_dialogs.rs · env_profiles.rs'],
         ['mcp_delete', 'MCP 서버 삭제', 'Window · 승인·인증 중 대상 보존', 'crates/connector-ui/src/lib.rs'],
@@ -272,7 +272,7 @@
         ['mcp_invoke', 'MCP 도구 직접 실행', '공용 중앙 이동·크기 조절 창 · 승인·인증 중 인자 초안 보존', 'crates/connector-ui/src/lib.rs'],
         ['mcp_approval', 'MCP 도구 실행 승인', 'Window · 요청별 포커스 초기화', 'crates/connector-ui/src/lib.rs:791'],
         ['mcp_trust', '원격 MCP 주소 신뢰', 'Window', 'crates/connector-ui/src/lib.rs:831'],
-        ['mcp_oauth', 'MCP OAuth 진행·동의', 'Window', 'crates/connector-ui/src/lib.rs:866']
+        ['mcp_oauth', 'MCP OAuth 진행·동의', 'Window · 비밀값 마스크·종료 시 undo 정리', 'crates/connector-ui/src/lib.rs:866']
       ]],
       ['문서·프로젝트 경로', [
         ['document_dirty', '미저장 문서 닫기', '공용 팝업 · 대상별 초점·반응형 버튼', 'crates/app/src/ui/document_dialogs.rs'],

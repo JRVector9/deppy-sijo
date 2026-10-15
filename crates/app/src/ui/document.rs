@@ -264,8 +264,55 @@ pub fn toolbar(
 /// 조합됐고, Split 모드는 컨테이너를 한 겹 더 씌우므로 Source 모드와 다른 id가 됐다 —
 /// 모드를 오갈 때마다 커서와 undo 기록이 따로 놀았다(2026-08-23 리뷰). 게다가 App이
 /// 그 조합을 역산하는 취약한 공식을 들고 있어야 했다.
+#[cfg(test)]
 pub fn source_editor(ui: &mut egui::Ui, id: egui::Id, source: &mut String, editable: bool) -> bool {
-    egui::ScrollArea::vertical()
+    source_editor_with_budget(
+        ui,
+        id,
+        source,
+        editable,
+        crate::document_io::DOCUMENT_REFUSE_BYTES_MAX as usize,
+    )
+    .0
+}
+
+/// App supplies the remaining global source+saved-source budget. A buffer adapter
+/// enforces UTF-8 bytes for paste, IME, ordinary input and undo/redo replacement.
+/// Overflow-only snapshots preserve selection and undo without cloning idle text.
+pub(crate) fn source_editor_with_budget(
+    ui: &mut egui::Ui,
+    id: egui::Id,
+    source: &mut String,
+    editable: bool,
+    max_bytes: usize,
+) -> (bool, bool) {
+    super::text_input::initialize_bounded_undo(ui.ctx(), id);
+    // TextEdit may acquire keyboard focus during this frame. The rare overflow
+    // event, rather than the previous frame's focus, controls rollback capture.
+    let needs_backup = editable && ui.input(|input| {
+        let incoming = input.events.iter().map(|event| match event {
+            egui::Event::Text(text) | egui::Event::Paste(text)
+            | egui::Event::Ime(egui::ImeEvent::Preedit { text, .. } | egui::ImeEvent::Commit(text)) => text.len(),
+            egui::Event::Key { key: egui::Key::Enter | egui::Key::Tab, pressed: true, .. } => 1,
+            _ => 0,
+        }).fold(0usize, usize::saturating_add);
+        let undo = input.events.iter().any(|event| matches!(event,
+            egui::Event::Key { key: egui::Key::Z | egui::Key::Y, pressed: true, modifiers, .. } if modifiers.command));
+        incoming > max_bytes.saturating_sub(source.len()) || undo
+    });
+    let backup = needs_backup.then(|| source.clone());
+    let state = needs_backup
+        .then(|| egui::TextEdit::load_state(ui.ctx(), id))
+        .flatten();
+    let undo_history = state.as_ref().map(|state| state.undoer());
+    let mut rejected = false;
+    let mut buffer = super::text_input::BoundedTextBuffer {
+        text: source,
+        max_bytes,
+        rejected: &mut rejected,
+        normalize_nfc: false,
+    };
+    let changed = egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
             // 원문은 **고정폭**이어야 한다 — `TextEdit`의 기본은 비례 폰트라 표·
@@ -273,7 +320,7 @@ pub fn source_editor(ui: &mut egui::Ui, id: egui::Id, source: &mut String, edita
             let font = egui::TextStyle::Monospace.resolve(ui.style());
             let row = ui.fonts_mut(|fonts| fonts.row_height(&font));
             ui.add(
-                egui::TextEdit::multiline(source)
+                egui::TextEdit::multiline(&mut buffer)
                     .id(id)
                     .interactive(editable)
                     .font(font.clone())
@@ -311,12 +358,231 @@ pub fn source_editor(ui: &mut egui::Ui, id: egui::Id, source: &mut String, edita
             )
         })
         .inner
-        .changed()
+        .changed();
+    if rejected {
+        if let Some(original) = backup {
+            *source = original;
+        }
+        if let Some(mut state) = state {
+            if let Some(history) = undo_history {
+                state.set_undoer(history);
+            }
+            state.store(ui.ctx(), id);
+        }
+        ui.ctx().request_repaint();
+    }
+    (changed && !rejected, rejected)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_budget_editor(
+        ctx: &egui::Context,
+        id: egui::Id,
+        source: &mut String,
+        max_bytes: usize,
+        events: Vec<egui::Event>,
+    ) -> (bool, bool) {
+        let mut result = (false, false);
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 700.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                result = source_editor_with_budget(ui, id, source, true, max_bytes);
+            },
+        );
+        output.textures_delta.clear();
+        result
+    }
+
+    fn select_editor_source(ctx: &egui::Context, id: egui::Id, source: &str) {
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut state = egui::TextEdit::load_state(ctx, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(source.chars().count()),
+            )));
+        state.store(ctx, id);
+    }
+
+    #[test]
+    fn full_fix_20261014_document_editor_budget_measures_utf8_bytes() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("utf8-budget");
+        let mut source = String::new();
+        run_budget_editor(&ctx, id, &mut source, 8, vec![]);
+        select_editor_source(&ctx, id, &source);
+        assert_eq!(
+            run_budget_editor(
+                &ctx,
+                id,
+                &mut source,
+                8,
+                vec![egui::Event::Paste("한글가".into())]
+            ),
+            (false, true)
+        );
+        assert!(
+            source.is_empty(),
+            "three Unicode characters exceed an eight-byte budget"
+        );
+        assert_eq!(
+            run_budget_editor(
+                &ctx,
+                id,
+                &mut source,
+                8,
+                vec![egui::Event::Text("한글".into())]
+            ),
+            (true, false)
+        );
+        assert_eq!(source, "한글");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_editor_allows_replacement_within_byte_budget() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("selection-budget");
+        let mut source = "abc".to_owned();
+        run_budget_editor(&ctx, id, &mut source, 3, vec![]);
+        select_editor_source(&ctx, id, &source);
+        assert_eq!(
+            run_budget_editor(
+                &ctx,
+                id,
+                &mut source,
+                3,
+                vec![egui::Event::Paste("한".into())]
+            ),
+            (true, false)
+        );
+        assert_eq!(source, "한");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_editor_ime_rejection_preserves_preedit_selection() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("ime-budget");
+        let mut source = "ab".to_owned();
+        run_budget_editor(&ctx, id, &mut source, 2, vec![]);
+        select_editor_source(&ctx, id, &source);
+        assert_eq!(
+            run_budget_editor(
+                &ctx,
+                id,
+                &mut source,
+                2,
+                vec![egui::Event::Ime(egui::ImeEvent::Preedit {
+                    text: "한".into(),
+                    active_range_chars: None
+                })]
+            ),
+            (false, true)
+        );
+        assert_eq!(source, "ab");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_editor_new_aggregate_budget_blocks_oversized_undo() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("undo-budget");
+        let mut source = "ok".to_owned();
+        run_budget_editor(&ctx, id, &mut source, 8, vec![]);
+        select_editor_source(&ctx, id, &source);
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        let cursor = state.cursor.char_range().unwrap();
+        let mut history = egui::util::undoer::Undoer::default();
+        history.feed_state(0.0, &(cursor, "original".to_owned()));
+        history.feed_state(1.0, &(cursor, "ok".to_owned()));
+        history.feed_state(2.0, &(cursor, "ok".to_owned()));
+        assert_eq!(
+            history.clone().undo(&(cursor, source.clone())).unwrap().1,
+            "original",
+            "the actual undo target must exceed the new byte budget"
+        );
+        state.set_undoer(history);
+        state.store(&ctx, id);
+        let result = run_budget_editor(
+            &ctx,
+            id,
+            &mut source,
+            2,
+            vec![egui::Event::Key {
+                key: egui::Key::Z,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+        );
+        assert_eq!(result, (false, true));
+        assert_eq!(
+            source, "ok",
+            "undo cannot exceed the remaining aggregate byte budget"
+        );
+        let state = egui::TextEdit::load_state(&ctx, id).unwrap();
+        assert_eq!(state.cursor.char_range(), Some(cursor));
+        assert_eq!(
+            state.undoer().undo(&(cursor, source.clone())).unwrap().1,
+            "original",
+            "a rejected undo preserves its original history for a later larger budget"
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_document_oversized_paste_preserves_selection() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("document-byte-budget-regression");
+        let mut source = "keep my selected text".to_owned();
+        let run = |source: &mut String, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(900.0, 700.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    source_editor(ui, id, source, true);
+                },
+            );
+            output.textures_delta.clear();
+        };
+        run(&mut source, vec![]);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut state = egui::text_edit::TextEditState::load(&ctx, id).unwrap();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::two(
+                egui::text::CCursor::new(0),
+                egui::text::CCursor::new(source.chars().count()),
+            )));
+        state.store(&ctx, id);
+        let payload = "a\n".repeat(9 * 1024 * 1024 / 2);
+        let start = std::time::Instant::now();
+        run(&mut source, vec![egui::Event::Paste(payload)]);
+        eprintln!(
+            "oversized paste: retained={} elapsed={:?}",
+            source.len(),
+            start.elapsed()
+        );
+        assert_eq!(
+            source, "keep my selected text",
+            "rejected paste must preserve existing selection"
+        );
+    }
 
     fn snapshot(
         mode: DocumentViewMode,

@@ -113,14 +113,19 @@ impl DocumentIoErrorCode {
 pub struct DocumentRevision {
     modified: std::time::SystemTime,
     len: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     device: u64,
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     inode: u64,
 }
 
 impl DocumentRevision {
-    fn from_metadata(metadata: &std::fs::Metadata) -> Result<Self, DocumentIoErrorCode> {
+    fn from_file_metadata(
+        file: &std::fs::File,
+        metadata: &std::fs::Metadata,
+    ) -> Result<Self, DocumentIoErrorCode> {
+        #[cfg(not(windows))]
+        let _ = file;
         let modified = metadata
             .modified()
             .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
@@ -134,7 +139,31 @@ impl DocumentRevision {
                 inode: metadata.ino(),
             })
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle as _;
+            use windows_sys::Win32::Storage::FileSystem::{
+                BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+            };
+            let mut identity = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+            // SAFETY: the open handle remains live and the API writes the whole
+            // information structure only on success; no uninitialized read occurs.
+            if unsafe { GetFileInformationByHandle(file.as_raw_handle(), identity.as_mut_ptr()) }
+                == 0
+            {
+                return Err(DocumentIoErrorCode::MetadataFailed);
+            }
+            // SAFETY: the successful API call initialized every field.
+            let identity = unsafe { identity.assume_init() };
+            Ok(Self {
+                modified,
+                len: metadata.len(),
+                device: u64::from(identity.dwVolumeSerialNumber),
+                inode: (u64::from(identity.nFileIndexHigh) << 32)
+                    | u64::from(identity.nFileIndexLow),
+            })
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             Ok(Self {
                 modified,
@@ -199,15 +228,37 @@ enum RawRead {
     },
 }
 
-/// 상한까지만 읽는다. 상한을 넘는 파일은 본문을 아예 읽지 않고 크기만 돌려준다.
-fn read_document_bounded(path: &Path) -> Result<RawRead, DocumentIoErrorCode> {
-    let mut file = std::fs::File::open(path).map_err(|error| {
+/// Open before checking the handle's type, without waiting for a FIFO peer.
+/// Following ordinary symlinks is intentional; save resolves and revalidates
+/// the same regular target rather than replacing the link entry.
+fn open_document_file(path: &Path) -> Result<std::fs::File, DocumentIoErrorCode> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             DocumentIoErrorCode::NotFound
         } else {
             DocumentIoErrorCode::ReadFailed
         }
     })?;
+    if !file
+        .metadata()
+        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?
+        .is_file()
+    {
+        return Err(DocumentIoErrorCode::FileTypeInvalid);
+    }
+    Ok(file)
+}
+
+/// 상한까지만 읽는다. 상한을 넘는 파일은 본문을 아예 읽지 않고 크기만 돌려준다.
+fn read_document_bounded(path: &Path) -> Result<RawRead, DocumentIoErrorCode> {
+    let mut file = open_document_file(path)?;
     let opened = file
         .metadata()
         .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
@@ -235,11 +286,14 @@ fn read_document_bounded(path: &Path) -> Result<RawRead, DocumentIoErrorCode> {
     let after = file
         .metadata()
         .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
-    if after.len() != bytes.len() as u64 {
+    if after.len() != bytes.len() as u64
+        || DocumentRevision::from_file_metadata(&file, &opened)?
+            != DocumentRevision::from_file_metadata(&file, &after)?
+    {
         return Err(DocumentIoErrorCode::Changed);
     }
 
-    let revision = DocumentRevision::from_metadata(&after)?;
+    let revision = DocumentRevision::from_file_metadata(&file, &after)?;
     Ok(RawRead::Content { bytes, revision })
 }
 
@@ -277,17 +331,11 @@ pub fn load_document(request: &DocumentLoadRequest) -> DocumentLoadOutcome {
 
 /// 저장 직전 다시 읽는 현재 revision(내용은 읽지 않는다).
 fn current_revision(path: &Path) -> Result<DocumentRevision, DocumentIoErrorCode> {
-    let metadata = std::fs::metadata(path).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            DocumentIoErrorCode::NotFound
-        } else {
-            DocumentIoErrorCode::MetadataFailed
-        }
-    })?;
-    if !metadata.is_file() {
-        return Err(DocumentIoErrorCode::FileTypeInvalid);
-    }
-    DocumentRevision::from_metadata(&metadata)
+    let file = open_document_file(path)?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
+    DocumentRevision::from_file_metadata(&file, &metadata)
 }
 
 struct TempFileGuard(Option<PathBuf>);
@@ -309,7 +357,22 @@ impl Drop for TempFileGuard {
 /// 같은 디렉터리에 임시 파일을 flush한 뒤 atomic replace한다. 실패 시 대상 파일은
 /// 절대 건드리지 않는다 — rename은 한 번만, 임시 파일이 완전히 쓰이고 sync된 뒤에만
 /// 호출한다.
-fn atomic_write_document(path: &Path, contents: &[u8]) -> Result<(), DocumentIoErrorCode> {
+enum DocumentCommitError {
+    Conflict,
+    Io(DocumentIoErrorCode),
+}
+
+impl From<DocumentIoErrorCode> for DocumentCommitError {
+    fn from(code: DocumentIoErrorCode) -> Self {
+        Self::Io(code)
+    }
+}
+
+fn atomic_write_document(
+    path: &Path,
+    contents: &[u8],
+    validate_commit: impl FnOnce() -> bool,
+) -> Result<DocumentRevision, DocumentCommitError> {
     let parent = path.parent().ok_or(DocumentIoErrorCode::ParentMissing)?;
     let file_name = path
         .file_name()
@@ -337,8 +400,18 @@ fn atomic_write_document(path: &Path, contents: &[u8]) -> Result<(), DocumentIoE
         .map_err(|_| DocumentIoErrorCode::TempWriteFailed)?;
     file.sync_all()
         .map_err(|_| DocumentIoErrorCode::TempSyncFailed)?;
+    let written_metadata = file
+        .metadata()
+        .map_err(|_| DocumentIoErrorCode::MetadataFailed)?;
+    let written_revision = DocumentRevision::from_file_metadata(&file, &written_metadata)?;
     drop(file);
 
+    // This checks after write+sync, when the expensive work is complete. Ordinary
+    // filesystem rename has no compare-and-swap against an unrelated writer:
+    // changes after this final check still require cooperation from that writer.
+    if !validate_commit() {
+        return Err(DocumentCommitError::Conflict);
+    }
     atomic_replace(&temp, path).map_err(|_| DocumentIoErrorCode::ReplaceFailed)?;
     guard.disarm();
 
@@ -348,7 +421,7 @@ fn atomic_write_document(path: &Path, contents: &[u8]) -> Result<(), DocumentIoE
     {
         let _ = std::fs::File::open(parent).and_then(|directory| directory.sync_all());
     }
-    Ok(())
+    Ok(written_revision)
 }
 
 #[cfg(unix)]
@@ -435,12 +508,32 @@ pub fn save_document(request: DocumentSaveRequest) -> DocumentSaveOutcome {
         }
     }
 
-    let outcome = match atomic_write_document(&request.path, request.contents.as_bytes()) {
-        Ok(()) => match current_revision(&request.path) {
-            Ok(revision) => DocumentSaveOutcome::Saved { revision },
-            Err(code) => DocumentSaveOutcome::Failed { code },
-        },
-        Err(code) => DocumentSaveOutcome::Failed { code },
+    // Resolve symlinks to the object loaded above. Revalidate both the alias and
+    // resolved path before commit, so a retargeted alias never redirects saving.
+    let target = match std::fs::canonicalize(&request.path) {
+        Ok(target) => target,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return DocumentSaveOutcome::Conflict;
+        }
+        Err(_) => {
+            return DocumentSaveOutcome::Failed {
+                code: DocumentIoErrorCode::MetadataFailed,
+            };
+        }
+    };
+    let expected = request.expected_revision;
+    let validate = || {
+        current_revision(&request.path) == Ok(expected) && current_revision(&target) == Ok(expected)
+    };
+    if !validate() {
+        return DocumentSaveOutcome::Conflict;
+    }
+    let outcome = match atomic_write_document(&target, request.contents.as_bytes(), validate) {
+        // The expected revision must describe our written object, not a later
+        // external edit observed after rename. That later edit conflicts next time.
+        Ok(revision) => DocumentSaveOutcome::Saved { revision },
+        Err(DocumentCommitError::Conflict) => DocumentSaveOutcome::Conflict,
+        Err(DocumentCommitError::Io(code)) => DocumentSaveOutcome::Failed { code },
     };
     if let DocumentSaveOutcome::Failed { code } = &outcome {
         tracing::warn!(
@@ -456,6 +549,176 @@ pub fn save_document(request: DocumentSaveRequest) -> DocumentSaveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn full_fix_20261014_document_fifo_does_not_block_load_lane() {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        use std::time::{Duration, Instant};
+        let dir = unique_dir("fifo-lane");
+        let fifo = dir.join("blocked.md");
+        let regular = write_file(&dir, "normal.md", b"normal document");
+        let native = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: the private fixture path is a valid NUL-terminated string.
+        assert_eq!(unsafe { libc::mkfifo(native.as_ptr(), 0o600) }, 0);
+        let mut worker = crate::lazy_worker::LazyBoundedWorker::new(
+            "document-fifo-regression",
+            Duration::from_secs(30),
+            || |request: DocumentLoadRequest| load_document(&request),
+            || {},
+        );
+        worker
+            .try_request(DocumentLoadRequest { path: fifo.clone() })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(250);
+        let early = loop {
+            if let Some(result) = worker.try_recv() {
+                break Some(result.into_result().unwrap());
+            }
+            if Instant::now() >= until {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        };
+        if early.is_none() {
+            // Release the old blocking reader before asserting RED; never leave
+            // a lane or Drop::join waiting on this fixture.
+            let writer = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+                .unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                if worker.try_recv().is_some() {
+                    break;
+                }
+                assert!(
+                    Instant::now() < until,
+                    "FIFO fixture reader did not release"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            drop(writer);
+        }
+        worker
+            .try_request(DocumentLoadRequest { path: regular })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(result) = worker.try_recv() {
+                assert!(matches!(
+                    result.into_result().unwrap(),
+                    DocumentLoadOutcome::Loaded { .. }
+                ));
+                break;
+            }
+            assert!(Instant::now() < until, "normal load did not finish");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(worker);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(
+                early,
+                Some(DocumentLoadOutcome::Failed {
+                    code: DocumentIoErrorCode::FileTypeInvalid
+                })
+            ),
+            "FIFO must be rejected before opening a writer"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_fix_20261014_document_symlink_save_preserves_loaded_target() {
+        let dir = unique_dir("symlink-target");
+        let target = write_file(&dir, "target.md", b"old source");
+        let alias = dir.join("alias.md");
+        std::os::unix::fs::symlink("target.md", &alias).unwrap();
+        let DocumentLoadOutcome::Loaded { revision, .. } = load_document(&DocumentLoadRequest {
+            path: alias.clone(),
+        }) else {
+            panic!("load failed");
+        };
+        let outcome = save_document(DocumentSaveRequest {
+            path: alias.clone(),
+            contents: "new source".into(),
+            expected_revision: revision,
+        });
+        let link_preserved = std::fs::symlink_metadata(&alias)
+            .unwrap()
+            .file_type()
+            .is_symlink();
+        let target_bytes = std::fs::read(&target).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(matches!(outcome, DocumentSaveOutcome::Saved { .. }));
+        assert!(link_preserved, "saving must preserve an admitted symlink");
+        assert_eq!(target_bytes, b"new source");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_external_edit_during_temp_write_conflicts() {
+        use std::time::{Duration, Instant};
+        let dir = unique_dir("save-race");
+        let target = write_file(&dir, "doc.md", b"original");
+        let DocumentLoadOutcome::Loaded { revision, .. } = load_document(&DocumentLoadRequest {
+            path: target.clone(),
+        }) else {
+            panic!("load failed");
+        };
+        let observer_dir = dir.clone();
+        let observer_target = target.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let observer = std::thread::spawn(move || {
+            ready_tx.send(()).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            loop {
+                let has_temp = || {
+                    std::fs::read_dir(&observer_dir)
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .any(|entry| {
+                            entry
+                                .file_name()
+                                .to_string_lossy()
+                                .contains("deppy-doc-tmp")
+                        })
+                };
+                if has_temp() {
+                    std::fs::write(
+                        &observer_target,
+                        b"external edit after initial revision check",
+                    )
+                    .unwrap();
+                    return has_temp();
+                }
+                assert!(
+                    Instant::now() < until,
+                    "temp-write race fixture was not reached"
+                );
+                std::thread::yield_now();
+            }
+        });
+        ready_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let outcome = save_document(DocumentSaveRequest {
+            path: target.clone(),
+            contents: "n".repeat(DOCUMENT_REFUSE_BYTES_MAX as usize),
+            expected_revision: revision,
+        });
+        let before_commit = observer.join().unwrap();
+        let bytes = std::fs::read(&target).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            before_commit,
+            "external edit must finish before commit for this regression"
+        );
+        assert!(
+            matches!(outcome, DocumentSaveOutcome::Conflict),
+            "concurrent edit must return Conflict: {outcome:?}"
+        );
+        assert_eq!(bytes, b"external edit after initial revision check");
+    }
 
     fn unique_dir(label: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

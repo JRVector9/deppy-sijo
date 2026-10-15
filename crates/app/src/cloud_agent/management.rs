@@ -3,13 +3,18 @@ use super::{CloudAgent, Request, Target, field, truncate_utf8};
 use crate::cloud_history_worker::{Job, ResultKind};
 use agent_mcp::{Auth, CloudRun, RunQuery, RunState, RunUpdate, now};
 use serde_json::{Value, json};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 const MAX_PENDING: usize = 16;
 const MAX_PENDING_BYTES: usize = 512 * 1024;
 const MAX_CACHED_RUNS: usize = 100;
 const MAX_CACHE_BYTES: usize = 1024 * 1024;
 const HEARTBEAT_TIMEOUT: i64 = 60;
+const MAINTENANCE_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 struct Fence {
     request: Request,
@@ -67,14 +72,24 @@ impl Pending {
 pub(super) struct Management {
     runs: Vec<CloudRun>,
     pending: HashMap<u64, Pending>,
-    bootstrap_started: bool,
+    stopping: bool,
+    bootstrap_initialized: bool,
+    bootstrap_in_flight: bool,
+    retry_after: Option<Instant>,
 }
 impl CloudAgent {
+    pub(super) fn seal_management(&mut self) {
+        self.management.stopping = true;
+        self.management.retry_after = None;
+    }
     pub(super) fn prepare_management(
         &mut self,
         req: &Request,
         target: Option<&Target>,
     ) -> Result<Option<Value>, String> {
+        if self.management.stopping {
+            return Err("shutdown_no_effect".into());
+        }
         if !self.history_ready {
             return Err("history_unavailable_no_effect".into());
         }
@@ -337,6 +352,30 @@ impl CloudAgent {
         let Some(pending) = self.management.pending.remove(&token) else {
             return;
         };
+        if matches!(pending.stage, Stage::Bootstrap) {
+            self.management.bootstrap_in_flight = false;
+            self.management.bootstrap_initialized = matches!(&result, ResultKind::ListRuns(Ok(_)));
+        }
+        // A failed maintenance read/save must not be admitted again on every
+        // frame. The deadline retains no job and is ignored once shutdown seals
+        // admission; already accepted finite continuations still drain below.
+        if !self.management.stopping
+            && pending.fence.is_none()
+            && matches!(
+                (&pending.stage, &result),
+                (Stage::Bootstrap, ResultKind::ListRuns(Err(())))
+                    | (Stage::Stale { .. }, ResultKind::GetRun(Err(())))
+                    | (
+                        Stage::Save {
+                            status: "stale",
+                            ..
+                        },
+                        ResultKind::SaveRun(Err(()))
+                    )
+            )
+        {
+            self.management.retry_after = Some(Instant::now() + MAINTENANCE_RETRY_DELAY);
+        }
         // The operator cache reflects durable truth independently of whether
         // the original caller still has permission to receive a response.
         if matches!(&result, ResultKind::SaveRun(Ok(())))
@@ -483,6 +522,11 @@ impl CloudAgent {
                 }
                 match result {
                     Ok(mut page) => {
+                        if matches!(pending.stage, Stage::Bootstrap)
+                            && self.error.as_deref() == Some("run_history_read_failed")
+                        {
+                            self.error = None;
+                        }
                         if let Some(fence) = &pending.fence {
                             page.runs.retain(|run| {
                                 run.connection_id == fence.request.principal.id
@@ -534,9 +578,6 @@ impl CloudAgent {
         }
     }
     pub(super) fn poll_management(&mut self) {
-        if !self.history_ready {
-            return;
-        }
         let queued: Vec<_> = self
             .management
             .pending
@@ -554,7 +595,20 @@ impl CloudAgent {
                 self.management.pending.get_mut(&token).unwrap().queued = Some(*job);
             }
         }
-        if self.history_ready && !self.management.bootstrap_started {
+        // Local saves retained before shutdown may still need actor capacity.
+        // Only the creation of new bootstrap/stale work is sealed here.
+        if self.management.stopping || !self.history_ready {
+            return;
+        }
+        if self
+            .management
+            .retry_after
+            .is_some_and(|after| Instant::now() < after)
+        {
+            return;
+        }
+        self.management.retry_after = None;
+        if !self.management.bootstrap_initialized && !self.management.bootstrap_in_flight {
             let pending = Pending {
                 fence: None,
                 stage: Stage::Bootstrap,
@@ -570,7 +624,9 @@ impl CloudAgent {
                 )
                 .is_ok()
             {
-                self.management.bootstrap_started = true;
+                self.management.bootstrap_in_flight = true;
+            } else {
+                self.management.retry_after = Some(Instant::now() + MAINTENANCE_RETRY_DELAY);
             }
         }
         let stale: Vec<_> = self
@@ -605,18 +661,20 @@ impl CloudAgent {
         }
     }
     pub(crate) fn management_poll_after(&self) -> Option<Duration> {
-        if !self.history_ready {
+        if self.management.stopping || !self.history_ready {
             return None;
         }
-        if self
+        let queued = self
             .management
             .pending
             .values()
             .any(|pending| pending.queued.is_some())
-        {
-            return Some(Duration::from_millis(250));
-        }
-        self.management
+            .then_some(MAINTENANCE_RETRY_DELAY);
+        let bootstrap = (!self.management.bootstrap_initialized
+            && !self.management.bootstrap_in_flight)
+            .then_some(Duration::ZERO);
+        let stale = self
+            .management
             .runs
             .iter()
             .filter(|run| !run.state.is_terminal() && run.state != RunState::Unknown)
@@ -628,7 +686,13 @@ impl CloudAgent {
                         .max(1) as u64,
                 )
             })
-            .min()
+            .min();
+        let maintenance = bootstrap.into_iter().chain(stale).min().map(|after| {
+            after.max(self.management.retry_after.map_or(Duration::ZERO, |retry| {
+                retry.saturating_duration_since(Instant::now())
+            }))
+        });
+        queued.into_iter().chain(maintenance).min()
     }
     pub fn cloud_runs(&self) -> Vec<CloudRun> {
         // Credentials can be loaded after history bootstrap or replaced later.
@@ -654,6 +718,9 @@ impl CloudAgent {
         })
     }
     pub fn request_run_cancel(&mut self, connection: &str, id: &str) -> Result<(), String> {
+        if self.management.stopping {
+            return Err("shutdown_no_effect".into());
+        }
         let run = self
             .management
             .runs
@@ -1250,7 +1317,7 @@ mod tests {
             bridge.history.wait().unwrap().result,
             ResultKind::SaveRun(Ok(()))
         ));
-        bridge.management.bootstrap_started = false;
+        bridge.management.bootstrap_initialized = false;
         bridge.poll_management();
         bridge.drain_history(|_, _| panic!("legacy bootstrap must not emit input"));
         assert_eq!(bridge.cloud_runs()[0].title, text);
@@ -1419,7 +1486,7 @@ mod tests {
             ResultKind::SaveRun(Ok(()))
         ));
 
-        bridge.management.bootstrap_started = false;
+        bridge.management.bootstrap_initialized = false;
         bridge.poll_management();
         bridge.drain_history(|_, _| panic!("legacy run bootstrap must not emit input"));
         let cached = &bridge.cloud_runs()[0];
@@ -1839,5 +1906,412 @@ mod tests {
             snapshot.truncated,
             "omitted legacy artifacts must remain explicit"
         );
+    }
+
+    #[test]
+    fn quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock() {
+        let directory =
+            std::env::temp_dir().join(format!("deppy-quality-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.db");
+        let db = agent_mcp::History::open(&path).unwrap();
+        let at = now() as i64;
+        let mut run = agent_mcp::CloudRun::new(
+            "saved-run",
+            "actor",
+            "Actor",
+            "workspace",
+            "session",
+            "generation",
+            "Saved report",
+            "",
+            at,
+        )
+        .unwrap();
+        db.save_run(&run).unwrap();
+        run.apply_report(
+            &run.actor(),
+            agent_mcp::RunUpdate {
+                state: agent_mcp::RunState::Running,
+                progress: None,
+                message: String::new(),
+                result: None,
+                artifacts: vec![],
+            },
+            at,
+        )
+        .unwrap();
+        db.save_run(&run).unwrap();
+        run.apply_report(
+            &run.actor(),
+            agent_mcp::RunUpdate {
+                state: agent_mcp::RunState::Completed,
+                progress: Some(100),
+                message: String::new(),
+                result: Some("Durable useful result".into()),
+                artifacts: vec![],
+            },
+            at,
+        )
+        .unwrap();
+        db.save_run(&run).unwrap();
+        drop(db);
+
+        let mut bridge = CloudAgent::new(
+            &path,
+            secret::RedactionService::new(),
+            egui::Context::default(),
+        );
+        bridge.initialize_history();
+        let open = bridge.history.wait().unwrap();
+        bridge.complete_history(
+            open,
+            &mut |_, _| panic!("bootstrap must not type"),
+            &mut vec![],
+        );
+        assert!(bridge.history_ready);
+
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        bridge.poll_management();
+        let bootstrap = bridge.history.wait().unwrap();
+        assert!(
+            matches!(&bootstrap.result, ResultKind::ListRuns(Err(()))),
+            "the initial native run load must actually fail under the exclusive lock"
+        );
+        bridge.complete_history(
+            bootstrap,
+            &mut |_, _| panic!("bootstrap must not type"),
+            &mut vec![],
+        );
+        assert!(bridge.cloud_runs().is_empty());
+        let retry_after = bridge
+            .management_poll_after()
+            .expect("bootstrap recovery must wake an empty cache");
+        assert!(retry_after > Duration::ZERO && retry_after <= MAINTENANCE_RETRY_DELAY);
+        for _ in 0..8 {
+            bridge.poll_management();
+        }
+        assert!(
+            bridge.management.pending.is_empty(),
+            "backoff must not retain repeated bootstrap jobs"
+        );
+        assert_eq!(
+            bridge.history.retained_bytes(),
+            0,
+            "backoff must not enqueue another actor job"
+        );
+        lock.execute_batch("COMMIT").unwrap();
+        drop(lock);
+
+        // Qualify the failure: the same actor still works after the lock is released.
+        let probe = bridge.operation_token();
+        assert!(
+            bridge
+                .history
+                .request(
+                    probe,
+                    Job::ListRuns {
+                        query: RunQuery::default(),
+                    }
+                )
+                .is_ok()
+        );
+        let recovered = bridge.history.wait().unwrap();
+        match &recovered.result {
+            ResultKind::ListRuns(Ok(page)) => {
+                assert_eq!(page.runs.len(), 1);
+                assert_eq!(page.runs[0].id, "saved-run");
+            }
+            _ => panic!("the actor must serve the persisted run again after SQLite unlocks"),
+        }
+        drop(recovered);
+
+        // Exercise the production wake deadline, without recreating the actor.
+        std::thread::sleep(retry_after);
+        bridge.drain_history(|_, _| panic!("history recovery must not type"));
+        let cached = bridge.cloud_runs();
+        bridge.shutdown();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert_eq!(
+            cached.len(),
+            1,
+            "a transient failed bootstrap must retry and reveal the saved run after SQLite recovers"
+        );
+        assert_eq!(cached[0].id, "saved-run");
+        assert_eq!(cached[0].result.as_deref(), Some("Durable useful result"));
+    }
+
+    #[test]
+    fn shutdown_drains_accepted_stale_read_and_durable_save_continuation() {
+        let directory = std::env::temp_dir().join(format!(
+            "deppy-shutdown-stale-continuation-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.db");
+        let mut bridge = CloudAgent::new(
+            &path,
+            secret::RedactionService::new(),
+            egui::Context::default(),
+        );
+        bridge.drain_history(|_, _| panic!("shutdown fixture must not type"));
+        let run = CloudRun::new(
+            "accepted-stale",
+            agent_mcp::LEGACY_CONNECTION_ID,
+            "Legacy",
+            "workspace",
+            "session",
+            "generation",
+            "Inspect",
+            "",
+            now() as i64 - 120,
+        )
+        .unwrap();
+        let token = bridge.operation_token();
+        assert!(
+            bridge
+                .history
+                .request(token, Job::SaveRun { run: run.clone() })
+                .is_ok()
+        );
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::SaveRun(Ok(()))
+        ));
+        bridge.install_cloud_run(run);
+        bridge.poll_management();
+        assert!(
+            bridge
+                .management
+                .pending
+                .values()
+                .any(|pending| matches!(pending.stage, Stage::Stale { .. })),
+            "the stale read must be accepted before shutdown seals admission"
+        );
+
+        bridge.shutdown();
+        let db = agent_mcp::History::open(&path).unwrap();
+        let saved = db
+            .get_run(agent_mcp::LEGACY_CONNECTION_ID, "accepted-stale")
+            .unwrap()
+            .unwrap();
+        drop(db);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert_eq!(
+            saved.state,
+            RunState::Unknown,
+            "the accepted read's finite save must commit before shutdown returns"
+        );
+        assert_eq!(bridge.cloud_runs()[0].state, RunState::Unknown);
+        assert!(bridge.management.pending.is_empty());
+        assert_eq!(bridge.history.retained_bytes(), 0);
+        assert!(bridge.management_poll_after().is_none());
+    }
+
+    #[test]
+    fn shutdown_does_not_retry_an_accepted_failed_bootstrap() {
+        let directory =
+            std::env::temp_dir().join(format!("deppy-shutdown-bootstrap-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.db");
+        let mut bridge = CloudAgent::new(
+            &path,
+            secret::RedactionService::new(),
+            egui::Context::default(),
+        );
+        bridge.initialize_history();
+        let open = bridge.history.wait().unwrap();
+        bridge.complete_history(
+            open,
+            &mut |_, _| panic!("bootstrap must not type"),
+            &mut vec![],
+        );
+        assert!(bridge.history_ready);
+        let lock = rusqlite::Connection::open(&path).unwrap();
+        lock.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        bridge.poll_management();
+        assert!(bridge.management.bootstrap_in_flight);
+        bridge.shutdown();
+        let failed = bridge.error.as_deref() == Some("run_history_read_failed");
+        lock.execute_batch("ROLLBACK").unwrap();
+        drop(lock);
+        std::fs::remove_dir_all(&directory).unwrap();
+
+        assert!(
+            failed,
+            "the accepted bootstrap must actually fail under the external lock"
+        );
+        assert!(!bridge.management.bootstrap_initialized);
+        assert!(!bridge.management.bootstrap_in_flight);
+        assert!(
+            bridge.management.retry_after.is_none(),
+            "shutdown must not retain a retry timer"
+        );
+        bridge.poll_management();
+        assert!(bridge.management.pending.is_empty());
+        assert_eq!(bridge.history.retained_bytes(), 0);
+        assert!(bridge.management_poll_after().is_none());
+    }
+}
+
+#[cfg(test)]
+mod review_shutdown_20261015 {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    struct LockGuard(Option<rusqlite::Connection>);
+    impl LockGuard {
+        fn release(&mut self) {
+            if let Some(connection) = self.0.take() {
+                // Connection Drop also rolls back if this explicit release fails.
+                let _ = connection.execute_batch("ROLLBACK");
+            }
+        }
+    }
+    impl Drop for LockGuard {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn stale_shutdown_fixture(
+        hold_external_lock: bool,
+        admit_stale_before_shutdown: bool,
+    ) -> (bool, usize, u128) {
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-review-stale-shutdown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("cloud.db");
+        let completions = Arc::new(AtomicUsize::new(0));
+        let observed = completions.clone();
+        let mut bridge = CloudAgent::with_worker(
+            crate::cloud_history_worker::HistoryWorker::new(Some(path.clone()), move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+            secret::RedactionService::new(),
+        );
+        bridge.drain_history(|_, _| panic!("shutdown fixture never types"));
+        assert!(bridge.history_ready);
+        // The first drain opens history; its waiting path does not start run
+        // bootstrap. Complete that empty bootstrap before measuring stale work.
+        bridge.poll_management();
+        bridge.drain_history(|_, _| panic!("empty bootstrap must never type"));
+        assert!(bridge.management.bootstrap_initialized);
+        let run = CloudRun::new(
+            "stale-run",
+            agent_mcp::LEGACY_CONNECTION_ID,
+            "Legacy",
+            "workspace",
+            "session",
+            "g1",
+            "Inspect",
+            "",
+            now() as i64 - 120,
+        )
+        .unwrap();
+        let token = bridge.operation_token();
+        assert!(
+            bridge
+                .history
+                .request(token, Job::SaveRun { run: run.clone() })
+                .is_ok()
+        );
+        assert!(matches!(
+            bridge.history.wait().unwrap().result,
+            ResultKind::SaveRun(Ok(()))
+        ));
+        bridge.install_cloud_run(run);
+        assert!(
+            bridge.management.pending.is_empty(),
+            "no initial outstanding management jobs"
+        );
+        assert_eq!(
+            bridge.history.retained_bytes(),
+            0,
+            "no initial outstanding actor jobs"
+        );
+        assert!(bridge.management_poll_after().is_some());
+        // Worker publication sends a result before firing its wake callback.
+        // Observe all three initial callbacks (OpenPage, ListRuns, SaveRun) so
+        // their late wake cannot be counted as a shutdown-created completion.
+        let callbacks_deadline = Instant::now() + Duration::from_secs(1);
+        while completions.load(Ordering::SeqCst) < 3 && Instant::now() < callbacks_deadline {
+            std::thread::yield_now();
+        }
+        assert_eq!(completions.load(Ordering::SeqCst), 3);
+        let baseline_completions = completions.load(Ordering::SeqCst);
+        let external = rusqlite::Connection::open(&path).unwrap();
+        let mut lock = if hold_external_lock {
+            external.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            LockGuard(Some(external))
+        } else {
+            drop(external);
+            LockGuard(None)
+        };
+        if admit_stale_before_shutdown {
+            bridge.poll_management();
+            assert!(
+                bridge
+                    .management
+                    .pending
+                    .values()
+                    .any(|pending| matches!(pending.stage, Stage::Stale { .. })),
+                "the locked stale read must be accepted before shutdown"
+            );
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+        let started = Instant::now();
+        let worker = std::thread::spawn(move || {
+            bridge.shutdown();
+            let _ = done_tx.send(());
+        });
+        // Only one stale run exists, and its first GetRun has a 100ms SQLite
+        // busy timeout. Give finite draining seven times that budget. Always
+        // release the fixture lock and join before asserting on the baseline.
+        let ended_before_release = done_rx.recv_timeout(Duration::from_millis(700)).is_ok();
+        let completions_before_release = completions
+            .load(Ordering::SeqCst)
+            .saturating_sub(baseline_completions);
+        lock.release();
+        worker.join().unwrap();
+        let elapsed_ms = started.elapsed().as_millis();
+        std::fs::remove_dir_all(&dir).unwrap();
+        eprintln!(
+            "stale-shutdown: lock={hold_external_lock}, ended_before_release={ended_before_release}, completions_before_release={completions_before_release}, total_elapsed_ms={elapsed_ms}"
+        );
+        (ended_before_release, completions_before_release, elapsed_ms)
+    }
+
+    #[test]
+    fn review_20261015_shutdown_unlocked_stale_run_finishes() {
+        let (ended, _, elapsed) = stale_shutdown_fixture(false, false);
+        assert!(
+            ended,
+            "unlocked control must finish within 700ms, elapsed={elapsed}ms"
+        );
+    }
+
+    #[test]
+    fn review_20261015_shutdown_does_not_reenqueue_failed_stale_reads_forever() {
+        let (ended, repeated_completions, _) = stale_shutdown_fixture(true, false);
+        assert!(
+            ended,
+            "shutdown kept creating failed stale read jobs after close began ({repeated_completions} completions while the external lock remained held)"
+        );
+    }
+
+    #[test]
+    fn shutdown_drains_one_accepted_locked_stale_read_without_retrying() {
+        let (ended, completions, _) = stale_shutdown_fixture(true, true);
+        assert!(
+            ended,
+            "shutdown must finish while the external lock is held"
+        );
+        assert_eq!(completions, 1, "only the accepted stale query may finish");
     }
 }

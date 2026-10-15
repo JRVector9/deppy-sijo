@@ -173,6 +173,7 @@ struct Patterns {
     next_id: u64,
     active_leases: usize,
     fail_closed: bool,
+    revision: u64,
     #[cfg(test)]
     prune_scans: usize,
 }
@@ -227,7 +228,15 @@ impl Patterns {
         self.recompute();
     }
 
+    fn advance_revision(&mut self) {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .expect("redaction revision exhausted");
+    }
+
     fn recompute(&mut self) {
+        self.advance_revision();
         self.bytes = self.entries.iter().map(|entry| entry.bytes.len()).sum();
         self.max_len = self
             .entries
@@ -257,6 +266,22 @@ impl Patterns {
     }
 }
 
+/// A coherent, borrowed corpus for one display projection. Registration cannot change the
+/// matching rules between its revision check and the last field being redacted.
+pub struct RedactionSnapshot<'a> {
+    patterns: std::sync::MutexGuard<'a, Patterns>,
+}
+
+impl RedactionSnapshot<'_> {
+    pub fn revision(&self) -> u64 {
+        self.patterns.revision
+    }
+
+    pub fn redact_wrapped_text(&self, text: &str) -> String {
+        redact_wrapped_patterns(text, false, &self.patterns)
+    }
+}
+
 impl RedactionService {
     pub fn new() -> Self {
         Self::with_clock(
@@ -282,6 +307,16 @@ impl RedactionService {
                 clock,
             }),
         })
+    }
+
+    /// Locks the current corpus and prunes grace-expired patterns before exposing its revision.
+    /// Keep the snapshot scoped to one synchronous projection; do not call registration or another
+    /// matching method on this service while holding it.
+    pub fn snapshot(&self) -> RedactionSnapshot<'_> {
+        let now = self.inner.clock.now();
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(now);
+        RedactionSnapshot { patterns }
     }
 
     /// secret과 그 변형(base64, URL-encoded/form-encoded, JSON-escaped)을
@@ -483,11 +518,11 @@ impl RedactionService {
     }
 
     fn mark_fail_closed(&self) {
-        self.inner
-            .patterns
-            .lock()
-            .expect("redaction patterns lock")
-            .fail_closed = true;
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        if !patterns.fail_closed {
+            patterns.fail_closed = true;
+            patterns.advance_revision();
+        }
     }
 
     fn maximum_input_len(&self) -> usize {
@@ -609,74 +644,75 @@ impl RedactionService {
     }
 
     fn redact_wrapped(&self, text: &str, fragment: bool) -> String {
-        if text.is_empty() {
-            return String::new();
-        }
-        if text.len() > MAX_WRAPPED_TEXT_BYTES {
-            return String::from_utf8_lossy(REPLACEMENT).into_owned();
-        }
-        let now = self.inner.clock.now();
-        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
-        patterns.prune(now);
-        if patterns.fail_closed {
-            return String::from_utf8_lossy(REPLACEMENT).into_owned();
-        }
-        if patterns.entries.is_empty() {
-            return text.to_owned();
-        }
-        let buffer = text.as_bytes();
-        let (mut stripped, mut index_map) = strip_ansi_with_map(buffer);
-        // Store one maximum end per original start instead of allocating one span per match.
-        // Even a repetitive input with many overlapping patterns uses O(input length) memory.
-        let mut match_ends = vec![0; buffer.len()];
-        for pattern in &patterns.entries {
-            mark_mapped_matches(
-                &stripped,
-                &index_map,
-                pattern.bytes.as_slice(),
-                &mut match_ends,
-            );
-        }
-        let original_len = stripped.len();
-        let mut compact_len = 0;
-        for read in 0..stripped.len() {
-            if !matches!(stripped[read], b'\r' | b'\n') {
-                stripped[compact_len] = stripped[read];
-                index_map[compact_len] = index_map[read];
-                compact_len += 1;
-            }
-        }
-        stripped.truncate(compact_len);
-        index_map.truncate(compact_len);
-        let boundaries = (fragment && !stripped.is_empty())
-            .then(|| FragmentBoundaries::new(&stripped, patterns.max_len));
-        for pattern in &patterns.entries {
-            let bytes = pattern.bytes.as_slice();
-            let pattern_has_newlines = bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
-            if compact_len == original_len && !pattern_has_newlines && boundaries.is_none() {
-                continue;
-            }
-            let compact_pattern = if pattern_has_newlines {
-                std::borrow::Cow::Owned(
-                    bytes
-                        .iter()
-                        .copied()
-                        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
-                        .collect::<Vec<_>>(),
-                )
-            } else {
-                std::borrow::Cow::Borrowed(bytes)
-            };
-            if compact_len < original_len || pattern_has_newlines {
-                mark_mapped_matches(&stripped, &index_map, &compact_pattern, &mut match_ends);
-            }
-            if let Some(boundaries) = &boundaries {
-                boundaries.mark(&compact_pattern, &index_map, &mut match_ends);
-            }
-        }
-        expand_utf8_spans(text, &mut match_ends);
-        String::from_utf8_lossy(&replace_marked_spans(buffer, &match_ends)).into_owned()
+        redact_wrapped_patterns(text, fragment, &self.snapshot().patterns)
     }
+}
+
+fn redact_wrapped_patterns(text: &str, fragment: bool, patterns: &Patterns) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    if text.len() > MAX_WRAPPED_TEXT_BYTES {
+        return String::from_utf8_lossy(REPLACEMENT).into_owned();
+    }
+    if patterns.fail_closed {
+        return String::from_utf8_lossy(REPLACEMENT).into_owned();
+    }
+    if patterns.entries.is_empty() {
+        return text.to_owned();
+    }
+    let buffer = text.as_bytes();
+    let (mut stripped, mut index_map) = strip_ansi_with_map(buffer);
+    // Store one maximum end per original start instead of allocating one span per match.
+    // Even a repetitive input with many overlapping patterns uses O(input length) memory.
+    let mut match_ends = vec![0; buffer.len()];
+    for pattern in &patterns.entries {
+        mark_mapped_matches(
+            &stripped,
+            &index_map,
+            pattern.bytes.as_slice(),
+            &mut match_ends,
+        );
+    }
+    let original_len = stripped.len();
+    let mut compact_len = 0;
+    for read in 0..stripped.len() {
+        if !matches!(stripped[read], b'\r' | b'\n') {
+            stripped[compact_len] = stripped[read];
+            index_map[compact_len] = index_map[read];
+            compact_len += 1;
+        }
+    }
+    stripped.truncate(compact_len);
+    index_map.truncate(compact_len);
+    let boundaries = (fragment && !stripped.is_empty())
+        .then(|| FragmentBoundaries::new(&stripped, patterns.max_len));
+    for pattern in &patterns.entries {
+        let bytes = pattern.bytes.as_slice();
+        let pattern_has_newlines = bytes.iter().any(|byte| matches!(byte, b'\r' | b'\n'));
+        if compact_len == original_len && !pattern_has_newlines && boundaries.is_none() {
+            continue;
+        }
+        let compact_pattern = if pattern_has_newlines {
+            std::borrow::Cow::Owned(
+                bytes
+                    .iter()
+                    .copied()
+                    .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            std::borrow::Cow::Borrowed(bytes)
+        };
+        if compact_len < original_len || pattern_has_newlines {
+            mark_mapped_matches(&stripped, &index_map, &compact_pattern, &mut match_ends);
+        }
+        if let Some(boundaries) = &boundaries {
+            boundaries.mark(&compact_pattern, &index_map, &mut match_ends);
+        }
+    }
+    expand_utf8_spans(text, &mut match_ends);
+    String::from_utf8_lossy(&replace_marked_spans(buffer, &match_ends)).into_owned()
 }
 
 struct FragmentBoundaries<'a> {
@@ -1233,6 +1269,7 @@ impl RedactionLease {
             );
         }
         patterns.active_leases = patterns.active_leases.saturating_sub(1);
+        patterns.advance_revision();
         self.released = true;
     }
 }
@@ -1613,6 +1650,45 @@ mod tests {
         let service = RedactionService::new();
         service.register(&SecretString::new(secret.into()));
         service
+    }
+
+    #[test]
+    fn display_snapshot_revision_tracks_registration_lease_retirement_and_prune() {
+        let (service, clock) = bounded_service(256, 256 * 1024, Duration::from_secs(10));
+        let initial = service.snapshot().revision();
+        assert_eq!(initial, service.snapshot().revision());
+        let permanent = SecretString::new("display-permanent-secret".into());
+        service.register_permanent(&permanent).unwrap();
+        let registered = service.snapshot().revision();
+        assert!(registered > initial);
+        let rotating = SecretString::new("display-rotating-secret".into());
+        let lease = service.acquire_rotating(&rotating).unwrap();
+        let leased = service.snapshot().revision();
+        assert!(leased > registered);
+        drop(lease);
+        let retired = service.snapshot().revision();
+        assert!(retired > leased);
+        clock.advance(Duration::from_secs(11));
+        let snapshot = service.snapshot();
+        assert!(snapshot.revision() > retired);
+        assert_eq!(
+            snapshot.redact_wrapped_text("display-permanent-secret"),
+            "[REDACTED]"
+        );
+        assert_eq!(
+            snapshot.redact_wrapped_text("display-rotating-secret"),
+            "display-rotating-secret"
+        );
+        let pruned = snapshot.revision();
+        drop(snapshot);
+        assert_eq!(pruned, service.snapshot().revision());
+        service.mark_fail_closed();
+        let snapshot = service.snapshot();
+        assert!(snapshot.revision() > pruned);
+        assert_eq!(
+            snapshot.redact_wrapped_text("otherwise safe text"),
+            "[REDACTED]"
+        );
     }
 
     fn redact_all(redactor: &mut StreamRedactor, chunks: &[&[u8]]) -> Vec<u8> {

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 /// 에이전트 종료 코드 sentinel 파일 이름 접두사. runtime `agent_wrapper`의 래퍼 스크립트(셸)와
 /// runtime worker(Rust) 양쪽이 **같은 문자열**로 파일 경로를 계산해야 하므로 상수로 공유한다
 /// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례) — 한쪽만 고치면 sentinel을 서로 못 찾는다.
-pub const AGENT_EXIT_SENTINEL_PREFIX: &str = "deppy-agent-exit-";
+pub use pty::query_fence::AGENT_EXIT_SENTINEL_PREFIX;
 
 /// PID로 결정되는 sentinel 경로. 래퍼 스크립트의 `$$`(자기 PID)와 runtime이 그 세션에 대해
 /// 이미 알고 있는 `process_identity().pid`가 항상 같은 프로세스(PTY가 직접 스폰한 `/bin/sh`)를

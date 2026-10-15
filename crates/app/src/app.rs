@@ -1,3 +1,6 @@
+#[path = "file_delete.rs"]
+pub(crate) mod file_delete;
+
 #[cfg(test)]
 #[path = "keychain_startup_tests.rs"]
 mod keychain_startup_tests;
@@ -5368,20 +5371,26 @@ fn execute_settings_job_with_repair(
             SettingsOutcomeKind::DotenvResynced(result)
         }
         SettingsJobAction::SetProjectPath { path } => {
-            let path_string = path.to_string_lossy().into_owned();
-            let identity = (!path_string.trim().is_empty())
-                .then(|| crate::folder_identity::probe(&path))
-                .flatten();
-            let result = db
-                .set_workspace_path_and_anchor_with_volume(
+            // A failed picker selection is not an intentional detach. Resolve
+            // the selected directory before changing the saved path/identity.
+            let result = (|| {
+                let path_string = path.to_str().ok_or(SettingsErrorCode::ProjectPath)?;
+                let identity = if path_string.trim().is_empty() {
+                    None
+                } else {
+                    crate::folder_identity::selected_folder(&path)
+                        .map_err(|_| SettingsErrorCode::ProjectPath)?
+                };
+                db.set_workspace_path_and_anchor_with_volume(
                     &workspace_id,
-                    &path_string,
+                    path_string,
                     identity.map(|value| value.anchor.dev),
                     identity.map(|value| value.anchor.ino),
                     identity.and_then(|value| value.volume),
                 )
-                .map_err(|_| SettingsErrorCode::ProjectPath);
-            if result.is_ok() && path_string.trim().is_empty() && {
+                .map_err(|_| SettingsErrorCode::ProjectPath)
+            })();
+            if result.is_ok() && path.to_str().is_some_and(|value| value.trim().is_empty()) && {
                 let mut repository = AppDotenvRepository(db);
                 crate::dotenv_sync::remove_workspace_dotenv(
                     &mut repository,
@@ -8460,7 +8469,7 @@ const USAGE_STALE_FRACTION_OF_WINDOW: f64 = 1.0;
 /// 두 창을 따로 판단하는 이유: 파일은 Claude Code가 statusline을 다시 그릴
 /// 때만 갱신된다. Claude를 엿새 안 쓰면 5시간 수치는 무의미하지만 주간 수치는
 /// 아직 정보가 있다. 한 덩어리로 버리면 멀쩡한 주간 값까지 잃는다.
-fn fresh_usage_windows(usage: ProviderUsage, age_minutes: f64) -> ProviderUsage {
+pub(crate) fn fresh_usage_windows(usage: ProviderUsage, age_minutes: f64) -> ProviderUsage {
     // age가 음수(시계 되감김)면 낡음으로 보지 않는다. NaN이면 어느 비교도 참이
     // 아니라 양쪽 다 비는데, 그때는 나이를 모르는 것이므로 버리는 쪽이 맞다.
     let fresh =
@@ -8483,51 +8492,6 @@ pub(crate) fn fresh_usage_after(
 ) -> Option<ProviderUsage> {
     let windows = fresh_usage_windows(usage, usage_age_minutes(elapsed));
     (windows.0.is_some() || windows.1.is_some()).then_some(windows)
-}
-
-fn claude_usage_snapshot() -> Option<ProviderUsage> {
-    type Cache = Option<(std::time::Instant, Option<ProviderUsage>)>;
-    static CACHE: std::sync::OnceLock<std::sync::Mutex<Cache>> = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
-    let mut cache = cache.lock().ok()?;
-    if let Some((checked_at, usage)) = *cache
-        && checked_at.elapsed() < std::time::Duration::from_secs(2)
-    {
-        return usage;
-    }
-    let usage = (|| {
-        let path = crate::paths::home_dir()?
-            .join(".deppy-sijo")
-            .join("claude-usage.json");
-        if std::fs::metadata(&path).ok()?.len() > 4 * 1024 {
-            return None;
-        }
-        let snapshot: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-        let percent = |name: &str| {
-            snapshot
-                .get(name)
-                .and_then(serde_json::Value::as_f64)
-                .filter(|value| value.is_finite())
-                .map(|value| value.clamp(0.0, 100.0).round() as u8)
-        };
-        // mcp-proxy가 파일을 쓴 시각(unix seconds). 이 필드가 없는 옛 파일은 나이를
-        // 알 길이 없으니 0분으로 보고 그대로 살린다.
-        let age_minutes = snapshot
-            .get("updated_at")
-            .and_then(serde_json::Value::as_i64)
-            .map_or(0.0, |updated_at| {
-                let now = i64::try_from(deppy_core::time::unix_ms() / 1000).unwrap_or(i64::MAX);
-                (now - updated_at) as f64 / 60.0
-            });
-        let (five_hour, seven_day) =
-            fresh_usage_windows((percent("five_hour"), percent("seven_day")), age_minutes);
-        // mcp-proxy는 둘 중 하나만 읽혀도 파일을 쓴다(없는 쪽은 null). 한쪽이라도
-        // 있으면 스냅샷으로 인정해야 나머지 한쪽이 화면에서 사라지지 않는다.
-        (five_hour.is_some() || seven_day.is_some()).then_some((five_hour, seven_day))
-    })();
-    *cache = Some((std::time::Instant::now(), usage));
-    usage
 }
 
 /// app-server 값이 있으면 우선하고, 아직 응답이 없거나 일부 창만 보고했으면
@@ -10540,6 +10504,7 @@ pub struct App {
     /// 탭 설계) App 전역 슬롯 하나가 아니라 집합이다 — 서로 다른 문서 둘을 동시에
     /// "저장 후 닫기"해도 서로의 continuation을 덮어쓰지 않는다.
     document_close_after_save: std::collections::HashSet<ui::workspace::DocumentTabId>,
+    document_pending_scope_close: Option<PendingDocumentScopeClose>,
     /// Markdown caches are keyed by unique DocumentTabId.
     document_markdown_viewer: ui::markdown_viewer::MarkdownViewer,
     document_image_worker: crate::markdown_image_io::ImageWorker,
@@ -10606,6 +10571,9 @@ pub struct App {
     /// there is no host thread/channel/poll/timer while unused. Connector와 Composer native
     /// picker가 이 한 슬롯을 공유해 동시에 둘 이상의 dialog/process를 만들지 않는다.
     app_host_io: Option<AppHostIoTask>,
+    /// Exact known-unsent import completion. One slot; no sensitive payload clone/re-read.
+    pending_connector_host_completion: Option<connector_contract::ConnectorIntent>,
+    claude_usage_snapshot: crate::claude_usage_snapshot::ClaudeUsageSnapshot,
     /// Render가 반환한 native-host intent. 다음 logic tick에서만 host task로 넘기며
     /// latest-only 한 건만 보존한다.
     pending_app_host_action: Option<AppHostIoAction>,
@@ -12362,6 +12330,7 @@ struct OpenDocument {
     /// 문서 렌더러에서 panic이 난 뒤 같은 내용을 매 프레임 다시 그리다 앱 전체를
     /// 종료하지 않도록 해당 탭만 안전 안내 화면으로 전환한다.
     render_failed: bool,
+    input_limit_rejected: bool,
 }
 
 impl OpenDocument {
@@ -12523,6 +12492,7 @@ fn apply_document_load_outcome_to_document(
         | document_io::DocumentLoadOutcome::Failed { .. } => {}
     }
     document.save_error = None;
+    document.input_limit_rejected = false;
     document.saved_feedback_until = None;
     document.source_revision = document.source_revision.wrapping_add(1);
 }
@@ -12594,6 +12564,257 @@ enum DocumentPendingConfirm {
     CloseWithDirty { id: ui::workspace::DocumentTabId },
     /// 저장 직전 다시 읽은 revision이 로드 시점과 달랐다 — 덮어쓰지 않았다.
     SaveConflict { id: ui::workspace::DocumentTabId },
+}
+
+#[derive(Debug, Clone)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "There is at most one pending close plan; its command remains owned inline"
+)]
+enum DocumentScopeCloseTarget {
+    Runtime {
+        workspace_id: String,
+        runtime_instance: u64,
+        command: runtime::RuntimeCommand,
+    },
+    Workspace {
+        workspace_id: String,
+        runtime_instance: u64,
+    },
+    AppExit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocumentScopeClosePhase {
+    Confirming,
+    Submitted,
+    Canceled,
+}
+
+#[derive(Debug)]
+struct PendingDocumentScopeClose {
+    target: DocumentScopeCloseTarget,
+    owners: Vec<crate::session_aux::SessionAuxScope>,
+    documents: Vec<ui::workspace::DocumentTabId>,
+    phase: DocumentScopeClosePhase,
+}
+
+fn plan_document_scope_close(
+    documents: &[OpenDocument],
+    views: &crate::session_aux::SessionAuxViews,
+    target: DocumentScopeCloseTarget,
+    mux: Option<&runtime::MuxSnapshot>,
+) -> Option<PendingDocumentScopeClose> {
+    let mut owners = Vec::new();
+    let mut protected_documents = Vec::new();
+    for (scope, view) in views.document_owners() {
+        if !document_scope_matches_close(scope, &target, mux) {
+            continue;
+        }
+        if let DocumentScopeCloseTarget::Runtime {
+            workspace_id,
+            runtime_instance,
+            ..
+        } = &target
+            && !document_scope_owner_is_live(scope, workspace_id, *runtime_instance, mux)
+        {
+            continue;
+        }
+        let protected: Vec<_> = view
+            .document_ids
+            .iter()
+            .copied()
+            .filter(|id| {
+                documents
+                    .iter()
+                    .any(|document| document.id == *id && (document.dirty || document.saving))
+            })
+            .collect();
+        if !protected.is_empty() {
+            owners.push(scope.clone());
+            protected_documents.extend(protected);
+        }
+    }
+    (!protected_documents.is_empty()).then_some(PendingDocumentScopeClose {
+        target,
+        owners,
+        documents: protected_documents,
+        phase: DocumentScopeClosePhase::Confirming,
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DocumentScopeCloseReadiness {
+    Canceled,
+    Waiting,
+    Ready,
+}
+
+fn document_scope_close_readiness(
+    pending: &PendingDocumentScopeClose,
+    documents: &[OpenDocument],
+    mut owner_valid: impl FnMut(&crate::session_aux::SessionAuxScope) -> bool,
+) -> DocumentScopeCloseReadiness {
+    if pending.phase == DocumentScopeClosePhase::Canceled {
+        return DocumentScopeCloseReadiness::Canceled;
+    }
+    if !matches!(pending.target, DocumentScopeCloseTarget::AppExit)
+        && !pending.owners.iter().all(&mut owner_valid)
+    {
+        return DocumentScopeCloseReadiness::Canceled;
+    }
+    if pending.documents.iter().any(|id| {
+        documents
+            .iter()
+            .any(|document| document.id == *id && (document.dirty || document.saving))
+    }) {
+        DocumentScopeCloseReadiness::Waiting
+    } else {
+        DocumentScopeCloseReadiness::Ready
+    }
+}
+
+fn cancel_document_scope_close_state(
+    pending: &mut Option<PendingDocumentScopeClose>,
+    confirms: &mut std::collections::VecDeque<DocumentPendingConfirm>,
+    close_after_save: &mut std::collections::HashSet<ui::workspace::DocumentTabId>,
+) {
+    if let Some(mut closing) = pending.take() {
+        confirms.retain(|confirm| {
+            !matches!(confirm,
+            DocumentPendingConfirm::CloseWithDirty { id } if closing.documents.contains(id))
+        });
+        for id in &closing.documents {
+            close_after_save.remove(id);
+        }
+        // A submitted command still owns an entry in the normal controller/protocol
+        // lane. Keep its fence as a tombstone until final delivery drops that entry.
+        if closing.phase != DocumentScopeClosePhase::Confirming {
+            closing.phase = DocumentScopeClosePhase::Canceled;
+            *pending = Some(closing);
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DocumentScopeCloseHandoff<'a> {
+    Runtime {
+        runtime_instance: u64,
+        command: &'a runtime::RuntimeCommand,
+    },
+    Workspace(&'a str),
+}
+
+fn document_scope_close_handoff_matches(
+    pending: &PendingDocumentScopeClose,
+    handoff: DocumentScopeCloseHandoff<'_>,
+) -> bool {
+    match (&pending.target, handoff) {
+        (
+            DocumentScopeCloseTarget::Workspace { workspace_id, .. },
+            DocumentScopeCloseHandoff::Workspace(id),
+        ) => workspace_id == id,
+        (
+            DocumentScopeCloseTarget::Runtime {
+                runtime_instance,
+                command,
+                ..
+            },
+            DocumentScopeCloseHandoff::Runtime {
+                runtime_instance: instance,
+                command: submitted,
+            },
+        ) => {
+            *runtime_instance == instance
+                && match (command, submitted) {
+                    (
+                        runtime::RuntimeCommand::ClosePane { pane: a },
+                        runtime::RuntimeCommand::ClosePane { pane: b },
+                    ) => a == b,
+                    (
+                        runtime::RuntimeCommand::CloseTab { tab: a },
+                        runtime::RuntimeCommand::CloseTab { tab: b },
+                    ) => a == b,
+                    (
+                        runtime::RuntimeCommand::KillSession { session: a },
+                        runtime::RuntimeCommand::KillSession { session: b },
+                    ) => a == b,
+                    _ => false,
+                }
+        }
+        _ => false,
+    }
+}
+
+fn document_scope_close_handoff_is_stale(
+    pending: &mut Option<PendingDocumentScopeClose>,
+    handoff: DocumentScopeCloseHandoff<'_>,
+    owners_valid: bool,
+) -> bool {
+    if !pending.as_ref().is_some_and(|pending| {
+        pending.phase != DocumentScopeClosePhase::Confirming
+            && document_scope_close_handoff_matches(pending, handoff)
+    }) {
+        return false;
+    }
+    let pending = pending.take().unwrap();
+    pending.phase == DocumentScopeClosePhase::Canceled || !owners_valid
+}
+
+fn document_scope_matches_close(
+    scope: &crate::session_aux::SessionAuxScope,
+    target: &DocumentScopeCloseTarget,
+    mux: Option<&runtime::MuxSnapshot>,
+) -> bool {
+    match target {
+        DocumentScopeCloseTarget::AppExit => true,
+        DocumentScopeCloseTarget::Workspace {
+            workspace_id,
+            runtime_instance,
+        } => scope.workspace_id == *workspace_id && scope.runtime_instance == *runtime_instance,
+        DocumentScopeCloseTarget::Runtime {
+            workspace_id,
+            runtime_instance,
+            command,
+        } => {
+            if scope.workspace_id != *workspace_id || scope.runtime_instance != *runtime_instance {
+                return false;
+            }
+            match command {
+                runtime::RuntimeCommand::ClosePane { pane } => scope.pane.as_ref() == Some(pane),
+                runtime::RuntimeCommand::CloseTab { tab } => mux.is_some_and(|mux| {
+                    mux.tabs
+                        .iter()
+                        .filter(|item| item.id == *tab)
+                        .flat_map(|item| &item.panes)
+                        .any(|pane| {
+                            scope.pane.as_ref() == Some(&pane.id)
+                                && scope.session == pane.session_id
+                        })
+                }),
+                runtime::RuntimeCommand::KillSession { session } => scope.session == Some(*session),
+                _ => false,
+            }
+        }
+    }
+}
+
+fn document_scope_owner_is_live(
+    scope: &crate::session_aux::SessionAuxScope,
+    workspace_id: &str,
+    runtime_instance: u64,
+    mux: Option<&runtime::MuxSnapshot>,
+) -> bool {
+    scope.workspace_id == workspace_id
+        && scope.runtime_instance == runtime_instance
+        && scope.pane.as_ref().is_none_or(|id| {
+            mux.is_some_and(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|pane| &pane.id == id && pane.session_id == scope.session)
+            })
+        })
 }
 
 impl DocumentPendingConfirm {
@@ -12752,7 +12973,7 @@ fn document_source_editor_id(id: ui::workspace::DocumentTabId, path: &Path) -> e
 /// 그 모드로 열린 적이 없으면 애초에 저장된 적이 없어 `remove`가 조용히 no-op이다.
 fn clear_document_editor_state(ctx: &egui::Context, document: &OpenDocument) {
     let editor_id = document_source_editor_id(document.id, &document.path);
-    ctx.data_mut(|d| d.remove::<egui::text_edit::TextEditState>(editor_id));
+    ui::text_input::forget_bounded_text_state(ctx, editor_id);
 }
 
 /// 문서가 닫힐 때 미리보기 쪽이 들고 있던 그 문서 몫의 상태도 지운다 — 가로 스크롤
@@ -12798,10 +13019,43 @@ fn find_open_document_by_path<'a>(
         .map(|document| document.id)
 }
 
+fn find_recoverable_document_by_path(
+    documents: &[OpenDocument],
+    views: &crate::session_aux::SessionAuxViews,
+    path: &Path,
+) -> Option<ui::workspace::DocumentTabId> {
+    find_open_document_by_path(
+        documents
+            .iter()
+            .filter(|document| views.document_has_dead_owner(document.id)),
+        path,
+    )
+}
+
 fn retained_document_bytes(document: &OpenDocument) -> Option<u64> {
     let source = u64::try_from(document.source.len()).ok()?;
     let saved_source = u64::try_from(document.saved_source.len()).ok()?;
     source.checked_add(saved_source)
+}
+
+fn document_source_byte_budget(
+    documents: &[OpenDocument],
+    id: ui::workspace::DocumentTabId,
+) -> usize {
+    let fixed = documents
+        .iter()
+        .try_fold(0u64, |total, document| {
+            let bytes = if document.id == id {
+                u64::try_from(document.saved_source.len()).ok()?
+            } else {
+                retained_document_bytes(document)?
+            };
+            total.checked_add(bytes)
+        })
+        .unwrap_or(u64::MAX);
+    DOCUMENT_TOTAL_RETAINED_BYTES_MAX
+        .saturating_sub(fixed)
+        .min(document_io::DOCUMENT_REFUSE_BYTES_MAX) as usize
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -13993,6 +14247,7 @@ impl AppHostIoFallback {
                 operation,
                 generation,
                 result: Err(ui::file_tree::FileTreeIoErrorCode::NativeFailure),
+                delete_guard: None,
             }),
             Self::FileTreeMaintenance {
                 operation,
@@ -14095,6 +14350,7 @@ struct AppFileTreeWatchJob {
 /// 걸러낸다.
 struct AppFileTreeWatchApplied {
     root: PathBuf,
+    physical_root: PathBuf,
     ignored_prefixes: Vec<PathBuf>,
     show_hidden: bool,
 }
@@ -14140,6 +14396,7 @@ struct AppFileTreeWatcher {
     generation: u64,
     revision: u64,
     root: PathBuf,
+    physical_root: PathBuf,
     ignored_prefixes: Vec<PathBuf>,
     show_hidden: bool,
 }
@@ -14220,6 +14477,7 @@ impl AppFileTreeWatcher {
             generation: 0,
             revision: 0,
             root: PathBuf::new(),
+            physical_root: PathBuf::new(),
             ignored_prefixes: Vec::new(),
             show_hidden: false,
         })
@@ -14367,6 +14625,7 @@ impl AppFileTreeWatcher {
         }
         self.generation = completion.generation;
         self.root = applied.root.clone();
+        self.physical_root = applied.physical_root.clone();
         self.ignored_prefixes = applied.ignored_prefixes.clone();
         self.show_hidden = applied.show_hidden;
         *self
@@ -14395,6 +14654,15 @@ impl AppFileTreeWatcher {
         }
         let mut events = Vec::with_capacity(ui::file_tree::FILE_TREE_WATCH_MAX_EVENTS);
         for path in paths {
+            // FSEvents returns physical paths. Map them using the namespace
+            // captured at registration, including files already deleted.
+            let path = if path.starts_with(&self.root) {
+                path
+            } else if let Ok(relative) = path.strip_prefix(&self.physical_root) {
+                self.root.join(relative)
+            } else {
+                continue;
+            };
             if !path.starts_with(&self.root)
                 || self
                     .ignored_prefixes
@@ -14476,21 +14744,31 @@ fn run_app_file_tree_watch_worker(
             ignored_prefixes,
             show_hidden,
         } = job;
-        let root = directories.first().cloned();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            app_file_tree_apply_watch_diff(&mut watcher, &mut watched, directories)
-        }));
-        let result = match (outcome, root) {
-            (Ok(Ok(())), Some(root)) => Ok(AppFileTreeWatchApplied {
+            use ui::file_tree::FileTreeMaintenanceErrorCode as Error;
+            let root = directories.first().cloned().ok_or(Error::InvalidSnapshot)?;
+            let physical_root =
+                std::fs::canonicalize(&root).map_err(|_| Error::WatchUnavailable)?;
+            let physical_directories = directories
+                .into_iter()
+                .map(|directory| {
+                    directory
+                        .strip_prefix(&root)
+                        .map(|relative| physical_root.join(relative))
+                        .map_err(|_| Error::InvalidSnapshot)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            app_file_tree_apply_watch_diff(&mut watcher, &mut watched, physical_directories)?;
+            Ok(AppFileTreeWatchApplied {
                 root,
+                physical_root,
                 ignored_prefixes,
                 show_hidden,
-            }),
-            // submit_replace가 빈 directories를 이미 걸러내므로 root == None은 실제로는
-            // 도달하지 않는다 — 방어적 분기.
-            (Ok(Ok(())), None) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot),
-            (Ok(Err(code)), _) => Err(code),
-            (Err(_), _) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
+            })
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(_) => Err(ui::file_tree::FileTreeMaintenanceErrorCode::NativeFailure),
         };
         let is_native_failure = matches!(
             result,
@@ -15268,6 +15546,7 @@ fn app_host_rename_is_noop(source: &Path, requested_name: &str) -> bool {
             .is_some_and(|name| ui::os_str_canonically_eq(name, requested_name))
 }
 
+#[cfg(test)]
 fn run_file_tree_host_io(
     request: ui::file_tree::FileTreeIoRequest,
     cancel: &std::sync::atomic::AtomicBool,
@@ -15280,7 +15559,64 @@ fn run_file_tree_host_io(
     )
 }
 
+#[cfg(test)]
 fn run_file_tree_host_io_with_native(
+    request: ui::file_tree::FileTreeIoRequest,
+    cancel: &std::sync::atomic::AtomicBool,
+    clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
+    trash_path: impl FnMut(&Path) -> Result<(), ()>,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    run_file_tree_host_io_with_delete_guard(request, cancel, clipboard_paths, trash_path).0
+}
+
+fn run_file_tree_host_io_with_delete_guard(
+    request: ui::file_tree::FileTreeIoRequest,
+    cancel: &std::sync::atomic::AtomicBool,
+    clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
+    trash_path: impl FnMut(&Path) -> Result<(), ()>,
+) -> (
+    Result<(), ui::file_tree::FileTreeIoErrorCode>,
+    Option<file_delete::FileTreeDeleteGuard>,
+) {
+    use ui::file_tree::{FileTreeIoErrorCode as Error, FileTreeIoRequest as Request};
+    let guard = if let Request::Trash {
+        root: Some(root),
+        target,
+        ..
+    } = &request
+    {
+        if app_host_file_operation_cancelled(cancel).is_err() {
+            return (Err(Error::NativeFailure), None);
+        }
+        match file_delete::FileTreeDeleteGuard::capture(root.as_path(), target.as_path()) {
+            Ok(guard) => Some(guard),
+            // A file can be movable without permission to open it. Keep the
+            // recoverable Trash attempt, but grant no permanent-delete proof.
+            Err(Error::InvalidPath | Error::NativeFailure) => None,
+            Err(error) => return (Err(error), None),
+        }
+    } else {
+        None
+    };
+    let target = match &request {
+        Request::Trash { target, .. } => Some(target.as_path().to_path_buf()),
+        _ => None,
+    };
+    let result = run_file_tree_host_io_effect(request, cancel, clipboard_paths, trash_path);
+    let guard = if result == Err(Error::TrashUnavailable)
+        && guard
+            .as_ref()
+            .zip(target.as_deref())
+            .is_some_and(|(guard, target)| guard.validate(target).is_ok())
+    {
+        guard
+    } else {
+        None
+    };
+    (result, guard)
+}
+
+fn run_file_tree_host_io_effect(
     request: ui::file_tree::FileTreeIoRequest,
     cancel: &std::sync::atomic::AtomicBool,
     mut clipboard_paths: impl FnMut() -> Option<Vec<PathBuf>>,
@@ -15365,7 +15701,9 @@ fn run_file_tree_host_io_with_native(
             };
             app_host_transfer_files(None, sources, destination.as_path(), move_files, cancel)
         }
-        Request::Trash { target, preflight } => {
+        Request::Trash {
+            target, preflight, ..
+        } => {
             let mut validation = AppHostFileOperationBudget::default();
             let target = if let Some((root, paths)) = preflight {
                 let sources = app_host_prepare_file_sources(
@@ -15394,13 +15732,7 @@ fn run_file_tree_host_io_with_native(
             app_host_file_operation_cancelled(cancel).map_err(|_| Error::TrashUnavailable)?;
             trash_path(&target).map_err(|_| Error::TrashUnavailable)
         }
-        Request::DeletePermanently { target } => {
-            let mut validation = AppHostFileOperationBudget::default();
-            app_host_validate_tree(target.as_path(), &mut validation, cancel, 0)
-                .map_err(|_| Error::NativeFailure)?;
-            app_host_file_operation_cancelled(cancel).map_err(|_| Error::NativeFailure)?;
-            app_host_remove_all(target.as_path()).map_err(|_| Error::NativeFailure)
-        }
+        Request::DeletePermanently { target, guard } => guard.remove(target.as_path(), cancel),
         Request::CopyFileUrls { paths } => {
             ui::clipboard_image::copy_file_urls_to_clipboard(&paths.into_paths())
                 .map_err(|_| Error::NativeFailure)
@@ -15436,6 +15768,51 @@ pub(crate) fn pr11_private_file_fixture_io(
             }
         },
     )
+}
+
+#[cfg(test)]
+pub(crate) fn popup_review_unavailable_trash(
+    intent: ui::file_tree::FileTreeIoIntent,
+) -> ui::file_tree::FileTreeIoCompletion {
+    let (result, delete_guard) = run_file_tree_host_io_with_delete_guard(
+        intent.request,
+        &std::sync::atomic::AtomicBool::new(false),
+        || None,
+        |_| Err(()),
+    );
+    ui::file_tree::FileTreeIoCompletion {
+        operation: intent.operation,
+        generation: intent.generation,
+        result,
+        delete_guard,
+    }
+}
+
+#[cfg(test)]
+pub(crate) use file_delete::DeleteStage as PopupReviewDeleteStage;
+
+#[cfg(test)]
+pub(crate) fn popup_review_delete_at_boundary(
+    request: ui::file_tree::FileTreeIoRequest,
+    _root: &Path,
+    hook: impl FnMut(PopupReviewDeleteStage, &Path),
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    match request {
+        ui::file_tree::FileTreeIoRequest::DeletePermanently { target, guard } => guard
+            .remove_with_hook(
+                target.as_path(),
+                &std::sync::atomic::AtomicBool::new(false),
+                hook,
+            ),
+        _ => panic!("permanent deletion fixture only"),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn popup_review_cancelled_delete(
+    request: ui::file_tree::FileTreeIoRequest,
+) -> Result<(), ui::file_tree::FileTreeIoErrorCode> {
+    run_file_tree_host_io(request, &std::sync::atomic::AtomicBool::new(true))
 }
 
 fn read_inbox_log_preview(
@@ -15619,10 +15996,17 @@ fn run_app_host_io(
         AppHostIoAction::FileTree(intent) => {
             let operation = intent.operation;
             let generation = intent.generation;
+            let (result, delete_guard) = run_file_tree_host_io_with_delete_guard(
+                intent.request,
+                cancel,
+                ui::clipboard_image::read_clipboard_file_list,
+                |path| trash::delete(path).map_err(|_| ()),
+            );
             AppHostIoCompletion::FileTree(ui::file_tree::FileTreeIoCompletion {
                 operation,
                 generation,
-                result: run_file_tree_host_io(intent.request, cancel),
+                result,
+                delete_guard,
             })
         }
         AppHostIoAction::FileTreeMaintenance(intent) => {
@@ -15861,11 +16245,57 @@ fn storage_structured_mutation(
     }
 }
 
+fn retain_connector_host_completion(
+    intent: connector_contract::ConnectorIntent,
+    dispatch: impl FnOnce(
+        connector_contract::ConnectorIntent,
+    ) -> Result<
+        connector_service::DispatchOutcome,
+        (
+            connector_service::DispatchError,
+            connector_contract::ConnectorIntent,
+        ),
+    >,
+) -> Option<connector_contract::ConnectorIntent> {
+    match dispatch(intent) {
+        Err((
+            connector_service::DispatchError::Backpressure
+            | connector_service::DispatchError::WorkerUnavailable,
+            intent,
+        )) => Some(intent),
+        // Admission transferred ownership; cancellation/replacement invalidates this payload.
+        Ok(_)
+        | Err((
+            connector_service::DispatchError::StaleHostAction
+            | connector_service::DispatchError::InvalidLimits,
+            _,
+        )) => None,
+    }
+}
+
 impl App {
+    #[allow(
+        clippy::result_large_err,
+        reason = "Rejected imports return the exact owned payload without cloning or extra boxing"
+    )]
     fn apply_app_host_completion(&mut self, completion: AppHostIoCompletion) {
         match completion {
             AppHostIoCompletion::Dispatch(intent) => {
-                if self.connector_coordinator.dispatch(intent).is_err() {
+                if matches!(
+                    &intent,
+                    connector_contract::ConnectorIntent::CompleteImportSource { .. }
+                        | connector_contract::ConnectorIntent::FailImportSource { .. }
+                ) {
+                    debug_assert!(self.pending_connector_host_completion.is_none());
+                    self.pending_connector_host_completion =
+                        retain_connector_host_completion(intent, |intent| {
+                            self.connector_coordinator.dispatch_host_completion(intent)
+                        });
+                    if self.pending_connector_host_completion.is_some() {
+                        self.egui_ctx
+                            .request_repaint_after(std::time::Duration::from_millis(50));
+                    }
+                } else if self.connector_coordinator.dispatch(intent).is_err() {
                     tracing::warn!("Connector host completion dispatch failed");
                 }
             }
@@ -16137,7 +16567,20 @@ impl App {
         }
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "Rejected imports return the exact owned payload without cloning or extra boxing"
+    )]
     fn poll_app_host_io(&mut self, ctx: &egui::Context) {
+        if let Some(intent) = self.pending_connector_host_completion.take() {
+            self.pending_connector_host_completion =
+                retain_connector_host_completion(intent, |intent| {
+                    self.connector_coordinator.dispatch_host_completion(intent)
+                });
+            if self.pending_connector_host_completion.is_some() {
+                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+            }
+        }
         let completed =
             self.app_host_io
                 .as_ref()
@@ -16167,9 +16610,13 @@ impl App {
         {
             self.pending_app_host_action = Some(request);
         }
-        let action = self
-            .connector_coordinator
-            .try_take_host_action()
+        // Keep the import completion lane bounded while allowing unrelated document/file work.
+        let connector_action = self
+            .pending_connector_host_completion
+            .is_none()
+            .then(|| self.connector_coordinator.try_take_host_action())
+            .flatten();
+        let action = connector_action
             .map(AppHostIoAction::Connector)
             .or_else(|| self.pending_app_host_action.take())
             .or_else(|| {
@@ -16891,6 +17338,7 @@ impl App {
             document_save_worker,
             document_pending_confirms: std::collections::VecDeque::new(),
             document_close_after_save: std::collections::HashSet::new(),
+            document_pending_scope_close: None,
             document_markdown_viewer: ui::markdown_viewer::MarkdownViewer::new(),
             document_image_worker: crate::markdown_image_io::new_worker(egui_ctx.clone()),
             pending_document_open: None,
@@ -16927,6 +17375,10 @@ impl App {
             connector_ui: connector_ui::ConnectorUi::new(&i18n),
             pending_connector_dispatch: None,
             app_host_io: None,
+            pending_connector_host_completion: None,
+            claude_usage_snapshot: crate::claude_usage_snapshot::ClaudeUsageSnapshot::new(
+                &egui_ctx,
+            ),
             pending_app_host_action: None,
             pending_workspace_add_picker: None,
             pending_app_host_retry: std::collections::VecDeque::new(),
@@ -20497,16 +20949,18 @@ impl App {
             std::iter::once(&self.active)
                 .chain(self.warm.values())
                 .any(|runtime| {
-                    runtime.id == scope.workspace_id
-                        && runtime.runtime_instance == scope.runtime_instance
-                        && scope.pane.as_ref().is_none_or(|id| {
-                            runtime.workspace_ui.mux().is_some_and(|mux| {
-                                mux.tabs
-                                    .iter()
-                                    .flat_map(|t| &t.panes)
-                                    .any(|p| &p.id == id && p.session_id == scope.session)
-                            })
+                    let mux = runtime
+                        .pending_events
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            runtime::RuntimeEvent::MuxUpdated { snapshot } => {
+                                Some(snapshot.as_ref())
+                            }
+                            _ => None,
                         })
+                        .or_else(|| runtime.workspace_ui.mux().map(|mux| mux.as_ref()));
+                    document_scope_owner_is_live(scope, &runtime.id, runtime.runtime_instance, mux)
                 })
         });
     }
@@ -21115,6 +21569,7 @@ impl App {
         let can_save = document.can_save();
         let status_text = self.document_toolbar_status_text(id, text);
         let load_state = document.load_state.clone();
+        let input_limit_rejected = document.input_limit_rejected;
         let workspace_root = self.active_tree_root().unwrap_or_else(|| {
             document
                 .path
@@ -21142,6 +21597,8 @@ impl App {
 
         let mut toolbar_action = None;
         let mut editor_changed = false;
+        let source_byte_budget = document_source_byte_budget(&self.documents, id);
+        let mut editor_rejected = false;
         let mut link_intent = None;
         let mut split_width: Option<f32> = None;
         let mut open_with_os_clicked = false;
@@ -21167,6 +21624,13 @@ impl App {
                 // 헤더와 같은 면이고 본문은 다른 단이라, 선이 없어도 경계가 보인다.
                 // 나란히 모드의 세로 분리선은 툴바 바로 아래(본문 시작)에서 시작한다.
                 toolbar_separator_y = Some(ui.cursor().top());
+                if input_limit_rejected {
+                    ui::popup::notice(
+                        ui,
+                        &text.t("document.limit.input_rejected", &[]),
+                        ui::popup::NoticeTone::Error,
+                    );
+                }
             }
 
             match &load_state {
@@ -21218,12 +21682,14 @@ impl App {
                     match mode {
                         ui::document::DocumentViewMode::Source => {
                             let editor_id = document_source_editor_id(document.id, &document.path);
-                            editor_changed = ui::document::source_editor(
-                                ui,
-                                editor_id,
-                                &mut document.source,
-                                editable,
-                            );
+                            (editor_changed, editor_rejected) =
+                                ui::document::source_editor_with_budget(
+                                    ui,
+                                    editor_id,
+                                    &mut document.source,
+                                    editable,
+                                    source_byte_budget,
+                                );
                         }
                         ui::document::DocumentViewMode::Preview => {
                             link_intent = self.document_markdown_viewer.show(
@@ -21261,12 +21727,14 @@ impl App {
                                 .find(|document| document.id == id)
                                 .expect("checked above");
                             let editor_id = document_source_editor_id(document.id, &document.path);
-                            editor_changed = ui::document::source_editor(
-                                &mut source_ui,
-                                editor_id,
-                                &mut document.source,
-                                editable,
-                            );
+                            (editor_changed, editor_rejected) =
+                                ui::document::source_editor_with_budget(
+                                    &mut source_ui,
+                                    editor_id,
+                                    &mut document.source,
+                                    editable,
+                                    source_byte_budget,
+                                );
                             // Split은 같은 프레임에 source와 preview를 함께 그린다 —
                             // `revision`(외부 스코프)이 다음 프레임에야 올라가면 방금 친
                             // 글자가 이 프레임의 preview에는 반영되지 않는다(캐시 키가
@@ -21370,6 +21838,11 @@ impl App {
         }
         if editor_changed {
             self.on_document_source_edited(id);
+        }
+        if editor_rejected
+            && let Some(document) = self.documents.iter_mut().find(|document| document.id == id)
+        {
+            document.input_limit_rejected = true;
         }
         if let Some(width) = split_width {
             self.session_aux.current.document_tab_split_width = Some(width);
@@ -21500,6 +21973,7 @@ impl App {
             return;
         };
         document.recompute_dirty();
+        document.input_limit_rejected = false;
         document.save_error = None;
         document.source_revision = document.source_revision.wrapping_add(1);
     }
@@ -21794,12 +22268,22 @@ impl App {
     /// 실행만 한다.
     fn begin_document_open(&mut self, path: PathBuf) {
         self.sync_session_aux_scope();
+        self.prune_session_aux_views();
         if let Some(id) = find_open_document_by_path(
             self.documents
                 .iter()
                 .filter(|d| self.session_aux.current.document_ids.contains(&d.id)),
             &path,
         ) {
+            self.activate_document_tab(id);
+            self.session_aux.current.document_cap_notice = false;
+            self.reveal_terminal_view_for_aux_tab();
+            return;
+        }
+        if let Some(id) =
+            find_recoverable_document_by_path(&self.documents, &self.session_aux, &path)
+            && self.session_aux.recover_document(id)
+        {
             self.activate_document_tab(id);
             self.session_aux.current.document_cap_notice = false;
             self.reveal_terminal_view_for_aux_tab();
@@ -21832,6 +22316,7 @@ impl App {
             view_only_byte_len: None,
             source_revision: 0,
             render_failed: false,
+            input_limit_rejected: false,
         });
         self.document_pending_loads.push_back((id, path));
         self.session_aux.current.active_document = Some(id);
@@ -21925,6 +22410,15 @@ impl App {
     /// 순수 함수 `resolve_document_confirm_choice`가 큐 맨 앞을 보고 정하고, 여기서는
     /// 그 결정만 실행한다.
     fn apply_document_confirm_choice(&mut self, choice: DocumentConfirmChoice) {
+        let canceled_scope = choice == DocumentConfirmChoice::Cancel
+            && self
+                .document_pending_confirms
+                .front()
+                .is_some_and(|confirm| {
+                    self.document_pending_scope_close
+                        .as_ref()
+                        .is_some_and(|pending| pending.documents.contains(&confirm.document_id()))
+                });
         match resolve_document_confirm_choice(&mut self.document_pending_confirms, choice) {
             Some(DocumentConfirmAction::Discard(id)) => self.close_document_entry(id),
             Some(DocumentConfirmAction::SaveThenClose(id)) => {
@@ -21933,15 +22427,219 @@ impl App {
             }
             None => {}
         }
+        if canceled_scope {
+            self.cancel_document_scope_close();
+        }
     }
 
     /// 저장 Conflict 확인(재로드/취소 두 가지)에서 사용자가 고른 선택을 적용한다 —
     /// `apply_document_confirm_choice`와 같은 구조.
     fn apply_document_conflict_choice(&mut self, reload: bool) {
+        if let Some(confirm) = self.document_pending_confirms.front() {
+            self.cancel_document_scope_close_for(confirm.document_id());
+        }
         if let Some(id) =
             resolve_document_conflict_choice(&mut self.document_pending_confirms, reload)
         {
             self.reload_document_from_disk(id);
+        }
+    }
+
+    fn request_document_scope_close(&mut self, target: DocumentScopeCloseTarget) -> bool {
+        let mux = match &target {
+            DocumentScopeCloseTarget::Runtime {
+                runtime_instance, ..
+            }
+            | DocumentScopeCloseTarget::Workspace {
+                runtime_instance, ..
+            } => self
+                .runtime_by_instance(*runtime_instance)
+                .and_then(|runtime| runtime.workspace_ui.mux().cloned()),
+            DocumentScopeCloseTarget::AppExit => None,
+        };
+        let Some(pending) =
+            plan_document_scope_close(&self.documents, &self.session_aux, target, mux.as_deref())
+        else {
+            return false;
+        };
+        // Modal requests are serial: a second close must not replace the original
+        // workspace/runtime/pane/session authorization while its prompt is open.
+        if self.document_pending_scope_close.is_none() {
+            for &id in &pending.documents {
+                enqueue_document_pending_confirm(
+                    &mut self.document_pending_confirms,
+                    DocumentPendingConfirm::CloseWithDirty { id },
+                );
+            }
+            self.document_pending_scope_close = Some(pending);
+        }
+        self.egui_ctx.request_repaint();
+        true
+    }
+
+    fn defer_document_runtime_close(
+        &mut self,
+        runtime_instance: u64,
+        command: &runtime::RuntimeCommand,
+    ) -> bool {
+        if !matches!(
+            command,
+            runtime::RuntimeCommand::ClosePane { .. }
+                | runtime::RuntimeCommand::CloseTab { .. }
+                | runtime::RuntimeCommand::KillSession { .. }
+        ) {
+            return false;
+        }
+        if self.document_scope_close_handoff_is_stale(DocumentScopeCloseHandoff::Runtime {
+            runtime_instance,
+            command,
+        }) {
+            return true;
+        }
+        let Some(workspace_id) = self
+            .runtime_by_instance(runtime_instance)
+            .map(|runtime| runtime.id.clone())
+        else {
+            return false;
+        };
+        self.request_document_scope_close(DocumentScopeCloseTarget::Runtime {
+            workspace_id,
+            runtime_instance,
+            command: command.clone(),
+        })
+    }
+
+    fn cancel_document_scope_close(&mut self) {
+        cancel_document_scope_close_state(
+            &mut self.document_pending_scope_close,
+            &mut self.document_pending_confirms,
+            &mut self.document_close_after_save,
+        );
+    }
+
+    fn cancel_document_scope_close_for(&mut self, id: ui::workspace::DocumentTabId) {
+        if self
+            .document_pending_scope_close
+            .as_ref()
+            .is_some_and(|pending| pending.documents.contains(&id))
+        {
+            self.cancel_document_scope_close();
+        }
+    }
+
+    fn document_scope_close_status(
+        &self,
+        pending: &PendingDocumentScopeClose,
+    ) -> DocumentScopeCloseReadiness {
+        document_scope_close_readiness(pending, &self.documents, |scope| {
+            self.runtime_by_instance(scope.runtime_instance)
+                .is_some_and(|runtime| match &pending.target {
+                    DocumentScopeCloseTarget::Workspace { workspace_id, .. } => {
+                        runtime.id == *workspace_id
+                    }
+                    _ => {
+                        document_scope_owner_is_live(
+                            scope,
+                            &runtime.id,
+                            runtime.runtime_instance,
+                            runtime.workspace_ui.mux().map(|mux| mux.as_ref()),
+                        ) && document_scope_matches_close(
+                            scope,
+                            &pending.target,
+                            runtime.workspace_ui.mux().map(|mux| mux.as_ref()),
+                        )
+                    }
+                })
+        })
+    }
+
+    fn document_scope_close_handoff_is_stale(
+        &mut self,
+        handoff: DocumentScopeCloseHandoff<'_>,
+    ) -> bool {
+        let owners_valid = self
+            .document_pending_scope_close
+            .as_ref()
+            .is_none_or(|pending| {
+                self.document_scope_close_status(pending) != DocumentScopeCloseReadiness::Canceled
+            });
+        document_scope_close_handoff_is_stale(
+            &mut self.document_pending_scope_close,
+            handoff,
+            owners_valid,
+        )
+    }
+
+    fn poll_document_scope_close(&mut self) {
+        let Some(pending) = self.document_pending_scope_close.as_ref() else {
+            return;
+        };
+        if pending.phase != DocumentScopeClosePhase::Confirming {
+            // A retired runtime also retires its entire WorkspaceUi protocol
+            // queue. Workspace controller entries still need their tombstone.
+            if let DocumentScopeCloseTarget::Runtime {
+                runtime_instance, ..
+            } = pending.target
+                && self.runtime_by_instance(runtime_instance).is_none()
+            {
+                self.cancel_document_scope_close();
+                self.document_pending_scope_close = None;
+            }
+            return;
+        }
+        match self.document_scope_close_status(pending) {
+            DocumentScopeCloseReadiness::Canceled => {
+                self.cancel_document_scope_close();
+                return;
+            }
+            DocumentScopeCloseReadiness::Waiting => return,
+            DocumentScopeCloseReadiness::Ready => {}
+        }
+        let target = self
+            .document_pending_scope_close
+            .as_ref()
+            .unwrap()
+            .target
+            .clone();
+        let admitted = match target {
+            DocumentScopeCloseTarget::Runtime {
+                runtime_instance,
+                command,
+                ..
+            } => {
+                self.runtime_by_instance_mut(runtime_instance)
+                    .is_some_and(|runtime| {
+                        // Return through the normal bounded Workspace protocol lane.
+                        // Re-admission also catches a new edit before host delivery.
+                        runtime.workspace_ui.submit_document_resolved_close(command)
+                    })
+            }
+            DocumentScopeCloseTarget::Workspace { workspace_id, .. } => self
+                .stage_workspace_controller_action(WorkspaceControllerAction::CloseWorkspace(
+                    workspace_id,
+                )),
+            DocumentScopeCloseTarget::AppExit => {
+                self.document_pending_scope_close = None;
+                self.egui_ctx
+                    .send_viewport_cmd(egui::ViewportCommand::Close);
+                return;
+            }
+        };
+        if admitted {
+            if let Some(pending) = self.document_pending_scope_close.as_mut() {
+                pending.phase = DocumentScopeClosePhase::Submitted;
+            }
+        } else {
+            self.egui_ctx
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn protect_document_app_exit(&mut self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.request_document_scope_close(DocumentScopeCloseTarget::AppExit)
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
         }
     }
 
@@ -22004,6 +22702,7 @@ impl App {
                             &mut self.document_close_after_save,
                             id,
                         );
+                        self.cancel_document_scope_close_for(id);
                     }
                 }
             }
@@ -22022,6 +22721,7 @@ impl App {
                         &mut self.document_close_after_save,
                         id,
                     );
+                    self.cancel_document_scope_close_for(id);
                 }
             }
         }
@@ -22082,6 +22782,7 @@ impl App {
             return;
         };
         if let Some(confirm) = apply_save_outcome_to_document(id, document, &outcome) {
+            self.cancel_document_scope_close_for(id);
             self.document_close_after_save.remove(&id);
             enqueue_document_pending_confirm(&mut self.document_pending_confirms, confirm);
             return;
@@ -22116,6 +22817,7 @@ impl App {
                 }
             }
             document_io::DocumentSaveOutcome::Failed { .. } => {
+                self.cancel_document_scope_close_for(id);
                 self.document_close_after_save.remove(&id);
             }
             document_io::DocumentSaveOutcome::Conflict => {
@@ -23451,6 +24153,9 @@ impl App {
                 }
             }
             WorkspaceControllerAction::Runtime(command) => {
+                if self.defer_document_runtime_close(self.active.runtime_instance, &command) {
+                    return;
+                }
                 if let runtime::RuntimeCommand::WriteInput { session, .. } = &command {
                     self.active.workspace_ui.clear_selection(*session);
                 }
@@ -23530,7 +24235,9 @@ impl App {
             }
             WorkspaceControllerAction::CloseWorkspace(workspace_id) => {
                 let was_active = workspace_id == self.active.id;
-                self.close_workspace_sessions(&workspace_id);
+                if !self.close_workspace_sessions(&workspace_id) {
+                    return;
+                }
                 if was_active
                     && let Some(fallback) = self
                         .workspaces
@@ -23669,6 +24376,18 @@ impl App {
                 .then(|| intent.focus_pane().cloned())
                 .flatten();
             let command = intent.into_command();
+            if self.defer_document_runtime_close(runtime_instance, &command) {
+                if let Some(runtime) = self.runtime_by_instance_mut(runtime_instance) {
+                    runtime.workspace_ui.complete_protocol(
+                        ui::workspace::WorkspaceProtocolCompletion {
+                            operation,
+                            generation,
+                            result: Err(ui::workspace::WorkspaceProtocolErrorCode::Busy),
+                        },
+                    );
+                }
+                continue;
+            }
             if matches!(
                 command,
                 runtime::RuntimeCommand::ClosePane { .. }
@@ -26477,7 +27196,23 @@ impl App {
 
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
-    fn close_workspace_sessions(&mut self, workspace_id: &str) {
+    fn close_workspace_sessions(&mut self, workspace_id: &str) -> bool {
+        if self.document_scope_close_handoff_is_stale(DocumentScopeCloseHandoff::Workspace(
+            workspace_id,
+        )) {
+            return false;
+        }
+        if let Some(runtime_instance) = std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .find(|runtime| runtime.id == workspace_id)
+            .map(|runtime| runtime.runtime_instance)
+            && self.request_document_scope_close(DocumentScopeCloseTarget::Workspace {
+                workspace_id: workspace_id.to_owned(),
+                runtime_instance,
+            })
+        {
+            return false;
+        }
         revoke_followup_authorizations(
             &mut self.pty_followup,
             &self.pending_prompt_deliveries,
@@ -26638,6 +27373,7 @@ impl App {
         self.pending_resource_maintenance
             .retain(|target| target.workspace_id != workspace_id);
         self.invalidate_port_inventory_topology();
+        true
     }
 
     /// 종료 숨김을 해제하고 config에도 즉시 반영한다. 같은 활성 워크스페이스 재선택처럼
@@ -34003,6 +34739,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.protect_document_app_exit(ctx);
         self.pump_project_keys();
         self.prune_session_aux_views();
         self.pump_scrollback_policy(ctx);
@@ -34231,6 +34968,7 @@ impl eframe::App for App {
         self.poll_pending_resume_agent();
         self.poll_pending_document_open();
         self.poll_document_io();
+        self.poll_document_scope_close();
         let current_image_document = self.session_aux.current.active_document.and_then(|id| {
             self.documents
                 .iter()
@@ -35483,8 +36221,11 @@ impl eframe::App for App {
                     claude_agent.is_some(),
                 )
                 .then(|| {
-                    claude_usage_snapshot()
-                        .or_else(|| crate::claude_usage::current(ui.ctx(), claude_agent))
+                    self.claude_usage_snapshot.current().or_else(|| {
+                        (!self.claude_usage_snapshot.is_pending())
+                            .then(|| crate::claude_usage::current(ui.ctx(), claude_agent))
+                            .flatten()
+                    })
                 })
                 .flatten();
                 let codex_usage = merge_codex_usage(codex_server_usage, codex_backend);
@@ -48596,7 +49337,7 @@ mod tests {
             .split_once("fn apply_work_history_tab_intent")
             .unwrap()
             .1
-            .split_once("fn handle_work_history_action")
+            .split_once("fn open_document(&mut self, path: PathBuf)")
             .unwrap()
             .0;
         for forbidden in ["ClosePane", "KillSession", "RuntimeCommand"] {
@@ -48761,6 +49502,7 @@ mod tests {
             view_only_byte_len: None,
             source_revision: 0,
             render_failed: false,
+            input_limit_rejected: false,
         }
     }
 
@@ -48801,6 +49543,542 @@ mod tests {
             limit: document_io::DocumentLimitTier::Full,
         };
         document
+    }
+
+    #[test]
+    fn full_fix_20261014_document_dead_owner_same_path_is_recoverable() {
+        let scope = |session| crate::session_aux::SessionAuxScope {
+            workspace_id: "document-recovery-fixture".into(),
+            runtime_instance: 1,
+            pane: Some(runtime::MuxPaneId(format!("pane-{session}"))),
+            session: Some(runtime::SessionId(session)),
+        };
+        let mut views = crate::session_aux::SessionAuxViews::default();
+        let old = scope(1);
+        let current = scope(2);
+        let document = stub_open_document_id(
+            17,
+            "/fixture/recover.md",
+            "unsaved source",
+            "disk source",
+            true,
+        );
+        views.switch(old.clone());
+        views.current.document_ids.push(document.id);
+        views.current.active_document = Some(document.id);
+        views.current.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
+        views.switch(current.clone());
+        views.retain_live(|owner| owner == &current);
+        // This is begin_document_open's production lookup, backed by real
+        // SessionAuxViews rather than UI stubs. Static wiring is verified below.
+        let reopened = find_recoverable_document_by_path(
+            std::slice::from_ref(&document),
+            &views,
+            &document.path,
+        );
+        let production = include_str!("app.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let caller = production
+            .split_once("fn begin_document_open(&mut self, path: PathBuf)")
+            .unwrap()
+            .1
+            .split_once("fn open_document(&mut self")
+            .unwrap()
+            .0;
+        assert!(caller.contains("find_recoverable_document_by_path("));
+        assert_eq!(
+            reopened,
+            Some(document.id),
+            "explicit reopen must recover retained dead-owner source"
+        );
+        assert!(views.recover_document(document.id));
+        assert_eq!(views.current.document_ids, [document.id]);
+        assert_eq!(document.source, "unsaved source");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_guards_each_lifecycle_target() {
+        let mux = cross_workspace_test_mux("tab", "pane", runtime::SessionId(41));
+        let owner = crate::session_aux::SessionAuxScope {
+            workspace_id: "ws".into(),
+            runtime_instance: 7,
+            pane: Some(runtime::MuxPaneId("pane".into())),
+            session: Some(runtime::SessionId(41)),
+        };
+        let mut views = crate::session_aux::SessionAuxViews::default();
+        views.switch(owner);
+        let document = stub_open_document_id(5, "/fixture/close.md", "edited", "disk", true);
+        views.current.document_ids.push(document.id);
+        let commands = [
+            runtime::RuntimeCommand::ClosePane {
+                pane: runtime::MuxPaneId("pane".into()),
+            },
+            runtime::RuntimeCommand::CloseTab {
+                tab: runtime::MuxTabId("tab".into()),
+            },
+            runtime::RuntimeCommand::KillSession {
+                session: runtime::SessionId(41),
+            },
+        ];
+        for command in commands {
+            let target = DocumentScopeCloseTarget::Runtime {
+                workspace_id: "ws".into(),
+                runtime_instance: 7,
+                command,
+            };
+            let pending = plan_document_scope_close(
+                std::slice::from_ref(&document),
+                &views,
+                target,
+                Some(&mux),
+            )
+            .unwrap();
+            assert_eq!(pending.documents, [document.id]);
+            assert_eq!(
+                document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
+                DocumentScopeCloseReadiness::Waiting
+            );
+        }
+        for target in [
+            DocumentScopeCloseTarget::Workspace {
+                workspace_id: "ws".into(),
+                runtime_instance: 7,
+            },
+            DocumentScopeCloseTarget::AppExit,
+        ] {
+            assert!(
+                plan_document_scope_close(
+                    std::slice::from_ref(&document),
+                    &views,
+                    target,
+                    Some(&mux)
+                )
+                .is_some()
+            );
+        }
+        let other = DocumentScopeCloseTarget::Runtime {
+            workspace_id: "other".into(),
+            runtime_instance: 7,
+            command: runtime::RuntimeCommand::ClosePane {
+                pane: runtime::MuxPaneId("pane".into()),
+            },
+        };
+        assert!(
+            plan_document_scope_close(std::slice::from_ref(&document), &views, other, Some(&mux))
+                .is_none()
+        );
+    }
+
+    fn document_close_fixture() -> (OpenDocument, PendingDocumentScopeClose) {
+        let document = stub_loaded_document_id(17, "/fixture/close.md", "edited", "disk", true);
+        let owner = crate::session_aux::SessionAuxScope {
+            workspace_id: "ws".into(),
+            runtime_instance: 7,
+            pane: Some(runtime::MuxPaneId("pane".into())),
+            session: Some(runtime::SessionId(41)),
+        };
+        let pending = PendingDocumentScopeClose {
+            target: DocumentScopeCloseTarget::Runtime {
+                workspace_id: "ws".into(),
+                runtime_instance: 7,
+                command: runtime::RuntimeCommand::ClosePane {
+                    pane: runtime::MuxPaneId("pane".into()),
+                },
+            },
+            owners: vec![owner],
+            documents: vec![document.id],
+            phase: DocumentScopeClosePhase::Confirming,
+        };
+        (document, pending)
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_cancels_if_original_owner_is_gone_or_reused() {
+        let (document, pending) = document_close_fixture();
+        let reused = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
+                document_scope_owner_is_live(scope, "ws", 7, Some(&reused))
+            }),
+            DocumentScopeCloseReadiness::Canceled
+        );
+        assert_eq!(
+            document_scope_close_readiness(&pending, &[], |_| false),
+            DocumentScopeCloseReadiness::Canceled,
+            "a disappeared target must never become an authorized close of a replacement"
+        );
+        assert_eq!(document.source, "edited");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_keeps_owner_fence_through_handoff() {
+        let (mut document, pending) = document_close_fixture();
+        document.saved_source = document.source.clone();
+        document.recompute_dirty();
+        let live = cross_workspace_test_mux("tab", "pane", runtime::SessionId(41));
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
+                document_scope_owner_is_live(scope, "ws", 7, Some(&live))
+            }),
+            DocumentScopeCloseReadiness::Ready,
+            "the close was authorized before entering the queued handoff"
+        );
+        let replacement = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
+                document_scope_owner_is_live(scope, "ws", 7, Some(&replacement))
+            }),
+            DocumentScopeCloseReadiness::Canceled,
+            "replacement after authorization still requires the original owner fence"
+        );
+        let production = include_str!("app.rs")
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .unwrap();
+        let function = |name: &str| {
+            production
+                .split_once(name)
+                .unwrap()
+                .1
+                .split_once("\n    fn ")
+                .unwrap()
+                .0
+        };
+        assert!(
+            function("fn poll_document_scope_close(&mut self)")
+                .contains("pending.phase = DocumentScopeClosePhase::Submitted;"),
+            "queued close handoff must retain the original owner fence until final delivery"
+        );
+        for name in [
+            "fn defer_document_runtime_close(",
+            "fn close_workspace_sessions(",
+        ] {
+            assert!(
+                function(name).contains("document_scope_close_handoff_is_stale"),
+                "{name} must consume and validate the same queued handoff fence"
+            );
+        }
+    }
+
+    #[test]
+    fn full_fix_20261014_document_submitted_runtime_handoff_checks_same_owner_once() {
+        let (mut document, mut pending) = document_close_fixture();
+        document.saved_source = document.source.clone();
+        document.recompute_dirty();
+        pending.phase = DocumentScopeClosePhase::Submitted;
+        let command = runtime::RuntimeCommand::ClosePane {
+            pane: runtime::MuxPaneId("pane".into()),
+        };
+        let replacement = cross_workspace_test_mux("tab", "pane", runtime::SessionId(99));
+        let valid =
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |scope| {
+                document_scope_owner_is_live(scope, "ws", 7, Some(&replacement))
+            }) != DocumentScopeCloseReadiness::Canceled;
+        let mut pending = Some(pending);
+        assert!(!document_scope_close_handoff_is_stale(
+            &mut pending,
+            DocumentScopeCloseHandoff::Runtime {
+                runtime_instance: 8,
+                command: &command
+            },
+            valid,
+        ));
+        assert!(
+            pending.is_some(),
+            "an unrelated runtime cannot consume the fence"
+        );
+        assert!(document_scope_close_handoff_is_stale(
+            &mut pending,
+            DocumentScopeCloseHandoff::Runtime {
+                runtime_instance: 7,
+                command: &command
+            },
+            valid,
+        ));
+        assert!(
+            pending.is_none(),
+            "the stale queued close is consumed exactly once"
+        );
+        assert_eq!(document.source, "edited");
+        let (_, mut pending) = document_close_fixture();
+        pending.phase = DocumentScopeClosePhase::Submitted;
+        let mut pending = Some(pending);
+        assert!(!document_scope_close_handoff_is_stale(
+            &mut pending,
+            DocumentScopeCloseHandoff::Runtime {
+                runtime_instance: 7,
+                command: &command
+            },
+            true,
+        ));
+        assert!(
+            pending.is_none(),
+            "a valid exact owner transfers the close once"
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_document_submitted_workspace_handoff_rejects_replacement_runtime() {
+        let (document, mut pending) = document_close_fixture();
+        pending.target = DocumentScopeCloseTarget::Workspace {
+            workspace_id: "ws".into(),
+            runtime_instance: 7,
+        };
+        pending.phase = DocumentScopeClosePhase::Submitted;
+        let owners_valid = pending.owners.iter().all(|scope| {
+            workspace_runtime_identity_matches("ws", 8, &scope.workspace_id, scope.runtime_instance)
+        });
+        assert!(!owners_valid);
+        let mut pending = Some(pending);
+        assert!(document_scope_close_handoff_is_stale(
+            &mut pending,
+            DocumentScopeCloseHandoff::Workspace("ws"),
+            owners_valid,
+        ));
+        assert!(pending.is_none());
+        assert_eq!(document.source, "edited");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_submitted_close_cancel_conflict_failure_leave_tombstone() {
+        for outcome in [
+            None,
+            Some(document_io::DocumentSaveOutcome::Conflict),
+            Some(document_io::DocumentSaveOutcome::Failed {
+                code: document_io::DocumentIoErrorCode::TempWriteFailed,
+            }),
+        ] {
+            let (mut document, mut pending) = document_close_fixture();
+            pending.phase = DocumentScopeClosePhase::Submitted;
+            let id = document.id;
+            let mut confirms = [DocumentPendingConfirm::CloseWithDirty { id }]
+                .into_iter()
+                .collect();
+            let conflict = outcome
+                .as_ref()
+                .and_then(|outcome| apply_save_outcome_to_document(id, &mut document, outcome));
+            if let Some(conflict) = conflict {
+                enqueue_document_pending_confirm(&mut confirms, conflict);
+            }
+            let mut after_save = [id].into_iter().collect();
+            let mut pending = Some(pending);
+            cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
+            assert_eq!(
+                pending.as_ref().unwrap().phase,
+                DocumentScopeClosePhase::Canceled
+            );
+            assert!(after_save.is_empty());
+            assert_eq!(
+                confirms.into_iter().collect::<Vec<_>>(),
+                conflict.into_iter().collect::<Vec<_>>()
+            );
+            let command = runtime::RuntimeCommand::ClosePane {
+                pane: runtime::MuxPaneId("pane".into()),
+            };
+            assert!(document_scope_close_handoff_is_stale(
+                &mut pending,
+                DocumentScopeCloseHandoff::Runtime {
+                    runtime_instance: 7,
+                    command: &command
+                },
+                true,
+            ));
+            assert!(
+                pending.is_none(),
+                "the canceled queued command must be discarded"
+            );
+            assert_eq!(document.source, "edited");
+        }
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_cancel_preserves_unrelated_confirmations() {
+        let (document, pending) = document_close_fixture();
+        let other = ui::workspace::DocumentTabId(20);
+        let mut pending = Some(pending);
+        let mut confirms = [
+            DocumentPendingConfirm::CloseWithDirty { id: document.id },
+            DocumentPendingConfirm::CloseWithDirty { id: other },
+        ]
+        .into_iter()
+        .collect();
+        let mut after_save = [document.id, other].into_iter().collect();
+        assert_eq!(
+            resolve_document_confirm_choice(&mut confirms, DocumentConfirmChoice::Cancel),
+            None
+        );
+        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
+        assert!(pending.is_none());
+        assert_eq!(
+            confirms.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::CloseWithDirty { id: other }]
+        );
+        assert_eq!(after_save, [other].into_iter().collect());
+        assert_eq!(document.source, "edited");
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_conflict_keeps_source_and_conflict_prompt() {
+        let (mut document, pending) = document_close_fixture();
+        document.saving = true;
+        document.saving_source = Some(document.source.clone());
+        let conflict = apply_save_outcome_to_document(
+            document.id,
+            &mut document,
+            &document_io::DocumentSaveOutcome::Conflict,
+        )
+        .unwrap();
+        let mut pending = Some(pending);
+        let mut confirms = [
+            DocumentPendingConfirm::CloseWithDirty { id: document.id },
+            conflict,
+        ]
+        .into_iter()
+        .collect();
+        let mut after_save = [document.id].into_iter().collect();
+        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
+        assert_eq!(confirms.into_iter().collect::<Vec<_>>(), vec![conflict]);
+        assert!(pending.is_none() && after_save.is_empty());
+        assert_eq!(document.source, "edited");
+        assert!(document.dirty && !document.saving);
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_save_failure_preserves_buffer() {
+        let (mut document, pending) = document_close_fixture();
+        document.saving = true;
+        let failure = document_io::DocumentSaveOutcome::Failed {
+            code: document_io::DocumentIoErrorCode::TempWriteFailed,
+        };
+        assert!(apply_save_outcome_to_document(document.id, &mut document, &failure).is_none());
+        let mut pending = Some(pending);
+        let mut confirms = std::collections::VecDeque::new();
+        let mut after_save = [document.id].into_iter().collect();
+        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
+        assert!(pending.is_none() && after_save.is_empty());
+        assert_eq!(document.source, "edited");
+        assert!(document.dirty && document.save_error.is_some());
+    }
+
+    #[test]
+    fn full_fix_20261014_document_worker_panic_cancels_close_before_later_manual_save() {
+        use std::time::{Duration, Instant};
+        let (mut document, pending) = document_close_fixture();
+        document.saving = true;
+        document.saving_source = Some(document.source.clone());
+        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
+            panic!("loaded fixture");
+        };
+        let id = document.id;
+        let unrelated = ui::workspace::DocumentTabId(99);
+        let mut worker = crate::lazy_worker::LazyBoundedWorker::<
+            ui::workspace::DocumentTabId,
+            (
+                ui::workspace::DocumentTabId,
+                document_io::DocumentSaveOutcome,
+            ),
+        >::new(
+            "document-save-panic-fixture",
+            Duration::from_secs(1),
+            || |_| panic!("synthetic save executor failure"),
+            || {},
+        );
+        worker.try_request(id).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let outcome = loop {
+            if let Some(outcome) = worker.try_recv() {
+                break outcome;
+            }
+            assert!(Instant::now() < until, "panic outcome must be published");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(
+            outcome.error_code(),
+            Some(crate::lazy_worker::LazyWorkerErrorCode::WorkerPanicked)
+        );
+        let mut documents = vec![document];
+        let mut pending = Some(pending);
+        let mut confirms = [
+            DocumentPendingConfirm::CloseWithDirty { id },
+            DocumentPendingConfirm::CloseWithDirty { id: unrelated },
+        ]
+        .into_iter()
+        .collect();
+        let mut after_save = [id].into_iter().collect();
+        // These are poll_document_io's real failure-state functions. The separate
+        // caller regression verifies both infrastructure branches connect them.
+        apply_document_save_infrastructure_failure(&mut documents, &mut after_save, id);
+        cancel_document_scope_close_state(&mut pending, &mut confirms, &mut after_save);
+        assert!(pending.is_none() && after_save.is_empty());
+        assert_eq!(documents[0].source, "edited");
+        assert!(documents[0].dirty && !documents[0].saving);
+        assert_eq!(
+            confirms.into_iter().collect::<Vec<_>>(),
+            vec![DocumentPendingConfirm::CloseWithDirty { id: unrelated }]
+        );
+        documents[0].saving = true;
+        documents[0].saving_source = Some(documents[0].source.clone());
+        apply_save_outcome_to_document(
+            id,
+            &mut documents[0],
+            &document_io::DocumentSaveOutcome::Saved { revision },
+        );
+        assert!(!documents[0].dirty);
+        assert!(
+            pending.is_none(),
+            "a later manual save cannot resume the old close"
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_document_scope_close_waits_for_edits_made_during_save() {
+        let (mut document, pending) = document_close_fixture();
+        let DocumentLoadState::Loaded { revision, .. } = document.load_state else {
+            panic!("loaded fixture");
+        };
+        document.saving = true;
+        document.saving_source = Some("edited".into());
+        document.source = "edited while saving".into();
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
+            DocumentScopeCloseReadiness::Waiting
+        );
+        apply_save_outcome_to_document(
+            document.id,
+            &mut document,
+            &document_io::DocumentSaveOutcome::Saved { revision },
+        );
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
+            DocumentScopeCloseReadiness::Waiting
+        );
+        assert_eq!(document.source, "edited while saving");
+        document.saved_source = document.source.clone();
+        document.recompute_dirty();
+        assert_eq!(
+            document_scope_close_readiness(&pending, std::slice::from_ref(&document), |_| true),
+            DocumentScopeCloseReadiness::Ready
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_document_aggregate_editor_budget_counts_saved_copies() {
+        let half = "a".repeat(6 * 1024 * 1024);
+        let documents = vec![
+            stub_open_document_id(1, "/a.md", "", "", false),
+            stub_open_document_id(2, "/b.md", &half, &half, false),
+            stub_open_document_id(3, "/c.md", &half, &half, false),
+        ];
+        assert_eq!(
+            document_source_byte_budget(&documents, ui::workspace::DocumentTabId(1)),
+            0
+        );
+        assert_eq!(
+            document_source_byte_budget(&documents[..2], ui::workspace::DocumentTabId(1)),
+            8 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -49897,7 +51175,7 @@ mod tests {
     }
 
     #[test]
-    fn document_poll의_두_save_worker_인프라_실패는_같은_정리_helper를_쓴다() {
+    fn full_fix_20261014_document_poll_infrastructure_failures_cancel_scope_close() {
         let source = include_str!("app.rs");
         let function_body = source
             .split_once("fn poll_document_io(&mut self) {")
@@ -49912,6 +51190,13 @@ mod tests {
                 .count(),
             2,
             "worker outcome Err와 admission Unavailable 모두 snapshot/continuation을 정리해야 한다"
+        );
+        assert_eq!(
+            function_body
+                .matches("self.cancel_document_scope_close_for(id);")
+                .count(),
+            2,
+            "worker outcome Err와 admission Unavailable 모두 이전 lifecycle close 요청을 취소해야 한다"
         );
     }
 
@@ -52014,6 +53299,72 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "The regression checks ownership of the exact rejected payload"
+    )]
+    fn full_fix_20261014_host_completion_retains_exact_unsent_bytes_then_delivers_once() {
+        use connector_contract::{ConnectorIntent, ImportSource, OperationId, SensitiveInput};
+        use connector_service::{DispatchError, DispatchOutcome};
+        let contents = SensitiveInput::new(b"synthetic import".to_vec());
+        let original_ptr = contents.expose_bytes().as_ptr();
+        let intent = ConnectorIntent::CompleteImportSource {
+            operation_id: OperationId::new("retained-host-import"),
+            source: ImportSource::File,
+            display_name: Some("fixture.json".to_owned()),
+            contents,
+        };
+        let retained = retain_connector_host_completion(intent, |intent| {
+            Err((DispatchError::Backpressure, intent))
+        });
+        let retained = retained.expect("queue-full must preserve the completed one-shot input");
+        if let ConnectorIntent::CompleteImportSource { contents, .. } = &retained {
+            assert_eq!(
+                contents.expose_bytes().as_ptr(),
+                original_ptr,
+                "sensitive input is moved, never cloned"
+            );
+        } else {
+            panic!("wrong completion");
+        }
+        let retained = retain_connector_host_completion(retained, |intent| {
+            Err((DispatchError::WorkerUnavailable, intent))
+        });
+        let mut delivered = 0;
+        let retained = retain_connector_host_completion(retained.unwrap(), |intent| {
+            if let ConnectorIntent::CompleteImportSource { contents, .. } = intent {
+                assert_eq!(contents.expose_bytes(), b"synthetic import");
+                delivered += 1;
+            }
+            Ok(DispatchOutcome::Queued)
+        });
+        assert!(retained.is_none());
+        assert_eq!(delivered, 1);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "The regression checks ownership of the exact rejected payload"
+    )]
+    fn full_fix_20261014_host_completion_cancelled_owner_discards_payload() {
+        use connector_contract::{ConnectorIntent, ErrorCode, ImportSource, OperationId};
+        use connector_service::DispatchError;
+        let intent = ConnectorIntent::FailImportSource {
+            operation_id: OperationId::new("cancelled-import"),
+            source: ImportSource::File,
+            error_code: ErrorCode::HostUnavailable,
+        };
+        assert!(
+            retain_connector_host_completion(intent, |intent| Err((
+                DispatchError::StaleHostAction,
+                intent
+            )))
+            .is_none()
+        );
+    }
+
+    #[test]
     fn connector_host_worker_failure는_exact_import를_fail_closed한다() {
         let operation_id = connector_contract::OperationId::new("import-op");
         let action = connector_service::HostAction::RequestImportSource {
@@ -52294,6 +53645,7 @@ mod tests {
         std::os::unix::fs::symlink(base.join("real"), base.join("alias")).unwrap();
         let alias_target = base.join("alias/a.txt");
         let request = Request::Trash {
+            root: Some(PathPayload::try_new(base.clone()).unwrap()),
             target: PathPayload::try_new(alias_target.clone()).unwrap(),
             preflight: Some((
                 PathPayload::try_new(base.clone()).unwrap(),
@@ -52414,6 +53766,7 @@ mod tests {
         let first = base.join("a.txt");
         std::fs::write(&first, b"first").unwrap();
         let request = Request::Trash {
+            root: Some(PathPayload::try_new(base.clone()).unwrap()),
             target: PathPayload::try_new(first.clone()).unwrap(),
             preflight: Some((
                 PathPayload::try_new(base.clone()).unwrap(),
@@ -53438,6 +54791,7 @@ mod tests {
             generation: gen1,
             result: Ok(AppFileTreeWatchApplied {
                 root: root1.clone(),
+                physical_root: root1.clone(),
                 ignored_prefixes: Vec::new(),
                 show_hidden: false,
             }),
@@ -53455,6 +54809,7 @@ mod tests {
             generation: gen2,
             result: Ok(AppFileTreeWatchApplied {
                 root: root2.clone(),
+                physical_root: root2.clone(),
                 ignored_prefixes: ignored2,
                 show_hidden: hidden2,
             }),
@@ -53494,6 +54849,7 @@ mod tests {
             generation: 0,
             revision: 0,
             root: PathBuf::new(),
+            physical_root: PathBuf::new(),
             ignored_prefixes: Vec::new(),
             show_hidden: false,
         };
@@ -59346,6 +60702,91 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn popup_audit_20261014_native_trash_proof_only_survives_failed_unchanged_object() {
+        use ui::file_tree::{
+            FileTreeIoErrorCode as Error, FileTreeIoRequest as Request,
+            FileTreePathPayload as Payload,
+        };
+        let base = unique_temp_dir("popup-native-trash-proof");
+        let target = base.join("selected.txt");
+        std::fs::write(&target, b"selected").unwrap();
+        let request = || Request::Trash {
+            root: Some(Payload::try_new(base.clone()).unwrap()),
+            target: Payload::try_new(target.clone()).unwrap(),
+            preflight: None,
+        };
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let (result, proof) =
+            run_file_tree_host_io_with_delete_guard(request(), &cancel, || None, |_| Err(()));
+        assert_eq!(result, Err(Error::TrashUnavailable));
+        assert!(proof.unwrap().validate(&target).is_ok());
+        let (result, proof) = run_file_tree_host_io_with_delete_guard(
+            request(),
+            &cancel,
+            || None,
+            |actual| {
+                std::fs::rename(actual, base.join("retained.txt")).unwrap();
+                std::fs::write(actual, b"replacement").unwrap();
+                Err(())
+            },
+        );
+        assert_eq!(result, Err(Error::TrashUnavailable));
+        assert!(
+            proof.is_none(),
+            "a failed backend that replaced the object yields no deletion authority"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), b"replacement");
+        let (result, proof) = run_file_tree_host_io_with_delete_guard(
+            request(),
+            &cancel,
+            || None,
+            |actual| app_host_remove_all(actual).map_err(|_| ()),
+        );
+        assert_eq!(result, Ok(()));
+        assert!(
+            proof.is_none(),
+            "successful native deletion returns no permanent-delete permission"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popup_audit_20261014_unreadable_file_keeps_normal_native_trash_success() {
+        use std::os::unix::fs::PermissionsExt as _;
+        use ui::file_tree::{FileTreeIoRequest as Request, FileTreePathPayload as Payload};
+        let base = unique_temp_dir("popup-unreadable-trash");
+        let target = base.join("selected.txt");
+        std::fs::write(&target, b"selected").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o0)).unwrap();
+        assert_eq!(
+            std::fs::File::open(&target).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let request = Request::Trash {
+            root: Some(Payload::try_new(base.clone()).unwrap()),
+            target: Payload::try_new(target.clone()).unwrap(),
+            preflight: None,
+        };
+        let mut native_calls = 0;
+        let (result, guard) = run_file_tree_host_io_with_delete_guard(
+            request,
+            &std::sync::atomic::AtomicBool::new(false),
+            || None,
+            |actual| {
+                native_calls += 1;
+                app_host_remove_all(actual).map_err(|_| ())
+            },
+        );
+        assert_eq!(result, Ok(()));
+        assert_eq!(native_calls, 1);
+        assert!(guard.is_none());
+        assert!(!target.exists());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     /// 정리 호출과 저장 조건이 실제로 배선돼 있는지 고정한다(2026-09-03 defect 5).
     #[test]
     fn refresh_workspaces는_순서_목록도_정리하고_저장한다() {
@@ -59365,6 +60806,303 @@ mod tests {
         assert!(
             body.contains("self.config.ui.workspace_order.len() != order_before"),
             "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn popup_audit_20261014_symlink_root_delivers_native_watch_events() {
+        let base = unique_temp_dir("popup-audit-symlink-watch")
+            .canonicalize()
+            .unwrap();
+        let physical = base.join("physical");
+        let logical = base.join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (operation, generation, directories, ignored_prefixes, show_hidden) =
+            app_file_tree_watch_intent(&mut tree, logical.clone());
+        let mut watcher = AppFileTreeWatcher::new(ctx).unwrap();
+        watcher
+            .submit_replace(
+                operation,
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let completion = loop {
+            if let Some(completion) = watcher.poll_completion() {
+                break completion;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native watch registration timeout"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert!(completion.result.is_ok());
+        std::fs::write(physical.join("new.txt"), b"native-change").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let observed_paths = loop {
+            let paths = watcher.pending.lock().unwrap().paths.clone();
+            if paths
+                .iter()
+                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("new.txt")))
+            {
+                break paths;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "native FSEvents callback did not observe the synthetic file change"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let snapshot = watcher.take_snapshot().unwrap().unwrap();
+        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+            operation,
+            generation,
+            result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
+        });
+        tree.apply_watch_snapshot(snapshot);
+        let refreshed = matches!(
+            tree.take_maintenance_intent(),
+            Some(ui::file_tree::FileTreeMaintenanceIntent {
+                request: ui::file_tree::FileTreeMaintenanceRequest::ListDirectory { .. },
+                ..
+            })
+        );
+        println!(
+            "symlink-watch raw={observed_paths:?}, physical={physical:?}, logical={logical:?}, refresh_queued={refreshed}"
+        );
+        drop(watcher);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            refreshed,
+            "native changes beneath a selected symlink root must reach the file tree in its logical path namespace"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor() {
+        let db_path = temp_db_path("popup-audit-missing-project-picker");
+        let base = unique_temp_dir("popup-audit-missing-project-picker");
+        let selected = base.join("selected");
+        std::fs::create_dir(&selected).unwrap();
+        let identity = crate::folder_identity::probe(&selected).unwrap();
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("anchored workspace").unwrap();
+        db.set_workspace_path_and_anchor_with_volume(
+            &workspace_id,
+            selected.to_str().unwrap(),
+            Some(identity.anchor.dev),
+            Some(identity.anchor.ino),
+            identity.volume,
+        )
+        .unwrap();
+        std::fs::rename(&selected, base.join("moved-after-native-selection")).unwrap();
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: workspace_id.clone(),
+                project_root: None,
+                action: SettingsJobAction::SetProjectPath {
+                    path: selected.clone(),
+                },
+            },
+        );
+        let reported_success = matches!(outcome.kind, SettingsOutcomeKind::ProjectPathSet(Ok(_)));
+        let stored_anchor = db.workspace_anchor(&workspace_id).unwrap();
+        let stored_path = db.workspace_path(&workspace_id).unwrap();
+        let stored_volume: Option<String> = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row(
+                "SELECT volume_uuid FROM workspace_volume_identities WHERE workspace_id=?1",
+                [&workspace_id],
+                |row| row.get(0),
+            )
+            .ok();
+        println!(
+            "missing-picked-folder: reported_success={reported_success}, before={:?}, after={stored_anchor:?}",
+            identity.anchor
+        );
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            !reported_success,
+            "a folder that disappeared before worker admission must fail instead of committing an unanchored path"
+        );
+        assert_eq!(
+            stored_anchor,
+            Some((identity.anchor.dev, identity.anchor.ino)),
+            "failed picker validation must preserve the prior workspace identity"
+        );
+        assert_eq!(stored_path.as_deref(), selected.to_str());
+        assert_eq!(stored_volume, identity.volume.map(|id| id.to_string()));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn full_fix_20261014_document_nonunix_project_folder_accepts_valid_directory() {
+        let db_path = temp_db_path("nonunix-project-folder");
+        let base = unique_temp_dir("nonunix-project-folder");
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("portable folder fixture").unwrap();
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: workspace_id.clone(),
+                project_root: None,
+                action: SettingsJobAction::SetProjectPath { path: base.clone() },
+            },
+        );
+        let success = matches!(outcome.kind, SettingsOutcomeKind::ProjectPathSet(Ok(_)));
+        let stored_path = db.workspace_path(&workspace_id).unwrap();
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            success,
+            "directory selection must not require a Unix anchor"
+        );
+        assert_eq!(stored_path.as_deref(), base.to_str());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn popup_audit_20261014_symlink_watch_maps_deleted_env_and_ignored_paths() {
+        let base = unique_temp_dir("popup-audit-watch-path-filter")
+            .canonicalize()
+            .unwrap();
+        let physical = base.join("physical");
+        let logical = base.join("alias");
+        std::fs::create_dir(&physical).unwrap();
+        std::os::unix::fs::symlink(&physical, &logical).unwrap();
+        let ctx = egui::Context::default();
+        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
+        let (operation, generation, directories, _, show_hidden) =
+            app_file_tree_watch_intent(&mut tree, logical.clone());
+        let mut watcher = AppFileTreeWatcher::new(ctx).unwrap();
+        watcher
+            .submit_replace(
+                operation,
+                generation,
+                directories,
+                vec![logical.join("ignored")],
+                show_hidden,
+            )
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(completion) = watcher.poll_completion() {
+                assert!(completion.result.is_ok());
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        // Deleted callbacks cannot be canonicalized when consumed. Use the
+        // namespace captured by the actual native watch-registration worker.
+        *watcher.pending.lock().unwrap() = PendingFileTreeWatchEvents {
+            paths: vec![
+                physical.join(".env"),
+                physical.join("ignored/.env"),
+                physical.join(".hidden/nested.txt"),
+                base.join("outside/.env"),
+            ],
+            overflowed: false,
+        };
+        let snapshot = watcher.take_snapshot().unwrap().unwrap();
+        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+            operation,
+            generation,
+            result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
+        });
+        tree.apply_watch_snapshot(snapshot);
+        let candidates = tree.take_env_warning_candidates();
+        drop(watcher);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert_eq!(
+            candidates,
+            vec![logical.join(".env")],
+            "physical events must map before env/ignore filtering even after a file disappears"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn popup_audit_20261014_picker_rejects_file_but_preserves_explicit_detach() {
+        let db_path = temp_db_path("popup-audit-invalid-folder-picker");
+        let base = unique_temp_dir("popup-audit-invalid-folder-picker");
+        let file = base.join("file.txt");
+        std::fs::write(&file, b"not a folder").unwrap();
+        let identity = crate::folder_identity::probe(&base).unwrap();
+        let mut db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("anchored workspace").unwrap();
+        db.set_workspace_path_and_anchor_with_volume(
+            &workspace_id,
+            base.to_str().unwrap(),
+            Some(identity.anchor.dev),
+            Some(identity.anchor.ino),
+            identity.volume,
+        )
+        .unwrap();
+        let outcome = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 1,
+                revision: 1,
+                workspace_id: workspace_id.clone(),
+                project_root: Some(base.clone()),
+                action: SettingsJobAction::SetProjectPath { path: file },
+            },
+        );
+        let rejected = matches!(
+            outcome.kind,
+            SettingsOutcomeKind::ProjectPathSet(Err(SettingsErrorCode::ProjectPath))
+        );
+        let preserved = db.workspace_path(&workspace_id).unwrap();
+        let detached = execute_settings_job(
+            &mut db,
+            &db_path,
+            &secret::RedactionService::new(),
+            SettingsJob {
+                generation: 2,
+                revision: 2,
+                workspace_id: workspace_id.clone(),
+                project_root: Some(base.clone()),
+                action: SettingsJobAction::SetProjectPath {
+                    path: PathBuf::new(),
+                },
+            },
+        );
+        let detached_ok = matches!(detached.kind, SettingsOutcomeKind::ProjectPathSet(Ok(ref row))
+            if row.path.is_empty() && row.folder_anchor.is_none());
+        drop(db);
+        remove_sqlite_files(&db_path);
+        std::fs::remove_dir_all(&base).unwrap();
+        assert!(
+            rejected,
+            "a selected regular file must not replace a folder binding"
+        );
+        assert_eq!(preserved.as_deref(), base.to_str());
+        assert!(
+            detached_ok,
+            "explicit empty-path detach must remain supported"
         );
     }
 }

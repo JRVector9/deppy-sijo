@@ -10,6 +10,7 @@
 //! 소켓은 이 스레드가 단독 소유한다(읽기+쓰기). 브리지 스레드는 소켓을 만지지 않고 발행
 //! 스냅샷만 갱신하며, 이 스레드가 tick마다 버전을 비교해 push한다.
 
+use std::io::{self, Read, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,72 @@ const MAX_INPUT_TEXT_BYTES: usize = 256 * 1024;
 /// tungstenite 프레임/메시지 크기 상한 — 기본(16MB/64MB) 대신 1MB로 낮춰 인증 전 대용량
 /// 프레임의 메모리 점유를 유계로 둔다. 서버 대시보드/승인 프레임은 이보다 훨씬 작다.
 const WS_SIZE_CAP: usize = 1024 * 1024;
+
+/// Bound each underlying read and automatic reply within authentication.
+/// Socket inactivity timeouts alone do not bound a progressing frame.
+struct AuthDeadlineStream {
+    stream: TcpStream,
+    authentication: Option<(Instant, Arc<AtomicBool>)>,
+}
+
+impl AuthDeadlineStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            authentication: None,
+        }
+    }
+
+    fn authentication_remaining(&self) -> io::Result<Option<Duration>> {
+        let Some((deadline, stop)) = &self.authentication else {
+            return Ok(None);
+        };
+        if stop.load(Ordering::SeqCst) {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "websocket authentication stopped",
+            ));
+        }
+        deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .map(Some)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::TimedOut, "websocket authentication deadline")
+            })
+    }
+}
+
+impl Read for AuthDeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if let Some(remaining) = self.authentication_remaining()? {
+            self.stream.set_read_timeout(Some(remaining.min(WS_TICK)))?;
+        }
+        let read = self.stream.read(buffer)?;
+        // A read may finish at the deadline, or concurrently with stop.
+        self.authentication_remaining()?;
+        Ok(read)
+    }
+}
+
+impl Write for AuthDeadlineStream {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if let Some(remaining) = self.authentication_remaining()? {
+            self.stream
+                .set_write_timeout(Some(remaining.min(WS_TICK)))?;
+        }
+        let written = self.stream.write(buffer)?;
+        self.authentication_remaining()?;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.authentication_remaining()?;
+        self.stream.flush()?;
+        self.authentication_remaining()?;
+        Ok(())
+    }
+}
 
 /// `/ws` 경로의 WebSocket 업그레이드 요청인가 (`Upgrade: websocket`). 경로를 `/ws`로 한정해
 /// 다른 경로로 온 업그레이드 헤더는 정적 라우팅으로 흘려보낸다(정적 셸은 404/401). 클라이언트
@@ -79,7 +146,6 @@ pub fn serve(
     let handshake = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
     );
-    use std::io::Write;
     if stream.write_all(handshake.as_bytes()).is_err() || stream.flush().is_err() {
         return;
     }
@@ -92,7 +158,8 @@ pub fn serve(
     let config = tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(WS_SIZE_CAP))
         .max_frame_size(Some(WS_SIZE_CAP));
-    let mut ws = WebSocket::from_raw_socket(stream, Role::Server, Some(config));
+    let mut ws =
+        WebSocket::from_raw_socket(AuthDeadlineStream::new(stream), Role::Server, Some(config));
 
     // 1) 인증 — 첫 텍스트 프레임의 토큰을 상수시간 비교. 실패/타임아웃은 close.
     if !authenticate(&mut ws, token, stop, AUTH_TIMEOUT) {
@@ -194,42 +261,63 @@ impl Drop for WatchBinding<'_> {
 /// 첫 프레임에서 토큰을 받아 인증한다. `timeout` 내 유효 토큰이면 true. `timeout`은 테스트가
 /// 짧은 데드라인을 주입할 수 있게 인자로 받는다(serve는 [`AUTH_TIMEOUT`]을 넘긴다).
 fn authenticate(
-    ws: &mut WebSocket<TcpStream>,
+    ws: &mut WebSocket<AuthDeadlineStream>,
     token: &str,
-    stop: &AtomicBool,
+    stop: &Arc<AtomicBool>,
     timeout: Duration,
 ) -> bool {
+    let (Ok(read_timeout), Ok(write_timeout)) = (
+        ws.get_ref().stream.read_timeout(),
+        ws.get_ref().stream.write_timeout(),
+    ) else {
+        return false;
+    };
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if stop.load(Ordering::SeqCst) {
-            return false;
+    ws.get_mut().authentication = Some((deadline, Arc::clone(stop)));
+    let authenticated = loop {
+        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
+            break false;
         }
-        match ws.read() {
+        let message = ws.read();
+        if Instant::now() >= deadline || stop.load(Ordering::SeqCst) {
+            break false;
+        }
+        match message {
             Ok(Message::Text(text)) => {
                 if text.len() > MAX_CLIENT_FRAME_BYTES {
-                    return false;
+                    break false;
                 }
-                return match ClientMsg::parse(text.as_str()) {
+                let valid = match ClientMsg::parse(text.as_str()) {
                     Some(ClientMsg::Auth {
                         token: provided, ..
                     }) => crate::static_srv::token_matches(token, provided.as_bytes()),
                     _ => false, // 첫 프레임이 auth가 아니면 거부
                 };
+                break valid && Instant::now() < deadline && !stop.load(Ordering::SeqCst);
             }
             // 인증 전 다른 프레임은 무시하고 계속 기다린다(브라우저 자동 pong 등).
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Binary(_) | Message::Frame(_)) => {}
-            Ok(Message::Close(_)) => return false,
+            Ok(Message::Close(_)) => break false,
             Err(e) if is_would_block(&e) => {} // tick 타임아웃 — 데드라인까지 재시도
-            Err(_) => return false,
+            Err(_) => break false,
         }
+    };
+    if !authenticated {
+        // Keep failure replies/close under the same bound. In particular a
+        // timed-out or stopped peer must not block serve's best-effort flush.
+        return false;
     }
-    false
+    ws.get_mut().authentication = None;
+    let stream = &mut ws.get_mut().stream;
+    let read_restored = stream.set_read_timeout(read_timeout).is_ok();
+    let write_restored = stream.set_write_timeout(write_timeout).is_ok();
+    read_restored && write_restored
 }
 
 /// 인증 후 스트림 루프: 발행 스냅샷 push + ping + 클라 메시지(resolve/watch) 처리.
 /// `watched`는 이 접속의 현재 시청 세션 — 호출측(serve)이 종료 시 해제를 보장한다.
 fn stream_loop(
-    ws: &mut WebSocket<TcpStream>,
+    ws: &mut WebSocket<AuthDeadlineStream>,
     dashboard: &DashboardHandle,
     stop: &AtomicBool,
     watch: &mut WatchBinding<'_>,
@@ -711,8 +799,9 @@ mod tests {
         server
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let mut ws = WebSocket::from_raw_socket(server, Role::Server, None);
-        let stop = AtomicBool::new(false);
+        let mut ws =
+            WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+        let stop = Arc::new(AtomicBool::new(false));
         let start = Instant::now();
         let ok = authenticate(&mut ws, "tok", &stop, Duration::from_millis(120));
         let elapsed = start.elapsed();
@@ -734,10 +823,253 @@ mod tests {
         server
             .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
-        let mut ws = WebSocket::from_raw_socket(server, Role::Server, None);
-        let stop = AtomicBool::new(true); // 이미 stop
+        let mut ws =
+            WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+        let stop = Arc::new(AtomicBool::new(true)); // 이미 stop
         let ok = authenticate(&mut ws, "tok", &stop, Duration::from_secs(5));
         assert!(!ok, "stop 상태인데 인증이 성공/대기했다");
         drop(client);
+    }
+    #[test]
+    fn review_20261015_auth_rejects_valid_message_completed_after_whole_deadline() {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server.set_read_timeout(Some(WS_TICK)).unwrap();
+        let mut ws =
+            WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+        let mut payload = format!(
+            r#"{{"type":"auth","v":{},"token":"tok"}}"#,
+            PROTOCOL_VERSION
+        )
+        .into_bytes();
+        payload.extend(std::iter::repeat_n(b' ', 160));
+        assert!(
+            matches!(
+                ClientMsg::parse(std::str::from_utf8(&payload).unwrap()),
+                Some(ClientMsg::Auth { .. })
+            ),
+            "fixture must be a valid auth frame"
+        );
+        let mut frame = vec![0x81, 0xfe];
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&[0; 4]);
+        frame.extend_from_slice(&payload);
+        client.write_all(&frame[..10]).unwrap();
+        let writer = std::thread::spawn(move || {
+            for chunk in frame[10..].chunks(5) {
+                std::thread::sleep(Duration::from_millis(160));
+                if client.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let start = Instant::now();
+        let accepted = authenticate(
+            &mut ws,
+            "tok",
+            &Arc::new(AtomicBool::new(false)),
+            AUTH_TIMEOUT,
+        );
+        let elapsed = start.elapsed();
+        drop(ws);
+        writer.join().unwrap();
+        eprintln!(
+            "auth whole deadline={:?}; elapsed={elapsed:?}; late valid message accepted={accepted}",
+            AUTH_TIMEOUT
+        );
+        assert!(
+            !accepted,
+            "a valid auth message completed after the whole deadline must be rejected"
+        );
+        assert!(
+            elapsed <= AUTH_TIMEOUT + WS_TICK + Duration::from_millis(100),
+            "auth whole deadline exceeded: {elapsed:?}"
+        );
+    }
+
+    fn masked_auth_frame(fin: bool, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        let mask = [1, 2, 3, 4];
+        let mut frame = vec![if fin { 0x80 | opcode } else { opcode }];
+        if payload.len() <= 125 {
+            frame.push(0x80 | payload.len() as u8);
+        } else {
+            frame.push(0xfe);
+            frame.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+        }
+        frame.extend_from_slice(&mask);
+        frame.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i % 4]),
+        );
+        frame
+    }
+
+    #[test]
+    fn auth_preserves_partial_frame_and_fragment_progress_across_read_ticks() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let read_timeout = Some(Duration::from_secs(3));
+        let write_timeout = Some(Duration::from_secs(4));
+        server.set_read_timeout(read_timeout).unwrap();
+        server.set_write_timeout(write_timeout).unwrap();
+        let mut ws =
+            WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+        let payload = format!(
+            r#"{{"type":"auth","v":{},"token":"tok"}}"#,
+            PROTOCOL_VERSION
+        );
+        let split = payload.len() / 2;
+        let first = masked_auth_frame(false, 1, &payload.as_bytes()[..split]);
+        let last = masked_auth_frame(true, 0, &payload.as_bytes()[split..]);
+        client.write_all(&masked_auth_frame(true, 9, &[])).unwrap();
+        client.write_all(&first[..8]).unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(WS_TICK + Duration::from_millis(80));
+            client.write_all(&first[8..]).unwrap();
+            client.write_all(&last).unwrap();
+            // Keep the authenticated socket alive until its owner closes it.
+            client
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let start = Instant::now();
+        let accepted = authenticate(&mut ws, "tok", &stop, Duration::from_secs(2));
+        let elapsed = start.elapsed();
+        let restored_read = ws.get_ref().stream.read_timeout().unwrap();
+        let restored_write = ws.get_ref().stream.write_timeout().unwrap();
+        let deadline_cleared = ws.get_ref().authentication.is_none();
+        drop(ws);
+        let mut client = writer.join().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut pong = [0; 2];
+        let received_pong = client.read_exact(&mut pong);
+        drop(client);
+        assert!(
+            accepted,
+            "valid fragmented auth was lost across a read timeout"
+        );
+        assert!(
+            elapsed >= WS_TICK,
+            "fixture did not cross a read tick: {elapsed:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+        assert_eq!(restored_read, read_timeout);
+        assert_eq!(restored_write, write_timeout);
+        assert!(deadline_cleared);
+        assert!(received_pong.is_ok());
+        assert_eq!(pong, [0x8a, 0]);
+    }
+
+    #[test]
+    fn auth_stop_interrupts_a_continuously_progressing_valid_frame() {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let mut ws =
+            WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+        let mut payload = format!(
+            r#"{{"type":"auth","v":{},"token":"tok"}}"#,
+            PROTOCOL_VERSION
+        )
+        .into_bytes();
+        payload.extend(std::iter::repeat_n(b' ', 160));
+        assert!(matches!(
+            ClientMsg::parse(std::str::from_utf8(&payload).unwrap()),
+            Some(ClientMsg::Auth { .. })
+        ));
+        let frame = masked_auth_frame(true, 1, &payload);
+        client.write_all(&frame[..10]).unwrap();
+        let writer = std::thread::spawn(move || {
+            for chunk in frame[10..].chunks(5) {
+                std::thread::sleep(Duration::from_millis(20));
+                if client.write_all(chunk).is_err() {
+                    break;
+                }
+            }
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        let stopper = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            signal.store(true, Ordering::SeqCst);
+        });
+        let start = Instant::now();
+        let accepted = authenticate(&mut ws, "tok", &stop, AUTH_TIMEOUT);
+        let elapsed = start.elapsed();
+        drop(ws);
+        stopper.join().unwrap();
+        writer.join().unwrap();
+        assert!(!accepted, "authentication succeeded after stop");
+        assert!(
+            elapsed <= WS_TICK + Duration::from_millis(400),
+            "progressing frame delayed stop: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn auth_deadline_and_stop_interrupt_automatic_pong_and_close_flushes() {
+        use std::net::TcpListener;
+        for opcode in [9, 8] {
+            for stopping in [false, true] {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+                let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+                let (server, _) = listener.accept().unwrap();
+                let mut ws =
+                    WebSocket::from_raw_socket(AuthDeadlineStream::new(server), Role::Server, None);
+                let stop = Arc::new(AtomicBool::new(false));
+                // Queue a real automatic reply, then interrupt its flush without
+                // filling a socket or service buffer.
+                ws.get_mut().authentication =
+                    Some((Instant::now() + Duration::from_secs(1), Arc::clone(&stop)));
+                client
+                    .write_all(&masked_auth_frame(true, opcode, &[]))
+                    .unwrap();
+                let received = ws.read().unwrap();
+                assert!(matches!(
+                    (opcode, received),
+                    (9, Message::Ping(_)) | (8, Message::Close(_))
+                ));
+                if stopping {
+                    stop.store(true, Ordering::SeqCst);
+                } else {
+                    ws.get_mut().authentication.as_mut().unwrap().0 = Instant::now();
+                }
+                let flushed = ws.flush();
+                client
+                    .set_read_timeout(Some(Duration::from_millis(20)))
+                    .unwrap();
+                let mut reply = [0; 8];
+                let received_reply = client.read(&mut reply);
+                drop(ws);
+                drop(client);
+                let expected = if stopping {
+                    io::ErrorKind::ConnectionAborted
+                } else {
+                    io::ErrorKind::TimedOut
+                };
+                assert!(
+                    matches!(flushed, Err(tungstenite::Error::Io(error)) if error.kind() == expected),
+                    "automatic reply escaped authentication deadline/stop"
+                );
+                assert!(
+                    received_reply.is_err_and(|error| {
+                        matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        )
+                    }),
+                    "interrupted authentication wrote a control reply"
+                );
+            }
+        }
     }
 }

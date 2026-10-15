@@ -192,6 +192,17 @@ impl PendingHostImportSlot {
         Ok(())
     }
 
+    fn matches(&self, operation_id: &OperationId, source: ImportSource) -> bool {
+        self.pending
+            .lock()
+            .expect("pending host import lock")
+            .as_ref()
+            .is_some_and(|pending| {
+                &pending.operation_id == operation_id
+                    && import_source_matches_request(source, pending.source)
+            })
+    }
+
     fn take_matching(&self, operation_id: &OperationId, source: ImportSource) -> bool {
         let mut pending = self.pending.lock().expect("pending host import lock");
         let matches = pending.as_ref().is_some_and(|pending| {
@@ -428,6 +439,8 @@ struct CommandEnvelope {
     intent: ConnectorIntent,
     dispatch_epoch: u64,
     invocation_context: Option<InvocationContext>,
+    /// Host completion admission is published only after successful queue insertion.
+    admission: Option<Receiver<()>>,
 }
 
 struct Inner {
@@ -526,6 +539,92 @@ impl ConnectorCoordinator {
         self.dispatch_with_context(intent, InvocationContext::global())
     }
 
+    /// Return the exact unsent host payload on rejection, so the app can retain a bounded
+    /// completion without cloning sensitive bytes. Only Complete/FailImportSource are accepted.
+    #[allow(clippy::result_large_err)]
+    pub fn dispatch_host_completion(
+        &self,
+        intent: ConnectorIntent,
+    ) -> Result<DispatchOutcome, (DispatchError, ConnectorIntent)> {
+        let (operation_id, source) = match &intent {
+            ConnectorIntent::CompleteImportSource {
+                operation_id,
+                source,
+                ..
+            }
+            | ConnectorIntent::FailImportSource {
+                operation_id,
+                source,
+                ..
+            } => (operation_id.clone(), *source),
+            _ => return Err((DispatchError::StaleHostAction, intent)),
+        };
+        // Every Request/Cancel/Complete dispatch uses this lock first. Release the ownership
+        // mutex before preparing a worker, while serialization keeps this exact owner valid.
+        let _dispatch = self
+            .inner
+            .dispatch_serialization
+            .lock()
+            .expect("connector dispatch serialization");
+        if !self
+            .inner
+            .pending_host_import
+            .matches(&operation_id, source)
+        {
+            return Err((DispatchError::StaleHostAction, intent));
+        }
+        let invalidates = invalidates_inflight(&intent);
+        let current_epoch = self.inner.dispatch_epoch.load(Ordering::Acquire);
+        let dispatch_epoch = if invalidates {
+            current_epoch.wrapping_add(1)
+        } else {
+            current_epoch
+        };
+        let (admit, admission) = sync_channel(1);
+        let command = CommandEnvelope {
+            intent,
+            dispatch_epoch,
+            invocation_context: None,
+            admission: Some(admission),
+        };
+        if let Err((error, command)) = self.enqueue_retaining(command) {
+            return Err((error, command.intent));
+        }
+        // No rejection above changes the epoch, trust, cancellation registry or import owner.
+        // The worker cannot consume this command until these success effects are published.
+        if invalidates {
+            self.inner.host_actions.remove_all_dynamic();
+            self.inner
+                .session_trust
+                .lock()
+                .expect("connector trust registry lock")
+                .clear();
+            self.inner
+                .dispatch_epoch
+                .store(dispatch_epoch, Ordering::Release);
+            for cancellation in self
+                .inner
+                .cancellations
+                .lock()
+                .expect("connector cancellation registry")
+                .values()
+            {
+                cancellation.cancel();
+            }
+        }
+        let consumed = self
+            .inner
+            .pending_host_import
+            .take_matching(&operation_id, source);
+        debug_assert!(
+            consumed,
+            "serialized import owner disappeared after admission"
+        );
+        // Capacity one means this publication does not wait for the worker to receive it.
+        let _ = admit.send(());
+        Ok(DispatchOutcome::Queued)
+    }
+
     pub fn dispatch_for_subject(
         &self,
         intent: ConnectorIntent,
@@ -539,6 +638,19 @@ impl ConnectorCoordinator {
         intent: ConnectorIntent,
         invocation_context: InvocationContext,
     ) -> Result<DispatchOutcome, DispatchError> {
+        if matches!(
+            &intent,
+            ConnectorIntent::CompleteImportSource { .. } | ConnectorIntent::FailImportSource { .. }
+        ) {
+            return self
+                .dispatch_host_completion(intent)
+                .map_err(|(error, _intent)| error);
+        }
+        let _dispatch = self
+            .inner
+            .dispatch_serialization
+            .lock()
+            .expect("connector dispatch serialization");
         if let ConnectorIntent::Cancel(operation_id) = &intent {
             if self.inner.pending_host_import.cancel(operation_id) {
                 self.inner
@@ -559,23 +671,6 @@ impl ConnectorCoordinator {
                 ..
             }
         ) {
-            return Err(DispatchError::StaleHostAction);
-        }
-        if let ConnectorIntent::CompleteImportSource {
-            operation_id,
-            source,
-            ..
-        }
-        | ConnectorIntent::FailImportSource {
-            operation_id,
-            source,
-            ..
-        } = &intent
-            && !self
-                .inner
-                .pending_host_import
-                .take_matching(operation_id, *source)
-        {
             return Err(DispatchError::StaleHostAction);
         }
         let invalidates = invalidates_inflight(&intent);
@@ -615,11 +710,6 @@ impl ConnectorCoordinator {
             intent => {
                 let invocation_context = matches!(&intent, ConnectorIntent::InvokeTool { .. })
                     .then_some(invocation_context);
-                let _dispatch = self
-                    .inner
-                    .dispatch_serialization
-                    .lock()
-                    .expect("connector dispatch serialization");
                 if let ConnectorIntent::Cancel(operation_id) = &intent
                     && let Some(cancellation) = self
                         .inner
@@ -654,6 +744,7 @@ impl ConnectorCoordinator {
                     intent,
                     dispatch_epoch,
                     invocation_context,
+                    admission: None,
                 })?;
             }
         }
@@ -675,7 +766,16 @@ impl ConnectorCoordinator {
         }
     }
 
-    fn enqueue(&self, mut command: CommandEnvelope) -> Result<(), DispatchError> {
+    fn enqueue(&self, command: CommandEnvelope) -> Result<(), DispatchError> {
+        self.enqueue_retaining(command)
+            .map_err(|(error, _command)| error)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn enqueue_retaining(
+        &self,
+        mut command: CommandEnvelope,
+    ) -> Result<(), (DispatchError, CommandEnvelope)> {
         for _attempt in 0..2 {
             let mut worker = self.inner.worker.lock().expect("connector worker lock");
             if worker
@@ -686,7 +786,10 @@ impl ConnectorCoordinator {
                 let _ = slot.thread.join();
             }
             if worker.is_none() {
-                *worker = Some(self.spawn_worker()?);
+                match self.spawn_worker() {
+                    Ok(spawned) => *worker = Some(spawned),
+                    Err(error) => return Err((error, command)),
+                }
             }
             let slot = worker.as_ref().expect("worker was initialized");
             self.inner
@@ -707,8 +810,7 @@ impl ConnectorCoordinator {
                         .metrics
                         .backpressure
                         .fetch_add(1, Ordering::AcqRel);
-                    drop(returned);
-                    return Err(DispatchError::Backpressure);
+                    return Err((DispatchError::Backpressure, returned));
                 }
                 Err(TrySendError::Disconnected(returned)) => {
                     self.inner
@@ -722,7 +824,7 @@ impl ConnectorCoordinator {
                 }
             }
         }
-        Err(DispatchError::WorkerUnavailable)
+        Err((DispatchError::WorkerUnavailable, command))
     }
 
     fn spawn_worker(&self) -> Result<WorkerSlot, DispatchError> {
@@ -1212,8 +1314,13 @@ impl Worker {
         progressed
     }
 
-    fn accept_command(&mut self, command: CommandEnvelope) {
+    fn accept_command(&mut self, mut command: CommandEnvelope) {
         self.metrics.queue_depth.fetch_sub(1, Ordering::AcqRel);
+        if let Some(admission) = command.admission.take()
+            && admission.recv().is_err()
+        {
+            return;
+        }
         self.last_activity = self.clock.now();
         let invalidated_pending_singletons = self.current_dispatch_epoch != command.dispatch_epoch;
         self.current_dispatch_epoch = command.dispatch_epoch;
@@ -10152,6 +10259,232 @@ mod tests {
                 }),
             Err(DispatchError::StaleHostAction)
         );
+    }
+
+    #[test]
+    fn all_review_20261014_import_completion_survives_command_backpressure() {
+        // Always release the synthetic repository gate before Fixture's joining Drop, including
+        // during assertion unwinding. No file picker, files, secrets or external transports run.
+        struct ReleaseGateOnDrop(Arc<Gate>);
+        impl Drop for ReleaseGateOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+
+        let open_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::clone(&open_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let _release_gate = ReleaseGateOnDrop(Arc::clone(&open_gate));
+        let operation_id =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
+        let completion = || ConnectorIntent::CompleteImportSource {
+            operation_id: operation_id.clone(),
+            source: ImportSource::File,
+            display_name: Some("fixture.json".to_owned()),
+            contents: SensitiveInput::new(b"fixture".to_vec()),
+        };
+
+        // The same actual bounded worker lane as command_queue_is_exactly_eight_and_backpressures:
+        // repository open is gated before the worker can dequeue any command.
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.repo.opens.load(Ordering::Acquire) == 1);
+        for _ in 1..8 {
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Activate)
+                .unwrap();
+        }
+        let full_queue_depth = fixture.coordinator.metrics().command_queue_depth;
+        let epoch_before = fixture
+            .coordinator
+            .inner
+            .dispatch_epoch
+            .load(Ordering::Acquire);
+        let cancellation = CancellationToken::default();
+        fixture
+            .coordinator
+            .inner
+            .cancellations
+            .lock()
+            .unwrap()
+            .insert(OperationId::new("existing-work"), cancellation.clone());
+        let trust = TrustEntry {
+            server_id: ServerId::new("existing-trust"),
+            config_revision: Revision(1),
+            fingerprint: EndpointFingerprint::parse("0".repeat(64)).unwrap(),
+        };
+        fixture
+            .coordinator
+            .inner
+            .session_trust
+            .lock()
+            .unwrap()
+            .insert(trust.clone());
+        let first = fixture.coordinator.dispatch(completion());
+        assert_eq!(
+            fixture
+                .coordinator
+                .inner
+                .dispatch_epoch
+                .load(Ordering::Acquire),
+            epoch_before
+        );
+        assert!(
+            !cancellation.is_cancelled(),
+            "a rejected completion must not cancel earlier work"
+        );
+        assert!(
+            fixture
+                .coordinator
+                .inner
+                .session_trust
+                .lock()
+                .unwrap()
+                .contains(&trust)
+        );
+        let pending_after_backpressure = fixture.coordinator.inner.pending_host_import.is_pending();
+
+        open_gate.release();
+        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
+        let retry = fixture.coordinator.dispatch(completion());
+        if retry == Ok(DispatchOutcome::Queued) {
+            wait_until(|| fixture.repo.imports.load(Ordering::Acquire) == 1);
+        }
+        let parses = fixture.repo.parses.load(Ordering::Acquire);
+        let imports = fixture.repo.imports.load(Ordering::Acquire);
+        eprintln!(
+            "queue_depth={full_queue_depth} first={first:?} pending_after_backpressure={pending_after_backpressure} retry={retry:?} parses={parses} imports={imports}"
+        );
+
+        assert_eq!(full_queue_depth, 8, "the actual worker lane must be full");
+        assert_eq!(first, Err(DispatchError::Backpressure));
+        assert_eq!(
+            retry,
+            Ok(DispatchOutcome::Queued),
+            "a rejected import completion must retain its operation ownership for retry; pending_after_backpressure={pending_after_backpressure}, parses={parses}, imports={imports}"
+        );
+        assert!(pending_after_backpressure);
+        assert_eq!(parses, 1);
+        assert_eq!(imports, 1);
+    }
+
+    #[test]
+    fn full_fix_20261014_import_rejection_returns_exact_sensitive_payload_and_cancel_is_terminal() {
+        struct ReleaseGateOnDrop(Arc<Gate>);
+        impl Drop for ReleaseGateOnDrop {
+            fn drop(&mut self) {
+                self.0.release();
+            }
+        }
+        let open_gate = Arc::new(Gate::closed());
+        let fixture = fixture(
+            Arc::clone(&open_gate),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let _release = ReleaseGateOnDrop(Arc::clone(&open_gate));
+        let operation_id =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Activate)
+            .unwrap();
+        wait_until(|| fixture.repo.opens.load(Ordering::Acquire) == 1);
+        for _ in 1..8 {
+            fixture
+                .coordinator
+                .dispatch(ConnectorIntent::Activate)
+                .unwrap();
+        }
+        let contents = SensitiveInput::new(b"known-unsent-fixture".to_vec());
+        let original_allocation = contents.expose_bytes().as_ptr();
+        let (error, retained) = fixture
+            .coordinator
+            .dispatch_host_completion(ConnectorIntent::CompleteImportSource {
+                operation_id: operation_id.clone(),
+                source: ImportSource::File,
+                display_name: None,
+                contents,
+            })
+            .unwrap_err();
+        assert_eq!(error, DispatchError::Backpressure);
+        let ConnectorIntent::CompleteImportSource { contents, .. } = &retained else {
+            panic!("completion kind changed");
+        };
+        assert_eq!(
+            contents.expose_bytes().as_ptr(),
+            original_allocation,
+            "retry must retain the original sensitive allocation"
+        );
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        let (error, retained) = fixture
+            .coordinator
+            .dispatch_host_completion(retained)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DispatchError::StaleHostAction,
+            "cancelled ownership cannot be revived by a retained payload"
+        );
+        drop(retained);
+        assert!(!fixture.coordinator.inner.pending_host_import.is_pending());
+        open_gate.release();
+        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
+        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    #[allow(
+        clippy::result_large_err,
+        reason = "The race test retains the exact rejected completion payload"
+    )]
+    fn full_fix_20261014_import_completion_cancel_race_consumes_owner_once() {
+        let fixture = fixture(
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(Gate::opened()),
+            Arc::new(SystemCoordinatorClock::default()),
+        );
+        let operation_id =
+            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
+        let coordinator = fixture.coordinator.clone();
+        let complete_id = operation_id.clone();
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let ready_child = Arc::clone(&ready);
+        let complete = std::thread::spawn(move || {
+            ready_child.wait();
+            coordinator.dispatch_host_completion(ConnectorIntent::CompleteImportSource {
+                operation_id: complete_id,
+                source: ImportSource::File,
+                display_name: None,
+                contents: SensitiveInput::new(b"fixture".to_vec()),
+            })
+        });
+        ready.wait();
+        fixture
+            .coordinator
+            .dispatch(ConnectorIntent::Cancel(operation_id))
+            .unwrap();
+        match complete.join().unwrap() {
+            Ok(DispatchOutcome::Queued) => {}
+            Err((DispatchError::StaleHostAction, intent)) => drop(intent),
+            other => panic!("unexpected completion race result: {other:?}"),
+        }
+        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
+        assert!(!fixture.coordinator.inner.pending_host_import.is_pending());
+        assert!(fixture.repo.imports.load(Ordering::Acquire) <= 1);
     }
 
     #[test]

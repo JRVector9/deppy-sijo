@@ -23,28 +23,11 @@ pub(crate) const POST_AGENT_SHELL_ENV_NAMES: [&str; 3] = [
     SHIM_DIR_ENV,
 ];
 
-/// 에이전트가 끝나면 그 자리에 평범한 셸을 얹는 래퍼.
-///
-/// `stty sane` 뒤의 드레인 한 줄이 핵심이다. 에이전트 TUI는 터미널에 커서 위치(CPR
-/// `ESC[2;1R`), 전경·배경색(OSC 10/11), 장치 속성(DA `ESC[?6c`)을 **질의**하고, 우리
-/// 터미널이 그 **응답을 PTY 입력 쪽으로 되돌려 쓴다**. 에이전트가 응답을 읽기 전에
-/// 끝나면 그 바이트가 입력 버퍼에 남아, 뒤이어 뜬 셸이 사용자가 타이핑한 것으로
-/// 읽는다 — 실제로 `zsh: command not found: 1R10`처럼 깨진 명령이 실행됐다
-/// (2026-08-19 사용자 보고).
-///
-/// `stty sane`은 **모드만 되돌릴 뿐 남은 입력을 버리지 않는다**. 그래서 비정규 모드로
-/// 잠깐 두고(`min 0 time 1` = 최대 0.1초, 없으면 즉시 반환) 남은 바이트를 `dd`로 읽어
-/// 버린다. 그동안 `-echo`라 그 바이트가 화면에 얼룩으로 찍히지도 않는다. 실측으로
-/// 두 효과를 모두 확인했다(실제 CPR/OSC/DA 시퀀스를 PTY에 주입 → 잔여 입력 없음,
-/// 화면 출력 없음). `stty`가 없거나 실패하면 `&&`로 건너뛰어 기존 동작 그대로다.
-/// 남은 터미널 질의 응답을 버리는 조각. 스크립트와 테스트가 **같은 문자열**을 쓰도록
-/// 상수로 둔다 — 한쪽만 고치면 회귀를 못 잡는다.
-///
-/// `time 0`(기다리지 않음)인 이유: 이 드레인은 **이미 버퍼에 있는 것만** 버려야 한다.
-/// `time 1`(0.1초 대기)로 두면 그 사이에 사용자가 친 글자까지 함께 삼킨다 — 실측으로
-/// 확인했다(에이전트 종료 50ms 뒤 타이핑: `time 1`은 삼킴, `time 0`은 살아남음).
-/// 질의 응답은 우리 터미널이 질의를 파싱하는 즉시(= 에이전트가 살아 있을 때) 써 넣으므로
-/// 이 시점엔 이미 버퍼에 있고, `time 0`으로도 그대로 걸린다(실측: 잔여 입력 없음).
+/// Discard only input already buffered at agent exit; waiting here would swallow later user
+/// keystrokes. A PID-specific, invisible output boundary also retires the old query owner:
+/// the PTY reader observes it ahead of a delayed Session pump. The existing exit sentinel
+/// retires that same owner even under reader backpressure, and queued protocol responses carry
+/// the owner through the writer. Queries after the marker retain normal shell replies.
 #[cfg(unix)]
 pub const DRAIN_PENDING_TTY_INPUT: &str =
     "stty -icanon -echo min 0 time 0 2>/dev/null && dd of=/dev/null bs=4096 count=1 2>/dev/null";
@@ -56,8 +39,9 @@ pub const DRAIN_PENDING_TTY_INPUT: &str =
 /// 만난다. 경로 계산은 `session::agent_exit_sentinel_path`와 이 접두사를 공유한다
 /// (`DRAIN_PENDING_TTY_INPUT`과 같은 관례 — 한쪽만 고치면 서로 못 찾는다).
 ///
-/// **화면에는 아무것도 안 남는다** — `printf`는 파일로만 쓰고, 실패해도(temp dir 없음
-/// 등) `|| true`로 조용히 넘어가 기존 동작(폴백 셸 진입)을 막지 않는다. 세션 로그
+/// 종료 stamp가 regular/owned 파일로 작성되지 않으면 invisible marker 뒤 원래 agent
+/// 종료 코드로 끝낸다. reader backpressure 때 독립 소유권 근거 없이 폴백 셸을 열면 옛
+/// 터미널 질의 응답이 새 셸 입력으로 들어갈 수 있기 때문이다. 세션 로그
 /// redaction과도 무관하다 — PTY로 나가는 바이트가 아니라 파일 시스템 쓰기라 로그에
 /// 찍힐 게 없다.
 ///
@@ -67,8 +51,9 @@ pub const DRAIN_PENDING_TTY_INPUT: &str =
 #[cfg(unix)]
 pub fn agent_then_shell_script() -> String {
     let prefix = session::AGENT_EXIT_SENTINEL_PREFIX;
+    let fence_prefix = pty::query_fence::AGENT_QUERY_FENCE_PREFIX.replace("\x1b", "\\033");
     format!(
-        r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${{TMPDIR:-/tmp}}/{prefix}$$" 2>/dev/null || true; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; if [ -n "${{DEPPY_SHIM_DIR:-}}" ] && [ -d "$DEPPY_SHIM_DIR" ]; then PATH="$DEPPY_SHIM_DIR:$PATH"; export PATH; fi; exec "${{SHELL:-/bin/sh}}""#
+        r#""$@"; __deppy_exit=$?; __deppy_stamp="${{TMPDIR:-/tmp}}/{prefix}$$"; __deppy_stamp_safe=0; if [ ! -e "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ]; then __deppy_stamp_safe=1; elif [ -f "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ] && [ -O "$__deppy_stamp" ]; then __deppy_stamp_safe=1; fi; __deppy_stamp_ok=0; if [ "$__deppy_stamp_safe" -eq 1 ] && printf '%s' "$__deppy_exit" 2>/dev/null > "$__deppy_stamp"; then __deppy_stamp_ok=1; fi; if [ -t 1 ]; then printf '{fence_prefix}%s\007' "$$"; fi; if [ "$__deppy_stamp_ok" -ne 1 ]; then exit "$__deppy_exit"; fi; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; if [ -n "${{DEPPY_SHIM_DIR:-}}" ] && [ -d "$DEPPY_SHIM_DIR" ]; then PATH="$DEPPY_SHIM_DIR:$PATH"; export PATH; fi; exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -212,6 +197,527 @@ mod tests {
                 "agent:none|shell:/h/.deppy-sijo/zdot:/h/custom:gone:gone:{}:/usr/bin:/bin",
                 shims.display()
             )
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_review_20261014_late_agent_query_cannot_reach_fallback_shell() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("deppy-late-query-audit-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fallback = dir.join("fallback-shell");
+        let ready = dir.join("fallback-ready");
+        let script = format!(
+            "#!/bin/sh\nstty -echo -icanon min 1 time 0\nprintf READY\n: > '{}'\ndd bs=1 count=6 2>/dev/null | od -An -tx1\nsleep 30\n",
+            ready.display()
+        );
+        std::fs::write(&fallback, script).unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let command = pty::CommandSpec {
+            program: "/bin/sh".to_owned(),
+            args: vec![
+                "-c".to_owned(),
+                crate::agent_wrapper::agent_then_shell_script(),
+                crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME.to_owned(),
+                "/bin/sh".to_owned(),
+                "-c".to_owned(),
+                "printf '\\033[6n'".to_owned(),
+            ],
+            env: vec![
+                ("SHELL".to_owned(), fallback.display().to_string()),
+                ("TMPDIR".to_owned(), dir.display().to_string()),
+            ],
+            cwd: Some(dir.clone()),
+        };
+        let mut live = session::Session::spawn_with_spec(
+            deppy_core::SessionId(1),
+            session::SessionKind::Agent,
+            &command,
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            ready.exists(),
+            "agent must be gone and fallback raw reader active before parser feed"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut output = Vec::new();
+        while std::time::Instant::now() < deadline {
+            live.pump(|bytes| output.extend_from_slice(bytes));
+            if String::from_utf8_lossy(&output)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(6)
+                .any(|bytes| bytes == ["1b", "5b", "31", "3b", "31", "52"])
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        println!("late_query_output={:?}", String::from_utf8_lossy(&output));
+        let received_late_query_response = String::from_utf8_lossy(&output)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(6)
+            .any(|bytes| bytes == ["1b", "5b", "31", "3b", "31", "52"]);
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            !received_late_query_response,
+            "fallback shell received late CPR after production wrapper's time-0 drain: {:?}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    fn raw_query_fixture(
+        agent: &str,
+        fallback_body: &str,
+    ) -> (std::path::PathBuf, session::Session, std::path::PathBuf) {
+        raw_query_fixture_with_wake(agent, fallback_body, None)
+    }
+
+    fn raw_query_fixture_with_wake(
+        agent: &str,
+        fallback_body: &str,
+        wake: Option<pty::PtyOutputWake>,
+    ) -> (std::path::PathBuf, session::Session, std::path::PathBuf) {
+        raw_query_fixture_inner(agent, fallback_body, wake, true)
+    }
+
+    fn raw_query_fixture_inner(
+        agent: &str,
+        fallback_body: &str,
+        wake: Option<pty::PtyOutputWake>,
+        writable_tmpdir: bool,
+    ) -> (std::path::PathBuf, session::Session, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("deppy-query-owners-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ready = dir.join("ready");
+        let fallback = dir.join("fallback");
+        std::fs::write(
+            &fallback,
+            format!("#!/bin/sh\nstty -echo -icanon min 1 time 0\n{fallback_body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let spec = pty::CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                agent_then_shell_script(),
+                AGENT_SESSION_WRAPPER_NAME.into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                agent.into(),
+            ],
+            env: vec![
+                ("SHELL".into(), fallback.display().to_string()),
+                (
+                    "TMPDIR".into(),
+                    if writable_tmpdir {
+                        dir.clone()
+                    } else {
+                        dir.join("missing-tmpdir")
+                    }
+                    .display()
+                    .to_string(),
+                ),
+                ("FIXTURE_READY".into(), ready.display().to_string()),
+                (
+                    "FIXTURE_ALLOW_EXIT".into(),
+                    dir.join("allow-exit").display().to_string(),
+                ),
+                (
+                    "FIXTURE_RESULT".into(),
+                    dir.join("result").display().to_string(),
+                ),
+            ],
+            cwd: Some(dir.clone()),
+        };
+        let live = match wake {
+            Some(wake) => session::Session::spawn_with_spec_and_output_wake(
+                deppy_core::SessionId(1),
+                session::SessionKind::Agent,
+                &spec,
+                80,
+                24,
+                100,
+                wake,
+            ),
+            None => session::Session::spawn_with_spec(
+                deppy_core::SessionId(1),
+                session::SessionKind::Agent,
+                &spec,
+                80,
+                24,
+                100,
+            ),
+        }
+        .unwrap();
+        (dir, live, ready)
+    }
+
+    fn wait_fixture_ready(ready: &std::path::Path) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(ready.exists(), "fixture must enter its raw reader");
+    }
+
+    fn pump_until(live: &mut session::Session, needle: &str) -> String {
+        let mut output = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            live.pump(|bytes| output.extend_from_slice(bytes));
+            if String::from_utf8_lossy(&output).contains(needle) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        String::from_utf8_lossy(&output).into_owned()
+    }
+
+    #[test]
+    fn full_fix_lifecycle_fallback_query_retains_only_its_own_response() {
+        let (dir, mut live, ready) = raw_query_fixture(
+            "printf '\\033[6n'",
+            r#"printf '\033[6n'; : > "$FIXTURE_READY"; dd bs=1 count=6 2>/dev/null | od -An -tx1; stty min 0 time 1; dd bs=4096 count=1 2>/dev/null | od -An -tx1; printf QUERY_DONE; sleep 30"#,
+        );
+        wait_fixture_ready(&ready);
+        let output = pump_until(&mut live, "QUERY_DONE");
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        let tokens: Vec<_> = output.split_whitespace().collect();
+        assert_eq!(
+            tokens
+                .windows(6)
+                .filter(|bytes| *bytes == ["1b", "5b", "31", "3b", "31", "52"])
+                .count(),
+            1,
+            "{output:?}"
+        );
+        assert!(
+            output.contains("QUERY_DONE"),
+            "new shell must receive its response: {output:?}"
+        );
+    }
+
+    #[test]
+    fn full_fix_lifecycle_input_fifty_ms_after_exit_survives_delayed_pump() {
+        let (dir, mut live, ready) = raw_query_fixture(
+            "printf '\\033[6n'",
+            r#": > "$FIXTURE_READY"; dd bs=1 count=1 2>/dev/null | od -An -tx1; printf INPUT_DONE; sleep 30"#,
+        );
+        wait_fixture_ready(&ready);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(live.write_input(b"K").unwrap().is_accepted());
+        let output = pump_until(&mut live, "INPUT_DONE");
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            output.split_whitespace().any(|byte| byte == "4b"),
+            "{output:?}"
+        );
+        assert!(output.contains("INPUT_DONE"), "{output:?}");
+    }
+
+    #[test]
+    fn full_fix_lifecycle_live_new_agent_query_still_receives_response() {
+        let (dir, mut live, ready) = raw_query_fixture(
+            r#"stty -echo -icanon min 1 time 0; printf '\033[6n'; : > "$FIXTURE_READY"; dd bs=1 count=6 2>/dev/null | od -An -tx1; printf AGENT_QUERY_DONE; sleep 30"#,
+            "sleep 30",
+        );
+        wait_fixture_ready(&ready);
+        let output = pump_until(&mut live, "AGENT_QUERY_DONE");
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        let tokens: Vec<_> = output.split_whitespace().collect();
+        assert!(
+            tokens
+                .windows(6)
+                .any(|bytes| bytes == ["1b", "5b", "31", "3b", "31", "52"]),
+            "{output:?}"
+        );
+        assert!(output.contains("AGENT_QUERY_DONE"), "{output:?}");
+    }
+
+    #[test]
+    fn full_fix_lifecycle_failed_exit_stamp_cannot_launch_a_fallback_owner() {
+        let (dir, mut live, ready) = raw_query_fixture_inner(
+            r#"printf '\033[6n'; exit 23"#,
+            r#": > "$FIXTURE_READY"; dd bs=1 count=6 > "$FIXTURE_RESULT" 2>/dev/null; printf FALLBACK_RESPONSE; sleep 30"#,
+            None,
+            false,
+        );
+        let mut output = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while std::time::Instant::now() < deadline {
+            live.pump(|bytes| output.extend_from_slice(bytes));
+            if ready.exists()
+                || matches!(live.lifecycle(), session::SessionLifecycle::Exited { .. })
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let fallback_started = ready.exists();
+        let lifecycle = live.lifecycle();
+        let received = std::fs::read(dir.join("result")).unwrap_or_default();
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            !fallback_started,
+            "failed exit stamp created an untracked fallback owner"
+        );
+        assert_eq!(
+            lifecycle,
+            session::SessionLifecycle::Exited {
+                exit_code: Some(23)
+            }
+        );
+        assert!(
+            received.is_empty(),
+            "fallback received a stale query response: {received:02x?}"
+        );
+    }
+
+    #[test]
+    fn full_fix_lifecycle_nonregular_exit_stamp_closes_without_opening_a_new_owner() {
+        use std::os::unix::ffi::OsStrExt as _;
+        for kind in ["symlink", "fifo"] {
+            let (dir, mut live, ready) = raw_query_fixture(
+                r#"while [ ! -f "$FIXTURE_ALLOW_EXIT" ]; do sleep 0.005; done; printf '\033[6n'; exit 23"#,
+                r#": > "$FIXTURE_READY"; dd bs=1 count=6 > "$FIXTURE_RESULT" 2>/dev/null; sleep 30"#,
+            );
+            let stamp =
+                session::agent_exit_sentinel_path(&dir, live.process_identity().pid.unwrap());
+            let protected = dir.join("protected");
+            std::fs::write(&protected, b"untouched").unwrap();
+            if kind == "symlink" {
+                std::os::unix::fs::symlink(&protected, &stamp).unwrap();
+            } else {
+                let name = std::ffi::CString::new(stamp.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+            }
+            std::fs::write(dir.join("allow-exit"), b"").unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while std::time::Instant::now() < deadline {
+                live.pump(|_| {});
+                if ready.exists()
+                    || matches!(live.lifecycle(), session::SessionLifecycle::Exited { .. })
+                {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            let fallback_started = ready.exists();
+            let lifecycle = live.lifecycle();
+            let received = std::fs::read(dir.join("result")).unwrap_or_default();
+            let protected_bytes = std::fs::read(&protected).unwrap();
+            drop(live);
+            std::fs::remove_dir_all(dir).unwrap();
+            assert!(
+                !fallback_started,
+                "{kind} stamp created an untracked fallback owner"
+            );
+            assert_eq!(
+                lifecycle,
+                session::SessionLifecycle::Exited {
+                    exit_code: Some(23)
+                },
+                "{kind}"
+            );
+            assert!(
+                received.is_empty(),
+                "{kind} fallback received stale CPR: {received:02x?}"
+            );
+            assert_eq!(
+                protected_bytes, b"untouched",
+                "{kind} stamp changed another file"
+            );
+        }
+    }
+
+    #[test]
+    fn full_fix_lifecycle_status_consuming_current_stamp_does_not_close_fallback() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("deppy-stamp-consume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let consumed = dir.join("consumed");
+        let ready = dir.join("ready");
+        let allow = dir.join("allow-exit");
+        let expected = dir.join("expected-stamp");
+        let printf_shim = dir.join("printf");
+        std::fs::write(
+            &printf_shim,
+            r#"#!/bin/sh
+/usr/bin/printf "$@" || exit 1
+stamp=$(cat "$FIXTURE_EXPECTED_STAMP")
+if [ -n "$stamp" ] && [ "$stamp" = "$TMPDIR/deppy-agent-exit-$PPID" ] && [ -f "$stamp" ]; then
+    rm -f "$stamp" || exit 1
+    : > "$FIXTURE_CONSUMED"
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&printf_shim, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let fallback = dir.join("fallback");
+        std::fs::write(
+            &fallback,
+            r#"#!/bin/sh
+: > "$FIXTURE_READY"
+sleep 30
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // Invoke only the stamp printf through an owned PATH shim. It writes valid bytes,
+        // then models the status consumer unlinking that exact file before printf returns.
+        let script = agent_then_shell_script().replace(
+            r#"printf '%s' "$__deppy_exit""#,
+            r#"env printf '%s' "$__deppy_exit""#,
+        );
+        let spec = pty::CommandSpec {
+            program: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                script,
+                AGENT_SESSION_WRAPPER_NAME.into(),
+                "/bin/sh".into(),
+                "-c".into(),
+                r#"while [ ! -f "$FIXTURE_ALLOW_EXIT" ]; do sleep 0.005; done; exit 23"#.into(),
+            ],
+            env: vec![
+                ("TMPDIR".into(), dir.display().to_string()),
+                ("SHELL".into(), fallback.display().to_string()),
+                ("PATH".into(), format!("{}:/usr/bin:/bin", dir.display())),
+                (
+                    "FIXTURE_EXPECTED_STAMP".into(),
+                    expected.display().to_string(),
+                ),
+                ("FIXTURE_CONSUMED".into(), consumed.display().to_string()),
+                ("FIXTURE_READY".into(), ready.display().to_string()),
+                ("FIXTURE_ALLOW_EXIT".into(), allow.display().to_string()),
+            ],
+            cwd: Some(dir.clone()),
+        };
+        let mut live = session::Session::spawn_with_spec(
+            deppy_core::SessionId(1),
+            session::SessionKind::Agent,
+            &spec,
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        let stamp = session::agent_exit_sentinel_path(&dir, live.process_identity().pid.unwrap());
+        std::fs::write(&expected, stamp.as_os_str().as_encoded_bytes()).unwrap();
+        std::fs::write(&allow, b"").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            live.pump(|_| {});
+            if matches!(live.lifecycle(), session::SessionLifecycle::Exited { .. }) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let qualified = consumed.exists();
+        let fallback_started = ready.exists();
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            qualified,
+            "fixture must consume only its valid current exit stamp"
+        );
+        assert!(
+            fallback_started,
+            "status consumption was mistaken for stamp write failure"
+        );
+    }
+
+    #[test]
+    fn full_fix_lifecycle_backpressured_reader_cannot_send_old_query_to_fallback() {
+        use std::sync::{Arc, Condvar, Mutex};
+        struct ReaderGate(Arc<(Mutex<(bool, bool)>, Condvar)>);
+        impl Drop for ReaderGate {
+            fn drop(&mut self) {
+                let (state, changed) = &*self.0;
+                state.lock().unwrap().1 = true;
+                changed.notify_all();
+            }
+        }
+        let gate = ReaderGate(Arc::new((Mutex::new((false, false)), Condvar::new())));
+        let reader_gate = Arc::clone(&gate.0);
+        let wake: pty::PtyOutputWake = Arc::new(move || {
+            let (state, changed) = &*reader_gate;
+            let mut state = state.lock().unwrap();
+            if state.0 {
+                return;
+            }
+            state.0 = true;
+            changed.notify_all();
+            // A stopped consumer's bounded output send prevents the reader reaching the
+            // marker. Gate that same boundary deterministically after the first query chunk.
+            while !state.1 {
+                let (next, timeout) = changed
+                    .wait_timeout(state, std::time::Duration::from_secs(3))
+                    .unwrap();
+                state = next;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+        });
+        let (dir, mut live, ready) = raw_query_fixture_with_wake(
+            r#"printf '\033[6n'; while [ ! -f "$FIXTURE_ALLOW_EXIT" ]; do sleep 0.005; done"#,
+            r#": > "$FIXTURE_READY"; dd bs=1 count=6 > "$FIXTURE_RESULT" 2>/dev/null; printf STALE_RESPONSE_RECEIVED; sleep 30"#,
+            Some(wake),
+        );
+        let gate_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !gate.0.0.lock().unwrap().0 && std::time::Instant::now() < gate_deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            gate.0.0.lock().unwrap().0,
+            "reader must park after publishing the old query"
+        );
+        std::fs::write(dir.join("allow-exit"), b"").unwrap();
+        wait_fixture_ready(&ready);
+        let mut output = Vec::new();
+        live.pump(|bytes| output.extend_from_slice(bytes));
+        let reader_still_blocked = {
+            let state = gate.0.0.lock().unwrap();
+            state.0 && !state.1
+        };
+        assert!(
+            reader_still_blocked,
+            "query parser and writer run while reader cannot observe the marker"
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let result = dir.join("result");
+        while std::fs::read(&result).unwrap_or_default().is_empty()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let received = std::fs::read(&result).unwrap_or_default();
+        drop(gate); // Always release the test-owned reader before joining workers.
+        drop(live);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            received.is_empty(),
+            "fallback received old CPR while the reader boundary was unobserved: {received:02x?}"
         );
     }
 }

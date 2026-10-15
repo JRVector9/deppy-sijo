@@ -126,6 +126,12 @@ struct PendingFinish {
     notice: Option<AnswerNotice>,
 }
 
+struct AnswerProjection {
+    source: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    corpus_revision: u64,
+    answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+}
+
 pub struct CloudAgent {
     pub boot: String,
     pub port: u16,
@@ -178,6 +184,7 @@ pub struct CloudAgent {
     records: Vec<Record>,
     pub history_truncated: bool,
     answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]>,
+    answer_projection: std::cell::RefCell<Option<AnswerProjection>>,
     pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
@@ -253,6 +260,7 @@ impl CloudAgent {
             records: vec![],
             history_truncated: false,
             answers: std::sync::Arc::from([]),
+            answer_projection: std::cell::RefCell::new(None),
             pending: HashMap::new(),
             redaction,
             token_lease: None,
@@ -272,6 +280,7 @@ impl CloudAgent {
             return;
         }
         self.history_revision = revision;
+        self.answer_projection.get_mut().take();
         let connections = self.connection_infos();
         self.answers = rows
             .iter()
@@ -304,23 +313,38 @@ impl CloudAgent {
         self.records = rows;
     }
     pub fn cloud_answers(&self) -> std::sync::Arc<[crate::ui::cloud_answer::Answer]> {
-        // History can be loaded before credentials are registered or replaced.
-        // Preserve routing identities while refreshing each display field.
-        self.answers
+        // One corpus lock makes both the cache check and a rebuilt projection coherent with
+        // credential registration, replacement, fail-closed changes and grace expiration.
+        let redaction = self.redaction.snapshot();
+        let mut cache = self.answer_projection.borrow_mut();
+        if let Some(projection) = cache.as_ref()
+            && std::sync::Arc::ptr_eq(&projection.source, &self.answers)
+            && projection.corpus_revision == redaction.revision()
+        {
+            return std::sync::Arc::clone(&projection.answers);
+        }
+        let answers: std::sync::Arc<[crate::ui::cloud_answer::Answer]> = self
+            .answers
             .iter()
             .cloned()
             .map(|mut answer| {
-                answer.message = self.redaction.redact_wrapped_text(&answer.message);
-                answer.connection = self.redaction.redact_wrapped_text(&answer.connection);
+                answer.message = redaction.redact_wrapped_text(&answer.message);
+                answer.connection = redaction.redact_wrapped_text(&answer.connection);
                 answer.run_label = answer.run.as_deref().map(|run| {
-                    let mut label = self.redaction.redact_wrapped_text(run);
+                    let mut label = redaction.redact_wrapped_text(run);
                     truncate_utf8(&mut label, 512);
                     label
                 });
                 answer
             })
             .collect::<Vec<_>>()
-            .into()
+            .into();
+        *cache = Some(AnswerProjection {
+            source: std::sync::Arc::clone(&self.answers),
+            corpus_revision: redaction.revision(),
+            answers: std::sync::Arc::clone(&answers),
+        });
+        answers
     }
     fn operation_token(&mut self) -> u64 {
         self.next_operation = self
@@ -673,6 +697,9 @@ impl CloudAgent {
         };
     }
     pub fn shutdown(&mut self) {
+        // Seal new maintenance admission before any completion can schedule a
+        // retry. Accepted durable work and its finite continuations still drain.
+        self.seal_management();
         self.recovery.stop();
         self.stop_connection();
         if let Some(mut worker) = self.tunnel.take() {
@@ -1355,7 +1382,30 @@ impl CloudAgent {
             return Err("invalid_arguments".into());
         }
         if req.tool == "list_sessions" {
-            let sessions: Vec<_> = self.targets.iter().filter(|t| self.authorize_connection(&req.principal,t,false).is_ok()).filter_map(|t| self.grants.get(&t.id).map(|g| json!({"session_id":t.id,"generation":t.generation,"workspace":t.workspace,"workspace_name":t.workspace_name,"title":t.title,"input_allowed":g.input&&t.live&&req.input_scope&&self.control.allows(&req.principal.id,&t.id,&t.generation,true),"live":t.live,"paste_bracketed":t.bracketed_paste,"paste_text_max_bytes":agent_mcp::MAX_PASTE,"paste_ai_confirmed":!t.known_ai||t.execution.is_some()}))).collect();
+            let redaction = self.redaction.snapshot();
+            let sessions: Vec<_> = self.targets.iter()
+                .filter(|target| self.authorize_connection(&req.principal, target, false).is_ok())
+                .filter_map(|target| self.grants.get(&target.id).map(|grant| {
+                    // Redact before clipping, so a clipped credential never escapes as a prefix.
+                    let mut title = redaction.redact_wrapped_text(&target.title);
+                    let mut workspace_name = redaction.redact_wrapped_text(&target.workspace_name);
+                    truncate_utf8(&mut title, 512);
+                    truncate_utf8(&mut workspace_name, 512);
+                    json!({
+                        "session_id": target.id,
+                        "generation": target.generation,
+                        "workspace": target.workspace,
+                        "workspace_name": workspace_name,
+                        "title": title,
+                        "input_allowed": grant.input && target.live && req.input_scope
+                            && self.control.allows(&req.principal.id, &target.id, &target.generation, true),
+                        "live": target.live,
+                        "paste_bracketed": target.bracketed_paste,
+                        "paste_text_max_bytes": agent_mcp::MAX_PASTE,
+                        "paste_ai_confirmed": !target.known_ai || target.execution.is_some(),
+                    })
+                }))
+                .collect();
             return Ok(Some(json!({"sessions":sessions})));
         }
         if req.tool == "list_runs" {
@@ -2105,6 +2155,123 @@ mod integration_tests {
             });
             assert_eq!(rx.recv().unwrap().unwrap(), rejected);
         }
+    }
+    #[test]
+    fn full_fix_cloud_20261015_unchanged_answer_projection_reuses_safe_arc() {
+        let mut bridge = CloudAgent::memory();
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: "projection-operation".into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: "original-session".into(),
+                created: now() as i64,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: "An unchanged safe answer".into(),
+                connection_id: Some("original-connection".into()),
+                run_id: Some("original-run".into()),
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let first = bridge.cloud_answers();
+        let second = bridge.cloud_answers();
+        assert_eq!(first[0].message, second[0].message);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "unchanged history and redaction corpus must reuse the safe projection"
+        );
+    }
+    #[test]
+    fn full_fix_cloud_20261015_projection_changes_with_history_and_fail_closed_corpus() {
+        let mut bridge = CloudAgent::memory();
+        let record = |message: &str| Record {
+            id: "projection-operation".into(),
+            tool: "notify".into(),
+            workspace: "workspace".into(),
+            session: "original-session".into(),
+            created: 17,
+            outcome: r#"{"status":"stored"}"#.into(),
+            message: message.into(),
+            connection_id: Some("original-connection".into()),
+            run_id: Some("original-run".into()),
+            generation: Some("generation".into()),
+            sequence: 1,
+        };
+        bridge.install_history(1, vec![record("First answer")]);
+        let first = bridge.cloud_answers();
+        // Replacing the accepted source at the same revision must also invalidate its projection.
+        bridge.install_history(1, vec![record("Replacement answer")]);
+        let changed = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&first, &changed));
+        assert_eq!(changed[0].message, "Replacement answer");
+        assert_eq!(first[0].message, "First answer");
+        bridge
+            .redaction
+            .register(&secret::SecretString::new("x".repeat(64 * 1024)));
+        let closed = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&changed, &closed));
+        assert_eq!(closed[0].message, "[REDACTED]");
+        assert_eq!(closed[0].connection, "[REDACTED]");
+        assert_eq!(closed[0].run_label.as_deref(), Some("[REDACTED]"));
+        assert_eq!(closed[0].id, changed[0].id);
+        assert_eq!(closed[0].session, changed[0].session);
+        assert_eq!(closed[0].run, changed[0].run);
+        assert_eq!(closed[0].created, 17);
+        assert!(std::sync::Arc::ptr_eq(&closed, &bridge.cloud_answers()));
+    }
+    #[test]
+    fn full_fix_cloud_20261015_projection_tracks_rotating_lease_grace_expiration() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Clock(AtomicU64);
+        impl secret::RedactionClock for Clock {
+            fn now(&self) -> Duration {
+                Duration::from_secs(self.0.load(Ordering::SeqCst))
+            }
+        }
+        let clock = std::sync::Arc::new(Clock(AtomicU64::new(0)));
+        let redaction = secret::RedactionService::with_clock(
+            secret::RedactionCorpusLimits::PRODUCTION,
+            Duration::from_secs(10),
+            clock.clone(),
+        )
+        .unwrap();
+        let mut bridge =
+            CloudAgent::with_worker(HistoryWorker::new(None, || {}), redaction.clone());
+        bridge.install_history(
+            1,
+            vec![Record {
+                id: "original-operation".into(),
+                tool: "notify".into(),
+                workspace: "workspace".into(),
+                session: "original-session".into(),
+                created: 19,
+                outcome: r#"{"status":"stored"}"#.into(),
+                message: "Answer: rotating-display-secret".into(),
+                connection_id: Some("original-connection".into()),
+                run_id: None,
+                generation: Some("generation".into()),
+                sequence: 1,
+            }],
+        );
+        let before = bridge.cloud_answers();
+        let lease = redaction
+            .acquire_rotating(&secret::SecretString::new("rotating-display-secret".into()))
+            .unwrap();
+        let active = bridge.cloud_answers();
+        assert_eq!(active[0].message, "Answer: [REDACTED]");
+        assert!(!std::sync::Arc::ptr_eq(&before, &active));
+        drop(lease);
+        let retired = bridge.cloud_answers();
+        assert_eq!(retired[0].message, "Answer: [REDACTED]");
+        clock.0.store(11, Ordering::SeqCst);
+        let expired = bridge.cloud_answers();
+        assert!(!std::sync::Arc::ptr_eq(&retired, &expired));
+        assert_eq!(expired[0].message, before[0].message);
+        assert!(std::sync::Arc::ptr_eq(&expired, &bridge.cloud_answers()));
+        assert_eq!(expired[0].id, before[0].id);
+        assert_eq!(active[0].message, "Answer: [REDACTED]");
     }
     #[test]
     fn late_secret_notify_answer_projection_preserves_identity_and_rescrubs_display_and_run_label()

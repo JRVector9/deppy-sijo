@@ -16,6 +16,7 @@ mod alloc;
 mod app;
 mod bench;
 mod claude_usage;
+mod claude_usage_snapshot;
 mod cloud_agent;
 mod cloud_history_worker;
 mod codex_app_server;

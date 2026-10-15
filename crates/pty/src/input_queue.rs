@@ -136,6 +136,7 @@ impl PtyInputQueueState {
 /// 결과 경계:
 /// - Backpressured(QueueFull): 지금은 가득 찼지만 큐가 빠지면 수용 가능 — 재시도 대상
 /// - Rejected(PayloadTooLarge): 빈 큐라도 정책상 영원히 수용 불가 — 재시도 무의미
+#[cfg(test)]
 pub(crate) fn enqueue_input(
     tx: &SyncSender<Vec<u8>>,
     queue: &PtyInputQueueState,
@@ -146,10 +147,20 @@ pub(crate) fn enqueue_input(
 
 /// Reserve the complete paste + submit before enqueueing either part. Each part retains
 /// its writer-message boundary; producers cannot interleave input between parts.
+#[cfg(test)]
 pub(crate) fn enqueue_input_batch(
     tx: &SyncSender<Vec<u8>>,
     queue: &PtyInputQueueState,
     parts: &[&[u8]],
+) -> anyhow::Result<PtyInputEnqueueResult> {
+    enqueue_input_with(tx, queue, parts, |bytes| bytes)
+}
+
+pub(crate) fn enqueue_input_with<T>(
+    tx: &SyncSender<T>,
+    queue: &PtyInputQueueState,
+    parts: &[&[u8]],
+    mut message: impl FnMut(Vec<u8>) -> T,
 ) -> anyhow::Result<PtyInputEnqueueResult> {
     let attempted_bytes = parts
         .iter()
@@ -210,7 +221,7 @@ pub(crate) fn enqueue_input_batch(
     let mut sent_bytes = 0usize;
     let mut sent_chunks = 0usize;
     for chunk in parts.iter().flat_map(|part| part.chunks(chunk_size)) {
-        match tx.try_send(chunk.to_vec()) {
+        match tx.try_send(message(chunk.to_vec())) {
             Ok(()) => {
                 sent_bytes += chunk.len();
                 sent_chunks += 1;

@@ -2,7 +2,7 @@ use super::*;
 use crate::cloud_agent::{Connection, Target};
 use agent_mcp::{ConnectionState, now};
 use base64::Engine as _;
-use egui_kittest::kittest::Queryable as _;
+use egui_kittest::kittest::{NodeT as _, Queryable as _};
 use sha2::{Digest, Sha256};
 
 pub(super) fn connection_fixture() -> (CloudAgent, Target, String, String, String) {
@@ -1315,4 +1315,108 @@ fn management_ui_new_operator_navigation_does_not_leave_the_old_request_opening(
             .is_none()
     );
     harness.get_by_label("Could not open the original session. It may have been closed; the report remains available.");
+}
+
+#[test]
+fn review_20261015_owner_can_revoke_read_consent_after_session_exit() {
+    let (mut bridge, mut target, review, research, _) = connection_fixture();
+    bridge
+        .set_connection_access(&review, &target, true, false)
+        .unwrap();
+    bridge
+        .set_connection_access(&research, &target, true, false)
+        .unwrap();
+    target.live = false;
+    bridge.set_targets(vec![target.clone()]);
+    assert!(bridge.connection_permission(&review, &target).read);
+    assert!(!bridge.connection_permission(&review, &target).input);
+    // The controller already accepts safe revocation on the retained exited target.
+    bridge
+        .set_connection_access(&review, &target, false, false)
+        .unwrap();
+    assert!(!bridge.connection_permission(&review, &target).read);
+    bridge
+        .set_connection_access(&review, &target, true, false)
+        .unwrap();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    harness
+        .get_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .click();
+    harness.run();
+    assert!(
+        !harness.state().connection_permission(&review, &target).read,
+        "the owner cannot withdraw retained read consent using the exited session's checkbox"
+    );
+    assert!(
+        harness
+            .state()
+            .connection_permission(&research, &target)
+            .read
+    );
+    let read = harness.get_by_role_and_label(
+        egui::accesskit::Role::CheckBox,
+        "Allow this connection to read · receive answers",
+    );
+    assert!(read.accesskit_node().is_disabled());
+    read.click();
+    harness.run();
+    assert!(!harness.state().connection_permission(&review, &target).read);
+    let input = harness.get_by_role_and_label(
+        egui::accesskit::Role::CheckBox,
+        "Allow this connection to input",
+    );
+    assert!(input.accesskit_node().is_disabled());
+    input.click();
+    harness.run();
+    assert!(
+        !harness
+            .state()
+            .connection_permission(&review, &target)
+            .input
+    );
+}
+
+#[test]
+fn management_ui_ended_read_revocation_preserves_other_session_consent() {
+    let (mut bridge, mut target, review, _, _) = connection_fixture();
+    let other = Target::fixture("other-session", "generation-2");
+    bridge.set_targets(vec![target.clone(), other.clone()]);
+    bridge
+        .set_connection_access(&review, &target, true, true)
+        .unwrap();
+    bridge
+        .set_connection_access(&review, &other, true, true)
+        .unwrap();
+    target.live = false;
+    bridge.set_targets(vec![target.clone(), other.clone()]);
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+    let reads = harness
+        .query_all_by_role_and_label(
+            egui::accesskit::Role::CheckBox,
+            "Allow this connection to read · receive answers",
+        )
+        .collect::<Vec<_>>();
+    assert_eq!(reads.len(), 2);
+    reads[0].click();
+    drop(reads);
+    harness.run();
+    let ended = harness.state().connection_permission(&review, &target);
+    let retained = harness.state().connection_permission(&review, &other);
+    assert!(!ended.read && !ended.input);
+    assert!(retained.read && retained.input);
 }

@@ -7,8 +7,10 @@
 //! 시한은 단계마다 건다: DNS 조회, TCP 연결, 그리고 소켓 읽기/쓰기. 어느 한 단계라도 시한 없이
 //! 두면 워커 스레드가 거기서 영구히 멈추고, 그러면 끄기도 종료도 막힌다.
 
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::io::{self, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::channel;
 use std::time::{Duration, Instant};
 
@@ -64,6 +66,8 @@ impl RelayTransport for TlsRelayTransport {
         // 4) TLS + WebSocket. connector를 `None`으로 두면 tungstenite가 이 크레이트에
         //    켜진 feature(`rustls-tls-webpki-roots`)로 기본 커넥터를 만든다 — 즉 컴파일된
         //    WebPKI 루트와 통상적인 호스트명 검증만 쓴다.
+        let mut stream = DeadlineTcpStream::new(stream);
+        stream.begin_io(handshake_budget)?;
         let mut config = tungstenite::protocol::WebSocketConfig::default();
         config.max_message_size = Some(MAX_RELAY_FRAME_BYTES);
         config.max_frame_size = Some(MAX_RELAY_FRAME_BYTES);
@@ -71,10 +75,7 @@ impl RelayTransport for TlsRelayTransport {
             tungstenite::client_tls_with_config(endpoint.url(), stream, Some(config), None)
                 .map_err(classify_handshake)?;
 
-        let session = TlsRelaySession {
-            socket,
-            applied_read_timeout: None,
-        };
+        let mut session = TlsRelaySession { socket };
         // 세션 단계의 쓰기 시한으로 되돌린다. 읽기 시한은 매 수신마다 워커가 준 값으로 맞춘다.
         session.set_write_timeout(WRITE_TIMEOUT)?;
         Ok(Box::new(session))
@@ -144,7 +145,7 @@ fn outstanding_lookups() -> usize {
 /// 일시적 실패로 본다 — TLS 오류나 DNS 실패로 영구히 포기하면 잠깐의 네트워크 장애가
 /// 사용자 개입을 요구하는 상태로 굳는다.
 type ClientHandshakeError = tungstenite::handshake::HandshakeError<
-    tungstenite::handshake::client::ClientHandshake<MaybeTlsStream<TcpStream>>,
+    tungstenite::handshake::client::ClientHandshake<MaybeTlsStream<DeadlineTcpStream>>,
 >;
 
 fn classify_handshake(error: ClientHandshakeError) -> TransportError {
@@ -160,40 +161,123 @@ fn classify_handshake(error: ClientHandshakeError) -> TransportError {
     }
 }
 
+/// The deadline belongs below both TLS and WebSocket decoders. A timeout on each raw read
+/// alone can be renewed indefinitely by a peer dripping partial records or message bytes.
+struct DeadlineTcpStream {
+    stream: TcpStream,
+    deadline: Option<Instant>,
+    stop: Option<Arc<AtomicBool>>,
+}
+
+const CANCEL_IO_SLICE: Duration = Duration::from_millis(50);
+
+impl DeadlineTcpStream {
+    fn new(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            deadline: None,
+            stop: None,
+        }
+    }
+
+    fn begin_io(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.deadline = Some(
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or(TransportError::Unavailable)?,
+        );
+        Ok(())
+    }
+
+    fn remaining_slice(&self) -> io::Result<Duration> {
+        if self
+            .stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::SeqCst))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "relay shutdown requested",
+            ));
+        }
+        let remaining = self
+            .deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or(CANCEL_IO_SLICE);
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "relay I/O deadline elapsed",
+            ));
+        }
+        Ok(remaining.min(CANCEL_IO_SLICE))
+    }
+}
+
+impl Read for DeadlineTcpStream {
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        loop {
+            self.stream
+                .set_read_timeout(Some(self.remaining_slice()?))?;
+            match self.stream.read(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for DeadlineTcpStream {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        loop {
+            self.stream
+                .set_write_timeout(Some(self.remaining_slice()?))?;
+            match self.stream.write(bytes) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.remaining_slice()?;
+        self.stream.flush()
+    }
+}
+
 struct TlsRelaySession {
-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
-    /// 마지막으로 적용한 읽기 시한. 매번 같은 값을 다시 거는 syscall을 피한다.
-    applied_read_timeout: Option<Duration>,
+    socket: WebSocket<MaybeTlsStream<DeadlineTcpStream>>,
 }
 
 impl TlsRelaySession {
     /// TLS 여부와 무관하게 밑에 깔린 TCP 소켓을 꺼낸다.
-    fn socket_ref(&self) -> Option<&TcpStream> {
-        match self.socket.get_ref() {
+    fn socket_io_mut(&mut self) -> Option<&mut DeadlineTcpStream> {
+        match self.socket.get_mut() {
             MaybeTlsStream::Plain(stream) => Some(stream),
-            MaybeTlsStream::Rustls(stream) => Some(&stream.sock),
+            MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
             _ => None,
         }
     }
 
-    fn set_write_timeout(&self, timeout: Duration) -> Result<(), TransportError> {
-        self.socket_ref()
+    fn set_write_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+        self.socket_io_mut()
             .ok_or(TransportError::Unavailable)?
-            .set_write_timeout(Some(timeout))
-            .map_err(|_| TransportError::Unavailable)
+            .begin_io(timeout)
     }
 
-    /// 워커가 준 수신 시한을 실제 소켓에 건다. 이게 없으면 끄기·종료가 고정 시한만큼 늦어진다.
     fn apply_read_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
-        if self.applied_read_timeout == Some(timeout) {
-            return Ok(());
-        }
-        self.socket_ref()
+        // Refresh the deadline even for the same duration: each receive owns a new total budget.
+        self.socket_io_mut()
             .ok_or(TransportError::Unavailable)?
-            .set_read_timeout(Some(timeout))
-            .map_err(|_| TransportError::Unavailable)?;
-        self.applied_read_timeout = Some(timeout);
-        Ok(())
+            .begin_io(timeout)
     }
 }
 
@@ -202,17 +286,14 @@ impl RelaySession for TlsRelaySession {
         self.apply_read_timeout(timeout)?;
         match self.socket.read() {
             Ok(Message::Binary(payload)) => Ok(Some(payload.to_vec())),
-            // 계약에 이진 프레임만 있다. 텍스트는 받지 않는다.
-            Ok(Message::Text(_)) => Err(TransportError::Unavailable),
-            Ok(Message::Close(_)) => Err(TransportError::Unavailable),
+            Ok(Message::Text(_) | Message::Close(_)) => Err(TransportError::Unavailable),
             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => Ok(None),
             Err(tungstenite::Error::Io(error))
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                // 읽기 시한만 지났다 — 연결은 살아 있다.
                 Ok(None)
             }
             Err(_) => Err(TransportError::Unavailable),
@@ -223,14 +304,24 @@ impl RelaySession for TlsRelaySession {
         if frame.len() > MAX_RELAY_FRAME_BYTES {
             return Err(TransportError::Unavailable);
         }
+        self.set_write_timeout(WRITE_TIMEOUT)?;
         self.socket
             .send(Message::Binary(frame.to_vec().into()))
             .map_err(|_| TransportError::Unavailable)
     }
 
     fn close(&mut self) {
-        let _ = self.socket.close(None);
-        let _ = self.socket.flush();
+        // Retire the transport immediately, including incomplete TLS/WS frames. Waiting to flush
+        // a graceful close to a stalled peer must not reintroduce a shutdown write dependency.
+        if let Some(io) = self.socket_io_mut() {
+            let _ = io.stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn set_stop_signal(&mut self, stop: Arc<AtomicBool>) {
+        if let Some(io) = self.socket_io_mut() {
+            io.stop = Some(stop);
+        }
     }
 }
 
@@ -378,10 +469,8 @@ mod tests {
             "수신 시한 인자를 `_timeout`으로 흘려버리면 안 된다"
         );
         assert!(production.contains("fn apply_read_timeout(&mut self, timeout: Duration)"));
-        assert!(
-            production.contains("self.applied_read_timeout == Some(timeout)"),
-            "같은 값을 매번 다시 거는 syscall은 피한다"
-        );
+        assert!(production.contains("stream.begin_io(handshake_budget)?"));
+        assert!(production.contains("fn remaining_slice(&self)"));
     }
 
     /// 자격증명 거부와 일시적 실패를 갈라야 자동 재시도 정책이 의미를 갖는다.
@@ -414,5 +503,310 @@ mod tests {
             "E2EE 계약과 데이터 평면의 암호문 상한이 갈라지면 안 된다"
         );
         assert_eq!(MAX_RELAY_FRAME_BYTES, relay_protocol::MAX_FRAME_BYTES);
+    }
+
+    #[test]
+    fn full_fix_20261014_relay_receive_obeys_total_budget() {
+        use std::io::Write;
+        use tungstenite::protocol::Role;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        let mut session = TlsRelaySession {
+            socket: WebSocket::from_raw_socket(
+                MaybeTlsStream::Plain(DeadlineTcpStream::new(client)),
+                Role::Client,
+                None,
+            ),
+        };
+        let send = std::thread::spawn(move || {
+            server.write_all(&[0x82, 8]).unwrap();
+            for _ in 0..8 {
+                std::thread::sleep(Duration::from_millis(25));
+                server.write_all(b"x").unwrap();
+            }
+        });
+        let started = Instant::now();
+        let result = session.receive(Duration::from_millis(40));
+        let elapsed = started.elapsed();
+        send.join().unwrap();
+        println!(
+            "receive_budget_ms=40 elapsed_ms={} received_bytes={}",
+            elapsed.as_millis(),
+            result.unwrap().map(|b| b.len()).unwrap_or(0)
+        );
+        assert!(
+            elapsed < Duration::from_millis(120),
+            "production receive ignored total deadline while bytes continued arriving"
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_relay_worker_shutdown_observes_receive_slice() {
+        use super::super::lifecycle::BackoffPolicy;
+        use super::super::worker::{
+            IgnoreObserver, RelayDeadlines, RelayFrameSink, RelayWorker, SinkOutcome,
+        };
+        use std::io::Write;
+        use std::sync::{Arc, mpsc};
+        use tungstenite::protocol::Role;
+        struct Ready {
+            session: Option<Box<dyn RelaySession>>,
+        }
+        impl RelayTransport for Ready {
+            fn connect(
+                &mut self,
+                _: &RelayEndpoint,
+                _: Duration,
+            ) -> Result<Box<dyn RelaySession>, TransportError> {
+                self.session.take().ok_or(TransportError::Unavailable)
+            }
+        }
+        struct Sink;
+        impl RelayFrameSink for Sink {
+            fn accept(&mut self, _: &[u8]) -> SinkOutcome {
+                SinkOutcome::Continue
+            }
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut peer, _) = listener.accept().unwrap();
+        let session = TlsRelaySession {
+            socket: WebSocket::from_raw_socket(
+                MaybeTlsStream::Plain(DeadlineTcpStream::new(client)),
+                Role::Client,
+                None,
+            ),
+        };
+        let (in_read, ready) = mpsc::sync_channel(1);
+        let (started_tx, started_rx) = mpsc::sync_channel(1);
+        let sender = std::thread::spawn(move || {
+            peer.write_all(&[0x82, 16]).unwrap();
+            peer.write_all(b"x").unwrap();
+            in_read.send(()).unwrap();
+            started_rx.recv().unwrap();
+            for _ in 1..16 {
+                std::thread::sleep(Duration::from_millis(200));
+                if peer.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let mut worker = RelayWorker::spawn(
+            RelayEndpoint::parse("wss://relay.example.test/").unwrap(),
+            Box::new(Ready {
+                session: Some(Box::new(session)),
+            }),
+            Box::new(Sink),
+            Arc::new(IgnoreObserver),
+            RelayDeadlines::default(),
+            BackoffPolicy::default(),
+        );
+        assert!(worker.enable());
+        ready.recv().unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        started_tx.send(()).unwrap();
+        let began = Instant::now();
+        worker.shutdown();
+        let elapsed = began.elapsed();
+        sender.join().unwrap();
+        println!(
+            "worker_receive_slice_ms=1000 shutdown_elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_millis(1500),
+            "actual RelayWorker shutdown blocked on continuously fragmented message"
+        );
+    }
+
+    fn loopback_rustls() -> (
+        TlsRelaySession,
+        rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
+    ) {
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
+        // These public synthetic fixtures are trusted only by this test's client config.
+        let certificate = CertificateDer::from(
+            include_bytes!("../../tests/fixtures/relay-loopback/localhost-cert.der").to_vec(),
+        );
+        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            include_bytes!("../../tests/fixtures/relay-loopback/localhost-key.der").to_vec(),
+        ));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(vec![certificate.clone()], private_key)
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(certificate).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        server
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let peer = std::thread::spawn(move || {
+            let mut peer = rustls::StreamOwned::new(
+                rustls::ServerConnection::new(Arc::new(server_config)).unwrap(),
+                server,
+            );
+            while peer.conn.is_handshaking() {
+                peer.conn.complete_io(&mut peer.sock).unwrap();
+            }
+            peer
+        });
+        let mut client = rustls::StreamOwned::new(
+            rustls::ClientConnection::new(
+                Arc::new(client_config),
+                ServerName::try_from("localhost").unwrap(),
+            )
+            .unwrap(),
+            DeadlineTcpStream::new(client),
+        );
+        client.sock.begin_io(Duration::from_secs(3)).unwrap();
+        while client.conn.is_handshaking() {
+            client.conn.complete_io(&mut client.sock).unwrap();
+        }
+        let peer = peer.join().unwrap();
+        let session = TlsRelaySession {
+            socket: WebSocket::from_raw_socket(
+                MaybeTlsStream::Rustls(client),
+                tungstenite::protocol::Role::Client,
+                None,
+            ),
+        };
+        (session, peer)
+    }
+
+    #[test]
+    fn full_fix_20261014_relay_rustls_partial_record_obeys_total_budget() {
+        let (mut session, mut peer) = loopback_rustls();
+        peer.conn
+            .writer()
+            .write_all(&[0x82, 4, b't', b'e', b's', b't'])
+            .unwrap();
+        let mut ciphertext = Vec::new();
+        while peer.conn.wants_write() {
+            peer.conn.write_tls(&mut ciphertext).unwrap();
+        }
+        assert!(
+            ciphertext.len() > 6,
+            "fixture must contain an encrypted TLS record"
+        );
+        let writer = std::thread::spawn(move || {
+            for byte in ciphertext {
+                if peer.sock.write_all(&[byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(15));
+            }
+        });
+        let started = Instant::now();
+        let partial = session.receive(Duration::from_millis(40)).unwrap();
+        let elapsed = started.elapsed();
+        assert!(
+            partial.is_none(),
+            "a partial TLS record cannot produce a WS frame"
+        );
+        // Preserve the TLS/WS decoder state across receive budgets, then finish normally.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut completed = None;
+        while completed.is_none() && Instant::now() < deadline {
+            completed = session.receive(Duration::from_millis(40)).unwrap();
+        }
+        writer.join().unwrap();
+        assert_eq!(completed.as_deref(), Some(b"test".as_slice()));
+        eprintln!(
+            "rustls partial record: budget_ms=40 first_receive_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_millis(120),
+            "TLS complete_io renewed the receive budget per ciphertext byte"
+        );
+    }
+
+    #[test]
+    fn full_fix_20261014_relay_rustls_fragmented_message_survives_deadlines_and_normal_send() {
+        let (mut session, mut peer) = loopback_rustls();
+        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
+        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(1);
+        let writer = std::thread::spawn(move || {
+            // A non-final binary fragment is retained when the next receive budget expires.
+            peer.write_all(&[0x02, 2, b'o', b'k']).unwrap();
+            peer.flush().unwrap();
+            first_tx.send(()).unwrap();
+            finish_rx.recv().unwrap();
+            peer.write_all(&[0x80, 1, b'!']).unwrap();
+            peer.flush().unwrap();
+            let mut socket =
+                WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Server, None);
+            assert_eq!(socket.read().unwrap().into_data().as_ref(), b"outbound");
+        });
+        first_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert!(
+            session
+                .receive(Duration::from_millis(40))
+                .unwrap()
+                .is_none()
+        );
+        finish_tx.send(()).unwrap();
+        assert_eq!(
+            session.receive(Duration::from_secs(3)).unwrap().as_deref(),
+            Some(b"ok!".as_slice())
+        );
+        session.send(b"outbound").unwrap();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn full_fix_20261014_relay_rustls_stop_retires_partial_record_promptly() {
+        let (mut session, mut peer) = loopback_rustls();
+        peer.conn
+            .writer()
+            .write_all(&[0x82, 4, b't', b'e', b's', b't'])
+            .unwrap();
+        let mut ciphertext = Vec::new();
+        while peer.conn.wants_write() {
+            peer.conn.write_tls(&mut ciphertext).unwrap();
+        }
+        // Withhold the record body indefinitely after establishing actual TLS.
+        peer.sock.write_all(&ciphertext[..6]).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        session.set_stop_signal(Arc::clone(&stop));
+        let reader = std::thread::spawn(move || {
+            let result = session.receive(Duration::from_secs(30));
+            session.close();
+            result
+        });
+        std::thread::sleep(Duration::from_millis(25));
+        let started = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        assert_eq!(reader.join().unwrap(), Err(TransportError::Unavailable));
+        let elapsed = started.elapsed();
+        eprintln!(
+            "rustls partial record stop: elapsed_ms={}",
+            elapsed.as_millis()
+        );
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "partial TLS record ignored the stop flag"
+        );
+        let mut closed = [0u8; 1];
+        assert_eq!(
+            peer.sock.read(&mut closed).unwrap(),
+            0,
+            "stop must retire the TCP transport"
+        );
     }
 }

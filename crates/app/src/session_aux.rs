@@ -2,7 +2,10 @@
 use crate::ui;
 use deppy_core::SessionId;
 use runtime::MuxPaneId;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct SessionAuxScope {
@@ -70,6 +73,7 @@ pub(crate) struct SessionAuxViews {
     pub owner: Option<SessionAuxScope>,
     pub current: SessionAuxView,
     parked: HashMap<SessionAuxScope, SessionAuxView>,
+    dead_document_owners: HashSet<SessionAuxScope>,
 }
 impl SessionAuxViews {
     pub fn switch(&mut self, owner: SessionAuxScope) {
@@ -88,6 +92,37 @@ impl SessionAuxViews {
             view.close_document(id);
         }
     }
+    pub fn document_owners(&self) -> impl Iterator<Item = (&SessionAuxScope, &SessionAuxView)> {
+        self.owner
+            .as_ref()
+            .map(|owner| (owner, &self.current))
+            .into_iter()
+            .chain(self.parked.iter())
+    }
+    pub fn document_has_dead_owner(&self, id: ui::workspace::DocumentTabId) -> bool {
+        self.document_owners().any(|(scope, view)| {
+            self.dead_document_owners.contains(scope) && view.document_ids.contains(&id)
+        })
+    }
+    /// An explicit reopen transfers just this retained document. Merely switching
+    /// sessions never imports another owner's tabs, and live owners are excluded.
+    pub fn recover_document(&mut self, id: ui::workspace::DocumentTabId) -> bool {
+        let old = self.parked.iter().find_map(|(scope, view)| {
+            (self.dead_document_owners.contains(scope) && view.document_ids.contains(&id))
+                .then(|| scope.clone())
+        });
+        let Some(old) = old else {
+            return false;
+        };
+        self.parked.get_mut(&old).unwrap().close_document(id);
+        if !self.current.document_ids.contains(&id) {
+            self.current.document_ids.push(id);
+        }
+        self.current.active_document = Some(id);
+        self.current.document_tab = ui::workspace::PaneAuxTabState::OpenActive;
+        self.current.aux_search.reset();
+        true
+    }
     pub fn git_result_owner(&mut self, generation: u64) -> Option<&mut SessionAuxView> {
         if self.current.owns_git_generation(generation) {
             return Some(&mut self.current);
@@ -105,7 +140,13 @@ impl SessionAuxViews {
             .find(|view| view.transcript_generation == Some(generation))
     }
     pub fn retain_live(&mut self, mut live: impl FnMut(&SessionAuxScope) -> bool) {
-        // Keep edited/open documents reachable until explicitly closed, under the global buffer cap.
+        self.dead_document_owners = self
+            .document_owners()
+            .filter(|(scope, view)| !view.document_ids.is_empty() && !live(scope))
+            .map(|(scope, _)| scope.clone())
+            .collect();
+        // Retain dead-owner buffers for explicit reopen; do not implicitly share
+        // them with a newly focused live session.
         self.parked
             .retain(|scope, view| !view.document_ids.is_empty() || live(scope));
     }
@@ -172,6 +213,34 @@ mod tests {
             "runtime reuse must not inherit old UI"
         );
         assert!(views.current.document_ids.is_empty());
+    }
+
+    #[test]
+    fn full_fix_20261014_document_explicit_recovery_excludes_live_owner() {
+        let mut views = SessionAuxViews::default();
+        let old = scope(1, 1);
+        let current = scope(1, 2);
+        let id = ui::workspace::DocumentTabId(7);
+        views.switch(old.clone());
+        views.current.document_ids = vec![id];
+        views.current.active_document = Some(id);
+        views.switch(current.clone());
+        views.retain_live(|_| true);
+        assert!(!views.document_has_dead_owner(id));
+        assert!(!views.recover_document(id));
+        assert!(
+            views.current.document_ids.is_empty(),
+            "live sessions must remain independent"
+        );
+        views.retain_live(|scope| scope == &current);
+        assert!(views.document_has_dead_owner(id));
+        assert!(views.recover_document(id));
+        assert_eq!(views.current.document_ids, [id]);
+        views.switch(old);
+        assert!(
+            views.current.document_ids.is_empty(),
+            "recovery moves one owner instead of sharing the buffer"
+        );
     }
     #[test]
     fn git_results_drop_only_when_the_same_kind_is_reissued() {

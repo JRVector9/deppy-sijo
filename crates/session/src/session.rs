@@ -79,6 +79,10 @@ pub struct Session {
     /// 백엔드 선택은 terminal::new_default_backend (기본 alacritty,
     /// ghostty-backend feature + DEPPY_TERM_BACKEND=ghostty면 libghostty — A/B 실측용).
     backend: Box<dyn TerminalBackend>,
+    query_fence: Option<(
+        pty::query_fence::QueryFence,
+        pty::query_fence::QueryFenceScanner,
+    )>,
     lifecycle: SessionLifecycle,
     dirty: bool,
     pending_full_dirty: bool,
@@ -156,6 +160,10 @@ impl Session {
         };
         let process_identity = pty.process_identity();
         let output = pty.take_output().expect("새 세션의 output 채널");
+        let query_fence = pty.terminal_response_fence().map(|fence| {
+            let scanner = fence.scanner();
+            (fence, scanner)
+        });
         Ok(Self {
             id,
             kind,
@@ -163,6 +171,7 @@ impl Session {
             process_identity,
             output,
             backend: terminal::new_default_backend(cols, rows, scrollback_lines),
+            query_fence,
             lifecycle: SessionLifecycle::Running,
             dirty: true,
             pending_full_dirty: true,
@@ -218,6 +227,7 @@ impl Session {
             process_identity: pty::ProcessIdentity::unavailable(),
             output,
             backend,
+            query_fence: None,
             lifecycle: SessionLifecycle::Exited { exit_code },
             dirty: true,
             pending_full_dirty: true,
@@ -275,6 +285,27 @@ impl Session {
 
     pub fn lifecycle(&self) -> SessionLifecycle {
         self.lifecycle
+    }
+
+    /// Runtime sentinel consumption must keep the old query owner retired after file removal.
+    pub fn retire_agent_query_owner(&self) {
+        if let Some((fence, _)) = &self.query_fence {
+            fence.retire();
+        }
+    }
+
+    /// The wrapper's actual TMPDIR and spawn age are shared with the PTY writer. A fast agent's
+    /// already-current exit file must be preserved when the runtime installs its watch.
+    pub fn agent_exit_sentinel_watch(&self) -> Option<(std::path::PathBuf, bool)> {
+        self.query_fence
+            .as_ref()
+            .and_then(|(fence, _)| fence.sentinel_watch())
+    }
+
+    pub fn agent_exit_sentinel_code(&self) -> Option<u32> {
+        self.query_fence
+            .as_ref()
+            .and_then(|(fence, _)| fence.read_exit_code())
     }
 
     /// 폭주 세션 동결(SIGSTOP)/재개(SIGCONT) — PtySession에 위임 (로드맵 B3).
@@ -338,38 +369,68 @@ impl Session {
                     // OSC 133 프롬프트 마크 스캔 (셸 통합 1단계) — 로그/감지와 같은
                     // raw output stream 기반이다 (설계문서 4.1).
                     self.prompt_marks.scan(&chunk);
-                    match self.backend.feed(&chunk) {
-                        Ok(changes) => {
-                            if changes.title_changed {
-                                self.refresh_title();
+                    let parts = if let Some((_, scanner)) = &mut self.query_fence {
+                        scanner.scan(&chunk)
+                    } else {
+                        vec![pty::query_fence::QueryFencePart::Output {
+                            bytes: chunk,
+                            after_boundary: false,
+                        }]
+                    };
+                    for part in parts {
+                        let (bytes, after_boundary) = match part {
+                            pty::query_fence::QueryFencePart::Output {
+                                bytes,
+                                after_boundary,
+                            } => (bytes, after_boundary),
+                            pty::query_fence::QueryFencePart::Boundary => {
+                                // Cancel an incomplete old escape sequence before the new owner.
+                                let _ = self.backend.feed(b"\x18");
+                                continue;
                             }
-                            if !changes.dirty_rows.is_empty()
-                                || changes.cursor_changed
-                                || changes.title_changed
-                                || changes.bell
-                            {
-                                self.dirty = true;
-                                self.mark_dirty_rows(&changes.dirty_rows);
-                            }
-                            // 터미널 질의(DA 등) 응답 회신
-                            if !changes.pty_responses.is_empty() {
-                                responded += changes.pty_responses.len();
-                                if responded > RESPONSE_PER_PUMP_CAP {
-                                    tracing::warn!("터미널 질의 응답 폭주 — 이번 tick 초과분 버림");
-                                } else if let Some(pty) = &mut self.pty {
-                                    match pty.write_input(&changes.pty_responses) {
-                                        Ok(result) if result.is_accepted() => {}
-                                        Ok(result) => tracing::warn!(
-                                            "터미널 질의 응답 전송 pressure: {result:?}"
-                                        ),
-                                        Err(e) => {
-                                            tracing::warn!("터미널 질의 응답 전송 실패: {e:#}");
+                        };
+                        match self.backend.feed(&bytes) {
+                            Ok(changes) => {
+                                if changes.title_changed {
+                                    self.refresh_title();
+                                }
+                                if !changes.dirty_rows.is_empty()
+                                    || changes.cursor_changed
+                                    || changes.title_changed
+                                    || changes.bell
+                                {
+                                    self.dirty = true;
+                                    self.mark_dirty_rows(&changes.dirty_rows);
+                                }
+                                // 터미널 질의(DA 등) 응답 회신
+                                if !changes.pty_responses.is_empty()
+                                    && self.query_fence.as_ref().is_none_or(|(fence, _)| {
+                                        fence.permits_response(after_boundary)
+                                    })
+                                {
+                                    responded += changes.pty_responses.len();
+                                    if responded > RESPONSE_PER_PUMP_CAP {
+                                        tracing::warn!(
+                                            "터미널 질의 응답 폭주 — 이번 tick 초과분 버림"
+                                        );
+                                    } else if let Some(pty) = &mut self.pty {
+                                        match pty.write_terminal_response(
+                                            &changes.pty_responses,
+                                            after_boundary,
+                                        ) {
+                                            Ok(result) if result.is_accepted() => {}
+                                            Ok(result) => tracing::warn!(
+                                                "터미널 질의 응답 전송 pressure: {result:?}"
+                                            ),
+                                            Err(e) => {
+                                                tracing::warn!("터미널 질의 응답 전송 실패: {e:#}");
+                                            }
                                         }
                                     }
                                 }
                             }
+                            Err(e) => tracing::warn!("terminal feed 실패: {e:#}"),
                         }
-                        Err(e) => tracing::warn!("terminal feed 실패: {e:#}"),
                     }
                 }
                 Err(TryRecvError::Empty) => break,

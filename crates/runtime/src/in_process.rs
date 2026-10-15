@@ -4946,10 +4946,13 @@ impl Worker {
         else {
             return;
         };
-        let path = agent_exit_sentinel_path(&std::env::temp_dir(), pid);
-        // 이 pid를 재사용한 옛 프로세스가 남긴 파일이 있으면(극히 드묾) 오판을 막기 위해
-        // 먼저 지운다 — session::agent_exit_sentinel_path 문서의 재사용 경고와 짝.
-        let _ = std::fs::remove_file(&path);
+        let (path, _) = self
+            .sessions
+            .get(&id)
+            .and_then(Session::agent_exit_sentinel_watch)
+            .unwrap_or_else(|| (agent_exit_sentinel_path(&std::env::temp_dir(), pid), false));
+        // The pinned fence rejects a previous PID occupant by spawn time. Deleting after a
+        // negative probe could erase a current exit written between that probe and this insert.
         self.agent_exit_watch.insert(id, path);
     }
 
@@ -4966,14 +4969,20 @@ impl Worker {
         }
         let mut resolved: Vec<(SessionId, PathBuf, u32)> = Vec::new();
         for (session, path) in &self.agent_exit_watch {
-            if let Ok(content) = std::fs::read_to_string(path)
-                && let Ok(code) = content.trim().parse::<u32>()
+            if let Some(code) = self
+                .sessions
+                .get(session)
+                .and_then(Session::agent_exit_sentinel_code)
             {
                 resolved.push((*session, path.clone(), code));
             }
         }
         for (session, path, code) in resolved {
             self.agent_exit_watch.remove(&session);
+            // Retire query ownership before removing the independent exit evidence.
+            if let Some(live) = self.sessions.get(&session) {
+                live.retire_agent_query_owner();
+            }
             let _ = std::fs::remove_file(&path);
             if let Some(detector) = self.detectors.get_mut(&session) {
                 detector.note_exit_sentinel(code);
@@ -14241,6 +14250,98 @@ mod tests {
             .replay_ansi(&mut ansi.as_bytes())
             .unwrap();
         (worker, group)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composer_wide_placeholder_accepts_input_without_moving_viewport() {
+        for offset in [0, 5, i32::MAX] {
+            let (mut worker, group) =
+                scrolled_composer_worker("› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H", true);
+            let id = SessionId(1);
+            worker.sessions.get_mut(&id).unwrap().scroll(offset);
+            let before = worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .take_snapshot()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let admission =
+                crate::InputAdmission::new(crate::InputPermit::new(), deadline, |write| write())
+                    .with_agent_guard(crate::AgentInputGuard {
+                        foreground_process_group: group,
+                        provider: crate::AgentPromptKind::Codex,
+                        intent: crate::AgentInputIntent::ExplicitPrompt,
+                    });
+            let body = "\x1b[200~한글 새 입력\nWIDE-COMPOSER-END\x1b[201~";
+            assert_eq!(
+                worker.admit_input_batch_checked(id, &[body.as_bytes(), b"\r"], Some(&admission)),
+                Ok(()),
+                "an untouched wide hint must accept explicit input at scroll offset {offset}"
+            );
+            let after = worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .take_snapshot()
+                .unwrap();
+            assert_eq!(after.scroll_offset, before.scroll_offset);
+            assert_eq!(after.visible_cells, before.visible_cells);
+            while !worker.sessions[&id]
+                .screen_text()
+                .contains("WIDE-COMPOSER-END")
+            {
+                assert!(Instant::now() < deadline, "input must reach the owned PTY");
+                let effects = worker.collect_session_pump_effects(&[id], false, true);
+                worker.finish_session_pump_effects(effects);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn composer_wide_cursor_still_protects_drafts_and_automatic_input() {
+        for (editor, intent) in [
+            (
+                "› 한글 초안\x1b[1;4H",
+                crate::AgentInputIntent::ExplicitPrompt,
+            ),
+            (
+                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;6H",
+                crate::AgentInputIntent::ExplicitPrompt,
+            ),
+            (
+                "› \x1b[2m한글 힌트\x1b[0m\x1b[1;4H",
+                crate::AgentInputIntent::AutomaticPrompt,
+            ),
+        ] {
+            for offset in [0, 5, i32::MAX] {
+                let (mut worker, group) = scrolled_composer_worker(editor, false);
+                let id = SessionId(1);
+                worker.sessions.get_mut(&id).unwrap().scroll(offset);
+                let admission = crate::InputAdmission::new(
+                    crate::InputPermit::new(),
+                    Instant::now() + Duration::from_secs(5),
+                    |write| write(),
+                )
+                .with_agent_guard(crate::AgentInputGuard {
+                    foreground_process_group: group,
+                    provider: crate::AgentPromptKind::Codex,
+                    intent,
+                });
+                assert_eq!(
+                    worker.admit_input_batch_checked(
+                        id,
+                        &[b"must-not-send", b"\r"],
+                        Some(&admission)
+                    ),
+                    Err(pty::PtyInputRejectReason::AdmissionDenied),
+                    "wide cursor normalization must preserve {intent:?} protection at offset {offset}"
+                );
+            }
+        }
     }
 
     #[test]

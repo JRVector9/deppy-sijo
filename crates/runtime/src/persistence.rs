@@ -153,6 +153,7 @@ impl PersistPipe {
             error_regex,
             done_regex,
         };
+        // This UUID is new, so this pipe cannot have an older queued update for it.
         if let Err(e) = persist::upsert_session(&self.conn, &row) {
             tracing::warn!("세션 영속 실패 (spawn): {e:#}");
         }
@@ -190,7 +191,7 @@ impl PersistPipe {
         row.args = args.to_vec();
         row.cwd = cwd.to_owned();
         row.status = persist::SESSION_STATUS_RUNNING.to_owned();
-        if let Err(e) = persist::upsert_session(&self.conn, &row) {
+        if let Err(e) = self.upsert_session_ordered(&row) {
             tracing::warn!(persistent_id, "세션 영속 실패 (restore): {e:#}");
         }
         self.rows.insert(session, row);
@@ -250,7 +251,7 @@ impl PersistPipe {
             return false;
         };
         row.status = persist::SESSION_STATUS_RUNNING.to_owned();
-        if let Err(e) = persist::upsert_session(&self.conn, &row) {
+        if let Err(e) = self.upsert_session_ordered(&row) {
             tracing::warn!(persistent_id = %row.id, "세션 영속 실패 (respawn): {e:#}");
         }
         self.rows.insert(new_session, row);
@@ -267,7 +268,8 @@ impl PersistPipe {
             return;
         }
         row.cwd = cwd.to_owned();
-        if let Err(e) = persist::upsert_session(&self.conn, row) {
+        let row = row.clone();
+        if let Err(e) = self.upsert_session_ordered(&row) {
             tracing::warn!("세션 cwd 영속 실패: {e:#}");
         }
     }
@@ -284,7 +286,8 @@ impl PersistPipe {
                 Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
             }
         }
-        if let Err(e) = persist::upsert_session(&self.conn, row) {
+        let row = row.clone();
+        if let Err(e) = self.upsert_session_ordered(&row) {
             tracing::warn!("세션 영속 실패 (exit direct fallback): {e:#}");
         }
     }
@@ -300,7 +303,8 @@ impl PersistPipe {
                 Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
             }
         }
-        if let Err(e) = persist::upsert_session(&self.conn, row) {
+        let row = row.clone();
+        if let Err(e) = self.upsert_session_ordered(&row) {
             tracing::warn!("세션 status 영속 실패 (direct fallback): {e:#}");
         }
     }
@@ -325,6 +329,27 @@ impl PersistPipe {
         {
             tracing::warn!("세션 log offset 영속 실패 (direct fallback): {e:#}");
         }
+    }
+
+    /// All callers run on the runtime owner thread. Complete earlier queued/in-flight
+    /// writes before a synchronous full-row upsert can change that UUID's execution state.
+    fn upsert_session_ordered(&mut self, row: &SessionRow) -> anyhow::Result<()> {
+        if let Some(handle) = &self.write_handle
+            && let Err(error) = handle.flush()
+        {
+            tracing::warn!(
+                "DB batch 순서 barrier 실패 — writer 종료 후 direct fallback: {error:#}"
+            );
+            // A failed/closed writer may still own an in-flight batch. Join it before the
+            // direct fallback, so a late old status cannot overwrite the new execution.
+            self.write_handle.take();
+            if let Some(worker) = self._write_worker.take()
+                && let Err(error) = worker.shutdown()
+            {
+                tracing::warn!("DB batch writer 종료 실패: {error:#}");
+            }
+        }
+        persist::upsert_session(&self.conn, row)
     }
 
     pub(crate) fn flush_async_writes(&self) -> anyhow::Result<Option<DbWriteStatsSnapshot>> {
@@ -696,5 +721,52 @@ mod tests {
 
         drop(pipe);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn all_review_20261014_respawn_must_retire_queued_exit_status() {
+        let (dir, db_path) = temp_db("review-respawn-order");
+        let db = storage::Db::open(&db_path).unwrap();
+        let workspace_id = db.create_workspace("runtime").unwrap();
+        drop(db);
+        let mut pipe = PersistPipe::open_with_worker_config(
+            &PersistConfig {
+                db_path: db_path.clone(),
+                workspace_id,
+            },
+            DbWriteWorkerConfig {
+                flush_interval: std::time::Duration::from_secs(3600),
+                ..DbWriteWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        let old = SessionId(1);
+        pipe.session_spawned(
+            old,
+            "shell",
+            None,
+            "shell",
+            "/bin/sh",
+            &[],
+            "/tmp",
+            None,
+            None,
+            None,
+            None,
+        );
+        pipe.session_exited(old);
+        assert!(pipe.session_respawned(old, SessionId(2)));
+        pipe.flush_async_writes().unwrap();
+        let status: String = rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .query_row("SELECT status FROM sessions", [], |r| r.get(0))
+            .unwrap();
+        drop(pipe);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            status,
+            persist::SESSION_STATUS_RUNNING,
+            "old queued exit overwrote respawn"
+        );
     }
 }

@@ -56,6 +56,7 @@ impl CloudAgent {
             .filter(|g| g.generation == target.generation);
         permission.read &= grant.is_some();
         permission.input &= grant.is_some_and(|g| g.input && target.live);
+        permission.local_completion &= permission.read && target.live;
         permission
     }
     pub(super) fn connection_lease(&self, target: &Target) -> Option<control::ControlLease> {
@@ -123,6 +124,35 @@ impl CloudAgent {
         let revoked = self.control.revoke_connection(id);
         self.revoke_leases(revoked);
         self.issued_leases.remove(id);
+    }
+
+    pub(super) fn set_connection_local_completion(
+        &mut self,
+        id: &str,
+        target: &Target,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if !self.connection_infos().iter().any(|info| {
+            info.principal.id == id && info.state == ConnectionState::Active
+        }) {
+            return Err("connection_not_active".into());
+        }
+        if !target.live || !self.targets.iter().any(|current| {
+            current.live
+                && current.id == target.id
+                && current.generation == target.generation
+                && current.workspace == target.workspace
+                && current.runtime == target.runtime
+                && current.runtime_token == target.runtime_token
+                && current.session == target.session
+                && current.pane == target.pane
+        }) {
+            return Err("session_changed_or_closed".into());
+        }
+        if enabled && !self.connection_permission(id, target).read {
+            return Err("client_read_not_allowed".into());
+        }
+        self.control.set_local_completion(id, &target.id, &target.generation, enabled)
     }
     pub fn take_session_control(&mut self, target: &Target) {
         self.allow_input(&target.id, false);

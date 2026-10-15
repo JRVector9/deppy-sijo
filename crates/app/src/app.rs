@@ -28344,6 +28344,7 @@ impl App {
                         })
                         .and_then(|(at, _)| u64::try_from(*at).ok()),
                     runtime: rt.runtime_instance,
+                    runtime_token: rt.runtime.instance_token().to_owned(),
                     session,
                     pane: pane.id.clone(),
                     live: !rt.live.exited_sessions.contains(&session),

@@ -31,6 +31,7 @@ pub struct Target {
     pub local_status_observed_at: Option<u64>,
     pub local_agent_present: bool,
     pub runtime: u64,
+    pub runtime_token: String,
     pub session: runtime::SessionId,
     pub pane: runtime::MuxPaneId,
     pub live: bool,
@@ -1606,7 +1607,7 @@ impl CloudAgent {
             .map_err(|_| "busy_no_effect")?;
         let grant = &self.grants[&target.id];
         // Retain only operation_id in App, not another full copy of request arguments.
-        let stored_request = Request {
+        let stored_request = Request { deferred: None,
             epoch: req.epoch,
             principal: req.principal.clone(),
             access_key: req.access_key.clone(),
@@ -1803,6 +1804,7 @@ impl Target {
             local_status_observed_at: None,
             local_agent_present: false,
             runtime: 1,
+            runtime_token: "fixture-runtime".into(),
             session: runtime::SessionId(1),
             pane: runtime::MuxPaneId::new(),
             live: true,
@@ -1940,7 +1942,7 @@ mod integration_tests {
             .unwrap();
         let (reply, rx) = mpsc::sync_channel(1);
         (
-            Request {
+            Request { deferred: None,
                 epoch,
                 principal: auth
                     .authenticate_principal(
@@ -3242,7 +3244,7 @@ mod guarded_input_tests {
                 .authenticate(&format!("Bearer {}", auth.token_for_user().as_str()), now())
                 .unwrap();
             let (reply, rx) = mpsc::sync_channel(1);
-            let mut req = Request {
+            let mut req = Request { deferred: None,
                 epoch,
                 principal: auth
                     .authenticate_principal(
@@ -3287,7 +3289,7 @@ mod guarded_input_tests {
                 )
                 .unwrap();
             }
-            let lease_recheck = Request {
+            let lease_recheck = Request { deferred: None,
                 epoch: req.epoch,
                 principal: req.principal.clone(),
                 access_key: req.access_key.clone(),
@@ -3700,7 +3702,7 @@ mod http_end_to_end_tests {
             .authenticate(&format!("Bearer {}", auth.token_for_user().as_str()), now())
             .unwrap();
         let (reply, receipt) = mpsc::sync_channel(1);
-        let req = Request {
+        let req = Request { deferred: None,
             epoch,
             principal: auth
                 .authenticate_principal(

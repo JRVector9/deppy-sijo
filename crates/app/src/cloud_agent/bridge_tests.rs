@@ -38,7 +38,7 @@ fn request(
     let header = format!("Bearer {}", client.bearer);
     let (reply, rx) = mpsc::sync_channel(1);
     (
-        Request {
+        Request { deferred: None,
             epoch: auth.authenticate(&header, now()).unwrap(),
             principal: auth.authenticate_principal(&header, now()).unwrap(),
             access_key: Some(URL_SAFE_NO_PAD.encode(Sha256::digest(client.bearer.as_bytes()))),

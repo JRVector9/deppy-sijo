@@ -84,7 +84,7 @@ impl CloudAgent {
         let mut target = target.clone();
         target.screen = None;
         self.output.pending.insert(token, Pending {
-            request: Request { epoch:req.epoch, principal:req.principal.clone(), access_key:req.access_key.clone(), input_scope:req.input_scope, deadline:req.deadline, tool:req.tool.clone(), args:json!({"session_id":field(&req.args,"session_id",128)?,"generation":target.generation}), reply:req.reply.clone() },
+            request: Request { deferred: None, epoch:req.epoch, principal:req.principal.clone(), access_key:req.access_key.clone(), input_scope:req.input_scope, deadline:req.deadline, tool:req.tool.clone(), args:json!({"session_id":field(&req.args,"session_id",128)?,"generation":target.generation}), reply:req.reply.clone() },
             target, auth:self.server.as_ref().ok_or("connection_not_active")?.auth.clone(), max_bytes,
         });
         Ok(None)
@@ -219,7 +219,7 @@ mod tests {
         if let Some(cursor) = cursor {
             args["cursor"] = json!(cursor);
         }
-        let req = Request {
+        let req = Request { deferred: None,
             epoch: auth.authenticate(&header, now()).unwrap(),
             principal: auth.authenticate_principal(&header, now()).unwrap(),
             access_key: None,

@@ -1,0 +1,25 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/core)
+   Compiling mcp v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/mcp)
+   Compiling audit v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/audit)
+   Compiling connector-service v0.12.1 (/private/tmp/deppy-full-fix-data-20261014/crates/connector-service)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.90s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/connector_service-c1dd4bab2f71eab1)
+
+running 1 test
+test coordinator::tests::all_review_20261014_import_completion_survives_command_backpressure ... queue_depth=8 first=Err(Backpressure) pending_after_backpressure=false retry=Err(StaleHostAction) parses=0 imports=0
+
+thread 'coordinator::tests::all_review_20261014_import_completion_survives_command_backpressure' (48485486) panicked at crates/connector-service/src/coordinator.rs:10216:9:
+assertion `left == right` failed: a rejected import completion must retain its operation ownership for retry; pending_after_backpressure=false, parses=0, imports=0
+  left: Err(StaleHostAction)
+ right: Ok(Queued)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    coordinator::tests::all_review_20261014_import_completion_survives_command_backpressure
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p connector-service --lib`

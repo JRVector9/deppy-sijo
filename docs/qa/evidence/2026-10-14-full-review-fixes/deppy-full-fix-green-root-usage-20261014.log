@@ -1,0 +1,10 @@
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.06s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 3 tests
+test claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_pending_worker_never_waits_on_frame ... ok
+test claude_usage_snapshot::tests::full_fix_20261014_usage_regular_bounded_file ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3220 filtered out; finished in 0.01s

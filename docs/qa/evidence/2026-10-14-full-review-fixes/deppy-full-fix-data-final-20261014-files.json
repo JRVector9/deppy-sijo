@@ -1,0 +1,46 @@
+{
+  "crates/core/src/fs.rs": {
+    "before_sha256": "6c514f2fd60a4418cde04a7f055563942721fdecf899e5f91f4c8a7a8711fd4c",
+    "after_sha256": "d6bcc08ab0c803479bc2da481923a046341065998174e11278373003bf7415a9"
+  },
+  "crates/storage-core/src/lib.rs": {
+    "before_sha256": "6b9700ee11f0290f95a537b8f405999cc93917b163aa47497c07c3e1af29389b",
+    "after_sha256": "42a8ca9c2ebe0d8708c89cb0e65f4f45bdf5399e4c99a3f0c3ccee4e154aad78"
+  },
+  "crates/storage-core/Cargo.toml": {
+    "before_sha256": "7ed2344b60e64e8e4eed5c41905462319481a31f4410e8438116e87832133eae",
+    "after_sha256": "8cb33fec5fbd960306199e0b0d1136d93865d3b8d7370cc98753db233cfd7fd3"
+  },
+  "crates/runtime/src/persistence.rs": {
+    "before_sha256": "1ca463b6e35064f8b797e0f92ca45a6e667f70317ff6003e92ea6e23542f6709",
+    "after_sha256": "715bfaccb08994877762a095c55e251beb538e3604c04ac6948c44fca7eac2ec"
+  },
+  "crates/connector-service/src/coordinator.rs": {
+    "before_sha256": "ac3eceddf02a80591173c37971daae312720c20eba32e0df413f518f680f0437",
+    "after_sha256": "f4205dc16b4d5f2aa2c37a15feba025c42fd9bd62ce5131074f5376b021a6aad"
+  },
+  "crates/web-remote/src/relay_client/tls.rs": {
+    "before_sha256": "5795b3bc871548c802d82588e1fcd3a6a50e43701d2233c9cce83313b5a7abfe",
+    "after_sha256": "9d9360117b6d4626cd3dbd83e5c5be64332dbfbe4878e844311853d354482ebc"
+  },
+  "crates/web-remote/src/relay_client/worker.rs": {
+    "before_sha256": "ec4e3ffb199b00a68450b58957a02bd8bb5a009a8c6e80591aeed01d6787886d",
+    "after_sha256": "b22eff4540fc619b5c041e8e9fe75153cd64e67ae5916f875960544d8657a1d0"
+  },
+  "crates/web-remote/Cargo.toml": {
+    "before_sha256": "49c5c5b60df5d182bec72a28d840ed79ccf466695b44b555d3dcbdbce4c9282a",
+    "after_sha256": "29c3566e9442adbd216b5352f606cc8b5012fc2180b773f506b5cba4d9502aea"
+  },
+  "crates/runtime/src/resource_monitor.rs": {
+    "before_sha256": "95f90ea96be5762e018d2934c0e4a451d0a0ca1a0fd5d5e1bb73a2aa018b8207",
+    "after_sha256": "95177c3094a9d162dac60217fee59b4883cca523c7e7757edca7337bcc1e9d64"
+  },
+  "crates/web-remote/tests/fixtures/relay-loopback/localhost-key.der": {
+    "new_sha256": "1b32d20d35cbe4a64e85822d6110b75e40e9b448266b854edb5170a831d78367",
+    "bytes": 1218
+  },
+  "crates/web-remote/tests/fixtures/relay-loopback/localhost-cert.der": {
+    "new_sha256": "623c73967431fd9922695d4f4d9b79f3e7a31d9bc661a9231fac54c297234ee5",
+    "bytes": 839
+  }
+}

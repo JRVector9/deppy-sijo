@@ -1,0 +1,5 @@
+receive_budget_ms=40 elapsed_ms=252 received_bytes=8
+
+thread 'main' (47841872) panicked at /private/tmp/deppy-all-review-remote-data-20261014/tls-production-copy.rs:442:5:
+production receive ignored total deadline while bytes continued arriving
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

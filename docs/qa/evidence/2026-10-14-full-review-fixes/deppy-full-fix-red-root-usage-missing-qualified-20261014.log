@@ -1,0 +1,42 @@
+   Compiling deppy-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/core)
+   Compiling secret v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/secret)
+   Compiling audit v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/audit)
+   Compiling mux v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mux)
+   Compiling persist v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/persist)
+   Compiling terminal v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/terminal)
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling mcp-store v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp-store)
+   Compiling storage-core v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage-core)
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling storage v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/storage)
+   Compiling http-client v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/http-client)
+   Compiling connector-contract v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-contract)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling relay-protocol v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/relay-protocol)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/mcp)
+   Compiling auth v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/auth)
+   Compiling i18n v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n)
+   Compiling connector-service v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-service)
+   Compiling connector-ui v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/connector-ui)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling platform v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/platform)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 44.26s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 1 test
+test claude_usage_snapshot::tests::full_fix_20261014_usage_slow_missing_result_allows_cli_fallback ...
+thread 'claude_usage_snapshot::tests::full_fix_20261014_usage_slow_missing_result_allows_cli_fallback' (49279277) panicked at crates/app/src/claude_usage_snapshot.rs:304:9:
+a slow absent snapshot must leave a completed interval for the CLI fallback
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    claude_usage_snapshot::tests::full_fix_20261014_usage_slow_missing_result_allows_cli_fallback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3246 filtered out; finished in 0.03s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

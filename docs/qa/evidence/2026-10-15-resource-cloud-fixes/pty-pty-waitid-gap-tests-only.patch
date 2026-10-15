@@ -1,0 +1,143 @@
+--- a/crates/pty/src/foreground_teardown_tests.rs
++++ b/crates/pty/src/foreground_teardown_tests.rs
+@@ -31,6 +31,10 @@
+     }
+ 
+     fn spawn_with_shell_exit(mode: &str, shell_exits: bool) -> Self {
++        Self::spawn_with_reaper(mode, shell_exits, false)
++    }
++
++    fn spawn_with_reaper(mode: &str, shell_exits: bool, pause_reaper: bool) -> Self {
+         static NEXT: AtomicU64 = AtomicU64::new(0);
+         let directory = std::env::temp_dir().join(format!(
+             "deppy-pty-foreground-{}-{}",
+@@ -55,8 +59,35 @@
+             ],
+             cwd: Some(directory.clone()),
+         };
++        let session: Box<dyn PtySession> = if pause_reaper {
++            // Only the before-poll regression uses the private concrete constructor. Stop and
++            // join its reaper while the shell is idle, before issuing the exit command.
++            let pair = openpty_with_retry(80, 24).unwrap();
++            let mut command = portable_pty::CommandBuilder::new(&spec.program);
++            command.args(&spec.args);
++            for (key, value) in &spec.env {
++                command.env(key, value);
++            }
++            command.cwd(spec.cwd.as_ref().unwrap());
++            let child = pair.slave.spawn_command(command).unwrap();
++            let mut session = spawn_unix_session(
++                pair.master,
++                pair.slave,
++                child,
++                None,
++                None,
++                None,
++                TestWorkerSpawnFailure::None,
++            )
++            .unwrap();
++            session.reaper_stop.store(true, Ordering::Release);
++            join_worker(session.reaper_thread.take(), "fixture reaper");
++            Box::new(session)
++        } else {
++            PortablePtyBackend.spawn(&spec, 80, 24).unwrap()
++        };
+         let mut fixture = Self {
+-            session: Some(PortablePtyBackend.spawn(&spec, 80, 24).unwrap()),
++            session: Some(session),
+             output: None,
+             process: None,
+             directory,
+@@ -103,11 +134,46 @@
+         assert!(!process.zombie_for_test());
+         if shell_exits {
+             assert_eq!(shell.process_group, Some(process.group as u32));
+-            // Let the actual reaper consume the shell. Do not use try_exit_code in this wait:
+-            // the later Drop/kill must recover its authority from the pre-reap member snapshot.
++            // Darwin hides zombies from proc_pidinfo before they are reaped. Non-consuming
++            // waitid must prove ECHILD for the periodic-reaper case, or an unreaped exit for
++            // the deterministic before-poll case. Do not call try_exit_code in either wait.
+             let deadline = Instant::now() + Duration::from_secs(3);
+-            while workload_signal::inspect(shell.pid.unwrap() as i32).is_some() {
+-                assert!(Instant::now() < deadline, "fixture shell was not reaped");
++            let shell_pid = shell.pid.unwrap() as i32;
++            loop {
++                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
++                let result = unsafe {
++                    libc::waitid(
++                        libc::P_PID,
++                        shell_pid as libc::id_t,
++                        info.as_mut_ptr(),
++                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
++                    )
++                };
++                if result != 0 {
++                    let error = std::io::Error::last_os_error();
++                    if error.raw_os_error() == Some(libc::ECHILD) {
++                        assert!(!pause_reaper, "stopped fixture reaper consumed shell");
++                        break;
++                    }
++                    assert_eq!(error.raw_os_error(), Some(libc::EINTR));
++                } else {
++                    let info = unsafe { info.assume_init() };
++                    let pid = unsafe { info.si_pid() };
++                    assert!(pid == 0 || pid == shell_pid);
++                    if pause_reaper
++                        && pid == shell_pid
++                        && matches!(
++                            info.si_code,
++                            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
++                        )
++                    {
++                        break;
++                    }
++                }
++                assert!(
++                    Instant::now() < deadline,
++                    "fixture shell exit/reap not observed"
++                );
+                 std::thread::sleep(Duration::from_millis(5));
+             }
+             assert!(
+@@ -217,8 +283,8 @@
+     foreground_teardown("ignore-hup-term", false, true);
+ }
+ 
+-fn descendant_after_shell_exit_teardown(use_kill: bool) {
+-    let mut fixture = Fixture::spawn_with_shell_exit("ignore-hup", true);
++fn descendant_after_shell_exit_teardown(use_kill: bool, pause_reaper: bool) {
++    let mut fixture = Fixture::spawn_with_reaper("ignore-hup", true, pause_reaper);
+     if use_kill {
+         fixture.session.as_mut().unwrap().kill().unwrap();
+     } else {
+@@ -229,16 +295,26 @@
+     drop(fixture);
+     assert!(
+         gone_without_rescue,
+-        "captured same-group descendant survived after shell reap: kill={use_kill} identity={process:?}"
++        "captured same-group descendant survived after shell exit: kill={use_kill} pause_reaper={pause_reaper} identity={process:?}"
+     );
+ }
+ 
+ #[test]
+ fn samegroup_descendant_after_shell_reap_exits_on_drop() {
+-    descendant_after_shell_exit_teardown(false);
++    descendant_after_shell_exit_teardown(false, false);
+ }
+ 
+ #[test]
+ fn samegroup_descendant_after_shell_reap_exits_on_kill() {
+-    descendant_after_shell_exit_teardown(true);
+-}
++    descendant_after_shell_exit_teardown(true, false);
++}
++
++#[test]
++fn samegroup_descendant_before_reaper_poll_exits_on_drop() {
++    descendant_after_shell_exit_teardown(false, true);
++}
++
++#[test]
++fn samegroup_descendant_before_reaper_poll_exits_on_kill() {
++    descendant_after_shell_exit_teardown(true, true);
++}

@@ -1,0 +1,11 @@
+{
+  "relative_to": "previous final management source, not initial snapshot/HEAD",
+  "path": "crates/app/src/cloud_agent/management.rs",
+  "before_sha256": "b6c09a7a9ce98fcf72fd6a47c2d3b78594a0c5bb9620b10f36aa7f233db5ca04",
+  "after_sha256": "73b2aef9a706fe46e6a64d231a2c44829fb93a575868d36f337f64688459a38f",
+  "patch_sha256": "c3e538085b5e87aa065e2917b584124be053e2b3d3451077b82b799b97f51721",
+  "patch_check_exit": 0,
+  "product_code_changed": false,
+  "cargo_executed_by_worker": false,
+  "observed_root_result": "App cloud 174 PASS / 1 FAIL / 3 ignored; exact-one accepted locked stale fixture observed 2 because initial Bootstrap was not completed"
+}

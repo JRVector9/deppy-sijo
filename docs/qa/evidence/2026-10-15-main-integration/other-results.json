@@ -1,0 +1,42 @@
+[
+  {
+    "name": "fmt",
+    "command": "cargo fmt --all -- --check",
+    "exit_code": 0
+  },
+  {
+    "name": "relay-node",
+    "command": "node --test web/relay-shell/tests/*.test.mjs",
+    "exit_code": 0,
+    "passed": 16,
+    "log": "relay-node-tests.log"
+  },
+  {
+    "name": "viewer-readability",
+    "command": "node scripts/verify-viewer-readability.mjs",
+    "exit_code": 0,
+    "assertions": 114,
+    "log": "viewer-readability.log"
+  },
+  {
+    "name": "viewer-history",
+    "command": "node scripts/verify-viewer-readability.mjs --history",
+    "exit_code": 0,
+    "assertions": 89,
+    "log": "viewer-history.log"
+  },
+  {
+    "name": "viewer-reading",
+    "command": "node scripts/verify-viewer-readability.mjs --reading",
+    "exit_code": 0,
+    "assertions": 182,
+    "log": "viewer-reading.log"
+  },
+  {
+    "name": "cloud-results-mobile",
+    "command": "node crates/web-remote/tests/fixtures/run-cloud-results-mobile.mjs",
+    "exit_code": 0,
+    "assertions": 77,
+    "log": "cloud-results-mobile.log"
+  }
+]

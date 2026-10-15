@@ -1,0 +1,6 @@
+after_250ms_fifo_result=None; normal_document_admission=Err(LazyWorkerSubmitError { status: "full" }); blocked=true
+after_writer_release=Failed { code: FileTypeInvalid }
+
+thread 'main' (47719624) panicked at /private/tmp/deppy-ui-doc-review-20261014.rs:82:5:
+special .md file must be rejected without blocking unrelated document loads
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

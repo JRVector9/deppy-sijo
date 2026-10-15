@@ -1,0 +1,9 @@
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+error[E0433]: cannot find `query_fence` in `pty`
+  --> crates/runtime/src/agent_wrapper.rs:52:29
+   |
+52 |     let fence_prefix = pty::query_fence::AGENT_QUERY_FENCE_PREFIX.replace("\x1b", "\\033");
+   |                             ^^^^^^^^^^^ could not find `query_fence` in `pty`
+
+For more information about this error, try `rustc --explain E0433`.
+error: could not compile `runtime` (lib) due to 1 previous error

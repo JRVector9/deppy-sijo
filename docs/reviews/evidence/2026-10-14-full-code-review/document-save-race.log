@@ -1,0 +1,5 @@
+observer_write_finished_before_temp_commit=true; outcome=Saved { revision: DocumentRevision { modified: SystemTime { tv_sec: 1791981154, tv_nsec: 675977181 }, len: 8388608, device: 16777232, inode: 577524371 } }; final_bytes=8388608; external_edit_lost=true
+
+thread 'main' (47925546) panicked at /private/tmp/deppy-ui-doc-review-20261014.rs:114:5:
+external edit made during temp write/sync must not be overwritten as Saved
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

@@ -1,0 +1,316 @@
+--- a/crates/app/src/ui/file_tree.rs
++++ b/crates/app/src/ui/file_tree.rs
+@@ -17071,4 +17071,175 @@
+             assert!(!harness.state().0.has_pending_confirmation());
+         }
+     }
+-}
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_child_permission_recovery_retries_listing() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let base = temp_root("popup-audit-permission-recovery");
++        let child = base.join("restricted");
++        std::fs::create_dir(&child).unwrap();
++        std::fs::write(child.join("recovered.txt"), b"recoverable").unwrap();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0)).unwrap();
++        assert_eq!(
++            std::fs::read_dir(&child).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        tree.toggle_dir(&child);
++        let denied = tree
++            .take_maintenance_intent()
++            .expect("child listing was admitted");
++        assert!(
++            matches!(&denied.request, FileTreeMaintenanceRequest::ListDirectory { directory, .. } if directory.as_path() == child)
++        );
++        tree.complete_maintenance(FileTreeMaintenanceCompletion {
++            operation: denied.operation,
++            generation: denied.generation,
++            result: Err(FileTreeMaintenanceErrorCode::PermissionDenied),
++        });
++        drain_listings(&mut tree);
++        assert!(tree.inaccessible_paths.contains(&child));
++        std::fs::set_permissions(&child, std::fs::Permissions::from_mode(0o700)).unwrap();
++        assert!(std::fs::read_dir(&child).is_ok());
++        tree.refresh();
++        drain_listings(&mut tree);
++        tree.toggle_dir(&child);
++        let retry = tree.take_maintenance_intent();
++        let was_retried = matches!(&retry, Some(FileTreeMaintenanceIntent { request: FileTreeMaintenanceRequest::ListDirectory { directory, .. }, .. }) if directory.as_path() == child);
++        println!(
++            "restored child access: retry={was_retried}, inaccessible={}",
++            tree.inaccessible_paths.contains(&child)
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            was_retried,
++            "after access is restored, Refresh plus expand must retry the child listing"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_partial_copy_failure_refreshes_destination() {
++        use std::os::unix::fs::PermissionsExt as _;
++        let base = temp_root("popup-audit-partial-copy");
++        let source = base.join("source");
++        let destination = base.join("destination");
++        std::fs::create_dir(&source).unwrap();
++        std::fs::create_dir(&destination).unwrap();
++        let readable = source.join("first.txt");
++        let denied = source.join("last.txt");
++        std::fs::write(&readable, b"first-content").unwrap();
++        std::fs::write(&denied, b"last-content").unwrap();
++        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0)).unwrap();
++        assert_eq!(
++            std::fs::File::open(&denied).unwrap_err().kind(),
++            std::io::ErrorKind::PermissionDenied
++        );
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(destination.clone()));
++        drain_listings(&mut tree);
++        tree.queue_io(
++            FileTreeIoRequest::CopyInto {
++                root: None,
++                sources: FileTreePathListPayload::try_new(vec![readable, denied.clone()]).unwrap(),
++                destination: FileTreePathPayload::try_new(destination.clone()).unwrap(),
++            },
++            vec![destination.clone()],
++            None,
++            None,
++        )
++        .unwrap();
++        let intent = tree.take_io_intent().unwrap();
++        let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++        assert!(result.is_err());
++        let first_published = destination.join("first.txt").is_file();
++        tree.complete_io(FileTreeIoCompletion {
++            operation: intent.operation,
++            generation: intent.generation,
++            result,
++        });
++        drain_listings(&mut tree);
++        let first_visible = tree
++            .flat
++            .iter()
++            .any(|row| row.path == destination.join("first.txt"));
++        println!(
++            "partial-copy result: first_published={first_published}, first_visible={first_visible}"
++        );
++        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o600)).unwrap();
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            first_published,
++            "native worker must really publish the first member before the last member fails"
++        );
++        assert!(
++            first_visible,
++            "a partially applied host failure must refresh the affected destination without depending on a healthy OS watcher"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation() {
++        use egui_kittest::kittest::Queryable as _;
++        use std::os::unix::fs::MetadataExt as _;
++        let base = temp_root("popup-audit-replaced-confirmation");
++        let target = base.join("selected.txt");
++        std::fs::write(&target, b"old-selected-content").unwrap();
++        let old_inode = std::fs::symlink_metadata(&target).unwrap().ino();
++        let mut tree = FileTreeUi::new(egui::Context::default());
++        tree.set_root(Some(base.clone()));
++        drain_listings(&mut tree);
++        tree.spawn_trash(DeleteTarget {
++            path: target.clone(),
++            label: "selected.txt".into(),
++            is_dir: false,
++        });
++        let failed_trash = tree.take_io_intent().unwrap();
++        tree.complete_io(FileTreeIoCompletion {
++            operation: failed_trash.operation,
++            generation: failed_trash.generation,
++            result: Err(FileTreeIoErrorCode::TrashUnavailable),
++        });
++        assert!(tree.confirm_delete.is_some());
++        std::fs::rename(&target, base.join("original-retained.txt")).unwrap();
++        std::fs::write(&target, b"new-unselected-content").unwrap();
++        let new_inode = std::fs::symlink_metadata(&target).unwrap().ino();
++        assert_ne!(old_inode, new_inode);
++        tree.refresh();
++        drain_listings(&mut tree);
++        let old_confirmation_retained = tree.confirm_delete.is_some();
++        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
++        let mut harness = delete_confirm_harness(tree, &catalog);
++        harness.run();
++        let mut issued_delete = false;
++        if let Some(button) = harness.query_by_label(&catalog.t("file_tree.permanent_delete", &[]))
++        {
++            button.click();
++            if let Some(intent) = (0..8).find_map(|_| {
++                harness.step();
++                harness.state_mut().0.take_io_intent()
++            }) {
++                issued_delete = true;
++                assert!(
++                    matches!(&intent.request, FileTreeIoRequest::DeletePermanently { target: payload } if payload.as_path() == target)
++                );
++                let result = crate::app::pr11_private_file_fixture_io(intent.request, &base);
++                assert_eq!(result, Ok(()));
++            }
++        }
++        let replacement_survived = target.exists();
++        let original_survived =
++            std::fs::read(base.join("original-retained.txt")).unwrap() == b"old-selected-content";
++        println!(
++            "replaced-file confirmation: inode {old_inode}->{new_inode}, retained={old_confirmation_retained}, issued_delete={issued_delete}, new_survived={replacement_survived}, original_survived={original_survived}"
++        );
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            replacement_survived,
++            "an old failed-trash confirmation must not authorize permanent deletion of a different inode created by a subsequent checkout/build"
++        );
++    }
++}
+--- a/crates/app/src/app.rs
++++ b/crates/app/src/app.rs
+@@ -59367,6 +59367,134 @@
+             "순서 목록이 줄어든 것만으로는 config를 저장하지 않는다"
+         );
+     }
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn popup_audit_20261014_symlink_root_delivers_native_watch_events() {
++        let base = unique_temp_dir("popup-audit-symlink-watch")
++            .canonicalize()
++            .unwrap();
++        let physical = base.join("physical");
++        let logical = base.join("alias");
++        std::fs::create_dir(&physical).unwrap();
++        std::os::unix::fs::symlink(&physical, &logical).unwrap();
++        let ctx = egui::Context::default();
++        let mut tree = ui::file_tree::FileTreeUi::new(ctx.clone());
++        let (operation, generation, directories, ignored_prefixes, show_hidden) =
++            app_file_tree_watch_intent(&mut tree, logical.clone());
++        let mut watcher = AppFileTreeWatcher::new(ctx).unwrap();
++        watcher
++            .submit_replace(
++                operation,
++                generation,
++                directories,
++                ignored_prefixes,
++                show_hidden,
++            )
++            .unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
++        let completion = loop {
++            if let Some(completion) = watcher.poll_completion() {
++                break completion;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "native watch registration timeout"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        };
++        assert!(completion.result.is_ok());
++        std::fs::write(physical.join("new.txt"), b"native-change").unwrap();
++        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
++        let observed_paths = loop {
++            let paths = watcher.pending.lock().unwrap().paths.clone();
++            if paths
++                .iter()
++                .any(|path| path.file_name() == Some(std::ffi::OsStr::new("new.txt")))
++            {
++                break paths;
++            }
++            assert!(
++                std::time::Instant::now() < deadline,
++                "native FSEvents callback did not observe the synthetic file change"
++            );
++            std::thread::sleep(std::time::Duration::from_millis(5));
++        };
++        let snapshot = watcher.take_snapshot().unwrap().unwrap();
++        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
++            operation,
++            generation,
++            result: Ok(ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied),
++        });
++        tree.apply_watch_snapshot(snapshot);
++        let refreshed = matches!(
++            tree.take_maintenance_intent(),
++            Some(ui::file_tree::FileTreeMaintenanceIntent {
++                request: ui::file_tree::FileTreeMaintenanceRequest::ListDirectory { .. },
++                ..
++            })
++        );
++        println!(
++            "symlink-watch raw={observed_paths:?}, physical={physical:?}, logical={logical:?}, refresh_queued={refreshed}"
++        );
++        drop(watcher);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            refreshed,
++            "native changes beneath a selected symlink root must reach the file tree in its logical path namespace"
++        );
++    }
++
++    #[test]
++    fn popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor() {
++        let db_path = temp_db_path("popup-audit-missing-project-picker");
++        let base = unique_temp_dir("popup-audit-missing-project-picker");
++        let selected = base.join("selected");
++        std::fs::create_dir(&selected).unwrap();
++        let identity = crate::folder_identity::probe(&selected).unwrap();
++        let mut db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("anchored workspace").unwrap();
++        db.set_workspace_path_and_anchor_with_volume(
++            &workspace_id,
++            selected.to_str().unwrap(),
++            Some(identity.anchor.dev),
++            Some(identity.anchor.ino),
++            identity.volume,
++        )
++        .unwrap();
++        std::fs::rename(&selected, base.join("moved-after-native-selection")).unwrap();
++        let outcome = execute_settings_job(
++            &mut db,
++            &db_path,
++            &secret::RedactionService::new(),
++            SettingsJob {
++                generation: 1,
++                revision: 1,
++                workspace_id: workspace_id.clone(),
++                project_root: None,
++                action: SettingsJobAction::SetProjectPath {
++                    path: selected.clone(),
++                },
++            },
++        );
++        let reported_success = matches!(outcome.kind, SettingsOutcomeKind::ProjectPathSet(Ok(_)));
++        let stored_anchor = db.workspace_anchor(&workspace_id).unwrap();
++        println!(
++            "missing-picked-folder: reported_success={reported_success}, before={:?}, after={stored_anchor:?}",
++            identity.anchor
++        );
++        drop(db);
++        remove_sqlite_files(&db_path);
++        std::fs::remove_dir_all(&base).unwrap();
++        assert!(
++            !reported_success,
++            "a folder that disappeared before worker admission must fail instead of committing an unanchored path"
++        );
++        assert_eq!(
++            stored_anchor,
++            Some((identity.anchor.dev, identity.anchor.ino)),
++            "failed picker validation must preserve the prior workspace identity"
++        );
++    }
+ }
+ 
+ #[cfg(test)]

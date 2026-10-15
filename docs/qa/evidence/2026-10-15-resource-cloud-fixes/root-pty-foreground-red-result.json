@@ -1,0 +1,16 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "pty",
+    "foreground_teardown_tests",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit_code": 101,
+  "log": "pty-foreground-red.log"
+}

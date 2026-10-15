@@ -1,0 +1,17 @@
+{
+  "command": [
+    "codex",
+    "-m",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"xhigh\"",
+    "-c",
+    "sandbox_mode=\"read-only\"",
+    "-c",
+    "developer_instructions=\"Read-only independent code review of product changes and cloud integration. Do not modify any files or run Cargo, app launch, real provider requests, user secrets or messages. Focus concrete reachable bottlenecks, resource leaks, race or stale-state bugs. Validate callers and existing safety checks. Review current dirty fixes and cloud agent integration. Report exact paths and evidence. Root owns Cargo tests.\"",
+    "review",
+    "--uncommitted"
+  ],
+  "exit_code": 124,
+  "log": "/private/tmp/deppy-cloud-review-root-20261015/codex-review.log"
+}

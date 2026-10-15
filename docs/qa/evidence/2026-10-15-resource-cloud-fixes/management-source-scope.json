@@ -1,0 +1,21 @@
+{
+  "baseline_head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "baseline_source_count": 422,
+  "changed_files": [
+    "crates/app/src/cloud_agent/management.rs",
+    "crates/app/src/cloud_agent.rs"
+  ],
+  "ownership_violations": [],
+  "files": {
+    "crates/app/src/cloud_agent.rs": {
+      "baseline_sha256": "76a973d53ecb3775bbea73cacedecb7f7c62d6ef5ac41a6da977cf5b830812ff",
+      "result_sha256": "cdaf74f1f8248662da789788d158d7e53d785e47f63aafb4788c5b8eece42247"
+    },
+    "crates/app/src/cloud_agent/management.rs": {
+      "baseline_sha256": "28c5604e2aeaebb5199d71b1a50460a491a42076e8fdefdb7ee01fb1fe726ec4",
+      "result_sha256": "b6c09a7a9ce98fcf72fd6a47c2d3b78594a0c5bb9620b10f36aa7f233db5ca04"
+    }
+  },
+  "cargo_executed_by_worker": false,
+  "app_launched": false
+}

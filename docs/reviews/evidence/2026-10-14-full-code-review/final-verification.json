@@ -1,0 +1,14 @@
+{
+  "source_files_checked": 412,
+  "source_changed_or_missing": [],
+  "product_patch_byte_identical": true,
+  "product_patch_sha256": "51581efbc7fc6f2d4e0977dba92202f3e1110ec9f2a014c6894791cfe8292956",
+  "evidence_files_checked": 31,
+  "docs_whitespace_and_links": "PASS",
+  "broad_result": {
+    "pass": 2238,
+    "fail": 0,
+    "ignored": 18
+  },
+  "note": "No release, restart, commit, push, user state mutation."
+}

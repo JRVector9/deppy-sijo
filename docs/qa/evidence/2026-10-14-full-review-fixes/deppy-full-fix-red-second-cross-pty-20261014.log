@@ -1,0 +1,19 @@
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/pty)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.22s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pty-2cb6fe6d1ccaea41)
+
+running 1 test
+test workload_signal::tests::failed_stop_verification_rolls_back_a_same_session_fork ...
+thread 'workload_signal::tests::failed_stop_verification_rolls_back_a_same_session_fork' (48912479) panicked at crates/pty/src/workload_signal.rs:297:9:
+failed STOP must retain new same-session births: Err(process group identity changed)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    workload_signal::tests::failed_stop_verification_rolls_back_a_same_session_fork
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 53 filtered out; finished in 0.54s
+
+error: test failed, to rerun pass `-p pty --lib`

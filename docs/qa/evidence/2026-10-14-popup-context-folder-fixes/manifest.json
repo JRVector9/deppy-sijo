@@ -1,0 +1,181 @@
+{
+  "baseline": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "phase": "complete",
+  "logs": [
+    {
+      "file": "delete-red.log",
+      "original": "/private/tmp/deppy-popup-fix-delete-red-20261014.log",
+      "original_sha256": "8b8b41ccad89a17c14e0395a246d7f9688bbbf69a1d97d1036ef6d5afbe7862b",
+      "stored_sha256": "8b8b41ccad89a17c14e0395a246d7f9688bbbf69a1d97d1036ef6d5afbe7862b"
+    },
+    {
+      "file": "delete-boundary-red.log",
+      "original": "/private/tmp/deppy-popup-fix-delete-boundary-red-20261014.log",
+      "original_sha256": "5e7ecf02439aa17ba68988de3d7c1c485a28349a99cea1f4a811948a3b899842",
+      "stored_sha256": "5e7ecf02439aa17ba68988de3d7c1c485a28349a99cea1f4a811948a3b899842"
+    },
+    {
+      "file": "input-red.log",
+      "original": "/private/tmp/deppy-popup-fix-input-red-20261014.log",
+      "original_sha256": "f29715bec67baeeee19678daa243a8c17db29f83d48a3ae7a608816a7efed6fd",
+      "stored_sha256": "f29715bec67baeeee19678daa243a8c17db29f83d48a3ae7a608816a7efed6fd"
+    },
+    {
+      "file": "oauth-red.log",
+      "original": "/private/tmp/deppy-popup-fix-secret-red-corrected-20261014.log",
+      "original_sha256": "71627649de7fd98e314aad470baf7a6dbfca1fe43737b61e25b9cb13114f589d",
+      "stored_sha256": "71627649de7fd98e314aad470baf7a6dbfca1fe43737b61e25b9cb13114f589d"
+    },
+    {
+      "file": "watch-picker-red.log",
+      "original": "/private/tmp/deppy-popup-fix-root-red-fresh-20261014.log",
+      "original_sha256": "5ea2e1793a0d814adface5f033e50e7000c8fcf69a9a1e08389d50cfc050550d",
+      "stored_sha256": "ae9a36c8aa944975d0afab291e52fc9cf323a72e485d8bff2f7e768da9184c2b"
+    },
+    {
+      "file": "connector-green.log",
+      "original": "/private/tmp/deppy-popup-fix-connector-green-20261014.log",
+      "original_sha256": "a1f125e716638ccfd53d5fc3bf03da9ddf559f7c144e2bb341c15ed783fd8b7d",
+      "stored_sha256": "a1f125e716638ccfd53d5fc3bf03da9ddf559f7c144e2bb341c15ed783fd8b7d"
+    },
+    {
+      "file": "app-input-green.log",
+      "original": "/private/tmp/deppy-popup-fix-app-input-green-20261014.log",
+      "original_sha256": "43bef3eee508d49d061d7d5adad58b2a1ced32f8c57b5203263abc210fedad91",
+      "stored_sha256": "43bef3eee508d49d061d7d5adad58b2a1ced32f8c57b5203263abc210fedad91"
+    },
+    {
+      "file": "app-audit-first-failed.log",
+      "original": "/private/tmp/deppy-popup-fix-app-audit-green-20261014.log",
+      "original_sha256": "08a1f1acc34bca422222cdaca59a30877e183f43c62eb0f85eae5cd1f3d6367f",
+      "stored_sha256": "6c56f390ab52baac6c52366b4fd3e72cb0b1af82216850a465a8215f3813a2c6"
+    },
+    {
+      "file": "app-full-first-failed.log",
+      "original": "/private/tmp/deppy-popup-fix-app-full-20261014.log",
+      "original_sha256": "a0fc705461b201acac2996a2443aa0a2005a5f19a51ede84d2577862e0a32886",
+      "stored_sha256": "26a813e64a85b28b7f88d0df4b063e4ad73215cc0cdda675981b2387c738cf0a"
+    },
+    {
+      "file": "fixture-oauth-first-failed.log",
+      "original": "/private/tmp/deppy-popup-fix-secret-red-20261014.log",
+      "original_sha256": "d8739b8ae45b6728804e6933cbf68b074e942848b14541d9e85fc7745198db21",
+      "stored_sha256": "d8739b8ae45b6728804e6933cbf68b074e942848b14541d9e85fc7745198db21"
+    },
+    {
+      "file": "fixture-oauth-private-api-failed.log",
+      "original": "/private/tmp/deppy-popup-fix-secret-red-final-20261014.log",
+      "original_sha256": "b96bded9109f36f9766b867e452bb85b478137c640cdc27def2c60b7b4615f02",
+      "stored_sha256": "b96bded9109f36f9766b867e452bb85b478137c640cdc27def2c60b7b4615f02"
+    },
+    {
+      "file": "stale-target-zero-tests.log",
+      "original": "/private/tmp/deppy-popup-fix-root-red-20261014.log",
+      "original_sha256": "d1d3f98a37d27cfa380da65bbdecc94384a41585d408192c666829c3d2ff7f71",
+      "stored_sha256": "d1d3f98a37d27cfa380da65bbdecc94384a41585d408192c666829c3d2ff7f71"
+    },
+    {
+      "file": "app-full-final.log",
+      "original": "/private/tmp/deppy-popup-fix-app-full-corrected-20261014.log",
+      "original_sha256": "ebdd40fc83206c24d8033367be4e23ef5f433b669e3e84afb7ac43363e07e8c7",
+      "stored_sha256": "e9fff9376d370b75b136d56b746a599c208e14de5f9024d8be45c709778e57f8"
+    },
+    {
+      "file": "app-popup-final.log",
+      "original": "/private/tmp/deppy-popup-fix-app-popup-final-20261014.log",
+      "original_sha256": "5189e50e6d9c3aa9a7f4066f52fa810ccda8eec9f5d08404d37ba64c98957bd0",
+      "stored_sha256": "5189e50e6d9c3aa9a7f4066f52fa810ccda8eec9f5d08404d37ba64c98957bd0"
+    },
+    {
+      "file": "app-refresh-final.log",
+      "original": "/private/tmp/deppy-popup-fix-app-refresh-final-20261014.log",
+      "original_sha256": "7a4dedeed4bd45b758ea14347a8292986433a81f8b661e37413ca36c0098083a",
+      "stored_sha256": "7a4dedeed4bd45b758ea14347a8292986433a81f8b661e37413ca36c0098083a"
+    },
+    {
+      "file": "terminal-green.log",
+      "original": "/private/tmp/deppy-popup-fix-terminal-green-20261014.log",
+      "original_sha256": "bf940d0f16033a771405256ad3ccb74110aa6ff947c7fde5462e976ac8d14ab5",
+      "stored_sha256": "bf940d0f16033a771405256ad3ccb74110aa6ff947c7fde5462e976ac8d14ab5"
+    },
+    {
+      "file": "clippy-first-failed.log",
+      "original": "/private/tmp/deppy-popup-fix-clippy-first-failed-20261014.log",
+      "original_sha256": "ebadbddac195fb8892d9ab922d2d1a1dc752c4b7d27a4f573543ab09ad56ce5b",
+      "stored_sha256": "ebadbddac195fb8892d9ab922d2d1a1dc752c4b7d27a4f573543ab09ad56ce5b"
+    },
+    {
+      "file": "clippy-final.log",
+      "original": "/private/tmp/deppy-popup-fix-clippy-final-20261014.log",
+      "original_sha256": "e6fcd4f3e0de6a0326106ebf863eb5c3c05fcda84a110853311fd09da3b623c3",
+      "stored_sha256": "e6fcd4f3e0de6a0326106ebf863eb5c3c05fcda84a110853311fd09da3b623c3"
+    },
+    {
+      "file": "boundary-final.log",
+      "original": "/private/tmp/deppy-popup-fix-boundary-final-20261014.log",
+      "original_sha256": "207731560b938be6a498d4de00e5066b420153c847460af6385a700a80279017",
+      "stored_sha256": "207731560b938be6a498d4de00e5066b420153c847460af6385a700a80279017"
+    },
+    {
+      "file": "static-final.log",
+      "original": "/private/tmp/deppy-popup-fix-static-final-20261014.log",
+      "original_sha256": "069ff986989bba5bc3c022641d4b1072402eac4270e32f48487da723d5c53979",
+      "stored_sha256": "069ff986989bba5bc3c022641d4b1072402eac4270e32f48487da723d5c53979"
+    }
+  ],
+  "checks": {
+    "app_full": {
+      "passed": 3181,
+      "failed": 0,
+      "ignored": 39,
+      "exit": 0
+    },
+    "connector_ui": {
+      "passed": 35,
+      "failed": 0,
+      "doc_tests": 0,
+      "exit": 0
+    },
+    "terminal": {
+      "passed": 138,
+      "failed": 0,
+      "ignored": 4,
+      "doc_tests": 0,
+      "exit": 0
+    },
+    "after_lint_app_popup": {
+      "passed": 87,
+      "failed": 0,
+      "ignored": 10,
+      "exit": 0
+    },
+    "after_lint_app_refresh": {
+      "passed": 1,
+      "failed": 0,
+      "exit": 0
+    },
+    "clippy_exit": 0,
+    "boundary_exit": 0,
+    "unique_passed": 3354,
+    "existing_ignored": 43,
+    "fmt_exit": 0,
+    "html_js_syntax_exit": 0,
+    "diff_exit": 0,
+    "evidence_source_sha": true,
+    "preexisting_source_preserved": true
+  },
+  "source_sha256": {
+    "crates/app/src/app.rs": "22ee82fc2c2a97d02ae185187cce7f991985066f56a74bcfde8f738443a391d6",
+    "crates/app/src/file_delete.rs": "85cba136d8695f4b46df906db60bd15257605f181bf25a97e8551f332151ed4d",
+    "crates/app/src/ui/file_tree.rs": "6cf886a59a6cfddc01600bd6c5ac8c1e027970f37182d6869997f7309117fef8",
+    "crates/app/src/ui/workspace.rs": "1e2bff612a635c57ebfa3523b49d73605fa0e0f715dd9d7855d7a96ef77a6a05",
+    "crates/connector-ui/src/lib.rs": "854aa0f7129fb404c573d58d972ef8471675ac32ef15fbf6441a2d9571a44e5d",
+    "crates/connector-ui/src/draft_text_edit.rs": "5148ec00b8837535984ec165551035667bfb5c12eacc0a41108ba9c58b7587c7",
+    "crates/connector-ui/src/oauth_secret_tests.rs": "e4ececfb05eb41075363e1afa7df97d0ca1414a3cdd0faa1696aa2460318dc2a"
+  },
+  "worker_patches": {
+    "delete": "1f6f82315b03a55d059ba0b9175388e6a839a9e45f00ea1e96e40a9177fd4523",
+    "input": "e740c8a90f62de24d139fd10ecb7d9cb50e99d73270d218f93602654d7704045",
+    "secret": "19b01b9e655bb0d37d2fbbb14e9a450002ac39a5a2715511fb0b1fe4aa3e9b04"
+  }
+}

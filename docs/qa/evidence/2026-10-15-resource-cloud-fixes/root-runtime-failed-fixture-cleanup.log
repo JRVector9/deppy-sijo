@@ -1,0 +1,2 @@
+qualified owned failed-fixture pid=85236 identity=Identity { pid: 85236, group: 85235, session: 85235, birth: (1792018430, 529793), zombie: false } path="/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-rt-logs-pr13-exit-teardown-77097"
+cleanup PASS, only pinned execution signalled; acknowledged=true

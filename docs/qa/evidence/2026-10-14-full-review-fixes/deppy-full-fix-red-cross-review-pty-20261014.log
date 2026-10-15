@@ -1,0 +1,24 @@
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/pty)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.59s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/pty-2cb6fe6d1ccaea41)
+
+running 2 tests
+test tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_drop ...
+thread 'tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_drop' (48787355) panicked at crates/pty/src/lib.rs:3359:9:
+frozen foreground group 81002 survived teardown use_kill=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill ...
+thread 'tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill' (48787374) panicked at crates/pty/src/lib.rs:3359:9:
+frozen foreground group 81022 survived teardown use_kill=true
+FAILED
+
+failures:
+
+failures:
+    tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_drop
+    tests::full_fix_lifecycle_frozen_foreground_is_reaped_by_kill
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 51 filtered out; finished in 1.62s
+
+error: test failed, to rerun pass `-p pty --lib`

@@ -1,0 +1,23 @@
+{
+  "worktree": "/private/tmp/deppy-cloud-fix-transport-20261015",
+  "baseline": "/private/tmp/deppy-cloud-fix-baseline-20261015/files",
+  "files": [
+    {
+      "path": "crates/web-remote/src/ws_api.rs",
+      "baseline_sha256": "aab67a2c967c0608b3402c8eeab4e48a13bc48892da861306576088635cc9bd2",
+      "result_sha256": "9c86106ab3ee188869338b90b14e9cd3ba9fb0fc499357fffc37c675f25352c6"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/permissions.rs",
+      "baseline_sha256": "c05c0c266f382b61accf01e6ab2f0fcf24503543950bf27a4541776757521274",
+      "result_sha256": "38dd199530d12ad077626c44a734c6e046ec96b75eed052d7231093737458742"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/management_tests.rs",
+      "baseline_sha256": "704f0173afd0a36f2f74e489737917269c001e44d0e10a474b58be6d0ca4f2a0",
+      "result_sha256": "6851a238a7403a7f529dbf56bc55dcb34bd395375709e4c31f07e4308ae59bb6"
+    }
+  ],
+  "patch_sha256": "019156239bdf1d53f77bacfff07834531b40172f39cd50743bb6d504c29d42de",
+  "tests_executed_here": false
+}

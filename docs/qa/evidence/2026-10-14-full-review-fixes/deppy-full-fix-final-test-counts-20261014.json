@@ -1,0 +1,795 @@
+{
+  "note": "Full workspace exit101; two causes corrected; affected App/storage/storage-core full rerun exit0. Latest result per harness; nested subprocess summaries excluded.",
+  "latest_totals": {
+    "passed": 5702,
+    "failed": 0,
+    "ignored": 65
+  },
+  "affected_totals": {
+    "passed": 3747,
+    "failed": 0,
+    "ignored": 42
+  },
+  "harnesses": [
+    {
+      "harness": "Running unittests src/lib.rs:agent_mcp",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 67,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs:audit",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 65,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:auth",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:connector_contract",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:connector_service",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 83,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:connector_ui",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 35,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running unittests src/lib.rs:deppy_core",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 19,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs:deppy_sijo",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 3214,
+        "failed": 0,
+        "ignored": 39
+      },
+      "nested_results_excluded": 1
+    },
+    {
+      "harness": "Running tests/agent_state_boundary.rs:agent_state_boundary",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/alloc_phys_footprint_release.rs:alloc_phys_footprint_release",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/dotenv_launch_boundary.rs:dotenv_launch_boundary",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/lazy_bounded_worker.rs:lazy_bounded_worker",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/logging_policy.rs:logging_policy",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/scrollback_rss_end_to_end.rs:scrollback_rss_end_to_end",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:http_client",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:i18n",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:mcp",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs:deppy_mcp_proxy",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 108,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/hook_task_prompt.rs:hook_task_prompt",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:mcp_store",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 42,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:mux",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:persist",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:platform",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:pty",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 57,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:relay_protocol",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 13,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_wire_vectors.rs:relay_wire_vectors",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:relay_server",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs:relay_server",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/deploy_manifests.rs:deploy_manifests",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/shutdown.rs:shutdown",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/transport_contract.rs:transport_contract",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:runtime",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 405,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:secret",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 79,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:session",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 81,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:storage",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 479,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/background_agent_lifecycle.rs:background_agent_lifecycle",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:storage_core",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:terminal",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 138,
+        "failed": 0,
+        "ignored": 4
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/lib.rs:web_remote",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 388,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/chrome_support_contract.rs:chrome_support_contract",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/cloud_results_chrome.rs:cloud_results_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_shell_chrome.rs:mobile_shell_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/mobile_usability_chrome.rs:mobile_usability_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/pwa_unified_chrome.rs:pwa_unified_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_chrome.rs:relay_shell_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_shell_deploy.rs:relay_shell_deploy",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/relay_webcrypto_vectors.rs:relay_webcrypto_vectors",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 4,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/transport_independence.rs:transport_independence",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_core_chrome.rs:viewer_core_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_grapheme_chrome.rs:viewer_grapheme_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_history_chrome.rs:viewer_history_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_readability_chrome.rs:viewer_readability_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running tests/viewer_reading_chrome.rs:viewer_reading_chrome",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Running unittests src/main.rs:xtask",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests agent_mcp",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests audit",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests auth",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_contract",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_service",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests connector_ui",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests deppy_core",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests http_client",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests i18n",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mcp",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mcp_store",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests mux",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests persist",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests platform",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests pty",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests relay_protocol",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests relay_server",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests runtime",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests secret",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests session",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests storage",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests storage_core",
+      "command_log": "deppy-full-fix-final-affected-app-storage-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests terminal",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    },
+    {
+      "harness": "Doc-tests web_remote",
+      "command_log": "deppy-full-fix-final-workspace-20261014.log",
+      "result": {
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      "nested_results_excluded": 0
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+   Compiling pty v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/pty)
+   Compiling session v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/session)
+   Compiling runtime v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime)
+   Compiling web-remote v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/Users/jr/Desktop/projects/deppy-sijo-performance/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 43.20s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 2 tests
+test claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer ...
+thread 'claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer' (48636323) panicked at crates/app/src/claude_usage_snapshot.rs:76:9:
+usage file blocked until a writer connected after 161.408708ms
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test claude_usage_snapshot::tests::full_fix_20261014_usage_regular_bounded_file ... ok
+
+failures:
+
+failures:
+    claude_usage_snapshot::tests::full_fix_20261014_usage_fifo_returns_without_writer
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 3220 filtered out; finished in 0.17s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

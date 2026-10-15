@@ -1,0 +1,33 @@
+{
+  "repository": "apple-oss-distributions/xnu",
+  "commit": "f6217f891ac0bb64f3d375211650a4c1ff8ca1ea",
+  "files": [
+    {
+      "path": "/private/tmp/deppy-native-memory-evidence-20261014/task.c",
+      "source_url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/task.c",
+      "sha256": "f5ea4822b15aca636c4d940679e878904729b88acf312821d2ebacbf69312f71"
+    },
+    {
+      "path": "/private/tmp/deppy-native-memory-evidence-20261014/task_info.h",
+      "source_url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/mach/task_info.h",
+      "sha256": "1c09d3ff0bb37b4c17da286f011c8ceb61962f610bd1304688bec4b90c556b81"
+    },
+    {
+      "path": "/private/tmp/deppy-native-memory-evidence-20261014/kern_proc.c",
+      "source_url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/bsd/kern/kern_proc.c",
+      "sha256": "34f745a213769ffa47b4edace6e3e158f654075def1b0fe50edf97f9bf53589d"
+    },
+    {
+      "path": "/private/tmp/deppy-native-memory-evidence-20261014/bsd_kern.c",
+      "source_url": "https://raw.githubusercontent.com/apple-oss-distributions/xnu/f6217f891ac0bb64f3d375211650a4c1ff8ca1ea/osfmk/kern/bsd_kern.c",
+      "sha256": "670dcdf6feb73845b102965c8dfab6175f87893bf0b7ca9fa450f38cc83ba19c"
+    }
+  ],
+  "measured_host": {
+    "macOS": "27.0",
+    "build": "26A428",
+    "Darwin": "27.0.0",
+    "kernel": "xnu-13432.1.9~1/RELEASE_ARM64_T6050",
+    "source_limit": "Public XNU source is a reference for metric definitions, not asserted to be the exact running kernel revision."
+  }
+}

@@ -1,0 +1,50 @@
+[
+  {
+    "name": "rename",
+    "chunk_id": "396871",
+    "wall_time_seconds": 1.290619833,
+    "exit_code": 101,
+    "original_token_count": 254,
+    "output": "key=Enter has_focus=false lost_focus=true done=Some(true) text_edit_focused=false raw=[Key { key: Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }] events=[Key { key: Enter, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]\nkey=Enter terminal_active=true terminal_accepts=true PTY_BYTES=[13]\nkey=Escape has_focus=false lost_focus=true done=Some(false) text_edit_focused=false raw=[Key { key: Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }] events=[Key { key: Escape, physical_key: None, pressed: true, repeat: false, modifiers: Modifiers::NONE }]\nkey=Escape terminal_active=true terminal_accepts=true PTY_BYTES=[27]\n\nthread 'main' (45692608) panicked at /private/tmp/deppy-file-rename-probe-20261014.rs:38:10:\nassertion `left == right` failed: file rename submit/cancel key leaked into production PTY mapper\n  left: 2\n right: 0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+  },
+  {
+    "name": "tree-focus",
+    "chunk_id": "5d3e82",
+    "wall_time_seconds": 1.284172125,
+    "exit_code": 101,
+    "original_token_count": 177,
+    "output": "frame=0 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false\nframe=1 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false\nframe=2 tree_row_clicked=true tree_focus_before_terminal=true terminal_active=true tree_focus_after_terminal=false\nframe=3 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false\n\nthread 'main' (45692625) panicked at /private/tmp/deppy-tree-focus-probe-20261014.rs:47:16:\nCmdDelete/CmdOptionV require tree focus, but prior file click lost it\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+  },
+  {
+    "name": "rename-row-id",
+    "chunk_id": "42f9bf",
+    "wall_time_seconds": 1.29557225,
+    "exit_code": 101,
+    "original_token_count": 229,
+    "output": "frame=0 row_index=0 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(8714522455845931963) focused=true buffer=b.txt\nframe=1 row_index=0 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(8714522455845931963) focused=true buffer=b.txt\nframe=2 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt\nframe=3 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt\nframe=4 row_index=1 old_id=Some(Id::new(8714522455845931963)) current_id=Id::new(331449032831427223) focused=false buffer=b.txt\n\nthread 'main' (45692623) panicked at /private/tmp/deppy-file-rename-row-id-probe-20261014.rs:18:20:\nwatcher inserted preceding sibling: rename target remains visible but loses its input id/focus\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+  },
+  {
+    "name": "secondary-drag",
+    "chunk_id": "3611c6",
+    "wall_time_seconds": 1.282254375,
+    "exit_code": 101,
+    "original_token_count": 180,
+    "output": "frame=0 scroll_offset=0\nframe=1 scroll_offset=0\nframe=2 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667\nframe=2 scroll_offset=0\nframe=3 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667\nframe=3 scroll_offset=7.916667\nframe=4 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667\nframe=4 scroll_offset=15.833334\nframe=5 SECONDARY=true drag=workspace-0 autoscroll_delta=-7.916667\nframe=5 scroll_offset=23.75\n\nthread 'main' (45692607) panicked at /private/tmp/deppy-workspace-secondary-drag-probe-20261014.rs:56:70:\nassertion `left == right` failed: right-button drag scrolled workspace list\n  left: 23.75\n right: 0.0\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+  },
+  {
+    "name": "secret-undo",
+    "chunk_id": "69c934",
+    "wall_time_seconds": 1.3528995,
+    "exit_code": 101,
+    "original_token_count": 158,
+    "output": "First secret widget: Id::new(18287745391449684521)\nSecond secret widget: Id::new(18287745391449684521)\nNew OAuth draft after Undo masked AccessKit value: Some(\"••••••••••••••••••\")\nSecond operation submitted fake secret byte count: 18\nMatches cancelled first operation fake fixture: true\n\nthread 'main' (45692627) panicked at /private/tmp/deppy-popup-review-probes-20261014/connector_secret_undo.rs:54:5:\nCancelled first OAuth client secret must not survive in widget undo history or re-enter a later OAuth operation\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"
+  },
+  {
+    "name": "context-close-control",
+    "chunk_id": "1597cc",
+    "wall_time_seconds": 1.291894375,
+    "exit_code": 0,
+    "original_token_count": 177,
+    "output": "frame=0 popup_before=false popup_after=false memory_before=false memory_after=false terminal_accepts=true PTY_BYTES=[]\nframe=1 popup_before=false popup_after=false memory_before=false memory_after=false terminal_accepts=true PTY_BYTES=[]\nframe=2 popup_before=false popup_after=true memory_before=false memory_after=true terminal_accepts=false PTY_BYTES=[]\nframe=3 popup_before=false popup_after=true memory_before=true memory_after=true terminal_accepts=false PTY_BYTES=[]\nframe=4 popup_before=false popup_after=true memory_before=true memory_after=true terminal_accepts=false PTY_BYTES=[]\nframe=5 popup_before=false popup_after=true memory_before=true memory_after=false terminal_accepts=false PTY_BYTES=[]\n"
+  }
+]

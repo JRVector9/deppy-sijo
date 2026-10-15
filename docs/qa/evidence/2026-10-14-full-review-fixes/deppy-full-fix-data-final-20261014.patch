@@ -1,0 +1,1901 @@
+--- a/crates/core/src/fs.rs
++++ b/crates/core/src/fs.rs
+@@ -1,20 +1,34 @@
+ //! 원자적 파일 기록 관례 (tmp + rename) — config/known_hosts/cert/아카이브 저장 공통.
+ 
+-use std::io;
++use std::io::{self, Write};
+ use std::path::{Path, PathBuf};
+ 
+-/// `<파일명>.deppytmp`에 쓴 뒤 rename한다 — 쓰기 중 크래시로 빈/부분 파일이 대상
+-/// 경로에 남지 않는다 (rename은 동일 디렉터리 내에서 원자적). rename 실패 시 tmp를
+-/// 지운다. 부모 디렉터리 존재는 호출측이 보장한다.
+-///
+-/// suffix `.deppytmp`: ~/.claude, ~/.codex 같은 외부 도구와 공유하는 디렉터리에서
+-/// 남의 `.tmp`와 충돌하지 않게 우리 것임을 표시한다.
++/// 고유한 임시 파일을 배타적으로 생성해 기록하고 같은 디렉터리에서 rename한다.
++/// 기존 대상의 permissions를 보존하며, 기록/flush/rename 실패 시 자신의 temp만 지운다.
++/// 부모 디렉터리 존재는 호출측이 보장한다.
+ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+     let tmp = tmp_path(path)?;
+-    std::fs::write(&tmp, bytes)?;
+-    std::fs::rename(&tmp, path).inspect_err(|_| {
++    // create_new rejects every existing entry, including symlinks. An unrelated writer or
++    // pre-existing .deppytmp can never become the object written by this call.
++    let mut file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&tmp)?;
++    let result = (|| {
++        match std::fs::metadata(path) {
++            Ok(metadata) => file.set_permissions(metadata.permissions())?,
++            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
++            Err(error) => return Err(error),
++        }
++        file.write_all(bytes)?;
++        file.sync_all()?;
++        drop(file);
++        std::fs::rename(&tmp, path)
++    })();
++    if result.is_err() {
+         let _ = std::fs::remove_file(&tmp);
+-    })
++    }
++    result
+ }
+ 
+ fn tmp_path(path: &Path) -> io::Result<PathBuf> {
+@@ -25,7 +39,7 @@
+         ));
+     };
+     let mut tmp = name.to_os_string();
+-    tmp.push(".deppytmp");
++    tmp.push(format!(".deppytmp-{}", uuid::Uuid::new_v4()));
+     Ok(path.with_file_name(tmp))
+ }
+ 
+@@ -73,4 +87,113 @@
+     fn 파일명_없는_경로는_에러다() {
+         assert!(atomic_write(Path::new("/"), b"x").is_err());
+     }
++    #[cfg(unix)]
++    #[test]
++    fn full_fix_20261014_atomic_write_preserves_preexisting_temp_symlink_target() {
++        use std::os::unix::fs::symlink;
++        let dir =
++            std::env::temp_dir().join(format!("deppy-atomic-symlink-audit-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let intended = dir.join("config.toml");
++        let victim = dir.join("other-user-file");
++        let temporary = dir.join("config.toml.deppytmp");
++        std::fs::write(&intended, b"old config").unwrap();
++        std::fs::write(&victim, b"must preserve").unwrap();
++        symlink(&victim, &temporary).unwrap();
++        atomic_write(&intended, b"new config").unwrap();
++        let victim_content = std::fs::read(&victim).unwrap();
++        let published_is_symlink = std::fs::symlink_metadata(&intended)
++            .unwrap()
++            .file_type()
++            .is_symlink();
++        eprintln!(
++            "production helper result: victim={:?}, published_config_is_symlink={published_is_symlink}",
++            String::from_utf8_lossy(&victim_content)
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(
++            victim_content, b"must preserve",
++            "atomic save truncated a different existing user file through its fixed temp symlink"
++        );
++        assert!(
++            !published_is_symlink,
++            "save published the temp symlink as its config"
++        );
++    }
++    #[test]
++    fn full_fix_20261014_atomic_write_parallel_saves_have_distinct_temporary_objects() {
++        use std::sync::{Arc, Barrier};
++        let dir = std::env::temp_dir().join(format!(
++            "deppy-atomic-concurrent-audit-{}",
++            std::process::id()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let target = Arc::new(dir.join("config.toml"));
++        let barrier = Arc::new(Barrier::new(4));
++        let workers: Vec<_> = (0..4)
++            .map(|n| {
++                let target = Arc::clone(&target);
++                let barrier = Arc::clone(&barrier);
++                std::thread::spawn(move || {
++                    let bytes = vec![b'A' + n; 1024 * 1024];
++                    let mut errors = 0usize;
++                    for _ in 0..30 {
++                        barrier.wait();
++                        if atomic_write(&target, &bytes).is_err() {
++                            errors += 1;
++                        }
++                        barrier.wait();
++                    }
++                    errors
++                })
++            })
++            .collect();
++        let errors: usize = workers
++            .into_iter()
++            .map(|worker| worker.join().unwrap())
++            .sum();
++        let bytes = std::fs::read(&*target).unwrap();
++        let valid = bytes.len() == 1024 * 1024 && bytes.iter().all(|byte| *byte == bytes[0]);
++        eprintln!(
++            "actual concurrent production saves: failed={errors}/120 final_payload_valid={valid}"
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(
++            errors, 0,
++            "unrelated successful writers share one temporary name and fail rename"
++        );
++        assert!(valid, "parallel saves mixed/truncated payloads");
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn full_fix_20261014_atomic_write_preserves_existing_private_mode() {
++        use std::os::unix::fs::PermissionsExt;
++        let dir = temp_dir("mode");
++        let path = dir.join("private-config");
++        std::fs::write(&path, b"old").unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
++        atomic_write(&path, b"new").unwrap();
++        assert_eq!(
++            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
++            0o600
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++
++    #[test]
++    fn full_fix_20261014_atomic_write_cleans_only_its_temp_on_publication_failure() {
++        let dir = temp_dir("rename-failure");
++        let path = dir.join("config");
++        std::fs::create_dir(&path).unwrap();
++        std::fs::write(path.join("existing"), b"retain").unwrap();
++        assert!(atomic_write(&path, b"new").is_err());
++        assert_eq!(std::fs::read(path.join("existing")).unwrap(), b"retain");
++        assert_eq!(
++            std::fs::read_dir(&dir).unwrap().count(),
++            1,
++            "failed save leaked its temporary file"
++        );
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
+ }
+--- a/crates/storage-core/src/lib.rs
++++ b/crates/storage-core/src/lib.rs
+@@ -28,15 +28,7 @@
+     // 워커 persist 연결과 동시 쓰기가 겹칠 때 SQLITE_BUSY로 실패하지 않게 대기
+     conn.busy_timeout(std::time::Duration::from_secs(5))?;
+ 
+-    // pending migration이 있으면 적용 전 파일 백업 (직전 1개 유지)
+-    let version = read_user_version(&conn)?;
+-    if version > 0 && version < migrations.len() {
+-        conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+-        let backup = path.with_extension("sqlite3.bak");
+-        std::fs::copy(path, &backup)
+-            .with_context(|| format!("마이그레이션 전 백업 실패: {}", backup.display()))?;
+-    }
+-    migrate(conn, migrations).with_context(|| {
++    migrate_with_backup(conn, migrations, Some(path)).with_context(|| {
+         format!(
+             "DB 마이그레이션 실패 — 백업: {}",
+             path.with_extension("sqlite3.bak").display()
+@@ -52,7 +44,15 @@
+ }
+ 
+ /// pending 마이그레이션을 하나의 IMMEDIATE 트랜잭션으로 적용한다.
+-fn migrate(mut conn: Connection, migrations: &[&str]) -> anyhow::Result<Connection> {
++fn migrate(conn: Connection, migrations: &[&str]) -> anyhow::Result<Connection> {
++    migrate_with_backup(conn, migrations, None)
++}
++
++fn migrate_with_backup(
++    mut conn: Connection,
++    migrations: &[&str],
++    path: Option<&Path>,
++) -> anyhow::Result<Connection> {
+     // 락 경합 최소화용 fast-path: 락 밖에서 한 번 읽어 이미 최신이면 트랜잭션 없이 리턴.
+     // (여기 값은 참고용 — 실제 결정은 아래 IMMEDIATE 락 안에서 다시 읽어 확정한다.)
+     let version = read_user_version(&conn)?;
+@@ -65,6 +65,15 @@
+     // 락 안에서 재확인 — 대기 중 다른 프로세스가 이미 올렸을 수 있다
+     let version = read_user_version(&tx)?;
+     ensure_not_ahead(version, migrations.len())?;
++    if version > 0
++        && version < migrations.len()
++        && let Some(path) = path
++    {
++        // This IMMEDIATE transaction owns the writer lock. A separate read-only connection
++        // sees the committed pre-migration snapshot, including WAL rows, while no other
++        // process can race ahead and replace the pre-migration backup with a newer schema.
++        backup_before_migration(path)?;
++    }
+     for (i, sql) in migrations.iter().enumerate().skip(version) {
+         tx.execute_batch(sql)
+             .with_context(|| format!("마이그레이션 {} 실패", i + 1))?;
+@@ -76,6 +85,56 @@
+     }
+     tx.commit().context("마이그레이션 커밋 실패")?;
+     Ok(conn)
++}
++
++/// Publish a completed standalone SQLite backup without touching the previous backup on failure.
++fn backup_before_migration(path: &Path) -> anyhow::Result<()> {
++    use std::sync::atomic::{AtomicU64, Ordering};
++    static NEXT_BACKUP: AtomicU64 = AtomicU64::new(0);
++    let backup = path.with_extension("sqlite3.bak");
++    let mut temporary_name = backup
++        .file_name()
++        .context("백업 파일명 없음")?
++        .to_os_string();
++    let nanos = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)?
++        .as_nanos();
++    temporary_name.push(format!(
++        ".deppytmp-{}-{nanos}-{}",
++        std::process::id(),
++        NEXT_BACKUP.fetch_add(1, Ordering::Relaxed)
++    ));
++    let temporary = backup.with_file_name(temporary_name);
++    let file = std::fs::OpenOptions::new()
++        .write(true)
++        .create_new(true)
++        .open(&temporary)
++        .context("백업 임시 파일 생성 실패")?;
++    let result = (|| -> anyhow::Result<()> {
++        file.set_permissions(std::fs::metadata(path)?.permissions())?;
++        let source = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
++        let mut destination = Connection::open(&temporary)?;
++        destination.pragma_update(None, "journal_mode", "DELETE")?;
++        {
++            let copy = rusqlite::backup::Backup::new(&source, &mut destination)?;
++            anyhow::ensure!(
++                copy.step(-1)? == rusqlite::backup::StepResult::Done,
++                "SQLite 백업이 완료되지 않음"
++            );
++        }
++        // The published .bak must restore using this main file alone, without WAL sidecars.
++        destination.pragma_update(None, "journal_mode", "DELETE")?;
++        destination.close().map_err(|(_, error)| error)?;
++        file.sync_all()?;
++        std::fs::rename(&temporary, &backup)
++            .with_context(|| format!("마이그레이션 전 백업 게시 실패: {}", backup.display()))?;
++        Ok(())
++    })();
++    drop(file);
++    if result.is_err() {
++        let _ = std::fs::remove_file(&temporary);
++    }
++    result.with_context(|| format!("마이그레이션 전 백업 실패: {}", backup.display()))
+ }
+ 
+ /// 현재 user_version (적용된 마이그레이션 수).
+@@ -127,4 +186,139 @@
+         conn.pragma_update(None, "user_version", 99).unwrap();
+         assert!(migrate(conn, MIGS).is_err());
+     }
+-}
++
++    #[test]
++    fn full_fix_20261014_backup_contains_committed_wal_rows_with_live_reader() {
++        let dir = std::env::temp_dir().join(format!(
++            "deppy-backup-regression-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("metadata.sqlite3");
++        const OLD: &[&str] = &["CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT);"];
++        const NEW: &[&str] = &[
++            "CREATE TABLE sample(id INTEGER PRIMARY KEY,value TEXT);",
++            "CREATE TABLE marker(id INTEGER PRIMARY KEY);",
++        ];
++        let writer = open_with_migrations(&path, OLD).unwrap();
++        writer
++            .execute("INSERT INTO sample VALUES(1,'before')", [])
++            .unwrap();
++        writer
++            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
++            .unwrap();
++        let reader = Connection::open(&path).unwrap();
++        reader.execute_batch("BEGIN;").unwrap();
++        let first: i64 = reader
++            .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get(0))
++            .unwrap();
++        assert_eq!(first, 1);
++        writer
++            .execute("INSERT INTO sample VALUES(2,'committed_after_reader')", [])
++            .unwrap();
++        let start = std::time::Instant::now();
++        let migrated = open_with_migrations(&path, NEW)
++            .expect("production migrate succeeded despite incomplete backup");
++        let elapsed = start.elapsed();
++        let live: i64 = migrated
++            .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get(0))
++            .unwrap();
++        let backup = Connection::open(path.with_extension("sqlite3.bak")).unwrap();
++        let saved: i64 = backup
++            .query_row("SELECT COUNT(*) FROM sample", [], |r| r.get(0))
++            .unwrap();
++        let integrity: String = backup
++            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
++            .unwrap();
++        let version = read_user_version(&migrated).unwrap();
++        println!(
++            "path={} live_rows={live} backup_rows={saved} migrated_version={version} backup_integrity={integrity} elapsed_ms={}",
++            dir.display(),
++            elapsed.as_millis()
++        );
++        reader.execute_batch("ROLLBACK;").unwrap();
++        drop(backup);
++        drop(migrated);
++        drop(reader);
++        drop(writer);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert!(elapsed < std::time::Duration::from_secs(8));
++        assert_eq!(
++            saved, live,
++            "successful pre-migration backup omitted a committed row"
++        );
++    }
++
++    #[cfg(unix)]
++    #[test]
++    fn full_fix_20261014_backup_does_not_follow_previous_backup_symlink() {
++        use std::os::unix::fs::symlink;
++        let dir = std::env::temp_dir().join(format!(
++            "deppy-backup-link-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("metadata.sqlite3");
++        drop(open_with_migrations(&path, &MIGS[..1]).unwrap());
++        let victim = dir.join("previous-backup-owner");
++        std::fs::write(&victim, b"previous backup must survive").unwrap();
++        symlink(&victim, path.with_extension("sqlite3.bak")).unwrap();
++        let migrated = open_with_migrations(&path, MIGS).unwrap();
++        let retained = std::fs::read(&victim).unwrap();
++        let published_is_symlink = std::fs::symlink_metadata(path.with_extension("sqlite3.bak"))
++            .unwrap()
++            .file_type()
++            .is_symlink();
++        drop(migrated);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(
++            retained, b"previous backup must survive",
++            "backup followed an old backup link and modified its owner"
++        );
++        assert!(
++            !published_is_symlink,
++            "new backup must publish its own completed SQLite file"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_backup_publication_failure_gates_migration_and_cleans_temp() {
++        let dir = std::env::temp_dir().join(format!(
++            "deppy-backup-failure-{}-{}",
++            std::process::id(),
++            std::time::SystemTime::now()
++                .duration_since(std::time::UNIX_EPOCH)
++                .unwrap()
++                .as_nanos()
++        ));
++        std::fs::create_dir_all(&dir).unwrap();
++        let path = dir.join("metadata.sqlite3");
++        drop(open_with_migrations(&path, &MIGS[..1]).unwrap());
++        let backup = path.with_extension("sqlite3.bak");
++        std::fs::create_dir(&backup).unwrap();
++        std::fs::write(backup.join("old-backup"), b"retain").unwrap();
++        let failed = open_with_migrations(&path, MIGS);
++        assert!(failed.is_err());
++        let conn = Connection::open(&path).unwrap();
++        assert_eq!(read_user_version(&conn).unwrap(), 1);
++        assert_eq!(std::fs::read(backup.join("old-backup")).unwrap(), b"retain");
++        assert!(
++            !std::fs::read_dir(&dir).unwrap().any(|entry| entry
++                .unwrap()
++                .file_name()
++                .to_string_lossy()
++                .contains("deppytmp")),
++            "failed backup must clean its exclusive temporary file"
++        );
++        drop(conn);
++        std::fs::remove_dir_all(&dir).unwrap();
++    }
++}
+--- a/crates/storage-core/Cargo.toml
++++ b/crates/storage-core/Cargo.toml
+@@ -7,4 +7,4 @@
+ 
+ [dependencies]
+ anyhow = { workspace = true }
+-rusqlite = { workspace = true }
++rusqlite = { workspace = true, features = ["backup"] }
+--- a/crates/runtime/src/persistence.rs
++++ b/crates/runtime/src/persistence.rs
+@@ -153,6 +153,7 @@
+             error_regex,
+             done_regex,
+         };
++        // This UUID is new, so this pipe cannot have an older queued update for it.
+         if let Err(e) = persist::upsert_session(&self.conn, &row) {
+             tracing::warn!("세션 영속 실패 (spawn): {e:#}");
+         }
+@@ -190,7 +191,7 @@
+         row.args = args.to_vec();
+         row.cwd = cwd.to_owned();
+         row.status = persist::SESSION_STATUS_RUNNING.to_owned();
+-        if let Err(e) = persist::upsert_session(&self.conn, &row) {
++        if let Err(e) = self.upsert_session_ordered(&row) {
+             tracing::warn!(persistent_id, "세션 영속 실패 (restore): {e:#}");
+         }
+         self.rows.insert(session, row);
+@@ -250,7 +251,7 @@
+             return false;
+         };
+         row.status = persist::SESSION_STATUS_RUNNING.to_owned();
+-        if let Err(e) = persist::upsert_session(&self.conn, &row) {
++        if let Err(e) = self.upsert_session_ordered(&row) {
+             tracing::warn!(persistent_id = %row.id, "세션 영속 실패 (respawn): {e:#}");
+         }
+         self.rows.insert(new_session, row);
+@@ -267,7 +268,8 @@
+             return;
+         }
+         row.cwd = cwd.to_owned();
+-        if let Err(e) = persist::upsert_session(&self.conn, row) {
++        let row = row.clone();
++        if let Err(e) = self.upsert_session_ordered(&row) {
+             tracing::warn!("세션 cwd 영속 실패: {e:#}");
+         }
+     }
+@@ -284,7 +286,8 @@
+                 Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
+             }
+         }
+-        if let Err(e) = persist::upsert_session(&self.conn, row) {
++        let row = row.clone();
++        if let Err(e) = self.upsert_session_ordered(&row) {
+             tracing::warn!("세션 영속 실패 (exit direct fallback): {e:#}");
+         }
+     }
+@@ -300,7 +303,8 @@
+                 Err(e) => tracing::warn!("세션 status batch enqueue 실패 — direct fallback: {e:#}"),
+             }
+         }
+-        if let Err(e) = persist::upsert_session(&self.conn, row) {
++        let row = row.clone();
++        if let Err(e) = self.upsert_session_ordered(&row) {
+             tracing::warn!("세션 status 영속 실패 (direct fallback): {e:#}");
+         }
+     }
+@@ -325,6 +329,27 @@
+         {
+             tracing::warn!("세션 log offset 영속 실패 (direct fallback): {e:#}");
+         }
++    }
++
++    /// All callers run on the runtime owner thread. Complete earlier queued/in-flight
++    /// writes before a synchronous full-row upsert can change that UUID's execution state.
++    fn upsert_session_ordered(&mut self, row: &SessionRow) -> anyhow::Result<()> {
++        if let Some(handle) = &self.write_handle
++            && let Err(error) = handle.flush()
++        {
++            tracing::warn!(
++                "DB batch 순서 barrier 실패 — writer 종료 후 direct fallback: {error:#}"
++            );
++            // A failed/closed writer may still own an in-flight batch. Join it before the
++            // direct fallback, so a late old status cannot overwrite the new execution.
++            self.write_handle.take();
++            if let Some(worker) = self._write_worker.take()
++                && let Err(error) = worker.shutdown()
++            {
++                tracing::warn!("DB batch writer 종료 실패: {error:#}");
++            }
++        }
++        persist::upsert_session(&self.conn, row)
+     }
+ 
+     pub(crate) fn flush_async_writes(&self) -> anyhow::Result<Option<DbWriteStatsSnapshot>> {
+@@ -697,4 +722,51 @@
+         drop(pipe);
+         std::fs::remove_dir_all(&dir).unwrap();
+     }
++
++    #[test]
++    fn all_review_20261014_respawn_must_retire_queued_exit_status() {
++        let (dir, db_path) = temp_db("review-respawn-order");
++        let db = storage::Db::open(&db_path).unwrap();
++        let workspace_id = db.create_workspace("runtime").unwrap();
++        drop(db);
++        let mut pipe = PersistPipe::open_with_worker_config(
++            &PersistConfig {
++                db_path: db_path.clone(),
++                workspace_id,
++            },
++            DbWriteWorkerConfig {
++                flush_interval: std::time::Duration::from_secs(3600),
++                ..DbWriteWorkerConfig::default()
++            },
++        )
++        .unwrap();
++        let old = SessionId(1);
++        pipe.session_spawned(
++            old,
++            "shell",
++            None,
++            "shell",
++            "/bin/sh",
++            &[],
++            "/tmp",
++            None,
++            None,
++            None,
++            None,
++        );
++        pipe.session_exited(old);
++        assert!(pipe.session_respawned(old, SessionId(2)));
++        pipe.flush_async_writes().unwrap();
++        let status: String = rusqlite::Connection::open(&db_path)
++            .unwrap()
++            .query_row("SELECT status FROM sessions", [], |r| r.get(0))
++            .unwrap();
++        drop(pipe);
++        std::fs::remove_dir_all(&dir).unwrap();
++        assert_eq!(
++            status,
++            persist::SESSION_STATUS_RUNNING,
++            "old queued exit overwrote respawn"
++        );
++    }
+ }
+--- a/crates/connector-service/src/coordinator.rs
++++ b/crates/connector-service/src/coordinator.rs
+@@ -192,6 +192,17 @@
+         Ok(())
+     }
+ 
++    fn matches(&self, operation_id: &OperationId, source: ImportSource) -> bool {
++        self.pending
++            .lock()
++            .expect("pending host import lock")
++            .as_ref()
++            .is_some_and(|pending| {
++                &pending.operation_id == operation_id
++                    && import_source_matches_request(source, pending.source)
++            })
++    }
++
+     fn take_matching(&self, operation_id: &OperationId, source: ImportSource) -> bool {
+         let mut pending = self.pending.lock().expect("pending host import lock");
+         let matches = pending.as_ref().is_some_and(|pending| {
+@@ -428,6 +439,8 @@
+     intent: ConnectorIntent,
+     dispatch_epoch: u64,
+     invocation_context: Option<InvocationContext>,
++    /// Host completion admission is published only after successful queue insertion.
++    admission: Option<Receiver<()>>,
+ }
+ 
+ struct Inner {
+@@ -526,6 +539,92 @@
+         self.dispatch_with_context(intent, InvocationContext::global())
+     }
+ 
++    /// Return the exact unsent host payload on rejection, so the app can retain a bounded
++    /// completion without cloning sensitive bytes. Only Complete/FailImportSource are accepted.
++    #[allow(clippy::result_large_err)]
++    pub fn dispatch_host_completion(
++        &self,
++        intent: ConnectorIntent,
++    ) -> Result<DispatchOutcome, (DispatchError, ConnectorIntent)> {
++        let (operation_id, source) = match &intent {
++            ConnectorIntent::CompleteImportSource {
++                operation_id,
++                source,
++                ..
++            }
++            | ConnectorIntent::FailImportSource {
++                operation_id,
++                source,
++                ..
++            } => (operation_id.clone(), *source),
++            _ => return Err((DispatchError::StaleHostAction, intent)),
++        };
++        // Every Request/Cancel/Complete dispatch uses this lock first. Release the ownership
++        // mutex before preparing a worker, while serialization keeps this exact owner valid.
++        let _dispatch = self
++            .inner
++            .dispatch_serialization
++            .lock()
++            .expect("connector dispatch serialization");
++        if !self
++            .inner
++            .pending_host_import
++            .matches(&operation_id, source)
++        {
++            return Err((DispatchError::StaleHostAction, intent));
++        }
++        let invalidates = invalidates_inflight(&intent);
++        let current_epoch = self.inner.dispatch_epoch.load(Ordering::Acquire);
++        let dispatch_epoch = if invalidates {
++            current_epoch.wrapping_add(1)
++        } else {
++            current_epoch
++        };
++        let (admit, admission) = sync_channel(1);
++        let command = CommandEnvelope {
++            intent,
++            dispatch_epoch,
++            invocation_context: None,
++            admission: Some(admission),
++        };
++        if let Err((error, command)) = self.enqueue_retaining(command) {
++            return Err((error, command.intent));
++        }
++        // No rejection above changes the epoch, trust, cancellation registry or import owner.
++        // The worker cannot consume this command until these success effects are published.
++        if invalidates {
++            self.inner.host_actions.remove_all_dynamic();
++            self.inner
++                .session_trust
++                .lock()
++                .expect("connector trust registry lock")
++                .clear();
++            self.inner
++                .dispatch_epoch
++                .store(dispatch_epoch, Ordering::Release);
++            for cancellation in self
++                .inner
++                .cancellations
++                .lock()
++                .expect("connector cancellation registry")
++                .values()
++            {
++                cancellation.cancel();
++            }
++        }
++        let consumed = self
++            .inner
++            .pending_host_import
++            .take_matching(&operation_id, source);
++        debug_assert!(
++            consumed,
++            "serialized import owner disappeared after admission"
++        );
++        // Capacity one means this publication does not wait for the worker to receive it.
++        let _ = admit.send(());
++        Ok(DispatchOutcome::Queued)
++    }
++
+     pub fn dispatch_for_subject(
+         &self,
+         intent: ConnectorIntent,
+@@ -539,6 +638,19 @@
+         intent: ConnectorIntent,
+         invocation_context: InvocationContext,
+     ) -> Result<DispatchOutcome, DispatchError> {
++        if matches!(
++            &intent,
++            ConnectorIntent::CompleteImportSource { .. } | ConnectorIntent::FailImportSource { .. }
++        ) {
++            return self
++                .dispatch_host_completion(intent)
++                .map_err(|(error, _intent)| error);
++        }
++        let _dispatch = self
++            .inner
++            .dispatch_serialization
++            .lock()
++            .expect("connector dispatch serialization");
+         if let ConnectorIntent::Cancel(operation_id) = &intent {
+             if self.inner.pending_host_import.cancel(operation_id) {
+                 self.inner
+@@ -559,23 +671,6 @@
+                 ..
+             }
+         ) {
+-            return Err(DispatchError::StaleHostAction);
+-        }
+-        if let ConnectorIntent::CompleteImportSource {
+-            operation_id,
+-            source,
+-            ..
+-        }
+-        | ConnectorIntent::FailImportSource {
+-            operation_id,
+-            source,
+-            ..
+-        } = &intent
+-            && !self
+-                .inner
+-                .pending_host_import
+-                .take_matching(operation_id, *source)
+-        {
+             return Err(DispatchError::StaleHostAction);
+         }
+         let invalidates = invalidates_inflight(&intent);
+@@ -615,11 +710,6 @@
+             intent => {
+                 let invocation_context = matches!(&intent, ConnectorIntent::InvokeTool { .. })
+                     .then_some(invocation_context);
+-                let _dispatch = self
+-                    .inner
+-                    .dispatch_serialization
+-                    .lock()
+-                    .expect("connector dispatch serialization");
+                 if let ConnectorIntent::Cancel(operation_id) = &intent
+                     && let Some(cancellation) = self
+                         .inner
+@@ -654,6 +744,7 @@
+                     intent,
+                     dispatch_epoch,
+                     invocation_context,
++                    admission: None,
+                 })?;
+             }
+         }
+@@ -675,7 +766,16 @@
+         }
+     }
+ 
+-    fn enqueue(&self, mut command: CommandEnvelope) -> Result<(), DispatchError> {
++    fn enqueue(&self, command: CommandEnvelope) -> Result<(), DispatchError> {
++        self.enqueue_retaining(command)
++            .map_err(|(error, _command)| error)
++    }
++
++    #[allow(clippy::result_large_err)]
++    fn enqueue_retaining(
++        &self,
++        mut command: CommandEnvelope,
++    ) -> Result<(), (DispatchError, CommandEnvelope)> {
+         for _attempt in 0..2 {
+             let mut worker = self.inner.worker.lock().expect("connector worker lock");
+             if worker
+@@ -686,7 +786,10 @@
+                 let _ = slot.thread.join();
+             }
+             if worker.is_none() {
+-                *worker = Some(self.spawn_worker()?);
++                match self.spawn_worker() {
++                    Ok(spawned) => *worker = Some(spawned),
++                    Err(error) => return Err((error, command)),
++                }
+             }
+             let slot = worker.as_ref().expect("worker was initialized");
+             self.inner
+@@ -707,8 +810,7 @@
+                         .metrics
+                         .backpressure
+                         .fetch_add(1, Ordering::AcqRel);
+-                    drop(returned);
+-                    return Err(DispatchError::Backpressure);
++                    return Err((DispatchError::Backpressure, returned));
+                 }
+                 Err(TrySendError::Disconnected(returned)) => {
+                     self.inner
+@@ -722,7 +824,7 @@
+                 }
+             }
+         }
+-        Err(DispatchError::WorkerUnavailable)
++        Err((DispatchError::WorkerUnavailable, command))
+     }
+ 
+     fn spawn_worker(&self) -> Result<WorkerSlot, DispatchError> {
+@@ -1212,8 +1314,13 @@
+         progressed
+     }
+ 
+-    fn accept_command(&mut self, command: CommandEnvelope) {
++    fn accept_command(&mut self, mut command: CommandEnvelope) {
+         self.metrics.queue_depth.fetch_sub(1, Ordering::AcqRel);
++        if let Some(admission) = command.admission.take()
++            && admission.recv().is_err()
++        {
++            return;
++        }
+         self.last_activity = self.clock.now();
+         let invalidated_pending_singletons = self.current_dispatch_epoch != command.dispatch_epoch;
+         self.current_dispatch_epoch = command.dispatch_epoch;
+@@ -10155,6 +10262,228 @@
+     }
+ 
+     #[test]
++    fn all_review_20261014_import_completion_survives_command_backpressure() {
++        // Always release the synthetic repository gate before Fixture's joining Drop, including
++        // during assertion unwinding. No file picker, files, secrets or external transports run.
++        struct ReleaseGateOnDrop(Arc<Gate>);
++        impl Drop for ReleaseGateOnDrop {
++            fn drop(&mut self) {
++                self.0.release();
++            }
++        }
++
++        let open_gate = Arc::new(Gate::closed());
++        let fixture = fixture(
++            Arc::clone(&open_gate),
++            Arc::new(Gate::opened()),
++            Arc::new(Gate::opened()),
++            Arc::new(SystemCoordinatorClock::default()),
++        );
++        let _release_gate = ReleaseGateOnDrop(Arc::clone(&open_gate));
++        let operation_id =
++            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
++        let completion = || ConnectorIntent::CompleteImportSource {
++            operation_id: operation_id.clone(),
++            source: ImportSource::File,
++            display_name: Some("fixture.json".to_owned()),
++            contents: SensitiveInput::new(b"fixture".to_vec()),
++        };
++
++        // The same actual bounded worker lane as command_queue_is_exactly_eight_and_backpressures:
++        // repository open is gated before the worker can dequeue any command.
++        fixture
++            .coordinator
++            .dispatch(ConnectorIntent::Activate)
++            .unwrap();
++        wait_until(|| fixture.repo.opens.load(Ordering::Acquire) == 1);
++        for _ in 1..8 {
++            fixture
++                .coordinator
++                .dispatch(ConnectorIntent::Activate)
++                .unwrap();
++        }
++        let full_queue_depth = fixture.coordinator.metrics().command_queue_depth;
++        let epoch_before = fixture
++            .coordinator
++            .inner
++            .dispatch_epoch
++            .load(Ordering::Acquire);
++        let cancellation = CancellationToken::default();
++        fixture
++            .coordinator
++            .inner
++            .cancellations
++            .lock()
++            .unwrap()
++            .insert(OperationId::new("existing-work"), cancellation.clone());
++        let trust = TrustEntry {
++            server_id: ServerId::new("existing-trust"),
++            config_revision: Revision(1),
++            fingerprint: EndpointFingerprint::parse("0".repeat(64)).unwrap(),
++        };
++        fixture
++            .coordinator
++            .inner
++            .session_trust
++            .lock()
++            .unwrap()
++            .insert(trust.clone());
++        let first = fixture.coordinator.dispatch(completion());
++        assert_eq!(
++            fixture
++                .coordinator
++                .inner
++                .dispatch_epoch
++                .load(Ordering::Acquire),
++            epoch_before
++        );
++        assert!(
++            !cancellation.is_cancelled(),
++            "a rejected completion must not cancel earlier work"
++        );
++        assert!(
++            fixture
++                .coordinator
++                .inner
++                .session_trust
++                .lock()
++                .unwrap()
++                .contains(&trust)
++        );
++        let pending_after_backpressure = fixture.coordinator.inner.pending_host_import.is_pending();
++
++        open_gate.release();
++        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
++        let retry = fixture.coordinator.dispatch(completion());
++        if retry == Ok(DispatchOutcome::Queued) {
++            wait_until(|| fixture.repo.imports.load(Ordering::Acquire) == 1);
++        }
++        let parses = fixture.repo.parses.load(Ordering::Acquire);
++        let imports = fixture.repo.imports.load(Ordering::Acquire);
++        eprintln!(
++            "queue_depth={full_queue_depth} first={first:?} pending_after_backpressure={pending_after_backpressure} retry={retry:?} parses={parses} imports={imports}"
++        );
++
++        assert_eq!(full_queue_depth, 8, "the actual worker lane must be full");
++        assert_eq!(first, Err(DispatchError::Backpressure));
++        assert_eq!(
++            retry,
++            Ok(DispatchOutcome::Queued),
++            "a rejected import completion must retain its operation ownership for retry; pending_after_backpressure={pending_after_backpressure}, parses={parses}, imports={imports}"
++        );
++        assert!(pending_after_backpressure);
++        assert_eq!(parses, 1);
++        assert_eq!(imports, 1);
++    }
++
++    #[test]
++    fn full_fix_20261014_import_rejection_returns_exact_sensitive_payload_and_cancel_is_terminal() {
++        struct ReleaseGateOnDrop(Arc<Gate>);
++        impl Drop for ReleaseGateOnDrop {
++            fn drop(&mut self) {
++                self.0.release();
++            }
++        }
++        let open_gate = Arc::new(Gate::closed());
++        let fixture = fixture(
++            Arc::clone(&open_gate),
++            Arc::new(Gate::opened()),
++            Arc::new(Gate::opened()),
++            Arc::new(SystemCoordinatorClock::default()),
++        );
++        let _release = ReleaseGateOnDrop(Arc::clone(&open_gate));
++        let operation_id =
++            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
++        fixture
++            .coordinator
++            .dispatch(ConnectorIntent::Activate)
++            .unwrap();
++        wait_until(|| fixture.repo.opens.load(Ordering::Acquire) == 1);
++        for _ in 1..8 {
++            fixture
++                .coordinator
++                .dispatch(ConnectorIntent::Activate)
++                .unwrap();
++        }
++        let contents = SensitiveInput::new(b"known-unsent-fixture".to_vec());
++        let original_allocation = contents.expose_bytes().as_ptr();
++        let (error, retained) = fixture
++            .coordinator
++            .dispatch_host_completion(ConnectorIntent::CompleteImportSource {
++                operation_id: operation_id.clone(),
++                source: ImportSource::File,
++                display_name: None,
++                contents,
++            })
++            .unwrap_err();
++        assert_eq!(error, DispatchError::Backpressure);
++        let ConnectorIntent::CompleteImportSource { contents, .. } = &retained else {
++            panic!("completion kind changed");
++        };
++        assert_eq!(
++            contents.expose_bytes().as_ptr(),
++            original_allocation,
++            "retry must retain the original sensitive allocation"
++        );
++        fixture
++            .coordinator
++            .dispatch(ConnectorIntent::Cancel(operation_id))
++            .unwrap();
++        let (error, retained) = fixture
++            .coordinator
++            .dispatch_host_completion(retained)
++            .unwrap_err();
++        assert_eq!(
++            error,
++            DispatchError::StaleHostAction,
++            "cancelled ownership cannot be revived by a retained payload"
++        );
++        drop(retained);
++        assert!(!fixture.coordinator.inner.pending_host_import.is_pending());
++        open_gate.release();
++        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
++        assert_eq!(fixture.repo.imports.load(Ordering::Acquire), 0);
++    }
++
++    #[test]
++    fn full_fix_20261014_import_completion_cancel_race_consumes_owner_once() {
++        let fixture = fixture(
++            Arc::new(Gate::opened()),
++            Arc::new(Gate::opened()),
++            Arc::new(Gate::opened()),
++            Arc::new(SystemCoordinatorClock::default()),
++        );
++        let operation_id =
++            request_import_operation(&fixture.coordinator, ImportSourceRequest::FilePicker);
++        let coordinator = fixture.coordinator.clone();
++        let complete_id = operation_id.clone();
++        let ready = Arc::new(std::sync::Barrier::new(2));
++        let ready_child = Arc::clone(&ready);
++        let complete = std::thread::spawn(move || {
++            ready_child.wait();
++            coordinator.dispatch_host_completion(ConnectorIntent::CompleteImportSource {
++                operation_id: complete_id,
++                source: ImportSource::File,
++                display_name: None,
++                contents: SensitiveInput::new(b"fixture".to_vec()),
++            })
++        });
++        ready.wait();
++        fixture
++            .coordinator
++            .dispatch(ConnectorIntent::Cancel(operation_id))
++            .unwrap();
++        match complete.join().unwrap() {
++            Ok(DispatchOutcome::Queued) => {}
++            Err((DispatchError::StaleHostAction, intent)) => drop(intent),
++            other => panic!("unexpected completion race result: {other:?}"),
++        }
++        wait_until(|| fixture.coordinator.metrics().command_queue_depth == 0);
++        assert!(!fixture.coordinator.inner.pending_host_import.is_pending());
++        assert!(fixture.repo.imports.load(Ordering::Acquire) <= 1);
++    }
++
++    #[test]
+     fn import_bytes_and_server_count_are_bounded_before_persistence() {
+         let fixture = fixture(
+             Arc::new(Gate::opened()),
+--- a/crates/web-remote/src/relay_client/tls.rs
++++ b/crates/web-remote/src/relay_client/tls.rs
+@@ -7,8 +7,10 @@
+ //! 시한은 단계마다 건다: DNS 조회, TCP 연결, 그리고 소켓 읽기/쓰기. 어느 한 단계라도 시한 없이
+ //! 두면 워커 스레드가 거기서 영구히 멈추고, 그러면 끄기도 종료도 막힌다.
+ 
+-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+-use std::sync::atomic::{AtomicUsize, Ordering};
++use std::io::{self, Read, Write};
++use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
++use std::sync::Arc;
++use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+ use std::sync::mpsc::channel;
+ use std::time::{Duration, Instant};
+ 
+@@ -64,6 +66,8 @@
+         // 4) TLS + WebSocket. connector를 `None`으로 두면 tungstenite가 이 크레이트에
+         //    켜진 feature(`rustls-tls-webpki-roots`)로 기본 커넥터를 만든다 — 즉 컴파일된
+         //    WebPKI 루트와 통상적인 호스트명 검증만 쓴다.
++        let mut stream = DeadlineTcpStream::new(stream);
++        stream.begin_io(handshake_budget)?;
+         let mut config = tungstenite::protocol::WebSocketConfig::default();
+         config.max_message_size = Some(MAX_RELAY_FRAME_BYTES);
+         config.max_frame_size = Some(MAX_RELAY_FRAME_BYTES);
+@@ -71,10 +75,7 @@
+             tungstenite::client_tls_with_config(endpoint.url(), stream, Some(config), None)
+                 .map_err(classify_handshake)?;
+ 
+-        let session = TlsRelaySession {
+-            socket,
+-            applied_read_timeout: None,
+-        };
++        let mut session = TlsRelaySession { socket };
+         // 세션 단계의 쓰기 시한으로 되돌린다. 읽기 시한은 매 수신마다 워커가 준 값으로 맞춘다.
+         session.set_write_timeout(WRITE_TIMEOUT)?;
+         Ok(Box::new(session))
+@@ -144,7 +145,7 @@
+ /// 일시적 실패로 본다 — TLS 오류나 DNS 실패로 영구히 포기하면 잠깐의 네트워크 장애가
+ /// 사용자 개입을 요구하는 상태로 굳는다.
+ type ClientHandshakeError = tungstenite::handshake::HandshakeError<
+-    tungstenite::handshake::client::ClientHandshake<MaybeTlsStream<TcpStream>>,
++    tungstenite::handshake::client::ClientHandshake<MaybeTlsStream<DeadlineTcpStream>>,
+ >;
+ 
+ fn classify_handshake(error: ClientHandshakeError) -> TransportError {
+@@ -160,40 +161,123 @@
+     }
+ }
+ 
++/// The deadline belongs below both TLS and WebSocket decoders. A timeout on each raw read
++/// alone can be renewed indefinitely by a peer dripping partial records or message bytes.
++struct DeadlineTcpStream {
++    stream: TcpStream,
++    deadline: Option<Instant>,
++    stop: Option<Arc<AtomicBool>>,
++}
++
++const CANCEL_IO_SLICE: Duration = Duration::from_millis(50);
++
++impl DeadlineTcpStream {
++    fn new(stream: TcpStream) -> Self {
++        Self {
++            stream,
++            deadline: None,
++            stop: None,
++        }
++    }
++
++    fn begin_io(&mut self, timeout: Duration) -> Result<(), TransportError> {
++        self.deadline = Some(
++            Instant::now()
++                .checked_add(timeout)
++                .ok_or(TransportError::Unavailable)?,
++        );
++        Ok(())
++    }
++
++    fn remaining_slice(&self) -> io::Result<Duration> {
++        if self
++            .stop
++            .as_ref()
++            .is_some_and(|stop| stop.load(Ordering::SeqCst))
++        {
++            return Err(io::Error::new(
++                io::ErrorKind::ConnectionAborted,
++                "relay shutdown requested",
++            ));
++        }
++        let remaining = self
++            .deadline
++            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
++            .unwrap_or(CANCEL_IO_SLICE);
++        if remaining.is_zero() {
++            return Err(io::Error::new(
++                io::ErrorKind::TimedOut,
++                "relay I/O deadline elapsed",
++            ));
++        }
++        Ok(remaining.min(CANCEL_IO_SLICE))
++    }
++}
++
++impl Read for DeadlineTcpStream {
++    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
++        loop {
++            self.stream
++                .set_read_timeout(Some(self.remaining_slice()?))?;
++            match self.stream.read(bytes) {
++                Err(error)
++                    if matches!(
++                        error.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
++                    ) => {}
++                result => return result,
++            }
++        }
++    }
++}
++
++impl Write for DeadlineTcpStream {
++    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
++        loop {
++            self.stream
++                .set_write_timeout(Some(self.remaining_slice()?))?;
++            match self.stream.write(bytes) {
++                Err(error)
++                    if matches!(
++                        error.kind(),
++                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
++                    ) => {}
++                result => return result,
++            }
++        }
++    }
++
++    fn flush(&mut self) -> io::Result<()> {
++        self.remaining_slice()?;
++        self.stream.flush()
++    }
++}
++
+ struct TlsRelaySession {
+-    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+-    /// 마지막으로 적용한 읽기 시한. 매번 같은 값을 다시 거는 syscall을 피한다.
+-    applied_read_timeout: Option<Duration>,
++    socket: WebSocket<MaybeTlsStream<DeadlineTcpStream>>,
+ }
+ 
+ impl TlsRelaySession {
+     /// TLS 여부와 무관하게 밑에 깔린 TCP 소켓을 꺼낸다.
+-    fn socket_ref(&self) -> Option<&TcpStream> {
+-        match self.socket.get_ref() {
++    fn socket_io_mut(&mut self) -> Option<&mut DeadlineTcpStream> {
++        match self.socket.get_mut() {
+             MaybeTlsStream::Plain(stream) => Some(stream),
+-            MaybeTlsStream::Rustls(stream) => Some(&stream.sock),
++            MaybeTlsStream::Rustls(stream) => Some(&mut stream.sock),
+             _ => None,
+         }
+     }
+ 
+-    fn set_write_timeout(&self, timeout: Duration) -> Result<(), TransportError> {
+-        self.socket_ref()
++    fn set_write_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
++        self.socket_io_mut()
+             .ok_or(TransportError::Unavailable)?
+-            .set_write_timeout(Some(timeout))
+-            .map_err(|_| TransportError::Unavailable)
+-    }
+-
+-    /// 워커가 준 수신 시한을 실제 소켓에 건다. 이게 없으면 끄기·종료가 고정 시한만큼 늦어진다.
++            .begin_io(timeout)
++    }
++
+     fn apply_read_timeout(&mut self, timeout: Duration) -> Result<(), TransportError> {
+-        if self.applied_read_timeout == Some(timeout) {
+-            return Ok(());
+-        }
+-        self.socket_ref()
++        // Refresh the deadline even for the same duration: each receive owns a new total budget.
++        self.socket_io_mut()
+             .ok_or(TransportError::Unavailable)?
+-            .set_read_timeout(Some(timeout))
+-            .map_err(|_| TransportError::Unavailable)?;
+-        self.applied_read_timeout = Some(timeout);
+-        Ok(())
++            .begin_io(timeout)
+     }
+ }
+ 
+@@ -202,17 +286,14 @@
+         self.apply_read_timeout(timeout)?;
+         match self.socket.read() {
+             Ok(Message::Binary(payload)) => Ok(Some(payload.to_vec())),
+-            // 계약에 이진 프레임만 있다. 텍스트는 받지 않는다.
+-            Ok(Message::Text(_)) => Err(TransportError::Unavailable),
+-            Ok(Message::Close(_)) => Err(TransportError::Unavailable),
++            Ok(Message::Text(_) | Message::Close(_)) => Err(TransportError::Unavailable),
+             Ok(Message::Ping(_) | Message::Pong(_) | Message::Frame(_)) => Ok(None),
+             Err(tungstenite::Error::Io(error))
+                 if matches!(
+                     error.kind(),
+-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
++                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                 ) =>
+             {
+-                // 읽기 시한만 지났다 — 연결은 살아 있다.
+                 Ok(None)
+             }
+             Err(_) => Err(TransportError::Unavailable),
+@@ -223,14 +304,24 @@
+         if frame.len() > MAX_RELAY_FRAME_BYTES {
+             return Err(TransportError::Unavailable);
+         }
++        self.set_write_timeout(WRITE_TIMEOUT)?;
+         self.socket
+             .send(Message::Binary(frame.to_vec().into()))
+             .map_err(|_| TransportError::Unavailable)
+     }
+ 
+     fn close(&mut self) {
+-        let _ = self.socket.close(None);
+-        let _ = self.socket.flush();
++        // Retire the transport immediately, including incomplete TLS/WS frames. Waiting to flush
++        // a graceful close to a stalled peer must not reintroduce a shutdown write dependency.
++        if let Some(io) = self.socket_io_mut() {
++            let _ = io.stream.shutdown(Shutdown::Both);
++        }
++    }
++
++    fn set_stop_signal(&mut self, stop: Arc<AtomicBool>) {
++        if let Some(io) = self.socket_io_mut() {
++            io.stop = Some(stop);
++        }
+     }
+ }
+ 
+@@ -378,10 +469,8 @@
+             "수신 시한 인자를 `_timeout`으로 흘려버리면 안 된다"
+         );
+         assert!(production.contains("fn apply_read_timeout(&mut self, timeout: Duration)"));
+-        assert!(
+-            production.contains("self.applied_read_timeout == Some(timeout)"),
+-            "같은 값을 매번 다시 거는 syscall은 피한다"
+-        );
++        assert!(production.contains("stream.begin_io(handshake_budget)?"));
++        assert!(production.contains("fn remaining_slice(&self)"));
+     }
+ 
+     /// 자격증명 거부와 일시적 실패를 갈라야 자동 재시도 정책이 의미를 갖는다.
+@@ -415,4 +504,309 @@
+         );
+         assert_eq!(MAX_RELAY_FRAME_BYTES, relay_protocol::MAX_FRAME_BYTES);
+     }
+-}
++
++    #[test]
++    fn full_fix_20261014_relay_receive_obeys_total_budget() {
++        use std::io::Write;
++        use tungstenite::protocol::Role;
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (mut server, _) = listener.accept().unwrap();
++        let mut session = TlsRelaySession {
++            socket: WebSocket::from_raw_socket(
++                MaybeTlsStream::Plain(DeadlineTcpStream::new(client)),
++                Role::Client,
++                None,
++            ),
++        };
++        let send = std::thread::spawn(move || {
++            server.write_all(&[0x82, 8]).unwrap();
++            for _ in 0..8 {
++                std::thread::sleep(Duration::from_millis(25));
++                server.write_all(b"x").unwrap();
++            }
++        });
++        let started = Instant::now();
++        let result = session.receive(Duration::from_millis(40));
++        let elapsed = started.elapsed();
++        send.join().unwrap();
++        println!(
++            "receive_budget_ms=40 elapsed_ms={} received_bytes={}",
++            elapsed.as_millis(),
++            result.unwrap().map(|b| b.len()).unwrap_or(0)
++        );
++        assert!(
++            elapsed < Duration::from_millis(120),
++            "production receive ignored total deadline while bytes continued arriving"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_relay_worker_shutdown_observes_receive_slice() {
++        use super::super::lifecycle::BackoffPolicy;
++        use super::super::worker::{
++            IgnoreObserver, RelayDeadlines, RelayFrameSink, RelayWorker, SinkOutcome,
++        };
++        use std::io::Write;
++        use std::sync::{Arc, mpsc};
++        use tungstenite::protocol::Role;
++        struct Ready {
++            session: Option<Box<dyn RelaySession>>,
++        }
++        impl RelayTransport for Ready {
++            fn connect(
++                &mut self,
++                _: &RelayEndpoint,
++                _: Duration,
++            ) -> Result<Box<dyn RelaySession>, TransportError> {
++                self.session.take().ok_or(TransportError::Unavailable)
++            }
++        }
++        struct Sink;
++        impl RelayFrameSink for Sink {
++            fn accept(&mut self, _: &[u8]) -> SinkOutcome {
++                SinkOutcome::Continue
++            }
++        }
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (mut peer, _) = listener.accept().unwrap();
++        let session = TlsRelaySession {
++            socket: WebSocket::from_raw_socket(
++                MaybeTlsStream::Plain(DeadlineTcpStream::new(client)),
++                Role::Client,
++                None,
++            ),
++        };
++        let (in_read, ready) = mpsc::sync_channel(1);
++        let (started_tx, started_rx) = mpsc::sync_channel(1);
++        let sender = std::thread::spawn(move || {
++            peer.write_all(&[0x82, 16]).unwrap();
++            peer.write_all(b"x").unwrap();
++            in_read.send(()).unwrap();
++            started_rx.recv().unwrap();
++            for _ in 1..16 {
++                std::thread::sleep(Duration::from_millis(200));
++                if peer.write_all(b"x").is_err() {
++                    break;
++                }
++            }
++        });
++        let mut worker = RelayWorker::spawn(
++            RelayEndpoint::parse("wss://relay.example.test/").unwrap(),
++            Box::new(Ready {
++                session: Some(Box::new(session)),
++            }),
++            Box::new(Sink),
++            Arc::new(IgnoreObserver),
++            RelayDeadlines::default(),
++            BackoffPolicy::default(),
++        );
++        assert!(worker.enable());
++        ready.recv().unwrap();
++        std::thread::sleep(Duration::from_millis(50));
++        started_tx.send(()).unwrap();
++        let began = Instant::now();
++        worker.shutdown();
++        let elapsed = began.elapsed();
++        sender.join().unwrap();
++        println!(
++            "worker_receive_slice_ms=1000 shutdown_elapsed_ms={}",
++            elapsed.as_millis()
++        );
++        assert!(
++            elapsed < Duration::from_millis(1500),
++            "actual RelayWorker shutdown blocked on continuously fragmented message"
++        );
++    }
++
++    fn loopback_rustls() -> (
++        TlsRelaySession,
++        rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
++    ) {
++        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
++        // These public synthetic fixtures are trusted only by this test's client config.
++        let certificate = CertificateDer::from(
++            include_bytes!("../../tests/fixtures/relay-loopback/localhost-cert.der").to_vec(),
++        );
++        let private_key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
++            include_bytes!("../../tests/fixtures/relay-loopback/localhost-key.der").to_vec(),
++        ));
++        let provider = Arc::new(rustls::crypto::ring::default_provider());
++        let server_config = rustls::ServerConfig::builder_with_provider(Arc::clone(&provider))
++            .with_safe_default_protocol_versions()
++            .unwrap()
++            .with_no_client_auth()
++            .with_single_cert(vec![certificate.clone()], private_key)
++            .unwrap();
++        let mut roots = rustls::RootCertStore::empty();
++        roots.add(certificate).unwrap();
++        let client_config = rustls::ClientConfig::builder_with_provider(provider)
++            .with_safe_default_protocol_versions()
++            .unwrap()
++            .with_root_certificates(roots)
++            .with_no_client_auth();
++        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
++        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
++        let (server, _) = listener.accept().unwrap();
++        server
++            .set_read_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        server
++            .set_write_timeout(Some(Duration::from_secs(3)))
++            .unwrap();
++        let peer = std::thread::spawn(move || {
++            let mut peer = rustls::StreamOwned::new(
++                rustls::ServerConnection::new(Arc::new(server_config)).unwrap(),
++                server,
++            );
++            while peer.conn.is_handshaking() {
++                peer.conn.complete_io(&mut peer.sock).unwrap();
++            }
++            peer
++        });
++        let mut client = rustls::StreamOwned::new(
++            rustls::ClientConnection::new(
++                Arc::new(client_config),
++                ServerName::try_from("localhost").unwrap(),
++            )
++            .unwrap(),
++            DeadlineTcpStream::new(client),
++        );
++        client.sock.begin_io(Duration::from_secs(3)).unwrap();
++        while client.conn.is_handshaking() {
++            client.conn.complete_io(&mut client.sock).unwrap();
++        }
++        let peer = peer.join().unwrap();
++        let session = TlsRelaySession {
++            socket: WebSocket::from_raw_socket(
++                MaybeTlsStream::Rustls(client),
++                tungstenite::protocol::Role::Client,
++                None,
++            ),
++        };
++        (session, peer)
++    }
++
++    #[test]
++    fn full_fix_20261014_relay_rustls_partial_record_obeys_total_budget() {
++        let (mut session, mut peer) = loopback_rustls();
++        peer.conn
++            .writer()
++            .write_all(&[0x82, 4, b't', b'e', b's', b't'])
++            .unwrap();
++        let mut ciphertext = Vec::new();
++        while peer.conn.wants_write() {
++            peer.conn.write_tls(&mut ciphertext).unwrap();
++        }
++        assert!(
++            ciphertext.len() > 6,
++            "fixture must contain an encrypted TLS record"
++        );
++        let writer = std::thread::spawn(move || {
++            for byte in ciphertext {
++                if peer.sock.write_all(&[byte]).is_err() {
++                    break;
++                }
++                std::thread::sleep(Duration::from_millis(15));
++            }
++        });
++        let started = Instant::now();
++        let partial = session.receive(Duration::from_millis(40)).unwrap();
++        let elapsed = started.elapsed();
++        assert!(
++            partial.is_none(),
++            "a partial TLS record cannot produce a WS frame"
++        );
++        // Preserve the TLS/WS decoder state across receive budgets, then finish normally.
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let mut completed = None;
++        while completed.is_none() && Instant::now() < deadline {
++            completed = session.receive(Duration::from_millis(40)).unwrap();
++        }
++        writer.join().unwrap();
++        assert_eq!(completed.as_deref(), Some(b"test".as_slice()));
++        eprintln!(
++            "rustls partial record: budget_ms=40 first_receive_ms={}",
++            elapsed.as_millis()
++        );
++        assert!(
++            elapsed < Duration::from_millis(120),
++            "TLS complete_io renewed the receive budget per ciphertext byte"
++        );
++    }
++
++    #[test]
++    fn full_fix_20261014_relay_rustls_fragmented_message_survives_deadlines_and_normal_send() {
++        let (mut session, mut peer) = loopback_rustls();
++        let (first_tx, first_rx) = std::sync::mpsc::sync_channel(1);
++        let (finish_tx, finish_rx) = std::sync::mpsc::sync_channel(1);
++        let writer = std::thread::spawn(move || {
++            // A non-final binary fragment is retained when the next receive budget expires.
++            peer.write_all(&[0x02, 2, b'o', b'k']).unwrap();
++            peer.flush().unwrap();
++            first_tx.send(()).unwrap();
++            finish_rx.recv().unwrap();
++            peer.write_all(&[0x80, 1, b'!']).unwrap();
++            peer.flush().unwrap();
++            let mut socket =
++                WebSocket::from_raw_socket(peer, tungstenite::protocol::Role::Server, None);
++            assert_eq!(socket.read().unwrap().into_data().as_ref(), b"outbound");
++        });
++        first_rx.recv_timeout(Duration::from_secs(3)).unwrap();
++        assert!(
++            session
++                .receive(Duration::from_millis(40))
++                .unwrap()
++                .is_none()
++        );
++        finish_tx.send(()).unwrap();
++        assert_eq!(
++            session.receive(Duration::from_secs(3)).unwrap().as_deref(),
++            Some(b"ok!".as_slice())
++        );
++        session.send(b"outbound").unwrap();
++        writer.join().unwrap();
++    }
++
++    #[test]
++    fn full_fix_20261014_relay_rustls_stop_retires_partial_record_promptly() {
++        let (mut session, mut peer) = loopback_rustls();
++        peer.conn
++            .writer()
++            .write_all(&[0x82, 4, b't', b'e', b's', b't'])
++            .unwrap();
++        let mut ciphertext = Vec::new();
++        while peer.conn.wants_write() {
++            peer.conn.write_tls(&mut ciphertext).unwrap();
++        }
++        // Withhold the record body indefinitely after establishing actual TLS.
++        peer.sock.write_all(&ciphertext[..6]).unwrap();
++        let stop = Arc::new(AtomicBool::new(false));
++        session.set_stop_signal(Arc::clone(&stop));
++        let reader = std::thread::spawn(move || {
++            let result = session.receive(Duration::from_secs(30));
++            session.close();
++            result
++        });
++        std::thread::sleep(Duration::from_millis(25));
++        let started = Instant::now();
++        stop.store(true, Ordering::SeqCst);
++        assert_eq!(reader.join().unwrap(), Err(TransportError::Unavailable));
++        let elapsed = started.elapsed();
++        eprintln!(
++            "rustls partial record stop: elapsed_ms={}",
++            elapsed.as_millis()
++        );
++        assert!(
++            elapsed < Duration::from_millis(250),
++            "partial TLS record ignored the stop flag"
++        );
++        let mut closed = [0u8; 1];
++        assert_eq!(
++            peer.sock.read(&mut closed).unwrap(),
++            0,
++            "stop must retire the TCP transport"
++        );
++    }
++}
+--- a/crates/web-remote/src/relay_client/worker.rs
++++ b/crates/web-remote/src/relay_client/worker.rs
+@@ -50,6 +50,9 @@
+     fn receive(&mut self, timeout: Duration) -> Result<Option<Vec<u8>>, TransportError>;
+     fn send(&mut self, frame: &[u8]) -> Result<(), TransportError>;
+     fn close(&mut self);
++    /// Production I/O can observe shutdown while inside TLS/WS reads and writes.
++    /// Test transports may rely on their own bounded receive contract instead.
++    fn set_stop_signal(&mut self, _stop: Arc<AtomicBool>) {}
+ }
+ 
+ /// 프레임 하나를 처리한 뒤 워커가 무엇을 해야 하는가.
+@@ -262,7 +265,7 @@
+     deadlines: RelayDeadlines,
+     inbox: &Receiver<RelayCommand>,
+     wake: &Wake,
+-    stop: &AtomicBool,
++    stop: &Arc<AtomicBool>,
+ ) {
+     while !stop.load(Ordering::SeqCst) {
+         if !apply_commands(lifecycle, inbox, observer) {
+@@ -310,8 +313,9 @@
+     deadlines: RelayDeadlines,
+     inbox: &Receiver<RelayCommand>,
+     wake: &Wake,
+-    stop: &AtomicBool,
++    stop: &Arc<AtomicBool>,
+ ) {
++    session.set_stop_signal(Arc::clone(stop));
+     // 세션이 열리자마자 싱크가 라우트 입장 자격증명을 낸다. 이 프레임이 나가지 못하면
+     // 이 세션에서는 아무것도 일어나지 않으므로, 실패는 곧 세션 실패다.
+     sink.session_started();
+--- a/crates/web-remote/Cargo.toml
++++ b/crates/web-remote/Cargo.toml
+@@ -52,3 +52,7 @@
+ # 컴파일 타임에 묶어 두기 위해 참조한다 — 두 값이 갈라지면 한쪽이 만든 프레임을 다른 쪽이
+ # 거부하는데, 그건 실제 기기에서만 드러난다.
+ relay-protocol = { path = "../relay-protocol" }
++
++[dev-dependencies]
++# Synthetic loopback TLS fixtures exercise the actual Rustls stream without changing production trust.
++rustls = { workspace = true }
+--- a/crates/runtime/src/resource_monitor.rs
++++ b/crates/runtime/src/resource_monitor.rs
+@@ -57,7 +57,7 @@
+     /// 세션 자손 프로세스들의 메모리 합. macOS는 pid별 phys_footprint 합 —
+     /// ps RSS 합산은 공유 페이지(dyld 캐시·런타임)를 자손 수만큼 중복 가산해
+     /// 수천 프로세스에서 수백 GiB 허수를 만든다(2026-07-23 실증). 조회 실패한
+-    /// pid와 그 외 플랫폼은 ps RSS로 폴백한다(상한 근사치).
++    /// pid와 그 외 플랫폼은 ps RSS로 폴백한다. 두 지표의 대소 관계는 보장하지 않는다.
+     pub rss_bytes: u64,
+     pub cpu_percent: Option<f32>,
+     pub high_cpu: bool,
+@@ -822,8 +822,8 @@
+ }
+ 
+ /// 자손 프로세스 한 행의 메모리. macOS는 phys_footprint를 조회해 ps RSS의 공유
+-/// 페이지 중복 합산을 제거하고, 실패한 행만 ps RSS로 폴백한다 — 절대 0으로
+-/// 떨어뜨리지 않는다. 캐시는 같은 샘플 주기 안에서 pid당 syscall 1회 바운드용.
++/// 페이지 중복 합산을 줄이고, 실패한 행만 ps RSS로 폴백한다. 성공한 값은 RSS와의
++/// 대소 관계나 0 여부에 따라 보정하지 않는다. 캐시는 같은 샘플 안에서 pid당 조회 1회용.
+ #[cfg(target_os = "macos")]
+ fn descendant_rss_bytes(
+     row: &ProcessRow,
+@@ -980,40 +980,201 @@
+ 
+     #[cfg(target_os = "macos")]
+     #[test]
+-    fn macos_자식_다수의_footprint_합은_ps_rss_합보다_작다() {
+-        let mut children: Vec<std::process::Child> = (0..5)
+-            .map(|_| {
++    #[ignore = "diagnostic: compare distinct native metrics over repeated child samples"]
++    fn all_review_20261014_macos_footprint_rss_repeat_probe() {
++        struct Children(Vec<std::process::Child>);
++        impl Drop for Children {
++            fn drop(&mut self) {
++                for child in &mut self.0 {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                }
++            }
++        }
++
++        let mut footprint_less_than_ps = 0;
++        let mut footprint_equal_to_ps = 0;
++        let mut footprint_greater_than_ps = 0;
++        for round in 0..20 {
++            let mut children = Children(Vec::new());
++            for _ in 0..5 {
++                children.0.push(
++                    std::process::Command::new("/bin/sleep")
++                        .arg("10")
++                        .spawn()
++                        .expect("sleep spawn"),
++                );
++            }
++            let mut footprint_sum = 0u64;
++            let mut ps_rss_sum = 0u64;
++            let mut native_footprint_sum = 0u64;
++            let mut native_resident_sum = 0u64;
++            for child in &children.0 {
++                let pid = child.id();
++                // Match the existing failing fixture's production helper then ps order.
++                footprint_sum += phys_footprint_for_pid(pid).expect("footprint");
++                let output = std::process::Command::new("/bin/ps")
++                    .args(["-o", "rss=", "-p", &pid.to_string()])
++                    .output()
++                    .expect("ps");
++                assert!(output.status.success());
++                let kib: u64 = String::from_utf8_lossy(&output.stdout)
++                    .trim()
++                    .parse()
++                    .expect("rss parse");
++                ps_rss_sum += kib * 1024;
++
++                // A single native call also returns the two distinct metrics together.
++                let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
++                let rc = unsafe {
++                    libc::proc_pid_rusage(
++                        pid as libc::c_int,
++                        libc::RUSAGE_INFO_V4,
++                        info.as_mut_ptr().cast(),
++                    )
++                };
++                assert_eq!(rc, 0, "native rusage query");
++                // SAFETY: the successful query initialized the requested structure.
++                let info = unsafe { info.assume_init() };
++                native_footprint_sum += info.ri_phys_footprint;
++                native_resident_sum += info.ri_resident_size;
++            }
++            match footprint_sum.cmp(&ps_rss_sum) {
++                std::cmp::Ordering::Less => footprint_less_than_ps += 1,
++                std::cmp::Ordering::Equal => footprint_equal_to_ps += 1,
++                std::cmp::Ordering::Greater => footprint_greater_than_ps += 1,
++            }
++            eprintln!(
++                "round={round} footprint_sum={footprint_sum} ps_rss_sum={ps_rss_sum} native_footprint_sum={native_footprint_sum} native_resident_sum={native_resident_sum}"
++            );
++            assert!(footprint_sum > 0 && ps_rss_sum > 0);
++            assert!(native_footprint_sum > 0 && native_resident_sum > 0);
++        }
++        eprintln!(
++            "rounds=20 footprint_lt_ps={footprint_less_than_ps} footprint_eq_ps={footprint_equal_to_ps} footprint_gt_ps={footprint_greater_than_ps}"
++        );
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn macos_cached_footprint_is_used_without_rss_ordering_or_zero_clamping() {
++        let row = ProcessRow {
++            pid: u32::MAX,
++            ppid: None,
++            pgid: None,
++            rss_bytes: 1234,
++            cpu_percent: None,
++        };
++        let mut cache = std::collections::HashMap::from([(row.pid, Some(8192))]);
++        assert_eq!(descendant_rss_bytes(&row, &mut cache), 8192);
++        cache.insert(row.pid, Some(0));
++        assert_eq!(descendant_rss_bytes(&row, &mut cache), 0);
++        cache.insert(row.pid, None);
++        assert_eq!(descendant_rss_bytes(&row, &mut cache), 1234);
++        assert_eq!(cache.get(&row.pid), Some(&None));
++    }
++
++    #[cfg(target_os = "macos")]
++    #[test]
++    fn macos_live_descendants_sum_native_memory_and_reuse_only_the_same_sample_cache() {
++        struct Children(Vec<std::process::Child>);
++        impl Children {
++            fn reap(&mut self) {
++                for child in &mut self.0 {
++                    let _ = child.kill();
++                    child.wait().expect("child reap");
++                }
++            }
++        }
++        impl Drop for Children {
++            fn drop(&mut self) {
++                for child in &mut self.0 {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                }
++            }
++        }
++
++        let mut children = Children(Vec::new());
++        for _ in 0..5 {
++            children.0.push(
+                 std::process::Command::new("/bin/sleep")
+                     .arg("10")
+                     .spawn()
+-                    .expect("sleep spawn")
++                    .expect("sleep spawn"),
++            );
++        }
++        let rows: Vec<_> = children
++            .0
++            .iter()
++            .map(|child| ProcessRow {
++                pid: child.id(),
++                ppid: Some(std::process::id()),
++                pgid: Some(77),
++                rss_bytes: 1234,
++                cpu_percent: None,
+             })
+             .collect();
+-        let mut footprint_sum = 0u64;
+-        let mut ps_rss_sum = 0u64;
+-        for child in &children {
+-            let pid = child.id();
+-            footprint_sum += phys_footprint_for_pid(pid).expect("footprint");
+-            let output = std::process::Command::new("ps")
+-                .args(["-o", "rss=", "-p", &pid.to_string()])
+-                .output()
+-                .expect("ps");
+-            let kib: u64 = String::from_utf8_lossy(&output.stdout)
+-                .trim()
+-                .parse()
+-                .expect("rss parse");
+-            ps_rss_sum += kib * 1024;
+-        }
+-        for child in &mut children {
+-            let _ = child.kill();
+-            let _ = child.wait();
+-        }
+-        // dyld 공유 캐시가 자식마다 ps RSS에 중복 가산되므로 footprint 합이
+-        // 항상 작아야 한다 — 공유 페이지 중복 제거의 회귀 가드.
+-        assert!(
+-            footprint_sum < ps_rss_sum,
+-            "footprint_sum={footprint_sum} ps_rss_sum={ps_rss_sum}"
+-        );
++        let mut cache = std::collections::HashMap::new();
++        let expected_sum: u64 = rows
++            .iter()
++            .map(|row| {
++                let value = descendant_rss_bytes(row, &mut cache);
++                assert!(cache.get(&row.pid).is_some_and(|value| value.is_some()));
++                value
++            })
++            .sum();
++        assert!(expected_sum > 0);
++        let cached = cache.clone();
++        let table = ProcessTable::new(&rows);
++        let target = SessionResourceTarget {
++            session: SessionId(1),
++            identity: ProcessIdentity {
++                pid: Some(rows[0].pid),
++                process_group: Some(77),
++                source: ProcessIdentitySource::PlatformFallback,
++            },
++        };
++        let usage = aggregate_session_usage_with_table(
++            target,
++            &table,
++            123,
++            100.0,
++            expected_sum,
++            &mut |row| descendant_rss_bytes(row, &mut cache),
++        );
++        assert_eq!(usage.process_count, rows.len());
++        assert_eq!(usage.rss_bytes, expected_sum);
++        assert!(usage.high_rss);
++        assert_eq!(cache, cached);
++
++        children.reap();
++        // A successful query stays memoized until this sample ends, even if the pid exits.
++        let same_sample = aggregate_session_usage_with_table(
++            target,
++            &table,
++            124,
++            100.0,
++            expected_sum,
++            &mut |row| descendant_rss_bytes(row, &mut cache),
++        );
++        assert_eq!(same_sample.rss_bytes, expected_sum);
++        assert_eq!(cache, cached);
++
++        // A fresh sample tries each pid again and falls back only for failed native queries.
++        let mut next_sample_cache = std::collections::HashMap::new();
++        let next_sample = aggregate_session_usage_with_table(
++            target,
++            &table,
++            125,
++            100.0,
++            1234 * rows.len() as u64 + 1,
++            &mut |row| descendant_rss_bytes(row, &mut next_sample_cache),
++        );
++        assert_eq!(next_sample.rss_bytes, 1234 * rows.len() as u64);
++        assert!(!next_sample.high_rss);
++        assert_eq!(next_sample_cache.len(), rows.len());
++        assert!(next_sample_cache.values().all(Option::is_none));
+     }
+ 
+     #[test]

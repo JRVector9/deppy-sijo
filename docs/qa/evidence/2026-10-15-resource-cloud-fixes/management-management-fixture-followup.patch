@@ -1,0 +1,38 @@
+--- a/crates/app/src/cloud_agent/management.rs
++++ b/crates/app/src/cloud_agent/management.rs
+@@ -2197,6 +2197,11 @@
+         );
+         bridge.drain_history(|_, _| panic!("shutdown fixture never types"));
+         assert!(bridge.history_ready);
++        // The first drain opens history; its waiting path does not start run
++        // bootstrap. Complete that empty bootstrap before measuring stale work.
++        bridge.poll_management();
++        bridge.drain_history(|_, _| panic!("empty bootstrap must never type"));
++        assert!(bridge.management.bootstrap_initialized);
+         let run = CloudRun::new(
+             "stale-run",
+             agent_mcp::LEGACY_CONNECTION_ID,
+@@ -2231,6 +2236,15 @@
+             "no initial outstanding actor jobs"
+         );
+         assert!(bridge.management_poll_after().is_some());
++        // Worker publication sends a result before firing its wake callback.
++        // Observe all three initial callbacks (OpenPage, ListRuns, SaveRun) so
++        // their late wake cannot be counted as a shutdown-created completion.
++        let callbacks_deadline = Instant::now() + Duration::from_secs(1);
++        while completions.load(Ordering::SeqCst) < 3 && Instant::now() < callbacks_deadline {
++            std::thread::yield_now();
++        }
++        assert_eq!(completions.load(Ordering::SeqCst), 3);
++        let baseline_completions = completions.load(Ordering::SeqCst);
+         let external = rusqlite::Connection::open(&path).unwrap();
+         let mut lock = if hold_external_lock {
+             external.execute_batch("BEGIN EXCLUSIVE").unwrap();
+@@ -2239,7 +2253,6 @@
+             drop(external);
+             LockGuard(None)
+         };
+-        let baseline_completions = completions.load(Ordering::SeqCst);
+         if admit_stale_before_shutdown {
+             bridge.poll_management();
+             assert!(

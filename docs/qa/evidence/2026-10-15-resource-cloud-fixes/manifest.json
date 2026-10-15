@@ -1,0 +1,942 @@
+{
+  "utc": "2026-10-14T23:37:26.861224+00:00",
+  "head": "d8826f0bdb8d89255f3448b5b61b6eee83faa87a",
+  "artifacts": [
+    {
+      "path": "root-affected-counts.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/affected-counts.json",
+      "source_sha256": "2b0415eb5263e9984e724177da5c0c46aa2458e41b362ad44bbd6cb62c7540e5",
+      "stored_sha256": "2b0415eb5263e9984e724177da5c0c46aa2458e41b362ad44bbd6cb62c7540e5",
+      "encoding": "identity",
+      "bytes": 6024
+    },
+    {
+      "path": "root-app-cloud-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-cloud-green.log",
+      "source_sha256": "bfc9a1aa934480430337115b7419939efcbaa6583dc44bb282a031d14470634e",
+      "stored_sha256": "bfc9a1aa934480430337115b7419939efcbaa6583dc44bb282a031d14470634e",
+      "encoding": "identity",
+      "bytes": 20287
+    },
+    {
+      "path": "root-app-cloud-green.log.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-cloud-green.log.attempt1",
+      "source_sha256": "8b8e95ad246071f64b5cddd33f6a5cc00bd7bb8da51293eb939e9e06825a0de1",
+      "stored_sha256": "8b8e95ad246071f64b5cddd33f6a5cc00bd7bb8da51293eb939e9e06825a0de1",
+      "encoding": "identity",
+      "bytes": 2960
+    },
+    {
+      "path": "root-app-cloud-green.log.attempt2",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-cloud-green.log.attempt2",
+      "source_sha256": "e2f72a66a2aec0667f8c31af48d4dacb42f4acd4ff60acf6f0ef6df06dd1dd34",
+      "stored_sha256": "e2f72a66a2aec0667f8c31af48d4dacb42f4acd4ff60acf6f0ef6df06dd1dd34",
+      "encoding": "identity",
+      "bytes": 20929
+    },
+    {
+      "path": "root-app-web-green-results.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-web-green-results.json",
+      "source_sha256": "05aa6fd1d60caf6cfc1ba87132409ec6d207aa3bba7bb979a92acaa1acc6d3b2",
+      "stored_sha256": "05aa6fd1d60caf6cfc1ba87132409ec6d207aa3bba7bb979a92acaa1acc6d3b2",
+      "encoding": "identity",
+      "bytes": 302
+    },
+    {
+      "path": "root-app-web-green-results.json.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-web-green-results.json.attempt1",
+      "source_sha256": "d6fb9a3f5364fd0bc40ea29cd59a22ba8a8443a66ae65f157d7e3b751a96390f",
+      "stored_sha256": "d6fb9a3f5364fd0bc40ea29cd59a22ba8a8443a66ae65f157d7e3b751a96390f",
+      "encoding": "identity",
+      "bytes": 336
+    },
+    {
+      "path": "root-app-web-green-results.json.attempt2",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/app-web-green-results.json.attempt2",
+      "source_sha256": "05aa6fd1d60caf6cfc1ba87132409ec6d207aa3bba7bb979a92acaa1acc6d3b2",
+      "stored_sha256": "05aa6fd1d60caf6cfc1ba87132409ec6d207aa3bba7bb979a92acaa1acc6d3b2",
+      "encoding": "identity",
+      "bytes": 302
+    },
+    {
+      "path": "root-archive-evidence.py",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/archive-evidence.py",
+      "source_sha256": "7d54ada0b923cb169ae186ba8405899bc0053328a5e670b44caabe1f14d9de5e",
+      "stored_sha256": "7d54ada0b923cb169ae186ba8405899bc0053328a5e670b44caabe1f14d9de5e",
+      "encoding": "identity",
+      "bytes": 4345
+    },
+    {
+      "path": "root-boundary-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/boundary-green.log",
+      "source_sha256": "6bbb7fca8957e37fbb04f08ec4dbda6fd475f0acb14ea6275c7e00dee2a860ab",
+      "stored_sha256": "6bbb7fca8957e37fbb04f08ec4dbda6fd475f0acb14ea6275c7e00dee2a860ab",
+      "encoding": "identity",
+      "bytes": 321
+    },
+    {
+      "path": "root-cleanup_failed_runtime_fixture.rs",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/cleanup_failed_runtime_fixture.rs",
+      "source_sha256": "b544aee1b67e07c4c354eba372962cacdcb81be82f46a39c82002cdf8a25e9a4",
+      "stored_sha256": "b544aee1b67e07c4c354eba372962cacdcb81be82f46a39c82002cdf8a25e9a4",
+      "encoding": "identity",
+      "bytes": 2377
+    },
+    {
+      "path": "root-clippy-before-pty-followup.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/clippy-before-pty-followup.log",
+      "source_sha256": "d2577f894e05c3f02a9101e2e4507a93ff8b0ce80015203386cadf4388fa855f",
+      "stored_sha256": "d2577f894e05c3f02a9101e2e4507a93ff8b0ce80015203386cadf4388fa855f",
+      "encoding": "identity",
+      "bytes": 2995
+    },
+    {
+      "path": "root-clippy-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/clippy-green.log",
+      "source_sha256": "b49d5b6f6f41afa516289b36af4d974b98b7a6b91db622b3380c54e28bc6e5b7",
+      "stored_sha256": "b49d5b6f6f41afa516289b36af4d974b98b7a6b91db622b3380c54e28bc6e5b7",
+      "encoding": "identity",
+      "bytes": 650
+    },
+    {
+      "path": "root-cloud_answers_optimized.rs",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/cloud_answers_optimized.rs",
+      "source_sha256": "17592bf2b1f3f35b93aa822dcdd6d65aa74df5b298cc7bf50ae74a4c40d79b57",
+      "stored_sha256": "17592bf2b1f3f35b93aa822dcdd6d65aa74df5b298cc7bf50ae74a4c40d79b57",
+      "encoding": "identity",
+      "bytes": 9174
+    },
+    {
+      "path": "root-deps-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/deps-green.log",
+      "source_sha256": "c3fffed6e32b2c5e0930449a782c8d6a1fb001baad470d4171507e39a0fd79b1",
+      "stored_sha256": "c3fffed6e32b2c5e0930449a782c8d6a1fb001baad470d4171507e39a0fd79b1",
+      "encoding": "identity",
+      "bytes": 174
+    },
+    {
+      "path": "root-evidence-verification-attempt1.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/evidence-verification-attempt1.json",
+      "source_sha256": "d24a54ea1ca81cdcd726fd014446a651f511deaea23fc6fa2cee83e528761a8d",
+      "stored_sha256": "d24a54ea1ca81cdcd726fd014446a651f511deaea23fc6fa2cee83e528761a8d",
+      "encoding": "identity",
+      "bytes": 412
+    },
+    {
+      "path": "root-final-source-snapshot.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/final-source-snapshot.json",
+      "source_sha256": "e3ab2e61229facdec5d48b9d059fbfa390a99ab0b4477e44ab2b1828f6e9cc76",
+      "stored_sha256": "e3ab2e61229facdec5d48b9d059fbfa390a99ab0b4477e44ab2b1828f6e9cc76",
+      "encoding": "identity",
+      "bytes": 47056
+    },
+    {
+      "path": "root-final-task-changes.patch",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/final-task-changes.patch",
+      "source_sha256": "4abcf37f6113f34346b50fe90c2ac38e2af96bcecd19582b2781e65958ad2fc0",
+      "stored_sha256": "4abcf37f6113f34346b50fe90c2ac38e2af96bcecd19582b2781e65958ad2fc0",
+      "encoding": "identity",
+      "bytes": 113769
+    },
+    {
+      "path": "root-final-test-counts.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/final-test-counts.json",
+      "source_sha256": "487b4b51581747df33b5c3ad1c2f18415e66aef4c301c6ffa64968e5ea465b43",
+      "stored_sha256": "487b4b51581747df33b5c3ad1c2f18415e66aef4c301c6ffa64968e5ea465b43",
+      "encoding": "identity",
+      "bytes": 29718
+    },
+    {
+      "path": "root-finalize-docs.py",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/finalize-docs.py",
+      "source_sha256": "360492f2c8b8738a8ea1db8e0b287b2c442ca556ec752f55c928df4988274e87",
+      "stored_sha256": "360492f2c8b8738a8ea1db8e0b287b2c442ca556ec752f55c928df4988274e87",
+      "encoding": "identity",
+      "bytes": 22478
+    },
+    {
+      "path": "root-fmt-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/fmt-green.log",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "identity",
+      "bytes": 0
+    },
+    {
+      "path": "root-integration-gates-results.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/integration-gates-results.json",
+      "source_sha256": "6debdca56623361126027d558519e4a581360634c7ca794486d132907e6ac992",
+      "stored_sha256": "6debdca56623361126027d558519e4a581360634c7ca794486d132907e6ac992",
+      "encoding": "identity",
+      "bytes": 1917
+    },
+    {
+      "path": "root-integration-gates-results.json.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/integration-gates-results.json.attempt1",
+      "source_sha256": "4e3c475b9bf1f1e1254e35e8e404de621a599bea5d60e84efd17922392b6d7d5",
+      "stored_sha256": "4e3c475b9bf1f1e1254e35e8e404de621a599bea5d60e84efd17922392b6d7d5",
+      "encoding": "identity",
+      "bytes": 533
+    },
+    {
+      "path": "root-macos-zombie-probe-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/macos-zombie-probe-result.json",
+      "source_sha256": "d9d2d49a8d0e56e98a361aa245be513205241a3f9b50831897c0f765ed50fa2f",
+      "stored_sha256": "d9d2d49a8d0e56e98a361aa245be513205241a3f9b50831897c0f765ed50fa2f",
+      "encoding": "identity",
+      "bytes": 109
+    },
+    {
+      "path": "root-macos-zombie-probe.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/macos-zombie-probe.log",
+      "source_sha256": "98cd772e58bf7a4b32c33db9da2883513401a75b0e2e983fc9e767dbd6319816",
+      "stored_sha256": "98cd772e58bf7a4b32c33db9da2883513401a75b0e2e983fc9e767dbd6319816",
+      "encoding": "identity",
+      "bytes": 3841
+    },
+    {
+      "path": "root-macos-zombie-probe.rs",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/macos-zombie-probe.rs",
+      "source_sha256": "1b251d426add8f98167146e2a01e08fe54a0a6f7907c14ec679df0b80786a246",
+      "stored_sha256": "1b251d426add8f98167146e2a01e08fe54a0a6f7907c14ec679df0b80786a246",
+      "encoding": "identity",
+      "bytes": 2906
+    },
+    {
+      "path": "root-production-probe-selection-attempt.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/production-probe-selection-attempt.json",
+      "source_sha256": "fb8a260c467b0ba863c16a8c186cabd0adc650e5c62912391ada75324cecf3b0",
+      "stored_sha256": "fb8a260c467b0ba863c16a8c186cabd0adc650e5c62912391ada75324cecf3b0",
+      "encoding": "identity",
+      "bytes": 550
+    },
+    {
+      "path": "root-projection-benchmark-compile.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/projection-benchmark-compile.log",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "identity",
+      "bytes": 0
+    },
+    {
+      "path": "root-projection-benchmark-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/projection-benchmark-green.log",
+      "source_sha256": "692269d7b6b83c0bcf28d0f7762c47fedfb75b3ffc03868d316aa6cdea8b9e93",
+      "stored_sha256": "692269d7b6b83c0bcf28d0f7762c47fedfb75b3ffc03868d316aa6cdea8b9e93",
+      "encoding": "identity",
+      "bytes": 5623
+    },
+    {
+      "path": "root-projection-benchmark-identity.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/projection-benchmark-identity.json",
+      "source_sha256": "483e4839adca96f774bc3b7da5b9c9b36248c8edc7059feddd5db8a2d9a4e844",
+      "stored_sha256": "483e4839adca96f774bc3b7da5b9c9b36248c8edc7059feddd5db8a2d9a4e844",
+      "encoding": "identity",
+      "bytes": 1053
+    },
+    {
+      "path": "root-pty-before-reaper-red-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-before-reaper-red-result.json",
+      "source_sha256": "e12773a9040d9ae0a2f038d4f5fd03317358749ee0cb43b1d1e6b93b068a8ad9",
+      "stored_sha256": "e12773a9040d9ae0a2f038d4f5fd03317358749ee0cb43b1d1e6b93b068a8ad9",
+      "encoding": "identity",
+      "bytes": 334
+    },
+    {
+      "path": "root-pty-before-reaper-red.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-before-reaper-red.log",
+      "source_sha256": "40371542cc24a858e94993516c666ff1742d17b3c033212a4873ab0dd2ea0e68",
+      "stored_sha256": "40371542cc24a858e94993516c666ff1742d17b3c033212a4873ab0dd2ea0e68",
+      "encoding": "identity",
+      "bytes": 1613
+    },
+    {
+      "path": "root-pty-followup-green-results.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-followup-green-results.json",
+      "source_sha256": "ee141f3883101258f65aee48cc34465ab911db4b67ebb0dd7ce53c195bccc624",
+      "stored_sha256": "ee141f3883101258f65aee48cc34465ab911db4b67ebb0dd7ce53c195bccc624",
+      "encoding": "identity",
+      "bytes": 731
+    },
+    {
+      "path": "root-pty-followup-green-results.json.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-followup-green-results.json.attempt1",
+      "source_sha256": "4897745d5cfa20ab00602a39bca3cafb72e052b14bf38c4284406f7f9dfed09b",
+      "stored_sha256": "4897745d5cfa20ab00602a39bca3cafb72e052b14bf38c4284406f7f9dfed09b",
+      "encoding": "identity",
+      "bytes": 325
+    },
+    {
+      "path": "root-pty-followup-green-results.json.attempt2",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-followup-green-results.json.attempt2",
+      "source_sha256": "7cd65099352b59d83d145469552e59df43484656273b72e7367fa6ac636d1f9e",
+      "stored_sha256": "7cd65099352b59d83d145469552e59df43484656273b72e7367fa6ac636d1f9e",
+      "encoding": "identity",
+      "bytes": 325
+    },
+    {
+      "path": "root-pty-foreground-red-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-foreground-red-result.json",
+      "source_sha256": "545948b7f23b8096adb73befa4fb99e39b4ef682e96badcfae4ab4659060e622",
+      "stored_sha256": "545948b7f23b8096adb73befa4fb99e39b4ef682e96badcfae4ab4659060e622",
+      "encoding": "identity",
+      "bytes": 242
+    },
+    {
+      "path": "root-pty-foreground-red.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-foreground-red.log",
+      "source_sha256": "91ca29977151f40c4ffb6d60d7f72bae3fbd1ea67b2483991af1fd8e027bb833",
+      "stored_sha256": "91ca29977151f40c4ffb6d60d7f72bae3fbd1ea67b2483991af1fd8e027bb833",
+      "encoding": "identity",
+      "bytes": 2916
+    },
+    {
+      "path": "root-pty-natural-exit-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-green.log",
+      "source_sha256": "8e1d2d5abf6df12685d38ff5eb26424e127285b5ec452be07e70415b55d02993",
+      "stored_sha256": "8e1d2d5abf6df12685d38ff5eb26424e127285b5ec452be07e70415b55d02993",
+      "encoding": "identity",
+      "bytes": 6070
+    },
+    {
+      "path": "root-pty-natural-exit-green.log.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-green.log.attempt1",
+      "source_sha256": "c99dafd1127724573eb9c4588896718fc89159890dfbed277f45bcc16dd042f7",
+      "stored_sha256": "c99dafd1127724573eb9c4588896718fc89159890dfbed277f45bcc16dd042f7",
+      "encoding": "identity",
+      "bytes": 6782
+    },
+    {
+      "path": "root-pty-natural-exit-green.log.attempt2",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-green.log.attempt2",
+      "source_sha256": "b4f01c511cd7984dc5ce88b28e93b0ed4383a3f5bbc0a47cf282731daa368fde",
+      "stored_sha256": "b4f01c511cd7984dc5ce88b28e93b0ed4383a3f5bbc0a47cf282731daa368fde",
+      "encoding": "identity",
+      "bytes": 7629
+    },
+    {
+      "path": "root-pty-natural-exit-red-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-red-result.json",
+      "source_sha256": "97db5a27956472ded11b84861bc04c4b53cf5d60ee454d03a3f34e1523d96b4e",
+      "stored_sha256": "97db5a27956472ded11b84861bc04c4b53cf5d60ee454d03a3f34e1523d96b4e",
+      "encoding": "identity",
+      "bytes": 331
+    },
+    {
+      "path": "root-pty-natural-exit-red.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-natural-exit-red.log",
+      "source_sha256": "c6c29a5c7334238485d720369c79e1704a12027c93410a237329d704a77f8188",
+      "stored_sha256": "c6c29a5c7334238485d720369c79e1704a12027c93410a237329d704a77f8188",
+      "encoding": "identity",
+      "bytes": 1566
+    },
+    {
+      "path": "root-pty-production-compile.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-compile.log",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "identity",
+      "bytes": 0
+    },
+    {
+      "path": "root-pty-production-compile.log.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-compile.log.attempt1",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "identity",
+      "bytes": 0
+    },
+    {
+      "path": "root-pty-production-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-green.log",
+      "source_sha256": "974cc5b81fdd31ff85899f76eb822ebaf43025e11adb8eed793f1c9751141004",
+      "stored_sha256": "974cc5b81fdd31ff85899f76eb822ebaf43025e11adb8eed793f1c9751141004",
+      "encoding": "identity",
+      "bytes": 1764
+    },
+    {
+      "path": "root-pty-production-green.log.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-green.log.attempt1",
+      "source_sha256": "3fa4dc9347f911d40d413af20a771273e535ef53d2842bb4d27d269ce6dbf617",
+      "stored_sha256": "3fa4dc9347f911d40d413af20a771273e535ef53d2842bb4d27d269ce6dbf617",
+      "encoding": "identity",
+      "bytes": 1765
+    },
+    {
+      "path": "root-pty-production-identity.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-identity.json",
+      "source_sha256": "3c0100688d2c0dbddbc570e20352b2deae496a98e151415ebbb8fe916ccf4242",
+      "stored_sha256": "3c0100688d2c0dbddbc570e20352b2deae496a98e151415ebbb8fe916ccf4242",
+      "encoding": "identity",
+      "bytes": 1932
+    },
+    {
+      "path": "root-pty-production-identity.json.attempt1",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/pty-production-identity.json.attempt1",
+      "source_sha256": "bca38ac0f20962ea84cc2454e5ba0f510c6c76af187bf858af1a2963f6212500",
+      "stored_sha256": "bca38ac0f20962ea84cc2454e5ba0f510c6c76af187bf858af1a2963f6212500",
+      "encoding": "identity",
+      "bytes": 1766
+    },
+    {
+      "path": "root-redaction-production.rs",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/redaction-production.rs",
+      "source_sha256": "ab70fa75543e404b14ee97dff214030eae8333f130fe223c39cc8eff9e7d29ec",
+      "stored_sha256": "ab70fa75543e404b14ee97dff214030eae8333f130fe223c39cc8eff9e7d29ec",
+      "encoding": "identity",
+      "bytes": 90101
+    },
+    {
+      "path": "root-root-projection-red-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/root-projection-red-result.json",
+      "source_sha256": "78c98ce21f00d2ce51842b8e262e8eea26100756edf2dbfd1c3f0c5b332f042f",
+      "stored_sha256": "78c98ce21f00d2ce51842b8e262e8eea26100756edf2dbfd1c3f0c5b332f042f",
+      "encoding": "identity",
+      "bytes": 323
+    },
+    {
+      "path": "root-root-projection-red.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/root-projection-red.log",
+      "source_sha256": "08755ead0bf8c2c5c349045b3b09595200315c8df26cd72af420647ef53b8eba",
+      "stored_sha256": "08755ead0bf8c2c5c349045b3b09595200315c8df26cd72af420647ef53b8eba",
+      "encoding": "identity",
+      "bytes": 3267
+    },
+    {
+      "path": "root-run-final-gates.py",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/run-final-gates.py",
+      "source_sha256": "9203a659301ba59447d3aab45a53f56959118a47d767a86245469543b3586ef1",
+      "stored_sha256": "9203a659301ba59447d3aab45a53f56959118a47d767a86245469543b3586ef1",
+      "encoding": "identity",
+      "bytes": 1426
+    },
+    {
+      "path": "root-run-production-pty.py",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/run-production-pty.py",
+      "source_sha256": "4b903f69b25145bd9644a0b66cdb05438632666459c008812522018f1845f7e9",
+      "stored_sha256": "4b903f69b25145bd9644a0b66cdb05438632666459c008812522018f1845f7e9",
+      "encoding": "identity",
+      "bytes": 2091
+    },
+    {
+      "path": "root-runtime-exit-handshake-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/runtime-exit-handshake-green.log",
+      "source_sha256": "4c0126b4e09a25ed3d170103cbda1c415944ef2a14a7a5c4a858b0e1bb02345c",
+      "stored_sha256": "4c0126b4e09a25ed3d170103cbda1c415944ef2a14a7a5c4a858b0e1bb02345c",
+      "encoding": "identity",
+      "bytes": 1308
+    },
+    {
+      "path": "root-runtime-failed-fixture-cleanup-compile.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/runtime-failed-fixture-cleanup-compile.log",
+      "source_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stored_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "encoding": "identity",
+      "bytes": 0
+    },
+    {
+      "path": "root-runtime-failed-fixture-cleanup.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/runtime-failed-fixture-cleanup.log",
+      "source_sha256": "8fffa576b8075547af20c323dd2438e2ca01f761872e96bf0584e0e620faa3a6",
+      "stored_sha256": "8fffa576b8075547af20c323dd2438e2ca01f761872e96bf0584e0e620faa3a6",
+      "encoding": "identity",
+      "bytes": 308
+    },
+    {
+      "path": "root-secret-pty-green-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/secret-pty-green-result.json",
+      "source_sha256": "6a3b3cc20656f875f9f95d2efb97c2e2f7baeb81270e442118b23e63b45bb91e",
+      "stored_sha256": "6a3b3cc20656f875f9f95d2efb97c2e2f7baeb81270e442118b23e63b45bb91e",
+      "encoding": "identity",
+      "bytes": 232
+    },
+    {
+      "path": "root-secret-pty-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/secret-pty-green.log",
+      "source_sha256": "7f0b05cd4419915681cc33e605d7089286c9d35a4a89066d48a318b565fffc7e",
+      "stored_sha256": "7f0b05cd4419915681cc33e605d7089286c9d35a4a89066d48a318b565fffc7e",
+      "encoding": "identity",
+      "bytes": 12950
+    },
+    {
+      "path": "root-verify-evidence.py",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/verify-evidence.py",
+      "source_sha256": "97b4e0392cc657bd3f637d3c69d7540c6393be1e74e970aa6f54597dccca2a88",
+      "stored_sha256": "97b4e0392cc657bd3f637d3c69d7540c6393be1e74e970aa6f54597dccca2a88",
+      "encoding": "identity",
+      "bytes": 3218
+    },
+    {
+      "path": "root-web-green-result.json",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/web-green-result.json",
+      "source_sha256": "e44d47914c42cfb029fcb28a2d8054fbfd08168118cbbcfd8961522267f48e69",
+      "stored_sha256": "e44d47914c42cfb029fcb28a2d8054fbfd08168118cbbcfd8961522267f48e69",
+      "encoding": "identity",
+      "bytes": 182
+    },
+    {
+      "path": "root-web-green.log",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/web-green.log",
+      "source_sha256": "c6856019e4f0e5526d8913008ad62f7ba43a7ffd107cb97efca6072591a608d8",
+      "stored_sha256": "c6856019e4f0e5526d8913008ad62f7ba43a7ffd107cb97efca6072591a608d8",
+      "encoding": "identity",
+      "bytes": 43055
+    },
+    {
+      "path": "root-workspace-green.log.gz",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/workspace-green.log",
+      "source_sha256": "ab3bb393a8fa3b23dd158be45c5fbd65fca9c03144e62bdcbfcebaadff0fac2a",
+      "stored_sha256": "2645461366d5b2e440c862309f07ad1e324021b76e25633cddcaf68de847ad68",
+      "encoding": "gzip",
+      "bytes": 140649
+    },
+    {
+      "path": "root-workspace-green.log.attempt1.gz",
+      "source": "/private/tmp/deppy-cloud-fix-root-20261015/workspace-green.log.attempt1",
+      "source_sha256": "c172f34d64dc32ce43ba8ef56082438215ea43774d9f0838de0a810711f01453",
+      "stored_sha256": "0555bff76053e53280a57fa475d5b66def2cc74f089bf0bd8d4f23c0866b400b",
+      "encoding": "gzip",
+      "bytes": 141224
+    },
+    {
+      "path": "management-management-before-fixture-followup.rs",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-before-fixture-followup.rs",
+      "source_sha256": "b6c09a7a9ce98fcf72fd6a47c2d3b78594a0c5bb9620b10f36aa7f233db5ca04",
+      "stored_sha256": "b6c09a7a9ce98fcf72fd6a47c2d3b78594a0c5bb9620b10f36aa7f233db5ca04",
+      "encoding": "identity",
+      "bytes": 91529
+    },
+    {
+      "path": "management-management-design-and-test-scope.md",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-design-and-test-scope.md",
+      "source_sha256": "531c18d8a9dc13a1dc711f09831cde5c846504a693b41412a78961c0f4341dfe",
+      "stored_sha256": "531c18d8a9dc13a1dc711f09831cde5c846504a693b41412a78961c0f4341dfe",
+      "encoding": "identity",
+      "bytes": 5786
+    },
+    {
+      "path": "management-management-fixes.patch",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-fixes.patch",
+      "source_sha256": "f23ccf603741ef9ce185c8f9f721f126e84a2754de2430ced4ccdb5bbfb70caf",
+      "stored_sha256": "f23ccf603741ef9ce185c8f9f721f126e84a2754de2430ced4ccdb5bbfb70caf",
+      "encoding": "identity",
+      "bytes": 22662
+    },
+    {
+      "path": "management-management-fixture-followup.json",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-fixture-followup.json",
+      "source_sha256": "ff6d54c3a2a7ac894f26c73d128fb0d779482e720b57c01c194bafb3ee81e524",
+      "stored_sha256": "ff6d54c3a2a7ac894f26c73d128fb0d779482e720b57c01c194bafb3ee81e524",
+      "encoding": "identity",
+      "bytes": 656
+    },
+    {
+      "path": "management-management-fixture-followup.md",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-fixture-followup.md",
+      "source_sha256": "e98f1306d4c869d3094ed1fcbaa165d808714e65ab29176418fda91024569989",
+      "stored_sha256": "e98f1306d4c869d3094ed1fcbaa165d808714e65ab29176418fda91024569989",
+      "encoding": "identity",
+      "bytes": 2537
+    },
+    {
+      "path": "management-management-fixture-followup.patch",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/management-fixture-followup.patch",
+      "source_sha256": "c3e538085b5e87aa065e2917b584124be053e2b3d3451077b82b799b97f51721",
+      "stored_sha256": "c3e538085b5e87aa065e2917b584124be053e2b3d3451077b82b799b97f51721",
+      "encoding": "identity",
+      "bytes": 1873
+    },
+    {
+      "path": "management-patch-apply-check.log",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/patch-apply-check.log",
+      "source_sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061",
+      "stored_sha256": "19eaf43821a7660ec323a87c8457bf74823beb296c39f5e01aa8a683aa50f061",
+      "encoding": "identity",
+      "bytes": 7
+    },
+    {
+      "path": "management-pty-exit-retention-peer-review.md",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/pty-exit-retention-peer-review.md",
+      "source_sha256": "05ee67a448ec7c5b80f5ae61a9ae3cab6dcecf0fabb10cc02c9533a68ba8eddb",
+      "stored_sha256": "05ee67a448ec7c5b80f5ae61a9ae3cab6dcecf0fabb10cc02c9533a68ba8eddb",
+      "encoding": "identity",
+      "bytes": 8504
+    },
+    {
+      "path": "management-source-scope.json",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/source-scope.json",
+      "source_sha256": "1c4463451412c9e1989a4d97862ad623748b72dab386ca9808d51925318c2b64",
+      "stored_sha256": "1c4463451412c9e1989a4d97862ad623748b72dab386ca9808d51925318c2b64",
+      "encoding": "identity",
+      "bytes": 786
+    },
+    {
+      "path": "management-transport-peer-review.md",
+      "source": "/private/tmp/deppy-cloud-fix-management-results-20261015/transport-peer-review.md",
+      "source_sha256": "0c91900041bd2320897d1ad592be444341f948b9b736430c0024e10ff3da7375",
+      "stored_sha256": "0c91900041bd2320897d1ad592be444341f948b9b736430c0024e10ff3da7375",
+      "encoding": "identity",
+      "bytes": 2716
+    },
+    {
+      "path": "pty-NOTES.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/NOTES.md",
+      "source_sha256": "caecc7f9c02afc369843daedba1e1ba9d27f1740b8c67251614c06bec8fffe70",
+      "stored_sha256": "caecc7f9c02afc369843daedba1e1ba9d27f1740b8c67251614c06bec8fffe70",
+      "encoding": "identity",
+      "bytes": 8388
+    },
+    {
+      "path": "pty-management-cross-review.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/management-cross-review.md",
+      "source_sha256": "74e4dcb066d6b84389735e1bcaef3bfe8dded51d315eae74afe3852bfde4db6a",
+      "stored_sha256": "74e4dcb066d6b84389735e1bcaef3bfe8dded51d315eae74afe3852bfde4db6a",
+      "encoding": "identity",
+      "bytes": 3567
+    },
+    {
+      "path": "pty-product-after-tests.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/product-after-tests.patch",
+      "source_sha256": "ae42396d9265474eaa4671188f2a5d08c5e7c8e4f01a62b589893c5d7892e844",
+      "stored_sha256": "ae42396d9265474eaa4671188f2a5d08c5e7c8e4f01a62b589893c5d7892e844",
+      "encoding": "identity",
+      "bytes": 14217
+    },
+    {
+      "path": "pty-pty-exit-retention-before-dedup.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention-before-dedup.patch",
+      "source_sha256": "9100e55986094cb385a0111e90d6b4055f56817c8203f0bd4696cfde5d736dfd",
+      "stored_sha256": "9100e55986094cb385a0111e90d6b4055f56817c8203f0bd4696cfde5d736dfd",
+      "encoding": "identity",
+      "bytes": 13666
+    },
+    {
+      "path": "pty-pty-exit-retention-notes.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention-notes.md",
+      "source_sha256": "fac40a4dac82ca33da4a47197db87f9509127b92c45011e4bedd92aab9dcd3d1",
+      "stored_sha256": "fac40a4dac82ca33da4a47197db87f9509127b92c45011e4bedd92aab9dcd3d1",
+      "encoding": "identity",
+      "bytes": 4957
+    },
+    {
+      "path": "pty-pty-exit-retention-product.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention-product.patch",
+      "source_sha256": "1ea9c454390cbe684cb9e86d75c3e5ccf157d852b7c9762ce8692f706b204356",
+      "stored_sha256": "1ea9c454390cbe684cb9e86d75c3e5ccf157d852b7c9762ce8692f706b204356",
+      "encoding": "identity",
+      "bytes": 9806
+    },
+    {
+      "path": "pty-pty-exit-retention-sha256.json",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention-sha256.json",
+      "source_sha256": "b3f47a3e448dbde772db5b57c9ce9728d074e6716ddd1727a9c011b4256600d1",
+      "stored_sha256": "b3f47a3e448dbde772db5b57c9ce9728d074e6716ddd1727a9c011b4256600d1",
+      "encoding": "identity",
+      "bytes": 676
+    },
+    {
+      "path": "pty-pty-exit-retention-tests-only.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention-tests-only.patch",
+      "source_sha256": "2ca6fb07c0c1544e788e154574645a9aeca621db903235a0eb7b89f9a714b13e",
+      "stored_sha256": "2ca6fb07c0c1544e788e154574645a9aeca621db903235a0eb7b89f9a714b13e",
+      "encoding": "identity",
+      "bytes": 4076
+    },
+    {
+      "path": "pty-pty-exit-retention.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-exit-retention.patch",
+      "source_sha256": "b7ffb65d7599de7fedba3c5931eab3650e5793cd44c3f59202054db36788a585",
+      "stored_sha256": "b7ffb65d7599de7fedba3c5931eab3650e5793cd44c3f59202054db36788a585",
+      "encoding": "identity",
+      "bytes": 13882
+    },
+    {
+      "path": "pty-pty-fix-final-cumulative.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-fix-final-cumulative.patch",
+      "source_sha256": "c8185d01494ce011ddae7c81ed7f7902fb6fa60bef460d71cdf355dd6998c27f",
+      "stored_sha256": "c8185d01494ce011ddae7c81ed7f7902fb6fa60bef460d71cdf355dd6998c27f",
+      "encoding": "identity",
+      "bytes": 32536
+    },
+    {
+      "path": "pty-pty-fix-waitid-gap-cumulative.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-fix-waitid-gap-cumulative.patch",
+      "source_sha256": "64bb086361b01fe147a362e636222ef640e6b75fe600476c95d16395612b25bd",
+      "stored_sha256": "64bb086361b01fe147a362e636222ef640e6b75fe600476c95d16395612b25bd",
+      "encoding": "identity",
+      "bytes": 36887
+    },
+    {
+      "path": "pty-pty-fix.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-fix.patch",
+      "source_sha256": "a93b3030d07091cbae745c0ba9c4f71ce36d1b14e8011342d6e80b3b3439752b",
+      "stored_sha256": "a93b3030d07091cbae745c0ba9c4f71ce36d1b14e8011342d6e80b3b3439752b",
+      "encoding": "identity",
+      "bytes": 21114
+    },
+    {
+      "path": "pty-pty-waitid-gap-combined.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-combined.patch",
+      "source_sha256": "58c04ae5f46b39c4422484ea630f06944506d45dd77074c995dfcf3521fa5061",
+      "stored_sha256": "58c04ae5f46b39c4422484ea630f06944506d45dd77074c995dfcf3521fa5061",
+      "encoding": "identity",
+      "bytes": 9585
+    },
+    {
+      "path": "pty-pty-waitid-gap-final-combined.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-final-combined.patch",
+      "source_sha256": "1afb220824ba078e4804c08dbc20819859203c7330d97d886a735c8766d61da9",
+      "stored_sha256": "1afb220824ba078e4804c08dbc20819859203c7330d97d886a735c8766d61da9",
+      "encoding": "identity",
+      "bytes": 10698
+    },
+    {
+      "path": "pty-pty-waitid-gap-final-cumulative.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-final-cumulative.patch",
+      "source_sha256": "b719fb6093a9015337f11c15c18c328f5b7be11332e6c5dcdfae8d4652d7ba38",
+      "stored_sha256": "b719fb6093a9015337f11c15c18c328f5b7be11332e6c5dcdfae8d4652d7ba38",
+      "encoding": "identity",
+      "bytes": 37417
+    },
+    {
+      "path": "pty-pty-waitid-gap-final-product.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-final-product.patch",
+      "source_sha256": "52b8f23b9a26146bd0bc25938f86043347d9e0703ae0332bc52e006162425091",
+      "stored_sha256": "52b8f23b9a26146bd0bc25938f86043347d9e0703ae0332bc52e006162425091",
+      "encoding": "identity",
+      "bytes": 4647
+    },
+    {
+      "path": "pty-pty-waitid-gap-final-sha256.json",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-final-sha256.json",
+      "source_sha256": "8ead7a18d753d5558379420843dc241dc4a8e8d6c4643c7bd89e1ffc42e55e20",
+      "stored_sha256": "8ead7a18d753d5558379420843dc241dc4a8e8d6c4643c7bd89e1ffc42e55e20",
+      "encoding": "identity",
+      "bytes": 1064
+    },
+    {
+      "path": "pty-pty-waitid-gap-notes.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-notes.md",
+      "source_sha256": "3689ee9c1525079cc2aad1c5d0820e1183e582622f89f02837dcf079d9bdafe7",
+      "stored_sha256": "3689ee9c1525079cc2aad1c5d0820e1183e582622f89f02837dcf079d9bdafe7",
+      "encoding": "identity",
+      "bytes": 5734
+    },
+    {
+      "path": "pty-pty-waitid-gap-product.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-product.patch",
+      "source_sha256": "3acf202b3e6020dc324fdbb400d75e057b8b249ffe56444b2e93a2de8d2a5262",
+      "stored_sha256": "3acf202b3e6020dc324fdbb400d75e057b8b249ffe56444b2e93a2de8d2a5262",
+      "encoding": "identity",
+      "bytes": 3534
+    },
+    {
+      "path": "pty-pty-waitid-gap-sha256.json",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-sha256.json",
+      "source_sha256": "a3b8f02abf03477a7ee042f5768fb183a287b982eaef478c58ede0e8ca988866",
+      "stored_sha256": "a3b8f02abf03477a7ee042f5768fb183a287b982eaef478c58ede0e8ca988866",
+      "encoding": "identity",
+      "bytes": 1046
+    },
+    {
+      "path": "pty-pty-waitid-gap-tests-only.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-gap-tests-only.patch",
+      "source_sha256": "bfb65f466f75be7fc44da74eff2109df040212534857e74e7c855d142e6517d4",
+      "stored_sha256": "bfb65f466f75be7fc44da74eff2109df040212534857e74e7c855d142e6517d4",
+      "encoding": "identity",
+      "bytes": 6051
+    },
+    {
+      "path": "pty-pty-waitid-owned-final-combined.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-owned-final-combined.patch",
+      "source_sha256": "ded39e6e81906e261812d282e0ee61153249cbde4692203016f7745b5e6ade3b",
+      "stored_sha256": "ded39e6e81906e261812d282e0ee61153249cbde4692203016f7745b5e6ade3b",
+      "encoding": "identity",
+      "bytes": 16545
+    },
+    {
+      "path": "pty-pty-waitid-owned-final-cumulative.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-owned-final-cumulative.patch",
+      "source_sha256": "b0ad5d03695f227618499de6e33383a5f04e85cf24c4d16b0d6f7818d5b1dc4b",
+      "stored_sha256": "b0ad5d03695f227618499de6e33383a5f04e85cf24c4d16b0d6f7818d5b1dc4b",
+      "encoding": "identity",
+      "bytes": 38836
+    },
+    {
+      "path": "pty-pty-waitid-owned-final-notes.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-owned-final-notes.md",
+      "source_sha256": "41f305a49eb4c8235fedfd16b70580efdb548238de5046b6a948257164bf3001",
+      "stored_sha256": "41f305a49eb4c8235fedfd16b70580efdb548238de5046b6a948257164bf3001",
+      "encoding": "identity",
+      "bytes": 6503
+    },
+    {
+      "path": "pty-pty-waitid-owned-final-product.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-owned-final-product.patch",
+      "source_sha256": "e2752bb96e8691564d61b0ddca907444e7780cc63d2c9dda054e1bbbeaa92818",
+      "stored_sha256": "e2752bb96e8691564d61b0ddca907444e7780cc63d2c9dda054e1bbbeaa92818",
+      "encoding": "identity",
+      "bytes": 10494
+    },
+    {
+      "path": "pty-pty-waitid-owned-final-sha256.json",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-owned-final-sha256.json",
+      "source_sha256": "459b962cce96b8acd68b20b578c38d7f10673efe77b3bdff129d7638cddc4aa8",
+      "stored_sha256": "459b962cce96b8acd68b20b578c38d7f10673efe77b3bdff129d7638cddc4aa8",
+      "encoding": "identity",
+      "bytes": 1070
+    },
+    {
+      "path": "pty-pty-waitid-retention-notes.md",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-retention-notes.md",
+      "source_sha256": "0d3639edffe20de93dc78e902e03409496f2ec34170301ca26c272925b523aa6",
+      "stored_sha256": "0d3639edffe20de93dc78e902e03409496f2ec34170301ca26c272925b523aa6",
+      "encoding": "identity",
+      "bytes": 2887
+    },
+    {
+      "path": "pty-pty-waitid-retention-sha256.json",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-retention-sha256.json",
+      "source_sha256": "91cd42cae0e1e52368f8f00744e28875be4064567b523e96d98cdcdd7e0a3fa1",
+      "stored_sha256": "91cd42cae0e1e52368f8f00744e28875be4064567b523e96d98cdcdd7e0a3fa1",
+      "encoding": "identity",
+      "bytes": 623
+    },
+    {
+      "path": "pty-pty-waitid-retention.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/pty-waitid-retention.patch",
+      "source_sha256": "3ece3dc2ad3cc0ab33ab351ee4bbfcabb938616c374c771ae770732c0cc306b3",
+      "stored_sha256": "3ece3dc2ad3cc0ab33ab351ee4bbfcabb938616c374c771ae770732c0cc306b3",
+      "encoding": "identity",
+      "bytes": 7966
+    },
+    {
+      "path": "pty-scope.txt",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/scope.txt",
+      "source_sha256": "fda31e9f828fb1f729781c64e315d8c2acd5995e1dd8b9074cf19baf2880bedc",
+      "stored_sha256": "fda31e9f828fb1f729781c64e315d8c2acd5995e1dd8b9074cf19baf2880bedc",
+      "encoding": "identity",
+      "bytes": 56
+    },
+    {
+      "path": "pty-sha256.txt",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/sha256.txt",
+      "source_sha256": "a92a781713bca11e83283700e6cc07c2b6ba2ec967400fac33fc31e3eb7e00fa",
+      "stored_sha256": "a92a781713bca11e83283700e6cc07c2b6ba2ec967400fac33fc31e3eb7e00fa",
+      "encoding": "identity",
+      "bytes": 298
+    },
+    {
+      "path": "pty-tests-only.patch",
+      "source": "/private/tmp/deppy-cloud-fix-pty-results-20261015/tests-only.patch",
+      "source_sha256": "601c3143b953226d10aabbc50ee536e6e18ef9dacf0d3a35e7934b50cd338675",
+      "stored_sha256": "601c3143b953226d10aabbc50ee536e6e18ef9dacf0d3a35e7934b50cd338675",
+      "encoding": "identity",
+      "bytes": 7287
+    },
+    {
+      "path": "transport-manifest.json",
+      "source": "/private/tmp/deppy-cloud-fix-transport-results-20261015/manifest.json",
+      "source_sha256": "847e44c37b6651d9229a7b2fd10c47adf41c4d59d1aa0fc6278c284b0d9af6fc",
+      "stored_sha256": "847e44c37b6651d9229a7b2fd10c47adf41c4d59d1aa0fc6278c284b0d9af6fc",
+      "encoding": "identity",
+      "bytes": 1039
+    },
+    {
+      "path": "transport-report.md",
+      "source": "/private/tmp/deppy-cloud-fix-transport-results-20261015/report.md",
+      "source_sha256": "49d8d47bd8248885dc820b69ebe728f66d7e7e2235cc1ce4cf3756cd1eca099b",
+      "stored_sha256": "49d8d47bd8248885dc820b69ebe728f66d7e7e2235cc1ce4cf3756cd1eca099b",
+      "encoding": "identity",
+      "bytes": 5977
+    },
+    {
+      "path": "transport-root-metadata-cache-peer-review.md",
+      "source": "/private/tmp/deppy-cloud-fix-transport-results-20261015/root-metadata-cache-peer-review.md",
+      "source_sha256": "c30b51dc0d1825ff711b1236607ca787c84c6cee565c86b07cc282f5e4857007",
+      "stored_sha256": "c30b51dc0d1825ff711b1236607ca787c84c6cee565c86b07cc282f5e4857007",
+      "encoding": "identity",
+      "bytes": 4186
+    },
+    {
+      "path": "transport-transport-permissions.baseline-relative.patch",
+      "source": "/private/tmp/deppy-cloud-fix-transport-results-20261015/transport-permissions.baseline-relative.patch",
+      "source_sha256": "019156239bdf1d53f77bacfff07834531b40172f39cd50743bb6d504c29d42de",
+      "stored_sha256": "019156239bdf1d53f77bacfff07834531b40172f39cd50743bb6d504c29d42de",
+      "encoding": "identity",
+      "bytes": 24708
+    },
+    {
+      "path": "baseline-source-baseline.json",
+      "source": "/private/tmp/deppy-cloud-fix-baseline-20261015/source-baseline.json",
+      "source_sha256": "163133fa00991b80f61048ecb1f7d3d5095ec2c5d3c16d8d2f292d43150d70dc",
+      "stored_sha256": "163133fa00991b80f61048ecb1f7d3d5095ec2c5d3c16d8d2f292d43150d70dc",
+      "encoding": "identity",
+      "bytes": 46369
+    },
+    {
+      "path": "baseline-products-before.patch",
+      "source": "/private/tmp/deppy-cloud-fix-baseline-20261015/products-before.patch",
+      "source_sha256": "256310dc351b51f659a2db6b02af93f2692889d57311ebb845adf7eb708f94c3",
+      "stored_sha256": "256310dc351b51f659a2db6b02af93f2692889d57311ebb845adf7eb708f94c3",
+      "encoding": "identity",
+      "bytes": 414902
+    },
+    {
+      "path": "review-perf-cloud_answers_optimized.log",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-cloud_answers_optimized.log",
+      "source_sha256": "5a32ec781fb22b5db6f0b6ec45e44bd586b54b5427a32a0cb5dd2e3df1b95ae1",
+      "stored_sha256": "5a32ec781fb22b5db6f0b6ec45e44bd586b54b5427a32a0cb5dd2e3df1b95ae1",
+      "encoding": "identity",
+      "bytes": 6002
+    },
+    {
+      "path": "review-root-cloud_answers_optimized-independent.log",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/root-cloud_answers_optimized-independent.log",
+      "source_sha256": "a97202af90c36a75148ea3ec5b335db8c3c611bc6eae07d5c4dceba043bd959c",
+      "stored_sha256": "a97202af90c36a75148ea3ec5b335db8c3c611bc6eae07d5c4dceba043bd959c",
+      "encoding": "identity",
+      "bytes": 6002
+    },
+    {
+      "path": "review-perf-identity.json",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-identity.json",
+      "source_sha256": "a20f0cfaabd4478fa7826746777cbac2a055ce76ae6f622fc4d5cb578080e036",
+      "stored_sha256": "a20f0cfaabd4478fa7826746777cbac2a055ce76ae6f622fc4d5cb578080e036",
+      "encoding": "identity",
+      "bytes": 5062
+    },
+    {
+      "path": "review-perf-cloud_answers_optimized.rs",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-cloud_answers_optimized.rs",
+      "source_sha256": "34b2a4f1285c55e6970c32396abda607c3c23eff27b6b653b73897a9c4689f01",
+      "stored_sha256": "34b2a4f1285c55e6970c32396abda607c3c23eff27b6b653b73897a9c4689f01",
+      "encoding": "identity",
+      "bytes": 7951
+    },
+    {
+      "path": "review-perf-redaction-production.rs",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-redaction-production.rs",
+      "source_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+      "stored_sha256": "de510fa577dabdf646018f07624be16cd6dd1557c7d4fe3926226f9187caef9d",
+      "encoding": "identity",
+      "bytes": 87348
+    },
+    {
+      "path": "review-perf-pty_nonfrozen.rs",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-pty_nonfrozen.rs",
+      "source_sha256": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3",
+      "stored_sha256": "1575aa130ece5b543a2f3377e1f912282be49a46f6a517101116c5fc45365ca3",
+      "encoding": "identity",
+      "bytes": 4110
+    },
+    {
+      "path": "review-perf-owned-workload.py",
+      "source": "/Users/jr/Desktop/projects/deppy-sijo-performance/docs/reviews/evidence/2026-10-15-resource-cloud-code-review/perf-owned-workload.py",
+      "source_sha256": "8c3c99a57bdb3d19a6075aa2aba377d16fab55840fbbe1870cb9dbd1e724eb84",
+      "stored_sha256": "8c3c99a57bdb3d19a6075aa2aba377d16fab55840fbbe1870cb9dbd1e724eb84",
+      "encoding": "identity",
+      "bytes": 351
+    }
+  ]
+}

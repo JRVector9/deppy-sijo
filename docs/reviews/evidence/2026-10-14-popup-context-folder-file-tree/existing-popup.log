@@ -1,0 +1,75 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.99s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 68 tests
+test app::tests::document_popups_failed_move_preserves_captured_paths_and_allows_retry ... ok
+test app::tests::popup_audit_automatic_launcher_stays_once_and_pending_launch_is_preserved ... ok
+test app::tests::document_popups_old_move_outcome_does_not_clear_new_prompt ... ok
+test folder_identity::tests::popup_review_real_directory_identity_is_stable_and_rejects_files ... ok
+test folder_identity::tests::popup_review_fifo_is_rejected_without_waiting_for_a_writer ... ok
+test ui::document_dialogs::tests::popup_parity_render_document_popups ... ignored, offscreen PNGs for manual visual review
+test shortcuts::tests::popup_audit_floating_form_blocks_global_close_shortcut ... ok
+test shortcuts::tests::popup_audit_confirmation_blocks_global_close_shortcut_without_consuming_it ... ok
+test shortcuts::tests::popup_audit_query_window_keeps_global_shortcuts_available ... ok
+test app::tests::popup_audit_folder_reopen_shows_launcher_even_when_previously_seen ... ok
+test ui::document_dialogs::tests::document_popups_moved_ignore_does_not_update ... ok
+test ui::composer::tests::kittest_mcp_popup과_서버선택은_각각_page를_한번만_요청한다 ... ok
+test ui::document_dialogs::tests::document_popups_moved_busy_submission_and_retry_keep_paths ... ok
+test ui::document_dialogs::tests::popup_review_next_dirty_document_does_not_inherit_discard_focus ... ok
+test ui::document_dialogs::tests::document_popups_disabled_save_preserves_choice_and_shows_reason ... ok
+test ui::environment_dialogs::tests::env_ports_popup_render_environment_and_notices ... ignored, offscreen environment and notice popup PNGs for visual review
+test ui::document_dialogs::tests::popup_review_next_conflict_does_not_inherit_reload_focus ... ok
+test ui::env_profiles::tests::env_ports_popup_variable_delete_escape_cancels_without_writing ... ok
+test ui::file_tree::tests::popup_parity_render_file_tree_confirmation_and_inline ... ignored, offscreen popup PNGs for manual visual review
+test ui::file_tree::tests::popup_parity_render_file_tree_create ... ignored, offscreen popup PNGs for manual visual review
+test ui::document_dialogs::tests::document_popups_dirty_x_and_backdrop_cancel ... ok
+test app::popup_behavior_connector_probes::popup_behavior_probe_next_connector_approval_does_not_inherit_allow_focus ... ok
+test ui::document_dialogs::tests::document_popups_cap_close_and_escape_acknowledge ... ok
+test ui::env_profiles::tests::env_ports_popup_variable_delete_has_standard_controls_and_preserves_source ... ok
+test ui::env_profiles::tests::env_ports_popup_source_menu_owns_first_escape_and_preserves_confirmation ... ok
+test ui::agent_terminal::tests::status_bar_cached_ports_popup_refreshes_on_every_reopen ... ok
+test ui::popup::confirmation::tests::popup_parity_render_workspace_close ... ignored, offscreen popup PNGs for manual visual review
+test ui::file_tree::tests::popup_review_closed_context_menu_does_not_cancel_inline_rename ... ok
+test ui::env_profiles::tests::env_ports_popup_variable_target_change_does_not_inherit_delete_focus ... ok
+test ui::popup::input::tests::popup_review_pending_fence_blocks_shortcut_then_expires_next_pass ... ok
+test app::tests::popup_review_settings_worker_requires_legacy_confirmation_and_rejects_volume_conflict ... ok
+test ui::environment_dialogs::tests::env_ports_popup_project_close_requires_fresh_choice_for_next_project ... ok
+test ui::file_tree::tests::pr11r_unclaimed_native_move_cannot_rebind_after_terminal_text_or_popup_focus ... ok
+test ui::ports::tests::env_ports_popup_render_port_list ... ignored, offscreen common port popup PNGs for visual review
+test ui::ports::tests::popup_parity_render_port_confirmation ... ignored, offscreen popup PNGs for manual visual review
+test ui::popup::confirmation::tests::confirmation_requires_explicit_action_and_escape_cancels ... ok
+test ui::popup::information::tests::env_ports_popup_information_wraps_and_keeps_close_inside_narrow_viewport ... ok
+global shortcut admitted before first trash modal: None
+test ui::file_tree::tests::popup_behavior_probe_trash_failure_before_shortcuts ... ok
+test ui::resource_manager::tests::popup_parity_render_resource_confirmations ... ignored, offscreen popup PNGs for manual visual review
+test ui::fleet::tests::popup_audit_followup_behind_confirmation_keeps_its_draft_on_escape ... ok
+test ui::fleet::tests::popup_audit_escape_closes_only_the_front_fleet_form ... ok
+test ui::workspace::tests::popup_parity_render_session_close ... ignored, offscreen popup PNGs for manual visual review
+test ui::popup::confirmation::tests::close_popup_new_workspace_target_does_not_inherit_close_focus ... ok
+test ui::document_dialogs::tests::document_popups_dirty_buttons_keep_three_distinct_choices ... ok
+test ui::workspace::tests::popup_review_actual_search_area_keeps_enter_shift_enter_and_escape ... ok
+test ui::workspace::tests::terminal_keyboard는_textedit_popup_window가_없을때만_활성이다 ... ok
+test ui::document_dialogs::tests::document_popups_conflict_reload_cancel_and_escape ... ok
+test ui::prompt_palette::tests::popup_audit_front_palette_escape_returns_from_edit_then_closes ... ok
+test ui::workspace::tests::close_popup_new_session_target_does_not_inherit_close_focus ... ok
+test ui::ports::tests::env_ports_popup_port_list_close_and_refresh_keep_native_popover_ownership ... ok
+test ui::prompt_palette::tests::popup_audit_palette_draft_survives_escape_owned_by_confirmation ... ok
+test workspace_add::tests::popup_parity_render_workspace_add ... ignored, offscreen popup PNGs for manual visual review
+test ui::workspace::tests::popup_behavior_probe_workspace_rename_does_not_paste_into_terminal ... ok
+test ui::workspace::tests::popup_review_pending_session_close_blocks_global_keys_before_modal_render ... ok
+test ui::ports::tests::env_ports_popup_port_list_keeps_controls_inside_a_narrow_viewport ... ok
+test ui::ports::tests::env_ports_popup_port_list_has_standard_action_sizes_and_exact_copy_intent ... ok
+test ui::workspace::tests::popup_review_pending_conflict_blocks_first_frame_text_and_enter ... ok
+test ui::file_tree::tests::popup_behavior_pending_delete_is_visible_when_file_list_is_hidden ... ok
+test ui::file_tree::tests::popup_audit_creation_error_is_visible_inside_the_form_and_draft_is_kept ... ok
+test workspace_add::tests::popup_parity_github_footer_buttons_have_padding_and_gap ... ok
+test ui::document_dialogs::tests::document_popups_long_paths_and_warning_fit_narrow_screen ... ok
+test workspace_add::tests::popup_parity_footer_hint_aligns_with_the_fields ... ok
+test workspace_add::tests::popup_parity_github_inputs_have_the_mockup_height ... ok
+test workspace_add::tests::popup_parity_github_path_row_is_aligned_and_fills_the_form ... ok
+test app::popup_behavior_connector_probes::popup_behavior_connector_approval_focus_ids_are_bounded ... ok
+test ui::project_keys::tests::korean_popup_with_app_fonts_keeps_fields_and_footer_inside_narrow_viewport ... ok
+test ui::document_dialogs::tests::popup_review_long_translated_footer_fits_narrow_short_viewport ... ok
+test ui::project_keys::tests::edit_popup_uses_480_shell_36_fields_34_footer_and_narrow_internal_scroll ... ok
+
+test result: ok. 58 passed; 0 failed; 10 ignored; 0 measured; 3123 filtered out; finished in 0.31s

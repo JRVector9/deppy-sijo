@@ -1,0 +1,3 @@
+source-extracted descendant_pids only: sessions=32 ps_rows=2048 calls_per_full_miss_pass=96 mean_per_pass_ms=1.313 found=61440
+source-extracted descendant_pids only: sessions=128 ps_rows=8192 calls_per_full_miss_pass=384 mean_per_pass_ms=18.015 found=245760
+source-extracted descendant_pids only: sessions=256 ps_rows=16384 calls_per_full_miss_pass=768 mean_per_pass_ms=70.400 found=491520

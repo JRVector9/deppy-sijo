@@ -1,0 +1,8 @@
+frame=0 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false
+frame=1 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false
+frame=2 tree_row_clicked=true tree_focus_before_terminal=true terminal_active=true tree_focus_after_terminal=false
+frame=3 tree_row_clicked=false tree_focus_before_terminal=false terminal_active=true tree_focus_after_terminal=false
+
+thread 'main' (45270617) panicked at /private/tmp/deppy-tree-focus-probe-20261014.rs:47:16:
+CmdDelete/CmdOptionV require tree focus, but prior file click lost it
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

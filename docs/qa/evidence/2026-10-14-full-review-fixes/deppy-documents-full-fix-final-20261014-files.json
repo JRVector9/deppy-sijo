@@ -1,0 +1,68 @@
+[
+  {
+    "file": "crates/app/src/document_io.rs",
+    "baseline_sha256": "d2cebf2c65a3a89b3a01474df2aaa9ff23b4db6052566fd0fe9fe3520ff48fcd",
+    "new_sha256": "54ff41498d642d9bc53415ea49525fbfd98cc82945e5d92e05035979c36de4e4",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/document_io.rs"
+  },
+  {
+    "file": "crates/app/src/session_aux.rs",
+    "baseline_sha256": "10d39b0cd1c0be70557626a666f81d64886e7b3a71333b7c2b983b42684dcde0",
+    "new_sha256": "c6b9c6b80fafc16c99f4962bab6558bd3b0eb9e352fdce56f926875e72759ddd",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/session_aux.rs"
+  },
+  {
+    "file": "crates/app/src/ui/document.rs",
+    "baseline_sha256": "3c10e683c862afccefa500acfd6e8078ee42cee5bdde2dcd097fcd30541cb6d2",
+    "new_sha256": "8d3ee8a9daf97d70b1554c574cd950779b258a084c254c482023e81e0a94d587",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/ui/document.rs"
+  },
+  {
+    "file": "crates/app/src/ui/workspace.rs",
+    "baseline_sha256": "1e2bff612a635c57ebfa3523b49d73605fa0e0f715dd9d7855d7a96ef77a6a05",
+    "new_sha256": "1afc5c7955ce1bba4f5aa491682c22ddab8514768251647d39bb6828bba730d5",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/ui/workspace.rs"
+  },
+  {
+    "file": "crates/app/src/folder_identity.rs",
+    "baseline_sha256": "4ef0119f0cf9ab025fe2057811e0bc281cf9754c5417754af47840e4cc9fe4be",
+    "new_sha256": "26e93e6d4c3e404e1f4dc13774cc6e26fecde162a42845484366209467cfb446",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/folder_identity.rs"
+  },
+  {
+    "file": "crates/app/src/app.rs",
+    "baseline_sha256": "22ee82fc2c2a97d02ae185187cce7f991985066f56a74bcfde8f738443a391d6",
+    "new_sha256": "63da8b2c1312eba48868d4239b55fa2c6baa67ecc18b66b7d768412d9fb511bd",
+    "baseline_source": "/private/tmp/deppy-full-fix-baseline-20261014/crates/app/src/app.rs"
+  },
+  {
+    "file": "crates/i18n/locales/ko-KR/messages.txt",
+    "baseline_sha256": "37ef57d3c2c992d7fe65bb92104ddd7e33e90de56ba5d5445595150a09500999",
+    "new_sha256": "d8bad29fa17e034c44bc1b028f4bf42b80e8c0f749522923970b9f6af5cca006",
+    "baseline_source": "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n/locales/ko-KR/messages.txt"
+  },
+  {
+    "file": "crates/i18n/locales/en-US/messages.txt",
+    "baseline_sha256": "e78bb8e4975991ac2631e24190723471fb6592eb62e9c4ae40875e8f28e5c2b9",
+    "new_sha256": "6eca1c9342480db76697efceece98c43c87f4cba06e23795dbe2093f4e1ca159",
+    "baseline_source": "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n/locales/en-US/messages.txt"
+  },
+  {
+    "file": "crates/i18n/locales/ja-JP/messages.txt",
+    "baseline_sha256": "71e38e9504094dbc0b81dd26e20785fa0b9b20fdff704d441062b631e4f7cd16",
+    "new_sha256": "e1d4ef65b101e045c7cd2ae3bb7b6f70487f850baf7403298b260407acbe4c38",
+    "baseline_source": "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n/locales/ja-JP/messages.txt"
+  },
+  {
+    "file": "crates/i18n/locales/zh-Hans/messages.txt",
+    "baseline_sha256": "229e4dd5c478ec814d013b6a50a039273e425295a1239ae696b8157850c188c3",
+    "new_sha256": "8eb50f439612429bf9cd59bf3483ad2f66043bf315e7035288fef3053b802520",
+    "baseline_source": "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n/locales/zh-Hans/messages.txt"
+  },
+  {
+    "file": "crates/i18n/locales/zh-Hant/messages.txt",
+    "baseline_sha256": "1920270e63ddae7be7acd746f6013cdf5cb6e9a125b42248512191cfcc3c51af",
+    "new_sha256": "9a8985125f9d9cb084c8c6a25cd5b5aee3d2d755b32eebbc98346cfcb1917fa8",
+    "baseline_source": "/Users/jr/Desktop/projects/deppy-sijo-performance/crates/i18n/locales/zh-Hant/messages.txt"
+  }
+]

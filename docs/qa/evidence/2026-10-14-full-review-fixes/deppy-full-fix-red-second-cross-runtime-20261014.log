@@ -1,0 +1,21 @@
+   Compiling pty v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/pty)
+   Compiling session v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/session)
+   Compiling runtime v0.12.1 (/private/tmp/deppy-full-fix-lifecycle-20261014/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6.65s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/runtime-92b62424000a532a)
+
+running 1 test
+test agent_wrapper::tests::full_fix_lifecycle_backpressured_reader_cannot_send_old_query_to_fallback ...
+thread 'agent_wrapper::tests::full_fix_lifecycle_backpressured_reader_cannot_send_old_query_to_fallback' (48913528) panicked at crates/runtime/src/agent_wrapper.rs:503:9:
+fallback received old CPR while the reader boundary was unobserved: [1b, 5b, 31, 3b, 31, 52]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    agent_wrapper::tests::full_fix_lifecycle_backpressured_reader_cannot_send_old_query_to_fallback
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 399 filtered out; finished in 0.68s
+
+error: test failed, to rerun pass `-p runtime --lib`

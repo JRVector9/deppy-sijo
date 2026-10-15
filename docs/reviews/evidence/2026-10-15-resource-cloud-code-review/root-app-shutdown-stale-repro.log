@@ -1,0 +1,24 @@
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/web-remote)
+   Compiling agent-mcp v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/agent-mcp)
+   Compiling deppy-sijo v0.12.1 (/private/tmp/deppy-cloud-review-worktree-20261015/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 18.49s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 2 tests
+test cloud_agent::management::review_shutdown_20261015::review_20261015_shutdown_does_not_reenqueue_failed_stale_reads_forever ... stale-shutdown: lock=true, ended_before_release=false, completions_before_release=6, total_elapsed_ms=717
+
+thread 'cloud_agent::management::review_shutdown_20261015::review_20261015_shutdown_does_not_reenqueue_failed_stale_reads_forever' (51668322) panicked at crates/app/src/cloud_agent/management.rs:1999:9:
+shutdown kept creating failed stale read jobs after close began (6 completions while the external lock remained held)
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test cloud_agent::management::review_shutdown_20261015::review_20261015_shutdown_unlocked_stale_run_finishes ... stale-shutdown: lock=false, ended_before_release=true, completions_before_release=3, total_elapsed_ms=2
+ok
+
+failures:
+
+failures:
+    cloud_agent::management::review_shutdown_20261015::review_20261015_shutdown_does_not_reenqueue_failed_stale_reads_forever
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 3256 filtered out; finished in 0.75s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

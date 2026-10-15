@@ -1,0 +1,56 @@
+   Compiling deppy-sijo v0.12.1 (/private/tmp/deppy-popup-fix-input-20261014/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.39s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 8 tests
+
+thread 'ui::workspace::tests::popup_input_tree_click_keeps_keyboard_for_next_frame_delete' (46765700) panicked at crates/app/src/ui/workspace.rs:22557:9:
+terminal renderer reclaimed the clicked tree owner
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'ui::workspace::tests::popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste' (46765701) panicked at crates/app/src/ui/workspace.rs:22576:9:
+assertion failed: FileTreeUi::input_regression_owns_keyboard(&harness.ctx)
+
+thread 'ui::workspace::tests::popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it' (46765702) panicked at crates/app/src/ui/workspace.rs:22631:9:
+assertion failed: FileTreeUi::input_regression_owns_keyboard(&harness.ctx)
+
+thread 'ui::workspace::tests::popup_input_file_rename_listing_insert_keeps_focus_and_target' (46765699) panicked at crates/app/src/ui/workspace.rs:22528:9:
+assertion `left == right` failed: watcher insertion changed the actual Rename widget owner
+  left: None
+ right: Some(Id::new(10235000109946946060))
+
+thread 'ui::workspace::tests::popup_input_file_rename_escape_consumes_raw_and_native_batch' (46765697) panicked at crates/app/src/ui/workspace.rs:22429:9:
+file-tree input reached the terminal protocol
+
+thread 'ui::workspace::tests::popup_input_file_rename_ime_enter_keeps_composition_owned' (46765698) panicked at crates/app/src/ui/workspace.rs:22494:9:
+IME Enter must finish composition before Rename submission
+test ui::workspace::tests::popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste ... FAILED
+test ui::workspace::tests::popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it ... FAILED
+test ui::workspace::tests::popup_input_tree_click_keeps_keyboard_for_next_frame_delete ... FAILED
+test ui::workspace::tests::popup_input_file_rename_listing_insert_keeps_focus_and_target ... FAILED
+test ui::workspace::tests::popup_input_file_rename_escape_consumes_raw_and_native_batch ... FAILED
+
+thread 'ui::workspace::tests::popup_input_file_rename_enter_consumes_raw_and_native_batch' (46765696) panicked at crates/app/src/ui/workspace.rs:22429:9:
+file-tree input reached the terminal protocol
+test ui::workspace::tests::popup_input_file_rename_ime_enter_keeps_composition_owned ... FAILED
+test ui::workspace::tests::popup_input_file_rename_enter_consumes_raw_and_native_batch ... FAILED
+
+thread 'ui::file_tree::tests::popup_input_secondary_workspace_drag_does_not_autoscroll' (46765695) panicked at crates/app/src/ui/file_tree.rs:12154:9:
+assertion failed: harness.state().tree.workspace_drag.is_none()
+test ui::file_tree::tests::popup_input_secondary_workspace_drag_does_not_autoscroll ... FAILED
+
+failures:
+
+failures:
+    ui::file_tree::tests::popup_input_secondary_workspace_drag_does_not_autoscroll
+    ui::workspace::tests::popup_input_file_rename_enter_consumes_raw_and_native_batch
+    ui::workspace::tests::popup_input_file_rename_escape_consumes_raw_and_native_batch
+    ui::workspace::tests::popup_input_file_rename_ime_enter_keeps_composition_owned
+    ui::workspace::tests::popup_input_file_rename_listing_insert_keeps_focus_and_target
+    ui::workspace::tests::popup_input_tree_click_keeps_keyboard_for_next_frame_delete
+    ui::workspace::tests::popup_input_tree_owner_returns_to_terminal_on_click_first_key_ime_and_paste
+    ui::workspace::tests::popup_input_tree_owner_survives_runtime_refocus_but_explicit_navigation_reclaims_it
+
+test result: FAILED. 0 passed; 8 failed; 0 ignored; 0 measured; 3191 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

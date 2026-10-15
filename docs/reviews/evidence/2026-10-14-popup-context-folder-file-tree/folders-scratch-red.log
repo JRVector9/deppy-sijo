@@ -1,0 +1,80 @@
+   Compiling deppy-core v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/core)
+   Compiling secret v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/secret)
+   Compiling winit v0.30.13 (/private/tmp/deppy-popup-review-worktree-20261014/third_party/winit-0.30.13)
+   Compiling alacritty_terminal v0.26.0 (/private/tmp/deppy-popup-review-worktree-20261014/third_party/alacritty_terminal-0.26.0)
+   Compiling audit v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/audit)
+   Compiling mux v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/mux)
+   Compiling terminal v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/terminal)
+   Compiling persist v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/persist)
+   Compiling pty v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/pty)
+   Compiling storage-core v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/storage-core)
+   Compiling mcp-store v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/mcp-store)
+   Compiling session v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/session)
+   Compiling storage v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/storage)
+   Compiling egui-wgpu v0.36.1
+   Compiling runtime v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/runtime)
+   Compiling accesskit_winit v0.32.2
+   Compiling http-client v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/http-client)
+   Compiling connector-contract v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/connector-contract)
+   Compiling relay-protocol v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/relay-protocol)
+   Compiling mcp v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/mcp)
+   Compiling web-remote v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/web-remote)
+   Compiling egui-winit v0.36.1
+   Compiling auth v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/auth)
+   Compiling i18n v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/i18n)
+   Compiling connector-ui v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/connector-ui)
+   Compiling connector-service v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/connector-service)
+   Compiling eframe v0.36.1
+   Compiling agent-mcp v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/agent-mcp)
+   Compiling egui_kittest v0.36.1
+   Compiling platform v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/platform)
+   Compiling deppy-sijo v0.12.1 (/private/tmp/deppy-popup-review-worktree-20261014/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 38s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-d0c94c47049f5fdd)
+
+running 6 tests
+test app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor ... missing-picked-folder: reported_success=true, before=WorkspaceFolderAnchor { dev: 16777232, ino: 577070370 }, after=None
+
+thread 'app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor' (45476176) panicked at crates/app/src/app.rs:59488:9:
+a folder that disappeared before worker admission must fail instead of committing an unanchored path
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events ... symlink-watch raw=["/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-49810-92b3f319-ddd1-4351-9f13-080650e60cb2/physical/new.txt"], physical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-49810-92b3f319-ddd1-4351-9f13-080650e60cb2/physical", logical="/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-app-document-popup-audit-symlink-watch-49810-92b3f319-ddd1-4351-9f13-080650e60cb2/alias", refresh_queued=false
+
+thread 'app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events' (45476251) panicked at crates/app/src/app.rs:59441:9:
+native changes beneath a selected symlink root must reach the file tree in its logical path namespace
+FAILED
+test ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing ... restored child access: retry=false, inaccessible=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing' (45477800) panicked at crates/app/src/ui/file_tree.rs:17169:9:
+after access is restored, Refresh plus expand must retry the child listing
+FAILED
+test ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination ... partial-copy result: first_published=true, first_visible=false
+
+thread 'ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination' (45477801) panicked at crates/app/src/ui/file_tree.rs:17230:9:
+a partially applied host failure must refresh the affected destination without depending on a healthy OS watcher
+FAILED
+test ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent ... permanent-delete parent escape: root_refresh_retained_confirm=true, issued_delete=true, outside_survived=false, original_survived=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent' (45477802) panicked at crates/app/src/ui/file_tree.rs:17089:9:
+an old failed-trash confirmation must not permanently delete an unselected file outside the original tree after the parent is redirected
+FAILED
+test ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation ... replaced-file confirmation: inode 577071222->577071223, retained=true, issued_delete=true, new_survived=false, original_survived=true
+
+thread 'ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation' (45477817) panicked at crates/app/src/ui/file_tree.rs:17293:9:
+an old failed-trash confirmation must not authorize permanent deletion of a different inode created by a subsequent checkout/build
+FAILED
+
+failures:
+
+failures:
+    app::tests::popup_audit_20261014_missing_picker_folder_does_not_erase_existing_anchor
+    app::tests::popup_audit_20261014_symlink_root_delivers_native_watch_events
+    ui::file_tree::tests::popup_audit_20261014_child_permission_recovery_retries_listing
+    ui::file_tree::tests::popup_audit_20261014_partial_copy_failure_refreshes_destination
+    ui::file_tree::tests::popup_audit_20261014_permanent_delete_rejects_redirected_parent
+    ui::file_tree::tests::popup_audit_20261014_replaced_file_cannot_reuse_old_delete_confirmation
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 3191 filtered out; finished in 5.33s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

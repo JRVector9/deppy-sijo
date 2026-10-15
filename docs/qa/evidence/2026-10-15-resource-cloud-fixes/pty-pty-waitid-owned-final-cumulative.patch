@@ -1,0 +1,941 @@
+--- a/crates/pty/src/lib.rs
++++ b/crates/pty/src/lib.rs
+@@ -1,6 +1,8 @@
+ //! PTY 격리 crate (설계문서 1.2 / 9장).
+ //! portable-pty 타입은 이 crate 밖으로 노출하지 않는다 — PtyBackend trait으로 감싼다.
+ 
++#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
++mod foreground_teardown_tests;
+ mod input_queue;
+ mod process_identity;
+ pub mod query_fence;
+@@ -590,6 +592,17 @@
+ /// 양쪽 `try_wait`가 안전하다.
+ #[cfg(unix)]
+ type SharedChild = std::sync::Arc<std::sync::Mutex<ChildPtyBox>>;
++/// A naturally exiting shell must retain authority over its already captured group members after
++/// its PID is reaped. Only an unreaped direct child's kernel exit observation can publish it.
++#[cfg(unix)]
++#[derive(Default)]
++struct ExitWorkloadState {
++    captured: Option<workload_signal::FrozenGroup>,
++    // Successful reap, ECHILD or explicit teardown permanently retires fresh exit authority.
++    reaped: bool,
++}
++#[cfg(unix)]
++type ExitWorkload = Arc<Mutex<ExitWorkloadState>>;
+ 
+ #[cfg(unix)]
+ fn spawn_unix_session(
+@@ -729,6 +742,7 @@
+     // reaper: 자식 자연 종료를 감지해 reader를 깨운다. cancel 쓰기 끝은 dup해 넘기고
+     // 세션 쪽(reader_cancel)은 teardown cancel 용도로 그대로 둔다.
+     let child: SharedChild = std::sync::Arc::new(std::sync::Mutex::new(child));
++    let exit_workload: ExitWorkload = Arc::new(Mutex::new(ExitWorkloadState::default()));
+     let reaper = (|| -> anyhow::Result<_> {
+         let cancel = duplicate_nonblocking_fd(reader_cancel_write.as_raw_fd())
+             .context("PTY reaper cancellation descriptor 생성 실패")?;
+@@ -738,7 +752,17 @@
+                 let child = std::sync::Arc::clone(&child);
+                 let exit_flag = std::sync::Arc::clone(&exit_flag);
+                 let reaper_stop = std::sync::Arc::clone(&reaper_stop);
+-                move || unix_reaper_loop(child, exit_flag, reaper_stop, cancel)
++                let exit_workload = Arc::clone(&exit_workload);
++                move || {
++                    unix_reaper_loop(
++                        child,
++                        owner_process,
++                        exit_workload,
++                        exit_flag,
++                        reaper_stop,
++                        cancel,
++                    )
++                }
+             })
+             .context("PTY reaper thread 생성 실패")?;
+         Ok(thread)
+@@ -771,6 +795,7 @@
+         writer_cancel: Some(writer_cancel_write),
+         process_group,
+         owner_process,
++        exit_workload,
+         query_fence,
+         frozen_groups: Mutex::new(Vec::new()),
+         exit_flag,
+@@ -1369,6 +1394,8 @@
+ #[cfg(unix)]
+ fn unix_reaper_loop(
+     child: SharedChild,
++    owner: Option<workload_signal::Process>,
++    exit_workload: ExitWorkload,
+     exit_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+     reader_cancel: OwnedFd,
+@@ -1378,7 +1405,7 @@
+             return; // kill/Drop 경로 — reader는 이미 cancel로 낙는다
+         }
+         let exited = match child.lock() {
+-            Ok(mut child) => match child.try_wait() {
++            Ok(mut child) => match try_wait_unix_child(&mut child, owner, &exit_workload) {
+                 Ok(Some(_)) => true,
+                 Ok(None) => false,
+                 Err(_) => return, // 조회 불가 — 더 기다려도 알 수 없다
+@@ -1392,6 +1419,117 @@
+         }
+         std::thread::sleep(std::time::Duration::from_millis(25));
+     }
++}
++
++/// Fresh waitid observations are valid only while the caller holds the original child mutex.
++#[cfg(unix)]
++enum ChildExitObservation {
++    PendingOwned,
++    ExitedOwned,
++    Retired,
++    Deferred,
++}
++
++/// macOS hides an exiting/zombie child from proc_pidinfo/getsid. WNOWAIT keeps that original
++/// direct child's PID allocated while its exact workload members are captured. Running polls
++/// never scan group membership; cached/reaped PIDs never grant new signal authority.
++#[cfg(unix)]
++fn observe_unix_child_exit(
++    owner: Option<workload_signal::Process>,
++    retained: &mut ExitWorkloadState,
++) -> std::io::Result<ChildExitObservation> {
++    #[cfg(any(target_os = "macos", target_os = "linux"))]
++    {
++        if retained.reaped {
++            return Ok(ChildExitObservation::Retired);
++        }
++        let Some(owner) = owner else {
++            return Ok(ChildExitObservation::Retired);
++        };
++        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
++        // SAFETY: the caller's child mutex serializes every reap of this original child.
++        let result = unsafe {
++            libc::waitid(
++                libc::P_PID,
++                owner.pid as libc::id_t,
++                info.as_mut_ptr(),
++                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
++            )
++        };
++        if result != 0 {
++            let error = std::io::Error::last_os_error();
++            if error.raw_os_error() == Some(libc::EINTR) {
++                return Ok(ChildExitObservation::Deferred);
++            }
++            if error.raw_os_error() != Some(libc::ECHILD) {
++                return Err(error);
++            }
++            retained.reaped = true;
++            return Ok(ChildExitObservation::Retired);
++        }
++        let info = unsafe { info.assume_init() };
++        let pid = unsafe { info.si_pid() };
++        if pid == 0 {
++            return Ok(ChildExitObservation::PendingOwned);
++        }
++        if pid != owner.pid {
++            return Err(std::io::Error::other(format!(
++                "PTY child exit identity mismatch: expected={} observed={pid} code={}",
++                owner.pid, info.si_code
++            )));
++        }
++        // Darwin can report a stopped child even with WEXITED alone. A stop/continue is
++        // neither an exit nor permission to consume status or capture on an ordinary poll.
++        if matches!(
++            info.si_code,
++            libc::CLD_STOPPED | libc::CLD_TRAPPED | libc::CLD_CONTINUED
++        ) {
++            return Ok(ChildExitObservation::PendingOwned);
++        }
++        if !matches!(
++            info.si_code,
++            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
++        ) {
++            return Err(std::io::Error::other(format!(
++                "PTY child exit notification mismatch: pid={pid} code={}",
++                info.si_code
++            )));
++        }
++        if retained.captured.is_none() && owner.pid == owner.group && owner.pid == owner.session {
++            match workload_signal::FrozenGroup::capture(owner.group, owner) {
++                Ok(group) => retained.captured = Some(group),
++                Err(error) => {
++                    tracing::debug!("PTY pre-reap workload capture skipped: {error:#}");
++                }
++            }
++        }
++        Ok(ChildExitObservation::ExitedOwned)
++    }
++    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
++    {
++        let _ = (owner, retained);
++        Ok(ChildExitObservation::Retired)
++    }
++}
++
++#[cfg(unix)]
++fn try_wait_unix_child(
++    child: &mut ChildPtyBox,
++    owner: Option<workload_signal::Process>,
++    exit_workload: &Mutex<ExitWorkloadState>,
++) -> std::io::Result<Option<portable_pty::ExitStatus>> {
++    let mut retained = exit_workload
++        .lock()
++        .map_err(|_| std::io::Error::other("PTY exit workload mutex poisoned"))?;
++    match observe_unix_child_exit(owner, &mut retained)? {
++        ChildExitObservation::PendingOwned | ChildExitObservation::Deferred => return Ok(None),
++        ChildExitObservation::ExitedOwned | ChildExitObservation::Retired => {}
++    }
++    let status = child.try_wait()?;
++    if status.is_some() {
++        retained.reaped = true;
++    }
++    Ok(status)
+ }
+ 
+ #[cfg(unix)]
+@@ -1567,6 +1705,8 @@
+     #[cfg(unix)]
+     owner_process: Option<workload_signal::Process>,
+     #[cfg(unix)]
++    exit_workload: ExitWorkload,
++    #[cfg(unix)]
+     query_fence: Option<query_fence::QueryFence>,
+     #[cfg(unix)]
+     frozen_groups: Mutex<Vec<workload_signal::FrozenGroup>>,
+@@ -1605,6 +1745,122 @@
+ }
+ 
+ impl PortablePtySession {
++    /// Pin the current shell/foreground executions while the original child and terminal still
++    /// exist. Once the master closes or the reaper consumes the shell, a cached PGID alone is
++    /// insufficient authority to signal a job-control foreground group.
++    #[cfg(unix)]
++    fn capture_owned_workloads(&self) -> Vec<workload_signal::FrozenGroup> {
++        let Ok(_child) = self.child.lock() else {
++            tracing::warn!("PTY child mutex poisoned during workload capture");
++            return Vec::new();
++        };
++        let owner = self.owner_process;
++        let Ok(mut retained) = self.exit_workload.lock() else {
++            tracing::warn!("PTY exit workload mutex poisoned during workload capture");
++            return Vec::new();
++        };
++        // A successful fresh waitid pins the original unreaped child even when Darwin hides
++        // its identity during exit. Keep the child mutex through every member snapshot.
++        let owner_pinned = match observe_unix_child_exit(owner, &mut retained) {
++            Ok(ChildExitObservation::PendingOwned | ChildExitObservation::ExitedOwned) => true,
++            Ok(ChildExitObservation::Retired | ChildExitObservation::Deferred) => false,
++            Err(error) => {
++                tracing::debug!("PTY teardown exit observation skipped: {error}");
++                false
++            }
++        };
++        let mut groups: Vec<_> = retained.captured.take().into_iter().collect();
++        drop(retained);
++        let Some(owner) = owner else {
++            return groups;
++        };
++        if !owner_pinned {
++            return groups; // Cached status or failed observation grants no new authority.
++        }
++        let Some(current) = workload_signal::inspect(owner.pid) else {
++            // portable-pty's owned Unix child starts a new session. Until it is reaped, its
++            // original PID/PGID/SID cannot be reused, including an exiting but not yet waitable
++            // Darwin child. This permits only the original shell group, never a fresh FG group.
++            if owner.pid == owner.group
++                && owner.pid == owner.session
++                && !groups.iter().any(|group| group.group() == owner.group)
++            {
++                match workload_signal::FrozenGroup::capture(owner.group, owner) {
++                    Ok(group) => groups.push(group),
++                    Err(error) => {
++                        tracing::debug!("PTY exiting shell workload capture skipped: {error:#}");
++                    }
++                }
++            }
++            return groups;
++        };
++        if !current.same_execution(owner) {
++            tracing::warn!("PTY owner identity changed during workload capture");
++            return groups;
++        }
++        let own_group = unsafe { libc::getpgrp() };
++        for group in [
++            Some(current.group),
++            self.foreground_process_group()
++                .and_then(|group| i32::try_from(group).ok())
++                .filter(|group| *group != current.group),
++        ]
++        .into_iter()
++        .flatten()
++        {
++            if signal_target(Some(group), own_group).is_none() {
++                continue;
++            }
++            match workload_signal::FrozenGroup::capture(group, owner) {
++                Ok(captured) => {
++                    if let Some(existing) =
++                        groups.iter_mut().find(|existing| existing.group() == group)
++                    {
++                        existing.merge_capture(captured);
++                    } else {
++                        groups.push(captured);
++                    }
++                }
++                Err(error) => {
++                    // Fail closed for this group; still cancel I/O, clean frozen groups and reap
++                    // the direct child. Short-lived shells can disappear during this snapshot.
++                    tracing::debug!(group, "PTY workload capture skipped: {error:#}");
++                }
++            }
++        }
++        groups
++    }
++
++    #[cfg(unix)]
++    fn terminate_captured_workloads(groups: &[workload_signal::FrozenGroup]) -> anyhow::Result<()> {
++        let mut first_error = None;
++        for (signal, grace) in [
++            (libc::SIGHUP, std::time::Duration::from_millis(20)),
++            (libc::SIGTERM, std::time::Duration::from_millis(200)),
++            (libc::SIGKILL, std::time::Duration::ZERO),
++        ] {
++            for group in groups {
++                if let Err(error) = group.signal_captured_members(signal) {
++                    first_error.get_or_insert(error);
++                }
++            }
++            let deadline = std::time::Instant::now() + grace;
++            while groups.iter().any(|group| group.captured_alive()) {
++                if std::time::Instant::now() >= deadline {
++                    break;
++                }
++                std::thread::sleep(std::time::Duration::from_millis(1));
++            }
++            if !groups.iter().any(|group| group.captured_alive()) {
++                break;
++            }
++        }
++        match first_error {
++            Some(error) => Err(error),
++            None => Ok(()),
++        }
++    }
++
+     /// Job-control foreground groups differ from the shell group. A stopped job cannot handle
+     /// HUP/TERM, so close its identity-checked group before the shell is reaped or PTY is closed.
+     #[cfg(unix)]
+@@ -1703,7 +1959,7 @@
+         join_worker(self.writer_thread.take(), "writer");
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+     fn signal_process_group(&self, signal: libc::c_int) {
+         let own = unsafe { libc::getpgrp() };
+         let Some(pgid) = signal_target(self.process_group, own) else {
+@@ -1724,11 +1980,36 @@
+         }
+     }
+ 
+-    #[cfg(unix)]
++    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+     fn process_group_alive(&self) -> bool {
+         self.process_group
+             .is_some_and(|pgid| unsafe { libc::killpg(pgid, 0) } == 0)
+     }
++}
++
++#[cfg(unix)]
++fn kill_unix_child_and_reap_bounded(
++    child: &mut ChildPtyBox,
++    exit_workload: &Mutex<ExitWorkloadState>,
++) -> anyhow::Result<()> {
++    // Capture has already taken the fixed members. Retire further exit-based authority before
++    // any raw teardown reap, including errors/timeouts, while the caller holds the child mutex.
++    exit_workload
++        .lock()
++        .map_err(|_| anyhow::anyhow!("PTY exit workload mutex poisoned"))?
++        .reaped = true;
++    // The reaper may already have cached the exit after HUP/TERM. Never kill the old PID after
++    // that cached status; holding the child mutex keeps try_wait and kill in one ownership scope.
++    let result = match child.try_wait() {
++        Ok(Some(_)) => Ok(()),
++        Err(error) if error.raw_os_error() == Some(libc::ECHILD) => Ok(()),
++        _ => match child.kill() {
++            Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
++            other => other.context("프로세스 kill 실패"),
++        },
++    };
++    reap_child_bounded(child);
++    result
+ }
+ 
+ /// kill 후 reap을 폴링으로 — kill이 실패해도(권한/플랫폼 문제) 무한 wait에
+@@ -1833,21 +2114,27 @@
+ 
+         #[cfg(unix)]
+         {
++            let workloads = self.capture_owned_workloads();
+             if let Err(error) = self.terminate_frozen_workloads() {
+                 tracing::warn!("frozen PTY workload teardown failed: {error:#}");
+             }
+             // Deterministic I/O cancellation wakes a writer
+             // blocked on a full PTY even if an escaped descendant still owns the slave endpoint.
+             self.stop_unix_worker_io();
+-            // 터미널 종료 규약: foreground process group에 SIGHUP —
+-            // 셸이 kill되어도 살아남는 grandchild job까지 정리 대상에 포함.
++            if let Err(error) = Self::terminate_captured_workloads(&workloads) {
++                tracing::warn!("PTY workload teardown failed: {error:#}");
++            }
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             self.signal_process_group(libc::SIGHUP);
+             // kill 실패해도 무한 wait에 매달리지 않는다 (bounded reap — codex P1)
+-            kill_and_reap_bounded(&mut self.child.lock().expect("PTY child mutex poisoned"));
+-            // 제품 정책(안정성 감사 Med #3, 2026-07-08): pane/세션 닫기 = 프로세스 트리 정리.
+-            // SIGHUP을 무시한 자손(nohup류)이 남지 않게 process group에 SIGTERM → 짧은
+-            // 유예 → SIGKILL로 에스컬레이션한다. pgid 재사용 오발 위험은 Drop 직후 수백 ms
+-            // 내 재확인이라 극소. 유예는 200ms로 짧게 — Drop이 UI/worker 스레드에서 불린다.
++            if let Err(error) = kill_unix_child_and_reap_bounded(
++                &mut self.child.lock().expect("PTY child mutex poisoned"),
++                &self.exit_workload,
++            ) {
++                tracing::warn!("PTY child teardown failed: {error:#}");
++            }
++            // Keep the existing fallback on Unix platforms without birth/session inspection.
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             if let Some(pgid) = self.process_group
+                 && self.process_group_alive()
+             {
+@@ -1990,11 +2277,11 @@
+ 
+     #[cfg(unix)]
+     fn try_exit_code(&mut self) -> anyhow::Result<Option<u32>> {
+-        let status = self
++        let mut child = self
+             .child
+             .lock()
+-            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?
+-            .try_wait()
++            .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
++        let status = try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)
+             .context("exit status 조회 실패")?;
+         if status.is_some() {
+             // reaper가 25ms 안에 같은 신호를 내지만, 소비자 폴링이 먼저 발견했으면
+@@ -2020,29 +2307,20 @@
+     fn kill(&mut self) -> anyhow::Result<()> {
+         #[cfg(unix)]
+         {
++            let workloads = self.capture_owned_workloads();
+             let frozen_result = self.terminate_frozen_workloads();
+-            // Drop과 같은 규약: process group에 SIGHUP까지 — grandchild job 포함
+-            // (reap은 try_exit_code/Drop 경로가 담당. codex P2)
++            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+             self.signal_process_group(libc::SIGHUP);
+             self.stop_unix_worker_io();
++            let workload_result = Self::terminate_captured_workloads(&workloads);
+             let mut child = self
+                 .child
+                 .lock()
+                 .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+-            // 바로 위 SIGHUP으로 자식이 죽으면 reaper가 25ms 안에 reap한다. 이미
+-            // 회수된 자식의 pid로 kill(2)을 보낼 수는 없다 — ESRCH가 나거나,
+-            // 최악에는 재사용된 남의 pid를 죽인다. 회수 여부를 먼저 보고, 그 사이의
+-            // 좁은 경합으로 ESRCH가 나면 이미 죽은 것으로 간주한다.
+-            let result = match child.try_wait() {
+-                Ok(Some(_)) => Ok(()),
+-                _ => match child.kill() {
+-                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
+-                    other => other.context("프로세스 kill 실패"),
+-                },
+-            };
++            let result = kill_unix_child_and_reap_bounded(&mut child, &self.exit_workload);
+             drop(child);
+             self.join_unix_workers();
+-            frozen_result.and(result)
++            frozen_result.and(workload_result).and(result)
+         }
+ 
+         #[cfg(windows)]
+@@ -2071,7 +2349,10 @@
+             .child
+             .lock()
+             .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+-        anyhow::ensure!(child.try_wait()?.is_none(), "PTY child exited");
++        anyhow::ensure!(
++            try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)?.is_none(),
++            "PTY child exited"
++        );
+         let owner = self.owner_process.context("process identity unavailable")?;
+         let current = workload_signal::inspect(owner.pid).context("PTY owner exited")?;
+         anyhow::ensure!(current.same_execution(owner), "PTY owner identity changed");
+@@ -2127,7 +2408,10 @@
+             .child
+             .lock()
+             .map_err(|_| anyhow::anyhow!("PTY child mutex poisoned"))?;
+-        anyhow::ensure!(child.try_wait()?.is_none(), "PTY child exited");
++        anyhow::ensure!(
++            try_wait_unix_child(&mut child, self.owner_process, &self.exit_workload)?.is_none(),
++            "PTY child exited"
++        );
+         let mut frozen = self
+             .frozen_groups
+             .lock()
+--- a/crates/pty/src/workload_signal.rs
++++ b/crates/pty/src/workload_signal.rs
+@@ -170,6 +170,57 @@
+         self.group
+     }
+ 
++    pub fn merge_capture(&mut self, other: Self) {
++        debug_assert_eq!(self.group, other.group);
++        debug_assert_eq!(self.session, other.session);
++        for process in other.members {
++            if !self.members.iter().any(|old| old.same_execution(process)) {
++                self.members.push(process);
++            }
++        }
++    }
++
++    pub fn captured_alive(&self) -> bool {
++        self.members.iter().any(|captured| {
++            inspect(captured.pid)
++                .is_some_and(|current| current.same_execution(*captured) && !current.zombie)
++        })
++    }
++
++    /// Normal teardown can outlive the shell and race a running workload's forks. Signal only
++    /// the executions pinned before terminal close; a new group member must not broaden that
++    /// authority or prevent the already captured members from being terminated.
++    pub fn signal_captured_members(&self, signal: libc::c_int) -> anyhow::Result<()> {
++        anyhow::ensure!(
++            self.group > 0 && self.group != unsafe { libc::getpgrp() },
++            "unsafe process group"
++        );
++        let mut first_error = None;
++        for captured in &self.members {
++            let Some(current) = inspect(captured.pid) else {
++                continue;
++            };
++            if !current.same_execution(*captured)
++                || current.zombie
++                || current.pid == unsafe { libc::getpid() }
++            {
++                continue;
++            }
++            // SAFETY: this individual member still has the captured PID/birth/group/session.
++            // No killpg is used after shell reap, so unpinned or reused groups are untouched.
++            if unsafe { libc::kill(current.pid, signal) } != 0 {
++                let error = std::io::Error::last_os_error();
++                if !super::signal_failure_is_already_gone(error.raw_os_error()) {
++                    first_error.get_or_insert(error);
++                }
++            }
++        }
++        match first_error {
++            Some(error) => Err(error.into()),
++            None => Ok(()),
++        }
++    }
++
+     fn current_members(&self) -> anyhow::Result<Vec<Process>> {
+         let current = members(self.group)?;
+         anyhow::ensure!(
+@@ -278,6 +329,69 @@
+     use std::io::{BufRead as _, Write as _};
+     use std::os::unix::process::CommandExt as _;
+     use std::process::{Command, Stdio};
++
++    #[test]
++    fn captured_signals_skip_changed_birth_group_and_session() {
++        let mut command = Command::new("python3");
++        command
++            .args([
++                "-c",
++                "import signal,time; signal.alarm(15); print('READY',flush=True); time.sleep(30)",
++            ])
++            .stdout(Stdio::piped());
++        unsafe {
++            command.pre_exec(|| {
++                if libc::setsid() < 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                Ok(())
++            });
++        }
++        struct Fixture(std::process::Child);
++        impl Drop for Fixture {
++            fn drop(&mut self) {
++                // This direct child has not been reaped, so its PID remains owned by this handle.
++                let _ = self.0.kill();
++                let _ = self.0.wait();
++            }
++        }
++        let mut fixture = Fixture(command.spawn().unwrap());
++        let mut output = std::io::BufReader::new(fixture.0.stdout.take().unwrap());
++        let mut line = String::new();
++        output.read_line(&mut line).unwrap();
++        assert_eq!(line.trim(), "READY");
++        let owner = inspect(fixture.0.id() as i32).unwrap();
++        assert!(FrozenGroup::capture(unsafe { libc::getpgrp() }, owner).is_err());
++        for field in 0..3 {
++            let mut group = FrozenGroup::capture(owner.group, owner).unwrap();
++            match field {
++                0 => group.members[0].birth.0 = group.members[0].birth.0.wrapping_add(1),
++                1 => group.members[0].group = -1,
++                _ => group.members[0].session = -1,
++            }
++            group.signal_captured_members(libc::SIGKILL).unwrap();
++            assert!(
++                !group.captured_alive(),
++                "changed identity must not remain pinned"
++            );
++            std::thread::sleep(Duration::from_millis(20));
++            assert!(
++                fixture.0.try_wait().unwrap().is_none(),
++                "a stale birth/group/session snapshot must not signal the live fixture"
++            );
++        }
++        let group = FrozenGroup::capture(owner.group, owner).unwrap();
++        assert!(group.captured_alive());
++        group.signal_captured_members(libc::SIGTERM).unwrap();
++        let deadline = Instant::now() + Duration::from_secs(1);
++        while fixture.0.try_wait().unwrap().is_none() {
++            assert!(
++                Instant::now() < deadline,
++                "matching captured process must terminate"
++            );
++            std::thread::sleep(Duration::from_millis(5));
++        }
++    }
+ 
+     #[test]
+     fn failed_stop_verification_rolls_back_a_same_session_fork() {
+--- /dev/null
++++ b/crates/pty/src/foreground_teardown_tests.rs
+@@ -0,0 +1,320 @@
++//! Real job-control foreground regressions. Every signal is scoped to an owned PTY or a
++//! birth/group/session-checked fixture PID; the Python child also has a hard lifetime.
++
++use super::*;
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicU64, Ordering};
++use std::time::{Duration, Instant};
++
++const WORKLOAD: &str = r#"import os, signal, sys, time
++signal.alarm(15)
++if sys.argv[2] != "normal":
++    signal.signal(signal.SIGHUP, signal.SIG_IGN)
++if sys.argv[2] == "ignore-hup-term":
++    signal.signal(signal.SIGTERM, signal.SIG_IGN)
++with open(sys.argv[1], "x") as output:
++    output.write(f"{os.getpid()} {os.getpgrp()} {os.getsid(0)}\n")
++while True:
++    time.sleep(0.01)
++"#;
++
++struct Fixture {
++    session: Option<Box<dyn PtySession>>,
++    output: Option<PtyOutputReceiver>,
++    process: Option<workload_signal::Process>,
++    directory: PathBuf,
++}
++
++impl Fixture {
++    fn spawn(mode: &str) -> Self {
++        Self::spawn_with_shell_exit(mode, false)
++    }
++
++    fn spawn_with_shell_exit(mode: &str, shell_exits: bool) -> Self {
++        Self::spawn_with_reaper(mode, shell_exits, false)
++    }
++
++    fn spawn_with_reaper(mode: &str, shell_exits: bool, pause_reaper: bool) -> Self {
++        static NEXT: AtomicU64 = AtomicU64::new(0);
++        let directory = std::env::temp_dir().join(format!(
++            "deppy-pty-foreground-{}-{}",
++            std::process::id(),
++            NEXT.fetch_add(1, Ordering::Relaxed)
++        ));
++        std::fs::create_dir(&directory).unwrap();
++        let pid_path = directory.join("identity");
++        let spec = CommandSpec {
++            program: "/bin/bash".into(),
++            args: vec!["--noprofile".into(), "--norc".into(), "-i".into()],
++            env: vec![
++                ("HISTFILE".into(), "/dev/null".into()),
++                ("BASH_ENV".into(), "/dev/null".into()),
++                ("ENV".into(), "/dev/null".into()),
++                ("PS1".into(), "FIXTURE> ".into()),
++                (
++                    "DEPPY_FIXTURE_PID".into(),
++                    pid_path.to_str().unwrap().to_owned(),
++                ),
++                ("DEPPY_FIXTURE_MODE".into(), mode.into()),
++            ],
++            cwd: Some(directory.clone()),
++        };
++        let session: Box<dyn PtySession> = if pause_reaper {
++            // Only the before-poll regression uses the private concrete constructor. Stop and
++            // join its reaper while the shell is idle, before issuing the exit command.
++            let pair = openpty_with_retry(80, 24).unwrap();
++            let mut command = portable_pty::CommandBuilder::new(&spec.program);
++            command.args(&spec.args);
++            for (key, value) in &spec.env {
++                command.env(key, value);
++            }
++            command.cwd(spec.cwd.as_ref().unwrap());
++            let child = pair.slave.spawn_command(command).unwrap();
++            let mut session = spawn_unix_session(
++                pair.master,
++                pair.slave,
++                child,
++                None,
++                None,
++                None,
++                TestWorkerSpawnFailure::None,
++            )
++            .unwrap();
++            session.reaper_stop.store(true, Ordering::Release);
++            join_worker(session.reaper_thread.take(), "fixture reaper");
++            Box::new(session)
++        } else {
++            PortablePtyBackend.spawn(&spec, 80, 24).unwrap()
++        };
++        let mut fixture = Self {
++            session: Some(session),
++            output: None,
++            process: None,
++            directory,
++        };
++        let session = fixture.session.as_mut().unwrap();
++        let shell = session.process_identity();
++        fixture.output = session.take_output();
++        // WORKLOAD contains no single quotes. Paths/modes are environment values, never shell code.
++        let invocation =
++            format!("python3 -c '{WORKLOAD}' \"$DEPPY_FIXTURE_PID\" \"$DEPPY_FIXTURE_MODE\"");
++        let command = if shell_exits {
++            // Disable job control to reproduce the existing same-shell-group descendant contract.
++            format!(
++                "set +m; {invocation} & while [ ! -s \"$DEPPY_FIXTURE_PID\" ]; do /bin/sleep 0.005; done; exit\n"
++            )
++        } else {
++            format!("{invocation}\n")
++        };
++        assert!(
++            session
++                .write_input(command.as_bytes())
++                .unwrap()
++                .is_accepted()
++        );
++        let deadline = Instant::now() + Duration::from_secs(5);
++        let fields = loop {
++            if let Ok(text) = std::fs::read_to_string(fixture.directory.join("identity")) {
++                let fields: Vec<i32> = text
++                    .split_whitespace()
++                    .filter_map(|field| field.parse().ok())
++                    .collect();
++                if fields.len() == 3 {
++                    break fields;
++                }
++            }
++            while fixture.output.as_ref().unwrap().try_recv().is_ok() {}
++            assert!(Instant::now() < deadline, "foreground fixture not ready");
++            std::thread::sleep(Duration::from_millis(5));
++        };
++        let process = workload_signal::inspect(fields[0]).unwrap();
++        fixture.process = Some(process);
++        assert_eq!(process.group, fields[1]);
++        assert_eq!(process.session, fields[2]);
++        assert!(!process.zombie_for_test());
++        if shell_exits {
++            assert_eq!(shell.process_group, Some(process.group as u32));
++            // Darwin hides zombies from proc_pidinfo before they are reaped. Non-consuming
++            // waitid must prove ECHILD for the periodic-reaper case, or an unreaped exit for
++            // the deterministic before-poll case. Do not call try_exit_code in either wait.
++            let deadline = Instant::now() + Duration::from_secs(3);
++            let shell_pid = shell.pid.unwrap() as i32;
++            loop {
++                let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
++                let result = unsafe {
++                    libc::waitid(
++                        libc::P_PID,
++                        shell_pid as libc::id_t,
++                        info.as_mut_ptr(),
++                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
++                    )
++                };
++                if result != 0 {
++                    let error = std::io::Error::last_os_error();
++                    if error.raw_os_error() == Some(libc::ECHILD) {
++                        assert!(!pause_reaper, "stopped fixture reaper consumed shell");
++                        break;
++                    }
++                    assert_eq!(error.raw_os_error(), Some(libc::EINTR));
++                } else {
++                    let info = unsafe { info.assume_init() };
++                    let pid = unsafe { info.si_pid() };
++                    assert!(pid == 0 || pid == shell_pid);
++                    if pause_reaper
++                        && pid == shell_pid
++                        && matches!(
++                            info.si_code,
++                            libc::CLD_EXITED | libc::CLD_KILLED | libc::CLD_DUMPED
++                        )
++                    {
++                        break;
++                    }
++                }
++                assert!(
++                    Instant::now() < deadline,
++                    "fixture shell exit/reap not observed"
++                );
++                std::thread::sleep(Duration::from_millis(5));
++            }
++            assert!(
++                fixture.same_process_alive(),
++                "descendant must outlive its shell"
++            );
++        } else {
++            assert_eq!(
++                session.foreground_process_group(),
++                Some(process.group as u32)
++            );
++            assert_ne!(
++                shell.process_group,
++                Some(process.group as u32),
++                "fixture must run in a real job-control group separate from its shell"
++            );
++        }
++        fixture
++    }
++
++    fn same_process_alive(&self) -> bool {
++        self.process.is_some_and(|process| {
++            workload_signal::inspect(process.pid).is_some_and(|current| {
++                current.same_execution(process) && !current.zombie_for_test()
++            })
++        })
++    }
++
++    fn wait_for_exit(&self, timeout: Duration) -> bool {
++        let deadline = Instant::now() + timeout;
++        while self.same_process_alive() && Instant::now() < deadline {
++            std::thread::sleep(Duration::from_millis(5));
++        }
++        !self.same_process_alive()
++    }
++}
++
++impl Drop for Fixture {
++    fn drop(&mut self) {
++        // Rescue only this captured execution, even if the assertion or product teardown failed.
++        if self.same_process_alive() {
++            unsafe {
++                libc::kill(self.process.unwrap().pid, libc::SIGKILL);
++            }
++        }
++        drop(self.session.take());
++        drop(self.output.take());
++        let _ = self.wait_for_exit(Duration::from_secs(2));
++        let _ = std::fs::remove_dir_all(&self.directory);
++    }
++}
++
++fn foreground_teardown(mode: &str, use_kill: bool, frozen: bool) {
++    let mut fixture = Fixture::spawn(mode);
++    if frozen {
++        fixture.session.as_ref().unwrap().freeze().unwrap();
++    }
++    let started = Instant::now();
++    if use_kill {
++        // Check kill itself; Drop must not supply the missing foreground escalation.
++        fixture.session.as_mut().unwrap().kill().unwrap();
++    } else {
++        drop(fixture.session.take());
++    }
++    let elapsed = started.elapsed();
++    let gone_without_rescue = fixture.wait_for_exit(Duration::from_millis(500));
++    let process = fixture.process.unwrap();
++    // Complete identity-checked rescue before reporting the protective assertion.
++    drop(fixture);
++    assert!(
++        gone_without_rescue,
++        "same foreground execution survived: mode={mode} kill={use_kill} frozen={frozen} identity={process:?} teardown={elapsed:?}"
++    );
++    assert!(
++        elapsed < Duration::from_secs(4),
++        "unbounded teardown: {elapsed:?}"
++    );
++}
++
++#[test]
++fn normal_foreground_hup_control_exits_on_drop() {
++    foreground_teardown("normal", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_drop() {
++    foreground_teardown("ignore-hup", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_exits_on_kill() {
++    foreground_teardown("ignore-hup", true, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_drop() {
++    foreground_teardown("ignore-hup-term", false, false);
++}
++
++#[test]
++fn nonfrozen_foreground_ignoring_hup_term_is_killed_on_kill() {
++    foreground_teardown("ignore-hup-term", true, false);
++}
++
++#[test]
++fn frozen_foreground_control_exits_on_drop() {
++    foreground_teardown("ignore-hup-term", false, true);
++}
++
++fn descendant_after_shell_exit_teardown(use_kill: bool, pause_reaper: bool) {
++    let mut fixture = Fixture::spawn_with_reaper("ignore-hup", true, pause_reaper);
++    if use_kill {
++        fixture.session.as_mut().unwrap().kill().unwrap();
++    } else {
++        drop(fixture.session.take());
++    }
++    let gone_without_rescue = fixture.wait_for_exit(Duration::from_millis(500));
++    let process = fixture.process.unwrap();
++    drop(fixture);
++    assert!(
++        gone_without_rescue,
++        "captured same-group descendant survived after shell exit: kill={use_kill} pause_reaper={pause_reaper} identity={process:?}"
++    );
++}
++
++#[test]
++fn samegroup_descendant_after_shell_reap_exits_on_drop() {
++    descendant_after_shell_exit_teardown(false, false);
++}
++
++#[test]
++fn samegroup_descendant_after_shell_reap_exits_on_kill() {
++    descendant_after_shell_exit_teardown(true, false);
++}
++
++#[test]
++fn samegroup_descendant_before_reaper_poll_exits_on_drop() {
++    descendant_after_shell_exit_teardown(false, true);
++}
++
++#[test]
++fn samegroup_descendant_before_reaper_poll_exits_on_kill() {
++    descendant_after_shell_exit_teardown(true, true);
++}

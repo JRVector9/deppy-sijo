@@ -1,0 +1,62 @@
+[
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "seconds": 169.946,
+    "log": "clippy.log"
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "seconds": 7.023,
+    "log": "boundary.log"
+  },
+  {
+    "name": "deps",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-deps"
+    ],
+    "exit_code": 0,
+    "seconds": 0.244,
+    "log": "deps.log"
+  },
+  {
+    "name": "diff",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0,
+    "seconds": 0.021,
+    "log": "diff.log"
+  }
+]

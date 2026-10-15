@@ -1,0 +1,88 @@
+error[E0308]: mismatched types
+   --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:254:26
+    |
+254 |         if choice_dialog(&snapshot) {
+    |            ------------- ^^^^^^^^^ expected `TerminalViewportSnapshot`, found a different `TerminalViewportSnapshot`
+    |            |
+    |            arguments to this function are incorrect
+    |
+note: there are multiple different versions of crate `terminal` in the dependency graph
+   --> crates/terminal/src/viewport_snapshot.rs:9:1
+    |
+  9 | pub struct TerminalViewportSnapshot {
+    | ----------------------------------- this is the found type
+    |
+   ::: crates/terminal/src/viewport_snapshot.rs:9:1
+    |
+  9 | pub struct TerminalViewportSnapshot {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this is the expected type
+    = help: you can use `cargo tree` to explore your dependency tree
+note: function defined here
+   --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:215:4
+    |
+215 | fn choice_dialog(snapshot: &terminal::TerminalViewportSnapshot) -> bool {
+    |    ^^^^^^^^^^^^^ ---------------------------------------------
+
+error[E0308]: mismatched types
+   --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:257:30
+    |
+257 |         let row = prompt_row(&snapshot, self.provider);
+    |                   ---------- ^^^^^^^^^ expected `TerminalViewportSnapshot`, found a different `TerminalViewportSnapshot`
+    |                   |
+    |                   arguments to this function are incorrect
+    |
+note: there are multiple different versions of crate `terminal` in the dependency graph
+   --> crates/terminal/src/viewport_snapshot.rs:9:1
+    |
+  9 | pub struct TerminalViewportSnapshot {
+    | ----------------------------------- this is the found type
+    |
+   ::: crates/terminal/src/viewport_snapshot.rs:9:1
+    |
+  9 | pub struct TerminalViewportSnapshot {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ this is the expected type
+    = help: you can use `cargo tree` to explore your dependency tree
+note: function defined here
+   --> /Users/jr/Desktop/projects/deppy-sijo-performance/crates/runtime/src/input_admission.rs:146:4
+    |
+146 | fn prompt_row(
+    |    ^^^^^^^^^^
+147 |     snapshot: &terminal::TerminalViewportSnapshot,
+    |     ---------------------------------------------
+
+error[E0308]: arguments to this function are incorrect
+   --> /private/tmp/deppy-composer-review-20261014/guard_probe.rs:7:20
+    |
+  7 | ...t mut live = session::Session::spawn_with_spec(deppy_core::SessionId(1001), session::SessionKind::Agent, &spec, 80, 24, 100).unw...
+    |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ ---------------------------                               ----- expected `pty::CommandSpec`, found `CommandSpec`
+    |                                                   |
+    |                                                   expected `deppy_core::SessionId`, found `SessionId`
+    |
+note: there are multiple different versions of crate `deppy_core` in the dependency graph
+   --> crates/core/src/lib.rs:12:1
+    |
+ 12 | pub struct SessionId(pub u64);
+    | -------------------- this is the found type
+    |
+   ::: crates/core/src/lib.rs:12:1
+    |
+ 12 | pub struct SessionId(pub u64);
+    | ^^^^^^^^^^^^^^^^^^^^ this is the expected type
+    = help: you can use `cargo tree` to explore your dependency tree
+note: there are multiple different versions of crate `pty` in the dependency graph
+   --> crates/pty/src/lib.rs:268:1
+    |
+268 | pub struct CommandSpec {
+    | ---------------------- this is the found type
+    |
+   ::: crates/pty/src/lib.rs:268:1
+    |
+268 | pub struct CommandSpec {
+    | ^^^^^^^^^^^^^^^^^^^^^^ this is the expected type
+    = help: you can use `cargo tree` to explore your dependency tree
+note: associated function defined here
+   --> crates/session/src/session.rs:111:11
+
+error: aborting due to 3 previous errors
+
+For more information about this error, try `rustc --explain E0308`.

@@ -1,0 +1,93 @@
+[
+  {
+    "name": "app-metadata",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "review_20261015_list_sessions_redacts_known_secret_display_metadata",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "cwd": "/private/tmp/deppy-cloud-review-worktree-20261015",
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/app-metadata-repro.log",
+    "summaries": [
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3255 filtered out; finished in 0.02s"
+    ]
+  },
+  {
+    "name": "app-ended-consent",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "review_20261015_owner_can_revoke_read_consent_after_session_exit",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "cwd": "/private/tmp/deppy-cloud-review-worktree-20261015",
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/app-ended-consent-repro.log",
+    "summaries": [
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3255 filtered out; finished in 0.10s"
+    ]
+  },
+  {
+    "name": "app-bootstrap",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "quality_review_20261015_bootstrap_recovers_after_transient_sqlite_lock",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "cwd": "/private/tmp/deppy-cloud-review-worktree-20261015",
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/app-bootstrap-repro.log",
+    "summaries": [
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3255 filtered out; finished in 0.12s"
+    ]
+  },
+  {
+    "name": "direct-ws-deadline",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "web-remote",
+      "--lib",
+      "review_20261015_auth_rejects_valid_message_completed_after_whole_deadline",
+      "--",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "cwd": "/private/tmp/deppy-cloud-review-worktree-20261015",
+    "exit_code": 101,
+    "log": "/private/tmp/deppy-cloud-review-root-20261015/direct-ws-deadline-repro.log",
+    "summaries": [
+      "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 389 filtered out; finished in 5.87s"
+    ]
+  }
+]

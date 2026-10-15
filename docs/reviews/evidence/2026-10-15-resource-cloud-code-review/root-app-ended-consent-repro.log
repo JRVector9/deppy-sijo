@@ -1,0 +1,18 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.20s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-fa4955f51ad668aa)
+
+running 1 test
+test cloud_agent::ui::management_tests::review_20261015_owner_can_revoke_read_consent_after_session_exit ...
+thread 'cloud_agent::ui::management_tests::review_20261015_owner_can_revoke_read_consent_after_session_exit' (51632198) panicked at crates/app/src/cloud_agent/ui/management_tests.rs:1347:5:
+the owner cannot withdraw retained read consent using the exited session's checkbox
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    cloud_agent::ui::management_tests::review_20261015_owner_can_revoke_read_consent_after_session_exit
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3255 filtered out; finished in 0.10s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

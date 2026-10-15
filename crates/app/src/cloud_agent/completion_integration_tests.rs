@@ -654,3 +654,206 @@ fn completion_input_only_revoke_preserves_accepted_watch_but_read_or_optout_revo
         assert_eq!(fixture.receipt(&started).outcome["status"], "unknown");
     }
 }
+
+#[test]
+fn completion_duplicate_posts_never_dispatch_the_original_input_again() {
+    let mut fixture = Fixture::new();
+    let mut started = fixture.start("duplicate", None);
+    assert!(fixture.try_start("duplicate", None).is_err());
+    let accepted = fixture.admit(&started, Ok(()));
+    let proof = fixture.completed_proof(&started, accepted);
+    fixture.bridge.install_native_turns(vec![proof]);
+    assert_eq!(
+        fixture.finish(&mut started)["local_completion"]["status"],
+        "completed"
+    );
+    let stored = fixture.receipt(&started);
+    assert!(fixture.try_start("duplicate", None).is_err());
+    assert_eq!(fixture.receipt(&started), stored);
+}
+
+#[test]
+fn completion_unknown_admission_and_replaced_execution_never_become_completed() {
+    let mut fixture = Fixture::new();
+    let mut started = fixture.start("unknown-admission", None);
+    let at = fixture.admit(
+        &started,
+        Err(runtime::PtyInputRejectReason::AdmissionUnknown),
+    );
+    assert_eq!(
+        fixture.finish(&mut started)["local_completion"]["status"],
+        "unknown"
+    );
+    let stored = fixture.receipt(&started);
+    let proof = fixture.completed_proof(&started, at);
+    fixture.bridge.install_native_turns(vec![proof]);
+    fixture
+        .bridge
+        .drain_history(|_, _| panic!("late proof cannot replay uncertain input"));
+    assert_eq!(fixture.receipt(&started), stored);
+    assert_eq!(fixture.public_admission(&started), stored.admission);
+
+    let mut fixture = Fixture::new();
+    let started = fixture.start("replaced-execution", None);
+    let at = fixture.admit(&started, Ok(()));
+    let mut replacement = fixture.target.clone();
+    replacement.execution = Some(AgentExecutionIdentity::fixture(AgentKind::Codex, 99));
+    fixture.bridge.set_targets(vec![replacement]);
+    let proof = fixture.completed_proof(&started, at);
+    fixture.bridge.install_native_turns(vec![proof]);
+    fixture
+        .bridge
+        .drain_history(|_, _| panic!("replacement cannot inherit the original watch"));
+    assert_eq!(fixture.receipt(&started).outcome["status"], "unknown");
+    assert_eq!(
+        fixture
+            .bridge
+            .completion_status_for_operation(
+                &fixture.connection,
+                &fixture.target.id,
+                &fixture.target.generation,
+                "replaced-execution"
+            )
+            .unwrap()
+            .local,
+        completion::LocalCompletionState::Revoked
+    );
+}
+
+#[test]
+fn completion_same_workspace_and_agent_proof_cannot_finish_a_different_session() {
+    let mut fixture = Fixture::new();
+    let mut other = fixture.target.clone();
+    other.id = uuid::Uuid::new_v4().to_string();
+    other.session = runtime::SessionId(2);
+    other.pane = runtime::MuxPaneId::new();
+    fixture
+        .bridge
+        .set_targets(vec![fixture.target.clone(), other.clone()]);
+    fixture
+        .bridge
+        .set_connection_access(&fixture.connection, &other, true, false)
+        .unwrap();
+    let mut started = fixture.start("independent-session", None);
+    let accepted = fixture.admit(&started, Ok(()));
+    let mut foreign = fixture.baseline.clone();
+    foreign.session_key = format!("{}:{}", other.workspace, other.session.0);
+    foreign.native_session_id = uuid::Uuid::new_v4().to_string();
+    foreign.turn_id = "different-native-session-turn".into();
+    foreign.started_at_micros = accepted + 1;
+    foreign.prompt_digest = Some(storage::native_prompt_digest(PROMPT));
+    foreign.completed = Some(storage::NativeTurnCompletionProof {
+        at_micros: accepted + 2,
+        execution_stamp: foreign.start_execution_stamp.clone(),
+    });
+    foreign.completion_revision += 1;
+    foreign.transcript_path = fixture
+        .root
+        .join(format!("rollout-other-{}.jsonl", foreign.native_session_id))
+        .to_str()
+        .unwrap()
+        .to_owned();
+    std::fs::write(
+        &foreign.transcript_path,
+        format!(
+            "{}\n{}\n",
+            json!({"type":"session_meta","payload":{"id":foreign.native_session_id}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","turn_id":foreign.turn_id}})
+        ),
+    )
+    .unwrap();
+    assert!(completion::confirm_codex_rollout(&foreign));
+    fixture
+        .bridge
+        .install_native_turns(vec![fixture.baseline.clone(), foreign]);
+    assert_eq!(
+        fixture
+            .bridge
+            .completion_status_for_target(&fixture.connection, &fixture.target)
+            .unwrap()
+            .local,
+        completion::LocalCompletionState::AwaitingStart
+    );
+    assert!(
+        fixture
+            .bridge
+            .completion_status_for_target(&fixture.connection, &other)
+            .is_none()
+    );
+    let proof = fixture.completed_proof(&started, accepted);
+    fixture.bridge.install_native_turns(vec![proof]);
+    assert_eq!(
+        fixture.finish(&mut started)["local_completion"]["status"],
+        "completed"
+    );
+    assert_eq!(
+        fixture.receipt(&started).identity.scope.session_id,
+        fixture.target.id
+    );
+}
+
+#[test]
+fn completion_run_view_is_bound_to_the_original_actor_session_generation_and_run() {
+    let mut fixture = Fixture::new();
+    fixture.rpc(
+        "release_control",
+        json!({"session_id":fixture.target.id,"generation":fixture.target.generation}),
+    );
+    for run in ["run-one", "run-two"] {
+        let registered = fixture.rpc("start_run", json!({"session_id":fixture.target.id,"generation":fixture.target.generation,"run_id":run,"title":"Private scoped fixture run"}));
+        assert_eq!(registered["result"]["isError"], false, "{registered}");
+    }
+    let control = fixture.rpc("acquire_control", json!({"session_id":fixture.target.id,"generation":fixture.target.generation,"run_id":"run-one"}));
+    assert_eq!(payload(&control)["control"], "acquired");
+    let mut started = fixture.start("run-operation", Some("run-one"));
+    let accepted = fixture.admit(&started, Ok(()));
+    let proof = fixture.completed_proof(&started, accepted);
+    fixture.bridge.install_native_turns(vec![proof]);
+    assert_eq!(fixture.finish(&mut started)["run_id"], "run-one");
+    assert_eq!(
+        fixture
+            .bridge
+            .completion_status_for_run(
+                &fixture.connection,
+                &fixture.target.id,
+                &fixture.target.generation,
+                "run-one"
+            )
+            .unwrap()
+            .local,
+        completion::LocalCompletionState::Completed
+    );
+    for (actor, session, generation, run) in [
+        (
+            fixture.connection.as_str(),
+            fixture.target.id.as_str(),
+            fixture.target.generation.as_str(),
+            "run-two",
+        ),
+        (
+            "foreign-actor",
+            fixture.target.id.as_str(),
+            fixture.target.generation.as_str(),
+            "run-one",
+        ),
+        (
+            fixture.connection.as_str(),
+            "foreign-session",
+            fixture.target.generation.as_str(),
+            "run-one",
+        ),
+        (
+            fixture.connection.as_str(),
+            fixture.target.id.as_str(),
+            "foreign-generation",
+            "run-one",
+        ),
+    ] {
+        assert!(
+            fixture
+                .bridge
+                .completion_status_for_run(actor, session, generation, run)
+                .is_none()
+        );
+    }
+}

@@ -1,3 +1,24 @@
+# 클라우드 로컬 완료 자동 반환 — 설계 승인·병렬 구현 시작, 2026-10-15
+
+- 사용자 `진행해`: 직전 제시한 원 제출 RPC SSE 자동 완료 반환 권장 설계를 승인했다. 별도 재확인 없이 구현한다. 앞 사용자 지시대로 모든 workers gpt-6.1-sol/xhigh/fork none.
+- canonical `/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`, base/main fb3357d21a2ba1ba639deba96bf72263a94a3d35. PR233/234 모두 merged, 제품0.12.3 bundle검증 완료. 이번 신규 feature 사용자용 release 예정0.13.0. 앱 restart 권한 없음.
+- 상세 계획 `docs/superpowers/plans/2026-10-15-cloud-local-completion.md`, 승인 spec `docs/superpowers/specs/2026-10-15-cloud-local-completion-design.md`. writing-plans/TDD 적용, 사용자 선정 parallel native collaboration 사용. 참조된 superpowers execution subskill은 catalog/files에 없어 해당 skill을 실행했다고 주장하지 않는다.
+- workers: completion_proof_20261015(storage/runtime/proxy/new pure completion module), completion_transport_20261015(agent-mcp SSE/ledger), completion_settings_20261015(existing cloud UI/5 locales). 각 별도 worker worktree, 현재 read-only mapping 완료, root의 plan/contracts 확정 후 test-only RED 착수 예정. root는 app.rs/cloud_agent.rs/access/control/cloud_history_worker/docs/version 통합 소유.
+- Root Cargo sole executor/jobs2/공용 performance target. 테스트 먼저 제출→root 실제 행동 RED→최소 구현 허가→GREEN. worker 임의 Cargo 금지. 사용자 DB·keys·clipboard·실계정·앱 상태 조작 금지.
+- 설계 결정: sidebar/global_turn_done과 독립된 native proof; 실제 accepted-input monotonic sequence와 원 actor/operation/run/session/generation/execution/native-turn 결속; full prompt digest는 corroboration만. 지원 증거 없는 provider는 입력 전 unsupported. 선택 연결+세션 read-required/default-off, input 권한 승격 없음. 별도 유계 SSE lane와 원 initialized host/session/cursor replay, 최종 durable receipt 후 원 reply, 반환과 모델ACK 분리.
+- 현재 제품 변경/테스트 실행 없음. 다음: workers test-only commits→root focused RED→병렬 GREEN, root integration, cross-review/전체 gates/PR/main/release0.13.0. 원 dirty worktree/0.12.3 산출물 보존.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015
+cat AGENTS.md
+head -n 65 docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff
+cat docs/superpowers/plans/2026-10-15-cloud-local-completion.md
+```
+
+---
+
 # 한글 IME·HTTP 수정 — main·0.12.3 빌드 완료, 클라우드 완료 알림 설계 대기, 2026-10-15
 
 ## 현재 목표와 작업 위치

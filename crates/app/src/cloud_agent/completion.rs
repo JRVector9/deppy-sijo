@@ -91,6 +91,9 @@ fn matches_proof(target: &WatchTarget, proof: &NativeTurnProof) -> bool {
 }
 
 impl Tracker {
+    /// Roll back only a pre-durable-claim reservation known not to have sent input.
+    pub(crate) fn discard_unclaimed(&mut self, _key: &WatchKey) {}
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
         &mut self,
@@ -608,6 +611,48 @@ mod tests {
         });
         own.completion_revision += 1;
         (tracker, key, target, own)
+    }
+
+    #[test]
+    fn completion_unclaimed_rollback_releases_capacity_and_allows_same_operation_retry() {
+        let (key, target, baseline) = fixture();
+        let mut tracker = Tracker::default();
+        for _ in 0..(WATCH_MAX + 1) {
+            tracker
+                .begin(
+                    key.clone(),
+                    target.clone(),
+                    &baseline,
+                    10,
+                    "@internal:operation".into(),
+                    storage::native_prompt_digest("own prompt"),
+                    START,
+                )
+                .unwrap();
+            tracker.discard_unclaimed(&key);
+            assert!(
+                tracker.state(&key).is_none(),
+                "unsent reservation has no terminal receipt"
+            );
+            assert!(tracker.watch_keys().is_empty());
+        }
+        tracker
+            .begin(
+                key.clone(),
+                target,
+                &baseline,
+                10,
+                "@internal:operation".into(),
+                storage::native_prompt_digest("own prompt"),
+                START,
+            )
+            .unwrap();
+        tracker.admit(&key, Err(runtime::PtyInputRejectReason::AdmissionDenied));
+        tracker.discard_unclaimed(&key);
+        assert!(
+            tracker.state(&key).is_none(),
+            "known-unsent claim rollback also clears its provisional status"
+        );
     }
 
     #[test]

@@ -92,7 +92,10 @@ fn matches_proof(target: &WatchTarget, proof: &NativeTurnProof) -> bool {
 
 impl Tracker {
     /// Roll back only a pre-durable-claim reservation known not to have sent input.
-    pub(crate) fn discard_unclaimed(&mut self, _key: &WatchKey) {}
+    pub(crate) fn discard_unclaimed(&mut self, key: &WatchKey) {
+        self.active.remove(key);
+        self.statuses.retain(|status| &status.key != key);
+    }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn begin(
@@ -266,7 +269,7 @@ impl Tracker {
             if proof.turn_id == watch.baseline_turn
                 || proof.started_at_micros < accepted_at
                 || proof.started_at_micros > accepted_at.saturating_add(START_TIMEOUT_MICROS)
-                || proof.prompt_digest != watch.prompt_digest
+                || proof.prompt_digest.as_deref() != Some(watch.prompt_digest.as_str())
                 || watch
                     .bound_turn
                     .as_ref()
@@ -558,7 +561,7 @@ mod tests {
             turn_id: "previous-turn".into(),
             started_at_micros: 2,
             start_execution_stamp: stamp,
-            prompt_digest: storage::native_prompt_digest("previous prompt"),
+            prompt_digest: Some(storage::native_prompt_digest("previous prompt")),
             transcript_path: format!("/isolated/rollout-fixture-{native}.jsonl"),
             completed: None,
             completion_revision: 4,
@@ -604,7 +607,7 @@ mod tests {
         let mut own = baseline;
         own.turn_id = "own-turn".into();
         own.started_at_micros = START + 2;
-        own.prompt_digest = storage::native_prompt_digest("own prompt");
+        own.prompt_digest = Some(storage::native_prompt_digest("own prompt"));
         own.completed = Some(NativeTurnCompletionProof {
             at_micros: START + 3,
             execution_stamp: own.start_execution_stamp.clone(),
@@ -727,8 +730,9 @@ mod tests {
                 5 => target.native_session_id.push('x'),
                 6 => target.execution = AgentExecutionIdentity::fixture(AgentKind::Codex, 99),
                 7 => {
-                    own.prompt_digest =
-                        storage::native_prompt_digest("own prompt with another suffix")
+                    own.prompt_digest = Some(storage::native_prompt_digest(
+                        "own prompt with another suffix",
+                    ))
                 }
                 8 => own.session_generation += 1,
                 9 => own.started_at_micros = START - 1,

@@ -1,4 +1,7 @@
 //! 원 요청의 완료 감시와 전달 상태. 파일·SQLite 작업은 기존 worker에 맡긴다.
+#[cfg(test)]
+#[path = "completion_retention_tests.rs"]
+mod retention_tests;
 use super::{
     CloudAgent, Target,
     completion::{self, Decision, LocalCompletionState, WatchKey, WatchTarget},
@@ -10,7 +13,7 @@ use agent_mcp::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     sync::mpsc,
 };
 
@@ -22,6 +25,7 @@ pub(crate) struct CompletionStatusView {
 struct Pending {
     identity: CompletionIdentity,
     permit: CompletionPermit,
+    input_permit: CompletionPermit,
     target: Target,
     watch_target: WatchTarget,
     reply: mpsc::SyncSender<Result<Value, String>>,
@@ -46,6 +50,8 @@ pub(super) struct CompletionBridge {
     finishes: HashMap<u64, (String, CompletionReceipt)>,
     statuses: VecDeque<Status>,
     last_projection: Option<std::time::Instant>,
+    observation_blocked: bool,
+    ready_runtimes: Option<HashSet<u64>>,
 }
 fn micros() -> i64 {
     std::time::SystemTime::now()
@@ -74,8 +80,62 @@ fn same_target(a: &Target, b: &Target) -> bool {
         && a.provider == b.provider
 }
 impl CloudAgent {
-    pub(crate) fn invalidate_completion_runtime(&mut self, _runtime: u64) {}
-    pub(crate) fn set_completion_observation_ready(&mut self, _ready: bool) {}
+    pub(crate) fn invalidate_completion_runtime(&mut self, runtime: u64) {
+        self.completion_bridge
+            .sequences
+            .retain(|(instance, _), _| *instance != runtime);
+        for pending in self.completion_bridge.pending.values() {
+            if pending.target.runtime == runtime {
+                pending.input_permit.revoke();
+            }
+        }
+        let affected: Vec<_> = self
+            .completion_bridge
+            .pending
+            .values()
+            .filter(|p| p.target.runtime == runtime)
+            .map(|p| (key(&p.identity), p.identity.clone()))
+            .collect();
+        for (watch_key, identity) in affected {
+            if let Some(decision) = self.completion_bridge.tracker.cancel(
+                &watch_key,
+                LocalCompletionState::Unknown,
+                "completion_runtime_events_lost",
+            ) {
+                self.record_completion_decisions(vec![decision]);
+                if let Some(status) = self
+                    .completion_bridge
+                    .statuses
+                    .iter_mut()
+                    .find(|s| s.identity == identity)
+                {
+                    status.view.local = LocalCompletionState::Unknown;
+                }
+            }
+        }
+        let target_keys: Vec<_> = self
+            .targets
+            .iter()
+            .filter(|t| t.runtime == runtime)
+            .map(|t| format!("{}:{}", t.workspace, t.session.0))
+            .collect();
+        self.completion_bridge
+            .native
+            .retain(|key, _| !target_keys.contains(key));
+    }
+    pub(crate) fn set_completion_observation_runtimes(&mut self, runtimes: &[(u64, bool)]) {
+        self.completion_bridge.ready_runtimes = Some(
+            runtimes
+                .iter()
+                .take(256)
+                .filter_map(|(id, ready)| ready.then_some(*id))
+                .collect(),
+        );
+        self.completion_bridge.observation_blocked = false;
+    }
+    pub(crate) fn set_completion_observation_ready(&mut self, ready: bool) {
+        self.completion_bridge.observation_blocked = !ready;
+    }
     pub(crate) fn completion_projection_due(&mut self) -> bool {
         if !self.has_completion_watches()
             || self
@@ -92,6 +152,13 @@ impl CloudAgent {
         self.completion_bridge
             .pending
             .get(internal)
+            .map(|p| p.input_permit.clone())
+    }
+    #[cfg(test)]
+    pub(super) fn completion_transport_permit(&self, internal: &str) -> Option<CompletionPermit> {
+        self.completion_bridge
+            .pending
+            .get(internal)
             .map(|p| p.permit.clone())
     }
     pub(crate) fn native_turn_keys(&self) -> Vec<String> {
@@ -104,10 +171,16 @@ impl CloudAgent {
     }
     pub(crate) fn completion_watch_keys(&self) -> Vec<String> {
         self.completion_bridge
-            .pending
-            .values()
+            .tracker
+            .watch_keys()
+            .into_iter()
+            .filter_map(|key| {
+                let internal =
+                    agent_mcp::operation_key(&key.connection_id, &key.operation_id).ok()?;
+                let p = self.completion_bridge.pending.get(&internal)?;
+                Some(format!("{}:{}", p.target.workspace, p.target.session.0))
+            })
             .take(64)
-            .map(|p| format!("{}:{}", p.target.workspace, p.target.session.0))
             .collect()
     }
     pub(crate) fn install_native_turns(&mut self, proofs: Vec<storage::NativeTurnProof>) {
@@ -116,7 +189,6 @@ impl CloudAgent {
             .take(256)
             .map(|p| (p.session_key.clone(), p))
             .collect();
-        self.poll_completions();
     }
     pub(crate) fn has_completion_watches(&self) -> bool {
         !self.completion_bridge.pending.is_empty()
@@ -202,16 +274,13 @@ impl CloudAgent {
             },
             at: now(),
         });
-        while self.completion_bridge.statuses.len() > 1000 {
-            if let Some(old) = self.completion_bridge.statuses.pop_front() {
-                old.permit.revoke();
-            }
-        }
+        self.prune_completion_statuses();
         self.completion_bridge.pending.insert(
             internal,
             Pending {
                 identity: identity.clone(),
                 permit,
+                input_permit: CompletionPermit::new(),
                 target: target.clone(),
                 watch_target,
                 reply: req.reply.clone(),
@@ -224,6 +293,21 @@ impl CloudAgent {
         );
         Ok(identity)
     }
+    fn prune_completion_statuses(&mut self) {
+        while self.completion_bridge.statuses.len() > 1000 {
+            let removable = self.completion_bridge.statuses.iter().position(|status| {
+                !self
+                    .completion_bridge
+                    .pending
+                    .values()
+                    .any(|p| p.identity == status.identity)
+            });
+            let Some(index) = removable else { break };
+            if let Some(old) = self.completion_bridge.statuses.remove(index) {
+                old.permit.revoke();
+            }
+        }
+    }
     pub(super) fn discard_completion(&mut self, internal: &str) {
         if let Some(p) = self.completion_bridge.pending.remove(internal) {
             self.completion_bridge
@@ -232,6 +316,7 @@ impl CloudAgent {
             self.completion_bridge
                 .statuses
                 .retain(|s| s.identity != p.identity);
+            p.input_permit.revoke();
             // 원 오류 응답이 전송되도록 permit은 반환 전에 취소하지 않는다.
         }
     }
@@ -244,7 +329,7 @@ impl CloudAgent {
         self.completion_bridge
             .pending
             .get(internal)
-            .is_some_and(|p| p.permit.is_live() && p.decision.is_none())
+            .is_some_and(|p| p.permit.is_live() && p.input_permit.is_live() && p.decision.is_none())
     }
     pub(super) fn record_completion_admission(
         &mut self,
@@ -258,12 +343,12 @@ impl CloudAgent {
         if p.admission.is_some() {
             return;
         }
+        p.input_permit.revoke();
         p.admission = Some(admission);
         let watch_key = key(&p.identity);
         if let Some(decision) = self.completion_bridge.tracker.admit(&watch_key, result) {
             self.record_completion_decisions(vec![decision]);
         }
-        self.poll_completions();
     }
     fn record_completion_decisions(&mut self, decisions: Vec<Decision>) {
         for decision in decisions {
@@ -273,6 +358,15 @@ impl CloudAgent {
                 continue;
             };
             if let Some(p) = self.completion_bridge.pending.get_mut(&internal) {
+                let mut decision = decision;
+                if p.watch_target != decision.target
+                    || (decision.state == LocalCompletionState::Completed
+                        && (decision.completion_revision.is_none()
+                            || decision.completed_at_micros.is_none()))
+                {
+                    decision.state = LocalCompletionState::Unknown;
+                    decision.reason = "completion_invalid_native_decision";
+                }
                 p.decision = Some(decision);
             }
         }
@@ -320,6 +414,11 @@ impl CloudAgent {
             })
             .collect();
         for identity in identities {
+            for pending in self.completion_bridge.pending.values() {
+                if pending.identity == identity {
+                    pending.input_permit.revoke();
+                }
+            }
             if let Some(decision) = self.completion_bridge.tracker.cancel(
                 &key(&identity),
                 LocalCompletionState::Revoked,
@@ -329,21 +428,29 @@ impl CloudAgent {
             }
         }
     }
-    pub(crate) fn poll_completions(&mut self) {
-        if let Some(server) = &self.server {
-            for _ in 0..128 {
-                let Ok(event) = server.delivery_events.try_recv() else {
-                    break;
-                };
-                if let Some(status) = self
-                    .completion_bridge
-                    .statuses
-                    .iter_mut()
-                    .find(|s| s.identity == event.identity)
-                {
-                    status.view.delivery = event.state;
-                }
+    pub(super) fn observe_completion_delivery(
+        &mut self,
+        event: agent_mcp::CompletionDeliveryEvent,
+    ) {
+        if let Some(status) = self
+            .completion_bridge
+            .statuses
+            .iter_mut()
+            .find(|s| s.identity == event.identity)
+        {
+            if status.view.delivery != CompletionDeliveryState::Closed {
+                status.view.delivery = event.state;
             }
+        }
+    }
+    pub(crate) fn poll_completions(&mut self) {
+        let delivery: Vec<_> = self
+            .server
+            .as_ref()
+            .map(|server| server.delivery_events.try_iter().take(128).collect())
+            .unwrap_or_default();
+        for event in delivery {
+            self.observe_completion_delivery(event);
         }
         let invalid: Vec<_> = self
             .completion_bridge
@@ -361,9 +468,10 @@ impl CloudAgent {
                     })
                     || !p.watch_target.execution.is_current()
             })
-            .map(|(_, p)| (key(&p.identity), p.permit.clone()))
+            .map(|(_, p)| (key(&p.identity), p.permit.clone(), p.input_permit.clone()))
             .collect();
-        for (key, permit) in invalid {
+        for (key, permit, input_permit) in invalid {
+            input_permit.revoke();
             permit.revoke();
             if let Some(d) = self.completion_bridge.tracker.cancel(
                 &key,
@@ -373,10 +481,20 @@ impl CloudAgent {
                 self.record_completion_decisions(vec![d]);
             }
         }
+        let expired = self.completion_bridge.tracker.expire(micros());
+        self.record_completion_decisions(expired);
         let observed: Vec<_> = self
             .completion_bridge
             .pending
             .values()
+            .filter(|p| {
+                !self.completion_bridge.observation_blocked
+                    && self
+                        .completion_bridge
+                        .ready_runtimes
+                        .as_ref()
+                        .is_none_or(|ready| ready.contains(&p.target.runtime))
+            })
             .filter_map(|p| {
                 self.completion_bridge
                     .native
@@ -393,8 +511,6 @@ impl CloudAgent {
             );
             self.record_completion_decisions(decisions);
         }
-        let expired = self.completion_bridge.tracker.expire(micros());
-        self.record_completion_decisions(expired);
         for p in self.completion_bridge.pending.values() {
             if let Some(status) = self
                 .completion_bridge
@@ -473,24 +589,13 @@ impl CloudAgent {
         let Some(p) = self.completion_bridge.pending.remove(&internal) else {
             return;
         };
+        self.operation_contexts.remove(&internal);
         let ok = matches!(result, ResultKind::FinishCompletion(Ok(())));
         let response = if ok {
             Ok(receipt.tool_result())
         } else {
             Err("outcome_unknown_do_not_retry_input".into())
         };
-        if let Some(status) = self
-            .completion_bridge
-            .statuses
-            .iter_mut()
-            .find(|s| s.identity == p.identity)
-        {
-            status.view.delivery = if p.permit.is_live() {
-                CompletionDeliveryState::Ready
-            } else {
-                CompletionDeliveryState::Closed
-            };
-        }
         let _ = p.reply.try_send(response);
     }
     pub(super) fn completion_status_for_target(
@@ -498,16 +603,31 @@ impl CloudAgent {
         connection: &str,
         target: &Target,
     ) -> Option<CompletionStatusView> {
-        self.completion_bridge
-            .statuses
-            .iter()
-            .rev()
-            .find(|s| {
-                s.identity.connection_id == connection
-                    && s.identity.scope.session_id == target.id
-                    && s.identity.scope.generation == target.generation
-            })
-            .map(|s| s.view)
+        if let Some(status) = self.completion_bridge.statuses.iter().rev().find(|s| {
+            s.identity.connection_id == connection
+                && s.identity.scope.session_id == target.id
+                && s.identity.scope.generation == target.generation
+        }) {
+            return self.completion_status_for_operation(
+                connection,
+                &target.id,
+                &target.generation,
+                &status.identity.scope.operation_id,
+            );
+        }
+        (self
+            .connection_permission(connection, target)
+            .local_completion
+            && (target.provider != Some(crate::agent_surface::AgentProvider::Codex)
+                || target.execution.is_none()
+                || !self
+                    .completion_bridge
+                    .native
+                    .contains_key(&format!("{}:{}", target.workspace, target.session.0))))
+        .then_some(CompletionStatusView {
+            local: LocalCompletionState::Unsupported,
+            delivery: CompletionDeliveryState::Closed,
+        })
     }
     pub(super) fn completion_status_for_operation(
         &self,

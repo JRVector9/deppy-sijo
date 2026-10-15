@@ -662,7 +662,7 @@ fn completion_input_only_revoke_preserves_accepted_watch_but_read_or_optout_revo
     assert!(
         fixture
             .bridge
-            .completion_input_permit(&started.internal)
+            .completion_transport_permit(&started.internal)
             .unwrap()
             .is_live()
     );
@@ -678,7 +678,7 @@ fn completion_input_only_revoke_preserves_accepted_watch_but_read_or_optout_revo
         fixture.admit(&started, Ok(()));
         let permit = fixture
             .bridge
-            .completion_input_permit(&started.internal)
+            .completion_transport_permit(&started.internal)
             .unwrap();
         if read {
             fixture

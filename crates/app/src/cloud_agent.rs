@@ -4,6 +4,10 @@ mod access;
 mod bridge_tests;
 pub(crate) mod completion;
 mod completion_bridge;
+#[cfg(test)]
+mod completion_event_loss_tests;
+#[cfg(test)]
+mod completion_integration_tests;
 pub(crate) use completion_bridge::CompletionStatusView;
 mod continuity;
 mod control;
@@ -102,6 +106,8 @@ struct PendingInput {
     session: runtime::SessionId,
     bytes: usize,
     submit: bool,
+    completion: bool,
+    admission_finalized: bool,
     deadline: std::time::Instant,
     reply: Option<std::sync::mpsc::SyncSender<Result<Value, String>>>,
 }
@@ -1274,12 +1280,19 @@ impl CloudAgent {
                             session: claim.target.session,
                             bytes: size,
                             submit: claim.submit,
+                            completion: claim.completion,
+                            admission_finalized: false,
                             deadline: claim.request.deadline,
                             reply: (!claim.completion).then_some(claim.request.reply),
                         },
                     );
                 }
                 Err(code) => {
+                    let code = if claim.completion {
+                        "pty_dispatch_rejected".to_owned()
+                    } else {
+                        code
+                    };
                     let outcome = json!({"status":"rejected","error":code,"retry":false});
                     self.finish_operation(
                         op.clone(),
@@ -1313,11 +1326,25 @@ impl CloudAgent {
             );
         }
     }
+    #[cfg(test)]
     pub fn observe_input(&mut self, runtime: u64, events: &[runtime::RuntimeEvent]) {
+        self.observe_input_with_integrity(runtime, events, true);
+    }
+    pub(crate) fn observe_input_with_integrity(
+        &mut self,
+        runtime: u64,
+        events: &[runtime::RuntimeEvent],
+        sequence_current: bool,
+    ) {
+        if !sequence_current {
+            self.invalidate_completion_runtime(runtime);
+        }
         self.observe_screen_events(runtime, events, now());
         self.observe_history(runtime, events);
         for event in events {
-            self.observe_completion_event(runtime, event);
+            if sequence_current {
+                self.observe_completion_event(runtime, event);
+            }
             let runtime::RuntimeEvent::InputAdmitted {
                 session,
                 operation_id,
@@ -1334,6 +1361,9 @@ impl CloudAgent {
                 continue;
             }
             let p = self.pending.remove(operation_id).unwrap();
+            if p.completion && p.admission_finalized {
+                continue;
+            }
             let outcome = match result {
                 Ok(()) => {
                     json!({"status":"queued","admission":"pty_queue","bytes":p.bytes,"submit":p.submit,"retry":false,"completion":"not_confirmed"})
@@ -1362,10 +1392,13 @@ impl CloudAgent {
         let timed_out: Vec<_> = self
             .pending
             .iter()
-            .filter(|(_, p)| Instant::now() >= p.deadline && p.reply.is_none())
+            .filter(|(_, p)| Instant::now() >= p.deadline && p.completion && !p.admission_finalized)
             .map(|(op, _)| op.clone())
             .collect();
         for op in timed_out {
+            if let Some(pending) = self.pending.get_mut(&op) {
+                pending.admission_finalized = true;
+            }
             self.record_completion_admission(&op, json!({"status":"unknown","error":"pty_admission_unknown","retry":false,"completion":"not_confirmed"}), Err(runtime::PtyInputRejectReason::AdmissionUnknown));
         }
         self.poll_completions();
@@ -1384,6 +1417,9 @@ impl CloudAgent {
             .collect();
         for op in abandoned {
             if let Some(pending) = self.pending.remove(&op) {
+                if pending.completion && pending.admission_finalized {
+                    continue;
+                }
                 self.finish_operation(
                     op,
                     json!({"status":"unknown","retry":false,"completion":"not_confirmed"}),

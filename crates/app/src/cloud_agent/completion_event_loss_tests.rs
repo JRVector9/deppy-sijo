@@ -122,7 +122,7 @@ fn completion_event_loss_durable_native_finish_preserves_closed_delivery() {
     assert!(
         fixture
             .bridge
-            .completion_input_permit(&started.internal)
+            .completion_transport_permit(&started.internal)
             .unwrap()
             .is_live(),
         "transport TTL closure is independent of read consent"

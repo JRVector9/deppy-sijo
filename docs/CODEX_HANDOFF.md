@@ -1,3 +1,24 @@
+# 클라우드 완료 알림 — 마지막 경합 수정 및 전체 검증 준비, 2026-10-15
+
+- 현재 canonical `deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`, HEAD882cd848 + root 통합 수정. 사용자 `진행해` 승인 feature; source0.13.0 (기존 shipped0.12.3), Cargo.lock27 inherited packages 갱신, CHANGELOG 작성. 아직 release/package/merge 미완료. 앱 종료·실행 권한 없음.
+- stage5 실제: MCP14PASS1ignored/App57PASS/runtime3PASS/storage10PASS+integration2PASS/parser1PASS. proxy subprocess fixture가 private .codex/sessions 밖이라 실패하여 fixture경로만 교정.
+- stage6 실제: MCP14PASS2FAIL1ignored(과대 Appreply cache/posthandoff false-noeffect), App57PASS1FAIL(절대 만료). stage7에서 수정 검증: MCP16PASS1ignored, parser+realproxy1PASS씩. App60PASS7FAIL(늦은 admission/유실·순서 경합6개 + History::open fixture가 실행중 watch를 startup-recover하는 검사 오류1개). Fixture는 readonly SQL로 교정, 제품 startup 동작을 우회하지 않음.
+- stage8 실제 App70PASS2FAIL: Closed delivery를 DB완료가 Ready로 덮는 결함 + canonical durable/wire payload 차이. Closed는 transport event만 delivery authority로 수정. stage9 실제 MCP16PASS2FAIL1ignored(canonical payload/known machinecode), App72PASS4FAIL(activewatch status pruning, unadmitted-input fence, unrelatedruntime readiness, canonicalpayload 연계). 로그 `/private/tmp/deppy-completion-stage{6,7,8,9}-*-20261015.log`.
+- root GREEN 후보: install_native_turns는 cache-only; admission처리 중 native완료판정 금지; 매 프레임 모든 입력 drain 후 runtime별 ready allowlist로 판정. 유실runtime은 accepted sequence/native cache를 폐기하고 Unknown, **별도 input_permit**만 revoke하여 original read stream을 보존. PendingInput 자체의 immutable admission_finalized bit로 늦은 receipt/abandon 차단. UI status cap은 activewatch를 건너뛰고 terminal만 제거. transport882cd848은 admission기반 canonical effect_state + bounded5codes를 통합. 현재 최종 GREEN 실행 전까지 완료로 세지 않음.
+- 독립 공식 SDK1.32.1 실제PASS: 정상48ms, configured61초 대기61016ms(default60s 초과), 강제 연결끊김 후 원요청 resume1021ms; submitted3/completed3/forced_disconnect1, polltool0/resumedGET1/errors0. `/private/tmp/deppy-completion-sdk-result-20261015.json`, privatefixture `/private/tmp/deppy-completion-sdk-20261015.lrtkcP`. 빌드 offline 외부 manifest yanked wnaf 해석 실패는 root Cargo.lock+vendored patch로 고정 후 실제 빌드0. 이 증거는 canonical-normalization 전 source cohort이며 최종 source SDK quick 검증 예정. 실cloudhost 장시간 요청호환/모델ACK 증거로 확대하지 않음.
+- stage10 실제 MCP18PASS1ignored/App74PASS2FAIL/runtime3PASS/storage10PASS+integration2PASS/proxy2PASS. App2개 실패는 입·출력 permit 분리 뒤에도 테스트가 input_permit을 read/transport권한으로 검사한 오래된 precondition이며 test-only transport permit getter로 교정했다. readonly교차리뷰는 추가로 is_disconnected가 이벤트를 prefetch하므로 backlog최종확인을 뒤로 옮길 것을 발견, active/warm 모두 수정했다. stage11 focused 재검증 중.
+- root만 Cargo/jobs2/shared performance target. workers gpt-6.1-sol/xhigh3명 별도 tree, 현재 최종 readonly 교차리뷰. 다음 stage10 focused → fullworkspace/fmt/clippy/boundary/deps → SDK quick → evidence/PR/CI/main →0.13.0 artifact CLI/plist2/arm64/signature/archive 검증. 사용자 DB/키/clipboard/실계정/실제입력 없음.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015
+cat AGENTS.md
+git status --short --branch
+git diff --stat
+tail -n 100 /private/tmp/deppy-completion-stage10-green-20261015.log
+```
+
+---
+
 # 클라우드 완료 알림 — 앱 통합·회귀 검증 진행, 2026-10-15
 
 - 목표/권한: 사용자 `진행해` 승인 설계대로 원 initialized MCP 요청에 검증된 로컬 완료를 자동 반환. 신규 feature0.13.0 예정, 현재0.12.3. 앱 launch/restart 권한 없음. canonical `deppy-sijo-ime-cloud-20261015`, branch `feat/cloud-local-completion-20261015`; 기존 dirty worktree/사용자 DB 보존.

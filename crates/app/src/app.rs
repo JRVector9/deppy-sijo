@@ -27138,10 +27138,16 @@ impl App {
             // 마지막으로 큐에 남은 이벤트를 처리해 방금 끝난 background 작업의 완료/오류
             // 알림을 놓치지 않는다 (codex 리뷰 — 축출 시 receiver drop으로 유실되던 것).
             let events = rt.events.drain();
-            self.cloud_agent.observe_input(rt.runtime_instance, &events);
+            let approval_events_overflowed = rt.events.take_overflowed();
+            self.cloud_agent.observe_input_with_integrity(
+                rt.runtime_instance,
+                &events,
+                !approval_events_overflowed
+                    && !rt.event_overflow_pending
+                    && !rt.events.is_disconnected(),
+            );
             self.observe_prompt_admissions(rt.runtime_instance, &events);
             Self::observe_scrollback_policy(&mut rt, &events);
-            let approval_events_overflowed = rt.events.take_overflowed();
             if approval_events_overflowed {
                 self.runtime_stream_warning = true;
             }
@@ -34801,6 +34807,7 @@ impl eframe::App for App {
     // 스킵 판단에 쓰는 바로 그 신호(minimized OR occluded — macOS는 occluded로 갱신되어
     // minimized 미갱신 문제를 피한다). None(미보고)이면 안전하게 Active 유지.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.cloud_agent.set_completion_observation_ready(false);
         self.protect_document_app_exit(ctx);
         self.pump_project_keys();
         self.prune_session_aux_views();
@@ -35183,7 +35190,14 @@ impl eframe::App for App {
         let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
-            self.cloud_agent.observe_input(rt.runtime_instance, &events);
+            let completion_events_overflowed = rt.events.take_overflowed();
+            self.cloud_agent.observe_input_with_integrity(
+                rt.runtime_instance,
+                &events,
+                !completion_events_overflowed
+                    && !rt.event_overflow_pending
+                    && !rt.events.is_disconnected(),
+            );
             prompt_admission_events.extend(
                 events
                     .iter()
@@ -35213,7 +35227,7 @@ impl eframe::App for App {
             if rt.events.has_backlog() {
                 ctx.request_repaint();
             }
-            if rt.events.take_overflowed() {
+            if completion_events_overflowed {
                 runtime_stream_overflowed = true;
                 approval_events_overflowed = true;
                 rt.event_overflow_pending = true;
@@ -35326,8 +35340,14 @@ impl eframe::App for App {
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
-        self.cloud_agent
-            .observe_input(self.active.runtime_instance, &new_events);
+        let completion_events_overflowed = self.active.events.take_overflowed();
+        self.cloud_agent.observe_input_with_integrity(
+            self.active.runtime_instance,
+            &new_events,
+            !completion_events_overflowed
+                && !self.active.event_overflow_pending
+                && !self.active.events.is_disconnected(),
+        );
         self.cloud_agent.expire_pending();
         self.observe_prompt_admissions(self.active.runtime_instance, &new_events);
         self.retire_prompt_delivery_targets();
@@ -35430,6 +35450,23 @@ impl eframe::App for App {
             // 프레임이 그리는 내용을 위해 프레임을 한 장 더 잡고, egui가 거기에 settle 프레임을
             // 하나 더 붙여 갱신 1회당 3프레임이 된다 (agenttui 실측: 페인트의 70%가 헛 프레임).
         }
+        let mut completion_runtimes = vec![(
+            self.active.runtime_instance,
+            !completion_events_overflowed
+                && !self.active.event_overflow_pending
+                && !self.active.events.is_disconnected()
+                && !self.active.events.has_backlog(),
+        )];
+        completion_runtimes.extend(self.warm.values().map(|rt| {
+            (
+                rt.runtime_instance,
+                !rt.event_overflow_pending
+                    && !rt.events.is_disconnected()
+                    && !rt.events.has_backlog(),
+            )
+        }));
+        self.cloud_agent
+            .set_completion_observation_runtimes(&completion_runtimes);
         self.pump_cloud_agent(ctx);
         if primary_activation_post_render_tick {
             // WorkspaceUi consumes MuxUpdated in ui(), after this logic pass. Wake one more tick
@@ -35446,7 +35483,7 @@ impl eframe::App for App {
         if self.active.events.has_backlog() {
             ctx.request_repaint();
         }
-        if self.active.events.take_overflowed() {
+        if completion_events_overflowed {
             self.runtime_stream_warning = true;
             approval_events_overflowed = true;
             self.active.event_overflow_pending = true;

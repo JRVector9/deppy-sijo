@@ -113,3 +113,45 @@ fn completion_event_loss_defers_native_result_until_runtime_input_drain_finishes
     let result = fixture.finish(&mut started);
     assert_eq!(result["local_completion"]["status"], "unknown");
 }
+
+#[test]
+fn completion_event_loss_durable_native_finish_preserves_closed_delivery() {
+    let mut fixture = Fixture::new();
+    let mut started = fixture.start("closed-delivery-native-finish", None);
+    let accepted_at = fixture.admit(&started, Ok(()));
+    assert!(
+        fixture
+            .bridge
+            .completion_input_permit(&started.internal)
+            .unwrap()
+            .is_live(),
+        "transport TTL closure is independent of read consent"
+    );
+    fixture
+        .bridge
+        .observe_completion_delivery(agent_mcp::CompletionDeliveryEvent {
+            identity: started.identity.clone(),
+            state: agent_mcp::CompletionDeliveryState::Closed,
+        });
+    fixture
+        .bridge
+        .install_native_turns(vec![fixture.completed_proof(&started, accepted_at)]);
+
+    let result = fixture.finish(&mut started);
+    assert_eq!(result["local_completion"]["status"], "completed");
+    let status = fixture
+        .bridge
+        .completion_status_for_operation(
+            &started.identity.connection_id,
+            &started.identity.scope.session_id,
+            &started.identity.scope.generation,
+            &started.identity.scope.operation_id,
+        )
+        .unwrap();
+    assert_eq!(status.local, LocalCompletionState::Completed);
+    assert_eq!(
+        status.delivery,
+        agent_mcp::CompletionDeliveryState::Closed,
+        "durable local completion cannot reopen a closed original transport"
+    );
+}

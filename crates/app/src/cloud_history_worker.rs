@@ -2,8 +2,8 @@
 //! Claim commits before App is allowed to dispatch an effect. Drop drains admitted DB jobs;
 //! closing the result receiver releases publication without running any terminal input.
 use agent_mcp::{
-    Claim, CloudRun, History, HistoryPage, HistoryQuery, OperationContext, Record, RunPage,
-    RunQuery,
+    Claim, CloudRun, CompletionIdentity, CompletionReceipt, History, HistoryPage, HistoryQuery,
+    OperationContext, Record, RunPage, RunQuery,
 };
 use serde_json::Value;
 use std::{
@@ -64,6 +64,15 @@ pub(crate) enum Job {
         connection_id: String,
         outcome: Value,
         message: String,
+    },
+    ClaimCompletion {
+        tool: String,
+        args: Value,
+        identity: CompletionIdentity,
+    },
+    FinishCompletion {
+        identity: CompletionIdentity,
+        receipt: CompletionReceipt,
     },
     #[cfg_attr(
         not(test),
@@ -171,6 +180,7 @@ impl Job {
                 }
                 id.len() + connection_id.len() + receipt + message.len() + RECEIPT_BYTES + 1024
             }
+            Self::ClaimCompletion { .. } | Self::FinishCompletion { .. } => RECEIPT_BYTES,
             Self::Lookup { id, connection_id } => {
                 agent_mcp::operation_key(connection_id, id).ok()?;
                 id.len() + connection_id.len() + RECEIPT_BYTES + 1024
@@ -228,6 +238,8 @@ pub(crate) enum ResultKind {
     Recent(Result<Vec<Record>, ()>),
     ClaimScoped(Result<Claim, ()>),
     FinishScoped(Result<(), ()>),
+    ClaimCompletion(Result<Claim, ()>),
+    FinishCompletion(Result<(), ()>),
     Lookup(Result<Option<Value>, ()>),
     LookupTarget(Result<Option<Value>, ()>),
     SaveRun(Result<(), ()>),
@@ -361,6 +373,8 @@ impl HistoryWorker {
                             db.finish_scoped(&id, &connection_id, &outcome, &message)
                                 .map_err(|_| ())
                         })),
+                        Job::ClaimCompletion { .. } => ResultKind::ClaimCompletion(Err(())),
+                        Job::FinishCompletion { .. } => ResultKind::FinishCompletion(Err(())),
                         Job::Lookup { id, connection_id } => {
                             ResultKind::Lookup(db.as_ref().ok_or(()).and_then(|db| {
                                 db.get_operation(&id, &connection_id).map_err(|_| ())
@@ -518,6 +532,189 @@ mod tests {
             worker.request(token, job).is_ok(),
             "known-unsent actor admission"
         );
+    }
+    fn completion_identity() -> CompletionIdentity {
+        CompletionIdentity {
+            connection_id: "completion-actor".into(),
+            transport_session_id: uuid::Uuid::new_v4().to_string(),
+            stream_id: uuid::Uuid::new_v4().to_string(),
+            request_id: json!(42),
+            auth_epoch: 1,
+            scope: agent_mcp::CompletionScope {
+                workspace: "completion-workspace".into(),
+                session_id: "completion-session".into(),
+                generation: "completion-generation".into(),
+                operation_id: "completion-operation".into(),
+                run_id: Some("completion-run".into()),
+            },
+        }
+    }
+    fn completion_receipt(identity: &CompletionIdentity) -> CompletionReceipt {
+        let now = deppy_core::time::unix_secs_i64() as u64;
+        CompletionReceipt {
+            identity: identity.clone(),
+            event_id: identity.event_id(),
+            admission: json!({"status":"submitted","operation_id":identity.scope.operation_id}),
+            outcome: json!({"status":"completed","reason":"native_turn_verified"}),
+            created_at: now,
+            completed_at: Some(now),
+            expires_at: now + agent_mcp::COMPLETION_RECEIPT_TTL,
+        }
+    }
+    #[test]
+    fn completion_history_worker_claims_and_finishes_private_original_identity() {
+        let directory = dir();
+        let path = directory.join("completion-history.db");
+        let mut worker = HistoryWorker::new(Some(path.clone()), || {});
+        let identity = completion_identity();
+        let args = json!({"text":"isolated completion fixture","submit":true});
+        let receipt = completion_receipt(&identity);
+        request(
+            &mut worker,
+            1,
+            Job::ClaimCompletion {
+                tool: "send_text".into(),
+                args: args.clone(),
+                identity: identity.clone(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::ClaimCompletion(Ok(Claim::New))
+        ));
+        let mut foreign = identity.clone();
+        foreign.transport_session_id = uuid::Uuid::new_v4().to_string();
+        request(
+            &mut worker,
+            2,
+            Job::ClaimCompletion {
+                tool: "send_text".into(),
+                args,
+                identity: foreign.clone(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::ClaimCompletion(Err(()))
+        ));
+        request(
+            &mut worker,
+            3,
+            Job::FinishCompletion {
+                identity: identity.clone(),
+                receipt: receipt.clone(),
+            },
+        );
+        assert!(matches!(
+            worker.wait().unwrap().result,
+            ResultKind::FinishCompletion(Ok(()))
+        ));
+        request(
+            &mut worker,
+            4,
+            Job::LookupTarget {
+                id: identity.scope.operation_id.clone(),
+                connection_id: identity.connection_id.clone(),
+                workspace: identity.scope.workspace.clone(),
+                session: identity.scope.session_id.clone(),
+                generation: identity.scope.generation.clone(),
+            },
+        );
+        let completion = worker.wait().unwrap();
+        let ResultKind::LookupTarget(Ok(Some(public))) = &completion.result else {
+            panic!("public operation receipt");
+        };
+        assert_eq!(
+            public, &receipt.admission,
+            "public lookup remains admission-only"
+        );
+        drop(completion);
+        assert_eq!(worker.retained_bytes(), 0);
+        drop(worker);
+        let db = History::open(&path).unwrap();
+        assert_eq!(db.get_completion(&identity).unwrap(), Some(receipt));
+        assert_eq!(db.get_completion(&foreign).unwrap(), None);
+        drop(db);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+    #[test]
+    fn completion_history_worker_rejects_invalid_and_oversized_jobs_before_queue() {
+        let identity = completion_identity();
+        let receipt = completion_receipt(&identity);
+        let claim = |identity, tool: &str, args| Job::ClaimCompletion {
+            identity,
+            tool: tool.into(),
+            args,
+        };
+        let finish = |identity, receipt| Job::FinishCompletion { identity, receipt };
+        let mut invalid_identity = identity.clone();
+        invalid_identity.auth_epoch = 0;
+        let mut mismatched_receipt = receipt.clone();
+        mismatched_receipt.identity.request_id = json!(43);
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.event_id.push('x');
+        let mut oversized_receipt = receipt.clone();
+        oversized_receipt.outcome = json!({"status":"unknown","message":"x".repeat(4096)});
+        for job in [
+            claim(invalid_identity.clone(), "send_text", json!({})),
+            claim(identity.clone(), &"t".repeat(65), json!({})),
+            claim(
+                identity.clone(),
+                "send_text",
+                json!({"text":"x".repeat(MAX_ARGS)}),
+            ),
+            finish(invalid_identity, receipt.clone()),
+            finish(identity.clone(), mismatched_receipt),
+            finish(identity.clone(), invalid_receipt),
+            finish(identity, oversized_receipt),
+        ] {
+            let mut worker = HistoryWorker::new(None, || {});
+            assert!(
+                worker.request(1, job).is_err(),
+                "invalid completion job admitted"
+            );
+            assert_eq!(worker.retained_bytes(), 0);
+            assert_eq!(worker.outstanding, 0);
+            assert!(
+                worker.handle.is_none(),
+                "invalid job opened the database worker"
+            );
+        }
+    }
+    #[test]
+    fn completion_history_worker_charges_full_jobs_until_result_consumed() {
+        let identity = completion_identity();
+        let receipt = completion_receipt(&identity);
+        let args = json!({"text":"x".repeat(8192)});
+        let mut worker = HistoryWorker::new(None, || {});
+        let retained_claim = serde_json::to_vec(&args).unwrap().len()
+            + "send_text".len()
+            + identity.encoded_len().unwrap();
+        request(
+            &mut worker,
+            1,
+            Job::ClaimCompletion {
+                tool: "send_text".into(),
+                args,
+                identity: identity.clone(),
+            },
+        );
+        assert!(worker.retained_bytes() >= retained_claim);
+        let result = worker.wait().unwrap();
+        assert!(
+            worker.retained_bytes() >= retained_claim,
+            "result released its reservation early"
+        );
+        drop(result);
+        assert_eq!(worker.retained_bytes(), 0);
+        let retained_finish =
+            identity.encoded_len().unwrap() + serde_json::to_vec(&receipt).unwrap().len();
+        request(&mut worker, 2, Job::FinishCompletion { identity, receipt });
+        assert!(worker.retained_bytes() >= retained_finish);
+        let result = worker.wait().unwrap();
+        assert!(worker.retained_bytes() >= retained_finish);
+        drop(result);
+        assert_eq!(worker.retained_bytes(), 0);
     }
     #[test]
     fn cloud_management_actor_scopes_receipts_and_persists_runs_without_effects() {

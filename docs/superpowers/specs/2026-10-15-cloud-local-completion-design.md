@@ -39,7 +39,7 @@
 - 상태: `자동 반환 대기`, `작업 중`, `완료 · 반환 대기`, `반환됨 · 수신 확인 없음`, `연결 끊김`, `미지원`, `확인 불가`, `만료`, `권한 해제`. 로컬 완료와 전달 상태를 분리한다.
 - read 공유 해제·옵션 해제·연결 폐기/만료·credential 교체·서버 중지 시 pending 전송을 차단하고 stream을 닫는다. 이미 쓴 bytes를 회수한다고 주장하지 않는다. 입력 권한만 해제된 경우 유효한 읽기 권한 아래 기존 완료 receipt는 조회할 수 있다.
 - 재시작 시 미완료 watch는 unknown으로 정리한다. 기존 입력·권한·새 세대 공유를 복원하지 않는다. 이미 확정된 receipt의 재전달도 원 identity에 대한 현재 읽기 권한을 요구한다.
-- 초기 상한: 대상당1 tracked turn, 전역64 active watch/16 wait stream, stream당1 reader, 이벤트1KiB, 15초 heartbeat, watch60분, 완료 receipt24시간·최대1000개. 저장/버퍼 용량 초과·만료는 명시적인 결과이며 조용히 유실하지 않는다. heartbeat가 외부 호스트 timeout을 해제한다고 가정하지 않는다.
+- 초기 상한: 대상당1 tracked turn, 전역64 active watch/16 wait stream, stream당1 reader, 이벤트1KiB, 15초 heartbeat, TurnStart 결속30초, watch60분, 끊긴 stream 재개10분, 완료 receipt24시간·최대1000개. 저장/버퍼 용량 초과·만료는 명시적인 결과이며 조용히 유실하지 않는다. heartbeat가 외부 호스트 timeout을 해제한다고 가정하지 않는다. client의 요청 timeout 지원이 미확인인 경우 상태를 미확인으로 표시하고 실제 제공자 자동 수신을 보장하지 않는다.
 - DB·HTTP write·재연결 대기는 UI frame 밖에서 수행한다. 모든 표시 문자열은 기존 RedactionService로 전송 직전에 정리하고 routing identity는 유지한다.
 
 ## 변경 경계와 PR 순서

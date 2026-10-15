@@ -1,0 +1,11 @@
+{
+  "rlib": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/libagent_mcp-b36c41597c32de06.rlib",
+  "rlib_mtime": 1792045532.7746482,
+  "rlib_sha256": "80182f7d3b9760674d4e1fbe879fe4241e6e4743a7bebae8c12d792e87ba1fc0",
+  "canonical_server_sha256": "a16c4e97a68527d10f7610d1ca56988aa54d7359d58007300fb7bfaf90ff56dc",
+  "probe_sha256": "47b1d1549c0dc180e52d14f69f2e3e5ae71217344a4fa3d36c45b0a1e84a7078",
+  "root_single_cargo_producer_log": "/private/tmp/deppy-followup-workspace-20261015.log",
+  "compilation_lines": [
+    "   Compiling agent-mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)"
+  ]
+}

@@ -1,0 +1,48 @@
+   Compiling deppy-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/core)
+   Compiling secret v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/secret)
+   Compiling mux v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mux)
+   Compiling pty v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/pty)
+   Compiling persist v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/persist)
+   Compiling terminal v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/terminal)
+   Compiling audit v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/audit)
+   Compiling mcp-store v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-store)
+   Compiling storage-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage-core)
+   Compiling storage v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage)
+   Compiling session v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/session)
+   Compiling runtime v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/runtime)
+   Compiling web-remote v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/web-remote)
+   Compiling agent-mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 22.34s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_mcp-56639ff6450b3c4c)
+
+running 2 tests
+test tests::busy_http_rejection_delivers_complete_error_with_unread_large_body ... 
+thread 'tests::busy_http_rejection_delivers_complete_error_with_unread_large_body' (71040182) panicked at crates/agent-mcp/src/tests.rs:296:5:
+read=Err(Os { code: 54, kind: ConnectionReset, message: "Connection reset by peer" }), response=HTTP/1.1 503 Service Unavailable
+Content-Type: application/json
+Content-Length: 111
+Connection: close
+Cache-Control: no-cache
+X-Content-Type-Options: nosniff
+Referrer-Policy: strict-origin-when-cross-origin
+Permissions-Policy: camera=(), microphone=(), geolocation=()
+Content-Security-Policy: default-src 'self'; connect-src 'self'; frame-ancestors 'none'
+Retry-After: 1
+
+{"code":"busy_no_effect","effect_state":"none","error":"busy_no_effect","retry_after_ms":1000,"retryable":true}
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test tests::early_http_rejections_deliver_framed_errors_with_unread_large_body ... 
+thread 'tests::early_http_rejections_deliver_framed_errors_with_unread_large_body' (71040193) panicked at crates/agent-mcp/src/tests.rs:276:9:
+status=401, response=Err(Os { code: 54, kind: ConnectionReset, message: "Connection reset by peer" })
+FAILED
+
+failures:
+
+failures:
+    tests::busy_http_rejection_delivers_complete_error_with_unread_large_body
+    tests::early_http_rejections_deliver_framed_errors_with_unread_large_body
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 70 filtered out; finished in 0.07s
+
+error: test failed, to rerun pass `-p agent-mcp --lib`

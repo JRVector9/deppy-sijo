@@ -1,0 +1,38 @@
+    Checking rustls v0.23.46
+    Checking deppy-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/core)
+    Checking secret v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/secret)
+    Checking ureq v3.4.0
+    Checking mux v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mux)
+    Checking audit v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/audit)
+    Checking persist v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/persist)
+    Checking mcp-store v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-store)
+    Checking storage-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage-core)
+    Checking relay-protocol v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/relay-protocol)
+    Checking tungstenite v0.30.0
+    Checking alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/alacritty_terminal-0.26.0)
+    Checking storage v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage)
+    Checking terminal v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/terminal)
+    Checking pty v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/pty)
+    Checking http-client v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/http-client)
+    Checking session v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/session)
+    Checking winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/winit-0.30.13)
+    Checking runtime v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/runtime)
+    Checking web-remote v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/web-remote)
+    Checking mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp)
+    Checking auth v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/auth)
+    Checking connector-contract v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-contract)
+    Checking egui-wgpu v0.36.1
+    Checking accesskit_winit v0.32.2
+    Checking i18n v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/i18n)
+    Checking egui-winit v0.36.1
+    Checking egui_kittest v0.36.1
+    Checking eframe v0.36.1
+    Checking connector-ui v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-ui)
+    Checking connector-service v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/connector-service)
+    Checking agent-mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)
+    Checking platform v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/platform)
+    Checking relay-server v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/relay-server)
+    Checking xtask v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/xtask)
+    Checking deppy-sijo v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/app)
+    Checking mcp-proxy v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-proxy)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2m 25s

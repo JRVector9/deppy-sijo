@@ -1,0 +1,108 @@
+   Compiling deppy-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/core)
+   Compiling secret v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/secret)
+   Compiling mux v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mux)
+   Compiling terminal v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/terminal)
+   Compiling persist v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/persist)
+   Compiling pty v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/pty)
+   Compiling audit v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/audit)
+   Compiling mcp-store v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-store)
+   Compiling storage-core v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage-core)
+   Compiling storage v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage)
+   Compiling session v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/session)
+   Compiling runtime v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/runtime)
+   Compiling web-remote v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/web-remote)
+   Compiling agent-mcp v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.53s
+     Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/agent_mcp-26ba1f47be18c971)
+
+running 75 tests
+test history::efficiency_tests::answer_cleanup_work_does_not_scale_with_input_tombstones ... ok
+test history::efficiency_tests::cloud_management_migration_adds_durable_tables_without_rewriting_claims ... ok
+test history::efficiency_tests::legacy_history_reopen_preserves_tombstones_and_bounds_answers ... ok
+test history::efficiency_tests::measure_history_completion_and_cleanup_scaling ... ignored, measures real History completion, recent reads, SQL steps and index footprint
+test history::management_tests::cloud_review_small_snapshot_returns_a_page_with_explicit_truncation ... ok
+test history::management_tests::cloud_review_valid_newline_answers_fit_retained_memory_snapshot_budget ... ok
+test history::management_tests::durable_run_pages_support_reused_ids_and_do_not_skip_byte_limited_rows ... ok
+test history::management_tests::durable_runs_reject_late_saves_and_restore_unfinished_as_unknown ... ok
+test history::management_tests::durable_save_requires_existing_cancel_request_and_terminal_result_is_immutable ... ok
+test history::management_tests::exact_actor_scoped_get_run_retrieves_beyond_first_page ... ok
+test history::management_tests::history_pages_filter_actor_and_generation_with_bounded_cursor ... ok
+test history::management_tests::legacy_scoped_claim_obeys_existing_tombstone_and_new_scope_binds_target ... ok
+test history::management_tests::query_rejects_oversized_external_rows_before_materialization ... ok
+test history::management_tests::same_external_id_is_independent_and_receipts_are_connection_scoped ... ok
+test history::management_tests::targeted_receipt_lookup_cannot_borrow_another_session_or_generation_permission ... ok
+test management::tests::cancel_request_is_distinct_from_same_actor_acknowledgment ... ok
+test management::tests::cloud_review_failed_recovery_cannot_claim_successful_stale_transition ... ok
+test management::tests::cloud_review_rejects_reports_without_recovery_metadata_headroom ... ok
+test management::tests::heartbeat_preserves_unknown_status_and_rejects_wrong_actor_or_older_reports ... ok
+test management::tests::queued_receipt_cannot_complete_a_run_and_terminal_runs_reject_late_reports ... ok
+test management::tests::run_and_artifact_bounds_fail_without_partial_mutation ... ok
+test management::tests::scoped_key_is_deterministic_disjoint_and_legacy_compatible ... ok
+test management::tests::stale_and_restored_runs_require_resume_before_completion ... ok
+test management::tests::wrong_actor_session_and_generation_cannot_mutate_original_run ... ok
+test oauth::tests::approval_near_deadline_denial_and_registration_flood_remain_bounded ... ok
+test oauth::tests::cloud_management_oauth_names_follow_approved_clients_and_refresh ... ok
+test oauth::tests::cloud_management_oauth_revoke_one_grant_keeps_other_grants_and_rejects_refresh ... ok
+test oauth::tests::failed_secret_registration_preserves_code_refresh_and_existing_access ... ok
+test oauth::tests::late_authorize_preserves_registration_and_denial_redirect_grace ... ok
+test oauth::tests::oauth_requires_owner_consent_pkce_binding_single_use_refresh_and_expiry ... ok
+test oauth::tests::redirect_bounds_reject_before_consent_and_allow_encoded_state ... ok
+test oauth::tests::refresh_replaces_its_access_slot_at_full_capacity ... ok
+test oauth::tests::refresh_scope_order_and_subset_preserve_original_refresh_grant ... ok
+test oauth::tests::refresh_scope_rejects_expansion_and_unknown_without_consuming_grant ... ok
+test server::deadline_tests::completed_bodies_and_bodyless_discovery_skip_cleanup_wait ... ok
+test server::deadline_tests::dripping_body_does_not_extend_cleanup_deadline ... ok
+test server::deadline_tests::dripping_bytes_do_not_extend_total_read_deadline ... ok
+test server::deadline_tests::untrusted_cleanup_length_cannot_consume_beyond_byte_cap ... ok
+test server::hostname_tests::dedicated_funnel_port_is_allowed_but_urls_and_bad_domains_are_rejected ... ok
+test server::hostname_tests::generated_hostname_updates_real_host_checks_and_oauth_resource_once ... ok
+test server::oauth_lock_tests::oauth_wake_can_read_auth_without_deadlock ... 
+running 1 test
+test server::oauth_lock_tests::oauth_wake_can_read_auth_without_deadlock ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 74 filtered out; finished in 0.00s
+
+ok
+test server::registry_tests::cloud_management_oauth_sync_preserves_last_verified_authentication ... ok
+test tests::actual_http_auth_origin_initialize_and_answer_tool_discovery ... ok
+test tests::answer_retention_uses_completion_order ... ok
+test tests::busy_http_rejection_delivers_complete_error_with_unread_large_body ... ok
+test tests::claimed_operations_survive_restart_and_cannot_be_reexecuted ... ok
+test tests::cloud_management_code_like_private_errors_and_structured_errors_are_safe ... ok
+test tests::cloud_management_fixed_management_errors_reach_live_http_without_authority_changes ... ok
+test tests::cloud_management_http_activity_uses_credential_identity_only ... ok
+test tests::cloud_management_live_http_old_and_new_tool_dispatch_remains_additive ... ok
+test tests::cloud_management_manual_identity_revocation_is_per_connection ... ok
+test tests::cloud_management_optional_public_port_preserves_exact_host_and_oauth_resource ... ok
+test tests::cloud_management_poll_contention_does_not_block_another_connection ... ok
+test tests::cloud_management_private_diagnostics_do_not_leave_as_tool_errors ... ok
+test tests::cloud_management_revoked_manual_credentials_do_not_exhaust_registry ... ok
+test tests::cloud_management_tools_are_additive_and_run_linkage_is_optional ... ok
+test tests::cloud_management_unknown_input_error_has_safe_retry_and_effect_fields ... ok
+test tests::cloud_management_wire_auth_kind_and_history_schema_are_canonical ... ok
+test tests::credential_revocation_waits_for_queue_admission_and_blocks_later_writes ... ok
+test tests::credentials_expire_and_rotate_without_reusing_authority ... ok
+test tests::early_http_rejections_deliver_framed_errors_with_unread_large_body ... ok
+test tests::fragmented_http_request_waits_for_remaining_bytes ... ok
+test tests::framed_http_fixture_rejects_truncated_or_oversized_responses ... ok
+test tests::history_database_symlinks_are_rejected ... ok
+test tests::legacy_answer_database_migrates_and_prunes_on_open ... ok
+test tests::notifications_and_responses_use_202_without_a_body ... ok
+test tests::notified_answers_survive_input_audit_churn_and_expire_with_newer_answers ... ok
+test tests::oauth_http_discovery_and_challenge_are_available_without_a_token ... ok
+test tests::persisted_answers_are_durable_and_exact_retries_return_receipt ... ok
+test tests::plain_text_cannot_execute_without_submit ... ok
+test tests::pr9_actual_http_dispatch_preserves_paste_args_and_envelope_budget ... ok
+test tests::pr9_explicit_paste_is_discovered_with_no_implicit_submit ... ok
+test tests::pr9_paste_utf8_controls_and_legacy_limits_remain_explicit ... ok
+test tests::queued_oauth_request_is_invalid_after_access_refresh ... ok
+test tests::rejected_http_body_cleanup_never_waits_for_declared_length_or_client_eof ... ok
+
+test result: ok. 74 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.55s
+
+   Doc-tests agent_mcp
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

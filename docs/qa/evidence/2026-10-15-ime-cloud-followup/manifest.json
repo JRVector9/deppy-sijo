@@ -1,0 +1,127 @@
+[
+  {
+    "file": "boundary.log",
+    "bytes": 378,
+    "sha256": "c9765728702372ea0f6d1f421eff59a8dcea8c57952652e634d5d4d3ee9b0c62"
+  },
+  {
+    "file": "clippy.log",
+    "bytes": 3415,
+    "sha256": "424d698a241ea9f0ecdad61bf5da0d122b7097864b6a87933d500f6d1d6706f0"
+  },
+  {
+    "file": "cloud-completion-research.md",
+    "bytes": 37244,
+    "sha256": "c86d44b59e1e1bc6bec5f38bc2712918030e1defca110e1da33d7d4a94096a72"
+  },
+  {
+    "file": "deps.log",
+    "bytes": 224,
+    "sha256": "3d0d505e5ab831727c7d65deea37e581b3e2b7f50559aa74d3b017cbf547eada"
+  },
+  {
+    "file": "document-green.log",
+    "bytes": 1970,
+    "sha256": "dccd6a63508bfb65d0d54112767fc62086c5b390398db6d4baf95da9e41582d1"
+  },
+  {
+    "file": "document-repeat.json",
+    "bytes": 237,
+    "sha256": "218d08a0b0f29df629fb8954797e9d58bd3c9d1f7d4d040fdff35d3f8c1a095b"
+  },
+  {
+    "file": "document-repeat.log",
+    "bytes": 5891,
+    "sha256": "411f01e0c86b5b1464d634924fc344bf84c67f26c60b7bf9b5a603863b902782"
+  },
+  {
+    "file": "final-gates.json",
+    "bytes": 1291,
+    "sha256": "abd205ee970f701aeeceb8aa0e9816e31de1780f1c271f7bad01e9ad1b5d4ff3"
+  },
+  {
+    "file": "fmt.log",
+    "bytes": 0,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  {
+    "file": "focused-results.json",
+    "bytes": 985,
+    "sha256": "95e891f64a87db0004dad3d69561c92f54b483e04f7638aa01766ec12581eff5"
+  },
+  {
+    "file": "hangul-github-research.md",
+    "bytes": 25208,
+    "sha256": "95d6b73eb4af7e9247a15d58a1d355e77b96f4987531bfc6bb696569c9e61276"
+  },
+  {
+    "file": "ime-empty-preedit-red.log",
+    "bytes": 1877,
+    "sha256": "8292016a78e143c2bf8c1a51a1b110ed1b331cbc156e6b6ef267bfdfe1fa25cd"
+  },
+  {
+    "file": "ime-first-preedit-red.log",
+    "bytes": 3960,
+    "sha256": "6564387a4914891a4b862814e9a48ef52111217e157f2e20c387c35bd598497a"
+  },
+  {
+    "file": "ime-workspace-green.log",
+    "bytes": 42261,
+    "sha256": "7abb4a537f3464a1c937690b2088c93a82c8414cb889186e1e7ddf6bc6c1f9fc"
+  },
+  {
+    "file": "mcp-baseline.log",
+    "bytes": 2038,
+    "sha256": "92d83f59afe8f41bd01e66f92ef3c3332613ff7aebb7fdc330af5b651d09e594"
+  },
+  {
+    "file": "mcp-final.log",
+    "bytes": 8951,
+    "sha256": "2f40b4f9043738393014cb6d602e251f77d7fee3dc44bc402f4e2f42c9a9525e"
+  },
+  {
+    "file": "mcp-http-red.log",
+    "bytes": 3241,
+    "sha256": "c39c969cdd2284fbd388ff7e1a12f9764e3d6228b5d2469b7c5e3f08323d9032"
+  },
+  {
+    "file": "mcp-rst-after-metadata.json",
+    "bytes": 656,
+    "sha256": "41f8094077e288df967c972629dcabab168db076b56e47a364e9a214829ca93a"
+  },
+  {
+    "file": "mcp-rst-after-summary.json",
+    "bytes": 230,
+    "sha256": "659e67d15c49d90f1508ad156b973f8929bb068fdbb77222cc13fa66ccb9103c"
+  },
+  {
+    "file": "mcp-rst-after.jsonl",
+    "bytes": 2842,
+    "sha256": "24ff9789990e310864afbb963a9187ad73f7d2272e4f95bbdc8863309aa9394f"
+  },
+  {
+    "file": "mcp-rst-before.jsonl",
+    "bytes": 2850,
+    "sha256": "db1908f4051d450d26c888016faeb9f36355432feb4ebc7c695987252ddaec47"
+  },
+  {
+    "file": "mcp-rst-before.rs",
+    "bytes": 4466,
+    "sha256": "47b1d1549c0dc180e52d14f69f2e3e5ae71217344a4fa3d36c45b0a1e84a7078"
+  },
+  {
+    "file": "terminal-green.log",
+    "bytes": 4939,
+    "sha256": "8743414a1c61773c72101a65a5b433eb661ee1d34b45034a9ec6be5d7d672935"
+  },
+  {
+    "file": "workspace-result.json",
+    "bytes": 17067,
+    "sha256": "2d9607cd9fbc25b598e1966d034e6da492bed72cfafe5d74b176b72e2603a90f"
+  },
+  {
+    "file": "workspace.log.gz",
+    "bytes": 141461,
+    "sha256": "0342efee482164973d4abc1064c9a665582e11125f2c02bb96e9df66280689db"
+  }
+]

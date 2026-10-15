@@ -1,0 +1,51 @@
+   Compiling deppy-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/core)
+   Compiling secret v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/secret)
+   Compiling winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/third_party/winit-0.30.13)
+   Compiling ureq v3.4.0
+   Compiling alacritty_terminal v0.26.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/third_party/alacritty_terminal-0.26.0)
+   Compiling audit v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/audit)
+   Compiling mux v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/mux)
+   Compiling terminal v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/terminal)
+   Compiling persist v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/persist)
+   Compiling pty v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/pty)
+   Compiling storage-core v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/storage-core)
+   Compiling mcp-store v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/mcp-store)
+   Compiling session v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/session)
+   Compiling storage v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/storage)
+   Compiling tungstenite v0.30.0
+   Compiling runtime v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/runtime)
+   Compiling egui-wgpu v0.36.1
+   Compiling accesskit_winit v0.32.2
+   Compiling http-client v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/http-client)
+   Compiling connector-contract v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/connector-contract)
+   Compiling relay-protocol v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/relay-protocol)
+   Compiling web-remote v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/web-remote)
+   Compiling mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/mcp)
+   Compiling egui-winit v0.36.1
+   Compiling auth v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/auth)
+   Compiling i18n v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/i18n)
+   Compiling eframe v0.36.1
+   Compiling connector-ui v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/connector-ui)
+   Compiling connector-service v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/connector-service)
+   Compiling egui_kittest v0.36.1
+   Compiling agent-mcp v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/agent-mcp)
+   Compiling platform v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/platform)
+   Compiling deppy-sijo v0.12.2 (/Users/jr/Desktop/projects/deppy-sijo-ime-fix-20261015/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 08s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/deps/deppy_sijo-7d717183928c26c4)
+
+running 1 test
+
+thread 'ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_preserves_the_first_preedit_frame' (70641190) panicked at crates/app/src/ui/workspace/tests/ime_input_harness.rs:101:9:
+pending terminal refocus interrupted the first Hangul jamo; transient_focus=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_preserves_the_first_preedit_frame ... FAILED
+
+failures:
+
+failures:
+    ui::workspace::tests::ime_input_harness::hangul_pending_terminal_refocus_preserves_the_first_preedit_frame
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3268 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

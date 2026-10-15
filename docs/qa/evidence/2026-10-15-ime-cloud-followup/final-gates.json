@@ -1,0 +1,75 @@
+[
+  {
+    "name": "mcp-final",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "agent-mcp",
+      "--",
+      "--test-threads=1"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-followup-mcp-final-20261015.log"
+  },
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-followup-clippy-20261015.log"
+  },
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-followup-fmt-20261015.log"
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-followup-boundary-20261015.log"
+  },
+  {
+    "name": "deps",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-deps"
+    ],
+    "exit_code": 0,
+    "log": "/private/tmp/deppy-followup-deps-20261015.log"
+  }
+]

@@ -1,0 +1,11 @@
+{
+  "requests": 400,
+  "complete": 400,
+  "errors": 0,
+  "connection_resets": 0,
+  "missing_heads": 0,
+  "truncated_or_short": 0,
+  "groups": 20,
+  "large_early_rejections_eof": 80,
+  "large_early_rejections_content_length": 80
+}

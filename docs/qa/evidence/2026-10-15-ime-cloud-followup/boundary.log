@@ -1,0 +1,4 @@
+   Compiling xtask v0.12.3 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.86s
+     Running `/Users/jr/Desktop/projects/deppy-sijo-performance/target/debug/xtask check-boundary`
+check-boundary OK — UI leaves have zero native/runtime capability; bounded composition-root terminal tail passed

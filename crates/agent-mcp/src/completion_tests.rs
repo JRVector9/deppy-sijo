@@ -386,3 +386,100 @@ fn completion_ledger_restart_marks_pending_unknown_without_changing_admission() 
     std::fs::remove_file(path).unwrap();
     std::fs::remove_dir(directory).unwrap();
 }
+
+#[test]
+fn completion_ledger_aged_restart_retains_receipt_from_terminalization_time() {
+    let directory =
+        std::env::temp_dir().join(format!("deppy-completion-aged-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("synthetic.sqlite");
+    let id = identity("aged-restart");
+    let admission = receipt(id.clone()).admission;
+    {
+        let db = History::open(&path).unwrap();
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &id)
+            .unwrap();
+        db.finish_scoped("aged-restart", &id.connection_id, &admission, "")
+            .unwrap();
+    }
+    let original_created = now() - 2 * COMPLETION_RECEIPT_TTL;
+    {
+        // Age only this private synthetic DB, simulating two days without a restart.
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute(
+            "UPDATE local_completion_receipts SET created=?1,expires=?2",
+            rusqlite::params![original_created, original_created + 3600],
+        )
+        .unwrap();
+    }
+    let restored_at = now();
+    {
+        let db = History::open(&path).unwrap();
+        let result = db.get_completion(&id).unwrap().unwrap();
+        assert_eq!(result.created_at, original_created);
+        assert_eq!(result.outcome["status"], "unknown");
+        assert!(result.expires_at >= restored_at + COMPLETION_RECEIPT_TTL);
+        assert_eq!(
+            db.get_operation("aged-restart", &id.connection_id).unwrap(),
+            Some(admission)
+        );
+    }
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}
+
+#[test]
+fn completion_ledger_terminal_capacity_prunes_only_expired_private_receipts() {
+    let directory =
+        std::env::temp_dir().join(format!("deppy-completion-cap-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("synthetic.sqlite");
+    let db = History::open(&path).unwrap();
+    let mut first = None;
+    for index in 0..MAX_COMPLETION_RECEIPTS {
+        let id = identity(&format!("retained-{index}"));
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &id)
+            .unwrap();
+        db.finish_completion(&id, &receipt(id.clone())).unwrap();
+        first.get_or_insert(id);
+    }
+    let rejected = identity("terminal-capacity");
+    assert!(
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &rejected)
+            .is_err()
+    );
+    assert!(
+        db.get_operation("terminal-capacity", &rejected.connection_id)
+            .unwrap()
+            .is_none()
+    );
+    let first = first.unwrap();
+    {
+        let fixture = rusqlite::Connection::open(&path).unwrap();
+        fixture
+            .execute(
+                "UPDATE local_completion_receipts SET expires=?1 WHERE operation_key=?2",
+                rusqlite::params![
+                    now() - 1,
+                    operation_key(&first.connection_id, &first.scope.operation_id).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+    assert_eq!(
+        db.claim_completion_scoped("send_text", &json!({"text":"synthetic"}), &rejected)
+            .unwrap(),
+        Claim::New
+    );
+    assert!(db.get_completion(&first).unwrap().is_none());
+    assert_eq!(
+        db.get_operation(&first.scope.operation_id, &first.connection_id)
+            .unwrap()
+            .unwrap()["status"],
+        "queued",
+        "retention cannot erase at-most-once input tombstones"
+    );
+    drop(db);
+    std::fs::remove_file(path).unwrap();
+    std::fs::remove_dir(directory).unwrap();
+}

@@ -299,6 +299,43 @@ fn completion_stream_late_redaction_preserves_only_real_routing_identity() {
 }
 
 #[test]
+fn completion_stream_reserve_budgets_maximum_original_result_before_effect() {
+    let mut boundary = None;
+    for length in 1..=128 {
+        let mut candidate = identity("boundary");
+        candidate.scope.session_id = "s".repeat(length);
+        candidate.scope.generation = "g".repeat(length);
+        candidate.scope.operation_id = "o".repeat(length);
+        candidate.scope.run_id = Some("r".repeat(length));
+        let mut maximum = receipt(candidate.clone());
+        maximum.admission = json!({"status":"queued","admission":"pty_queue","bytes":u64::MAX,"submit":false,"retry":false,"completion":"not_confirmed"});
+        maximum.outcome = json!({"status":"unknown","local_turn_completed":false,"source":"verified_native_turn","reason":"x".repeat(64),"observed_at":u64::MAX});
+        if maximum.validate().is_err() {
+            boundary = Some(candidate.scope);
+            break;
+        }
+    }
+    let boundary = boundary.expect("maximum legal routing sizes exceed the bounded wire event");
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let _socket = post(&server, &token, &session, "boundary");
+    let req = next_request(&server);
+    let reserved = req
+        .deferred
+        .as_ref()
+        .unwrap()
+        .reserve(boundary, CompletionPermit::new());
+    assert!(
+        matches!(reserved, Err(ref code) if code == "completion_result_too_large_no_effect"),
+        "reserve must reject before input when the declared maximum receipt cannot fit: {reserved:?}"
+    );
+    req.reply
+        .try_send(Err("completion_result_too_large_no_effect".into()))
+        .unwrap();
+}
+
+#[test]
 fn completion_ledger_atomic_claim_capacity_preserves_no_effect() {
     let db = History::open_memory().unwrap();
     for index in 0..MAX_COMPLETION_WATCHES {

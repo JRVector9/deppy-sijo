@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::{Read, Write},
+    io::Write,
     net::{Shutdown, TcpStream},
     sync::{
         Arc, Mutex, OnceLock, Weak,
@@ -101,7 +101,6 @@ impl CompletionReceipt {
                 && self.admission.is_object()
                 && self.outcome.is_object()
                 && self.expires_at >= self.created_at
-                && self.expires_at.saturating_sub(self.created_at) <= COMPLETION_RECEIPT_TTL + 3600
                 && self
                     .completed_at
                     .is_none_or(|at| at >= self.created_at && at <= self.expires_at),
@@ -191,12 +190,35 @@ struct Session {
     owner: TransportOwner,
     expires: u64,
 }
+struct Stream {
+    identity: CompletionIdentity,
+    owner: TransportOwner,
+    permit: CompletionPermit,
+    reply: Option<Receiver<Result<Value, String>>>,
+    result: Option<Result<Value, String>>,
+    socket: Option<TcpStream>,
+    reader: bool,
+    primed: bool,
+    started: Instant,
+    disconnected: Option<Instant>,
+    heartbeat: Instant,
+    expires: u64,
+    closed: bool,
+    state: CompletionDeliveryState,
+    dirty: bool,
+}
 #[derive(Default)]
 struct Registry {
     sessions: HashMap<String, Session>,
+    streams: HashMap<String, Stream>,
 }
 pub(crate) struct CompletionLane {
     registry: Mutex<Registry>,
+    auth: Weak<Auth>,
+    stop: Arc<AtomicBool>,
+    redaction: secret::RedactionService,
+    wake: SyncSender<()>,
+    events: SyncSender<CompletionDeliveryEvent>,
 }
 
 /// Server-issued capability for this original POST, never supplied in tool arguments.
@@ -207,30 +229,149 @@ pub struct DeferredTransport {
     pub(crate) session: Option<String>,
     pub(crate) request_id: Value,
     pub(crate) handoff: SyncSender<String>,
+    pub(crate) reserved: Arc<AtomicBool>,
 }
 impl DeferredTransport {
     pub fn reserve(
         &self,
-        _scope: CompletionScope,
-        _permit: CompletionPermit,
+        scope: CompletionScope,
+        permit: CompletionPermit,
     ) -> Result<CompletionIdentity, String> {
-        Err("completion_unavailable_no_effect".into())
+        let session = self
+            .session
+            .as_ref()
+            .ok_or("completion_transport_required_no_effect")?;
+        let identity = CompletionIdentity {
+            connection_id: self.owner.connection_id.clone(),
+            transport_session_id: session.clone(),
+            stream_id: uuid::Uuid::new_v4().to_string(),
+            request_id: self.request_id.clone(),
+            auth_epoch: self.owner.epoch,
+            scope,
+        };
+        identity
+            .validate()
+            .map_err(|_| "invalid_completion_identity_no_effect")?;
+        let at = crate::now();
+        CompletionReceipt {
+            identity: identity.clone(),
+            event_id: identity.event_id(),
+            admission: json!({"status":"queued","admission":"pty_queue","completion":"not_confirmed"}),
+            outcome: json!({"status":"unknown","reason":"completion_not_confirmed"}),
+            created_at: at,
+            completed_at: None,
+            expires_at: at + COMPLETION_RECEIPT_TTL,
+        }.validate().map_err(|_| "completion_result_too_large_no_effect")?;
+        if !permit.is_live() || !self.lane.authorized(&self.owner) {
+            return Err("completion_revoked_no_effect".into());
+        }
+        let mut registry = self
+            .lane
+            .registry
+            .try_lock()
+            .map_err(|_| "completion_busy_no_effect")?;
+        if registry
+            .sessions
+            .get(session)
+            .is_none_or(|s| s.owner != self.owner || at >= s.expires)
+        {
+            return Err("completion_transport_required_no_effect".into());
+        }
+        if registry.streams.len() >= MAX_COMPLETION_RECEIPTS
+            || registry
+                .streams
+                .values()
+                .filter(|s| !s.closed && s.result.is_none())
+                .count()
+                >= MAX_COMPLETION_WATCHES
+            || registry.streams.values().filter(|s| s.reader).count() >= MAX_READERS
+        {
+            return Err("completion_capacity_no_effect".into());
+        }
+        if registry.streams.values().any(|s| {
+            !s.closed
+                && s.result.is_none()
+                && s.identity.scope.workspace == identity.scope.workspace
+                && s.identity.scope.session_id == identity.scope.session_id
+                && s.identity.scope.generation == identity.scope.generation
+        }) {
+            return Err("local_task_busy_no_effect".into());
+        }
+        if self
+            .reserved
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err("completion_transport_already_reserved_no_effect".into());
+        }
+        let _ = permit.0.wake.set(self.lane.wake.clone());
+        let started = Instant::now();
+        registry.streams.insert(
+            identity.stream_id.clone(),
+            Stream {
+                identity: identity.clone(),
+                owner: self.owner.clone(),
+                permit,
+                reply: None,
+                result: None,
+                socket: None,
+                reader: true,
+                primed: false,
+                started,
+                disconnected: None,
+                heartbeat: started,
+                expires: at + COMPLETION_RECEIPT_TTL,
+                closed: false,
+                state: CompletionDeliveryState::Waiting,
+                dirty: true,
+            },
+        );
+        if self.handoff.try_send(identity.stream_id.clone()).is_err() {
+            registry.streams.remove(&identity.stream_id);
+            return Err("completion_transport_closed_no_effect".into());
+        }
+        let _ = self.lane.wake.try_send(());
+        Ok(identity)
     }
 }
 
 impl CompletionLane {
     pub(crate) fn new(
-        _auth: &Arc<Auth>,
-        _stop: Arc<AtomicBool>,
-        _redaction: secret::RedactionService,
+        auth: &Arc<Auth>,
+        stop: Arc<AtomicBool>,
+        redaction: secret::RedactionService,
     ) -> (Arc<Self>, Receiver<CompletionDeliveryEvent>) {
-        let (_events, event_rx) = mpsc::sync_channel(128);
-        (
-            Arc::new(Self {
-                registry: Mutex::new(Registry::default()),
-            }),
-            event_rx,
-        )
+        let (events, event_rx) = mpsc::sync_channel(128);
+        let (wake, wake_rx) = mpsc::sync_channel(1);
+        let lane = Arc::new(Self {
+            registry: Mutex::new(Registry::default()),
+            auth: Arc::downgrade(auth),
+            stop,
+            redaction,
+            wake,
+            events,
+        });
+        let weak = Arc::downgrade(&lane);
+        thread::Builder::new()
+            .name("mcp-completion".into())
+            .spawn(move || {
+                while let Some(lane) = weak.upgrade() {
+                    lane.maintain();
+                    if lane.stop.load(Ordering::Acquire) {
+                        break;
+                    }
+                    drop(lane);
+                    let _ = wake_rx.recv_timeout(Duration::from_millis(20));
+                }
+            })
+            .expect("completion maintenance thread");
+        (lane, event_rx)
+    }
+    fn authorized(&self, owner: &TransportOwner) -> bool {
+        !self.stop.load(Ordering::Acquire)
+            && self.auth.upgrade().is_some_and(|auth| {
+                auth.current_access(owner.epoch, owner.access_key.as_deref(), crate::now())
+            })
     }
     pub(crate) fn initialize(&self, owner: TransportOwner, expires: u64) -> Option<String> {
         let mut registry = self.registry.lock().ok()?;
@@ -252,21 +393,271 @@ impl CompletionLane {
                 .is_some_and(|s| s.owner == *owner && crate::now() < s.expires)
         })
     }
-    pub(crate) fn begin(&self, _stream: &str, _reply: Receiver<Result<Value, String>>) -> bool {
-        false
+    pub(crate) fn begin(&self, id: &str, reply: Receiver<Result<Value, String>>) -> bool {
+        let Ok(mut registry) = self.registry.lock() else {
+            return false;
+        };
+        let Some(stream) = registry.streams.get_mut(id).filter(|s| !s.closed) else {
+            return false;
+        };
+        stream.reply = Some(reply);
+        let _ = self.wake.try_send(());
+        true
     }
-    pub(crate) fn attach(&self, _id: &str, _socket: TcpStream) -> bool {
-        false
+    pub(crate) fn attach(&self, id: &str, socket: TcpStream) -> bool {
+        let Ok(mut registry) = self.registry.lock() else {
+            return false;
+        };
+        let Some(stream) = registry
+            .streams
+            .get_mut(id)
+            .filter(|s| !s.closed && s.reader && s.socket.is_none())
+        else {
+            return false;
+        };
+        stream.socket = Some(socket);
+        stream.primed = false;
+        stream.disconnected = None;
+        stream.heartbeat = Instant::now();
+        let _ = self.wake.try_send(());
+        true
     }
     pub(crate) fn resume(
         &self,
-        _owner: &TransportOwner,
-        _session: &str,
-        _cursor: &str,
+        owner: &TransportOwner,
+        session: &str,
+        cursor: &str,
     ) -> Result<String, u16> {
-        Err(404)
+        let (id, sequence) = cursor.rsplit_once(':').ok_or(404u16)?;
+        if !matches!(sequence, "0" | "1") {
+            return Err(404);
+        }
+        let mut registry = self.registry.lock().map_err(|_| 503u16)?;
+        let readers = registry.streams.values().filter(|s| s.reader).count();
+        let stream = registry.streams.get_mut(id).ok_or(404u16)?;
+        if stream.closed
+            || stream.owner != *owner
+            || stream.identity.transport_session_id != session
+            || !stream.permit.is_live()
+            || !self.authorized(owner)
+            || stream
+                .disconnected
+                .is_some_and(|at| at.elapsed() >= RECONNECT_TTL)
+            || crate::now() >= stream.expires
+            || (sequence == "1" && stream.result.is_none())
+        {
+            return Err(404);
+        }
+        if stream.reader {
+            return Err(409);
+        }
+        if sequence == "1" {
+            return Err(204);
+        }
+        if readers >= MAX_READERS {
+            return Err(503);
+        }
+        stream.reader = true;
+        Ok(id.into())
     }
-    pub(crate) fn abandon_reader(&self, _id: &str) {}
+    pub(crate) fn abandon_reader(&self, id: &str) {
+        if let Ok(mut registry) = self.registry.lock()
+            && let Some(stream) = registry.streams.get_mut(id)
+        {
+            stream.disconnect();
+        }
+    }
+    fn maintain(&self) {
+        let mut writes = Vec::new();
+        {
+            let Ok(mut registry) = self.registry.lock() else {
+                return;
+            };
+            registry.sessions.retain(|_, s| crate::now() < s.expires);
+            registry.streams.retain(|_, s| crate::now() < s.expires);
+            for (id, stream) in &mut registry.streams {
+                if !stream.closed
+                    && (!stream.permit.is_live()
+                        || !self.authorized(&stream.owner)
+                        || (stream.result.is_none() && stream.started.elapsed() >= WATCH_TTL)
+                        || stream
+                            .disconnected
+                            .is_some_and(|at| at.elapsed() >= RECONNECT_TTL))
+                {
+                    stream.closed = true;
+                    stream.reader = false;
+                    if let Some(socket) = stream.socket.take() {
+                        let _ = socket.shutdown(Shutdown::Both);
+                    }
+                    stream.reply.take();
+                    stream.state = CompletionDeliveryState::Closed;
+                    stream.dirty = true;
+                }
+                if !stream.closed
+                    && stream.result.is_none()
+                    && let Some(reply) = &stream.reply
+                {
+                    let result = match reply.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(TryRecvError::Disconnected) => {
+                            Some(Err("outcome_unknown_do_not_retry_input".into()))
+                        }
+                        Err(TryRecvError::Empty) => None,
+                    };
+                    if let Some(result) = result {
+                        stream.reply = None;
+                        stream.result = Some(result);
+                        stream.expires = crate::now() + COMPLETION_RECEIPT_TTL;
+                        stream.state = CompletionDeliveryState::Ready;
+                        stream.dirty = true;
+                    }
+                }
+                if stream.dirty
+                    && self
+                        .events
+                        .try_send(CompletionDeliveryEvent {
+                            identity: stream.identity.clone(),
+                            state: stream.state,
+                        })
+                        .is_ok()
+                {
+                    stream.dirty = false;
+                }
+                if !stream.closed
+                    && let Some(socket) = stream.socket.take()
+                {
+                    writes.push(SocketWrite {
+                        id: id.clone(),
+                        socket,
+                        identity: stream.identity.clone(),
+                        owner: stream.owner.clone(),
+                        permit: stream.permit.clone(),
+                        primed: stream.primed,
+                        heartbeat_due: Instant::now() >= stream.heartbeat,
+                        result: stream.result.clone(),
+                    });
+                }
+            }
+        }
+        for mut action in writes {
+            let result = self.write_socket(&mut action);
+            let Ok(mut registry) = self.registry.lock() else {
+                continue;
+            };
+            let Some(stream) = registry.streams.get_mut(&action.id) else {
+                continue;
+            };
+            if stream.closed || !stream.permit.is_live() {
+                let _ = action.socket.shutdown(Shutdown::Both);
+                stream.reader = false;
+            } else if result.is_err() {
+                let _ = action.socket.shutdown(Shutdown::Both);
+                stream.disconnect();
+            } else if action.result.is_some() {
+                let _ = action.socket.shutdown(Shutdown::Write);
+                stream.reader = false;
+                stream.state = CompletionDeliveryState::ReturnedUnacknowledged;
+                stream.dirty = true;
+            } else {
+                stream.primed = true;
+                if !action.primed || action.heartbeat_due {
+                    stream.heartbeat = Instant::now() + HEARTBEAT;
+                }
+                stream.socket = Some(action.socket);
+            }
+        }
+    }
+    fn write_socket(&self, action: &mut SocketWrite) -> std::io::Result<()> {
+        action.socket.set_nonblocking(true)?;
+        let peer_closed = matches!(action.socket.peek(&mut [0]), Ok(0));
+        action.socket.set_nonblocking(false)?;
+        if peer_closed {
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        let mut bytes = Vec::new();
+        if !action.primed {
+            bytes.extend_from_slice(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\nMCP-Session-Id: {}\r\n\r\nid: {}:0\nretry: 1000\ndata:\n\n", action.identity.transport_session_id, action.identity.stream_id).as_bytes());
+        }
+        if let Some(result) = &action.result {
+            let mut result = result.clone();
+            if let Ok(value) = &mut result {
+                redact_display(value, &self.redaction.snapshot());
+            }
+            let mut frame = completion_frame(&action.identity, &result);
+            if frame.len() > MAX_COMPLETION_EVENT_BYTES {
+                frame = completion_frame(
+                    &action.identity,
+                    &Err("completion_result_too_large_unknown".into()),
+                );
+            }
+            bytes.extend_from_slice(frame.as_bytes());
+        } else if action.primed && action.heartbeat_due {
+            bytes.extend_from_slice(b": keepalive\n\n");
+        }
+        let deadline = Instant::now() + WRITE_TIMEOUT;
+        let mut offset = 0;
+        while offset < bytes.len() {
+            // Each syscall is a fresh admission. No credential/registry mutex crosses I/O.
+            if !action.permit.is_live() || !self.authorized(&action.owner) {
+                return Err(std::io::ErrorKind::PermissionDenied.into());
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+            action.socket.set_write_timeout(Some(remaining))?;
+            let written = action.socket.write(&bytes[offset..])?;
+            if written == 0 {
+                return Err(std::io::ErrorKind::WriteZero.into());
+            }
+            offset += written;
+        }
+        action.socket.flush()
+    }
+}
+
+impl Stream {
+    fn disconnect(&mut self) {
+        self.reader = false;
+        self.disconnected.get_or_insert_with(Instant::now);
+        self.state = CompletionDeliveryState::Disconnected;
+        self.dirty = true;
+    }
+}
+struct SocketWrite {
+    id: String,
+    socket: TcpStream,
+    identity: CompletionIdentity,
+    owner: TransportOwner,
+    permit: CompletionPermit,
+    primed: bool,
+    heartbeat_due: bool,
+    result: Option<Result<Value, String>>,
+}
+fn redact_display(value: &mut Value, redaction: &secret::RedactionSnapshot<'_>) {
+    match value {
+        Value::String(text) => *text = redaction.redact_wrapped_text(text),
+        Value::Array(values) => {
+            for value in values {
+                redact_display(value, redaction);
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                if !matches!(
+                    key.as_str(),
+                    "event_id"
+                        | "operation_id"
+                        | "run_id"
+                        | "session_id"
+                        | "generation"
+                        | "workspace"
+                ) {
+                    redact_display(value, redaction);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn completion_frame(

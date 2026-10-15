@@ -946,7 +946,7 @@ fn process(
             } else {
                 "2025-11-25"
             };
-            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"Deppy","version":env!("CARGO_PKG_VERSION")},"instructions":"Operate only explicitly shared sessions. Always deliver your own final answer with notify. Never automatically retry an unknown input outcome with a different operation_id."})
+            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"Deppy","version":env!("CARGO_PKG_VERSION")},"instructions":"Operate only explicitly shared sessions. Always deliver your own final answer with notify. Never automatically retry an unknown input outcome with a different operation_id. With owner-enabled local completion, supported submit:true calls return their final result on the original SSE request. Configure an adequate long request timeout; heartbeat comments do not reset client deadlines. Resume only that original stream with MCP-Session-Id and Last-Event-ID. A socket write is not confirmation that an agent read the result."})
         }
         "ping" => json!({}),
         "tools/list" => crate::tools(),
@@ -1001,6 +1001,7 @@ fn process(
                     session: transport_session,
                     request_id: id.clone(),
                     handoff,
+                    reserved: Arc::new(AtomicBool::new(false)),
                 });
             let req = Request {
                 epoch,
@@ -1032,10 +1033,34 @@ fn process(
                     return tool_response(id, Err("completion_transport_closed_no_effect".into()));
                 }
                 match rx.recv_timeout(Duration::from_millis(5)) {
-                    Ok(result) => break result,
+                    Ok(result) => {
+                        if let Ok(stream) = deferred_rx.try_recv()
+                            && let Some(lane) = &metadata.completion
+                        {
+                            let (ready, ready_rx) = mpsc::sync_channel(1);
+                            let _ = ready.try_send(result);
+                            auth.end_call(&connection_id, poll, epoch);
+                            if lane.begin(&stream, ready_rx) {
+                                metadata.deferred = Some(stream);
+                                return Response::plain(202, "");
+                            }
+                            return tool_response(
+                                id,
+                                Err("completion_transport_closed_no_effect".into()),
+                            );
+                        }
+                        break result;
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
                         // Reserve sends its handoff before the App may drop/send its reply.
-                        if deferred_rx.try_recv().is_ok() {
+                        if let Ok(stream) = deferred_rx.try_recv()
+                            && let Some(lane) = &metadata.completion
+                        {
+                            auth.end_call(&connection_id, poll, epoch);
+                            if lane.begin(&stream, rx) {
+                                metadata.deferred = Some(stream);
+                                return Response::plain(202, "");
+                            }
                             return tool_response(
                                 id,
                                 Err("completion_transport_closed_no_effect".into()),

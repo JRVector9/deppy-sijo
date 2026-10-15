@@ -107,24 +107,110 @@ fn record_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Record> {
 impl History {
     pub fn claim_completion_scoped(
         &self,
-        _tool: &str,
-        _args: &Value,
-        _identity: &crate::CompletionIdentity,
+        tool: &str,
+        args: &Value,
+        identity: &crate::CompletionIdentity,
     ) -> anyhow::Result<Claim> {
-        anyhow::bail!("completion_ledger_unavailable")
+        identity.validate()?;
+        let context = OperationContext {
+            connection_id: identity.connection_id.clone(),
+            operation_id: identity.scope.operation_id.clone(),
+            run_id: identity.scope.run_id.clone(),
+            generation: identity.scope.generation.clone(),
+        };
+        context.validate()?;
+        let key = operation_key(&context.connection_id, &context.operation_id)?;
+        self.claim_internal(
+            &key,
+            tool,
+            args,
+            &identity.scope.workspace,
+            &identity.scope.session_id,
+            Some(&context),
+            Some(identity),
+        )
     }
     pub fn finish_completion(
         &self,
-        _identity: &crate::CompletionIdentity,
-        _receipt: &crate::CompletionReceipt,
+        identity: &crate::CompletionIdentity,
+        receipt: &crate::CompletionReceipt,
     ) -> anyhow::Result<()> {
-        anyhow::bail!("completion_ledger_unavailable")
+        identity.validate()?;
+        receipt.validate()?;
+        anyhow::ensure!(
+            identity == &receipt.identity,
+            "completion_identity_mismatch"
+        );
+        anyhow::ensure!(
+            receipt.expires_at <= crate::now().saturating_add(crate::COMPLETION_RECEIPT_TTL),
+            "invalid_completion_receipt"
+        );
+        let key = operation_key(&identity.connection_id, &identity.scope.operation_id)?;
+        let record = serde_json::to_string(receipt)?;
+        anyhow::ensure!(record.len() <= 4096, "completion_result_too_large");
+        let tx = self.0.unchecked_transaction()?;
+        let row: Option<(String, Option<String>)> = tx.query_row(
+            "SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END,CASE WHEN receipt IS NULL OR length(CAST(receipt AS BLOB))<=4096 THEN receipt ELSE CAST(0 AS BLOB) END FROM local_completion_receipts WHERE operation_key=?1",
+            [&key], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional()?;
+        let (stored_identity, existing) =
+            row.ok_or_else(|| anyhow::anyhow!("completion_not_claimed"))?;
+        let stored_identity: crate::CompletionIdentity = serde_json::from_str(&stored_identity)?;
+        stored_identity.validate()?;
+        anyhow::ensure!(&stored_identity == identity, "completion_identity_mismatch");
+        if let Some(existing) = existing {
+            let existing: crate::CompletionReceipt = serde_json::from_str(&existing)?;
+            existing.validate()?;
+            anyhow::ensure!(existing == *receipt, "completion_receipt_conflict");
+            return Ok(());
+        }
+        let outcome: String = tx.query_row("SELECT CASE WHEN length(CAST(outcome AS BLOB))<=2048 THEN outcome END FROM operations WHERE id=?1", [&key], |r| r.get(0))?;
+        let outcome: Value = serde_json::from_str(&outcome)?;
+        anyhow::ensure!(
+            outcome == receipt.admission || outcome == json!({"status":"unknown","retry":false}),
+            "completion_admission_conflict"
+        );
+        // The old get_operation path remains admission-only. Private stream metadata
+        // lives exclusively in this ledger and is never copied into operations.
+        let admission = serde_json::to_string(&receipt.admission)?;
+        anyhow::ensure!(admission.len() <= 2048, "history_outcome_too_large");
+        tx.execute(
+            "UPDATE operations SET outcome=?2 WHERE id=?1",
+            params![key, admission],
+        )?;
+        tx.execute("UPDATE local_completion_receipts SET receipt=?2,expires=?3 WHERE operation_key=?1 AND receipt IS NULL", params![key,record,receipt.expires_at])?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn get_completion(
         &self,
-        _identity: &crate::CompletionIdentity,
+        identity: &crate::CompletionIdentity,
     ) -> anyhow::Result<Option<crate::CompletionReceipt>> {
-        anyhow::bail!("completion_ledger_unavailable")
+        identity.validate()?;
+        let key = operation_key(&identity.connection_id, &identity.scope.operation_id)?;
+        let row: Option<(String, Option<String>)> = self.0.query_row(
+            "SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END,CASE WHEN receipt IS NULL OR length(CAST(receipt AS BLOB))<=4096 THEN receipt ELSE CAST(0 AS BLOB) END FROM local_completion_receipts WHERE operation_key=?1 AND expires>?2",
+            params![key,crate::now()], |r| Ok((r.get(0)?,r.get(1)?)),
+        ).optional()?;
+        let Some((stored_identity, record)) = row else {
+            return Ok(None);
+        };
+        let stored_identity: crate::CompletionIdentity = serde_json::from_str(&stored_identity)?;
+        stored_identity.validate()?;
+        if stored_identity != *identity {
+            return Ok(None);
+        }
+        record
+            .map(|record| {
+                let receipt: crate::CompletionReceipt = serde_json::from_str(&record)?;
+                receipt.validate()?;
+                anyhow::ensure!(
+                    receipt.identity == *identity,
+                    "completion_identity_mismatch"
+                );
+                Ok(receipt)
+            })
+            .transpose()
     }
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         // Do not follow a user-controlled symlink to an unrelated DB.
@@ -173,7 +259,9 @@ impl History {
         // changing operation fingerprints or at-most-once tombstones.
         self.0.execute_batch("CREATE TABLE IF NOT EXISTS answer_completion(sequence INTEGER PRIMARY KEY AUTOINCREMENT, operation_id TEXT NOT NULL UNIQUE); INSERT OR IGNORE INTO answer_completion(operation_id) SELECT id FROM operations WHERE tool='notify' AND message<>'' ORDER BY rowid; UPDATE operations SET message='' WHERE tool='notify' AND message<>'' AND id NOT IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100);")?;
         self.0.execute_batch("CREATE TABLE IF NOT EXISTS operation_context(operation_key TEXT PRIMARY KEY,connection_id TEXT NOT NULL,external_id TEXT NOT NULL,run_id TEXT,generation TEXT NOT NULL,UNIQUE(connection_id,external_id)); CREATE INDEX IF NOT EXISTS operation_context_actor ON operation_context(connection_id,generation,operation_key); CREATE TABLE IF NOT EXISTS cloud_runs(connection_id TEXT NOT NULL,id TEXT NOT NULL,workspace TEXT NOT NULL,session TEXT NOT NULL,generation TEXT NOT NULL,state TEXT NOT NULL,record TEXT NOT NULL,PRIMARY KEY(connection_id,id)); CREATE INDEX IF NOT EXISTS cloud_runs_actor ON cloud_runs(connection_id);")?;
+        self.0.execute_batch("CREATE TABLE IF NOT EXISTS local_completion_receipts(operation_key TEXT PRIMARY KEY,identity TEXT NOT NULL,created INTEGER NOT NULL,expires INTEGER NOT NULL,receipt TEXT); CREATE INDEX IF NOT EXISTS local_completion_expiry ON local_completion_receipts(expires) WHERE receipt IS NOT NULL;")?;
         self.restore_runs()?;
+        self.restore_completions()?;
         Ok(())
     }
     pub fn claim(
@@ -185,7 +273,7 @@ impl History {
         session: &str,
     ) -> anyhow::Result<Claim> {
         validate_operation_id(id)?;
-        self.claim_internal(id, tool, args, workspace, session, None)
+        self.claim_internal(id, tool, args, workspace, session, None, None)
     }
     pub fn claim_scoped(
         &self,
@@ -199,8 +287,9 @@ impl History {
         context.validate()?;
         anyhow::ensure!(id == context.operation_id, "operation_context_mismatch");
         let key = operation_key(&context.connection_id, id)?;
-        self.claim_internal(&key, tool, args, workspace, session, Some(context))
+        self.claim_internal(&key, tool, args, workspace, session, Some(context), None)
     }
+    #[allow(clippy::too_many_arguments)]
     fn claim_internal(
         &self,
         key: &str,
@@ -209,6 +298,7 @@ impl History {
         workspace: &str,
         session: &str,
         context: Option<&OperationContext>,
+        completion: Option<&crate::CompletionIdentity>,
     ) -> anyhow::Result<Claim> {
         anyhow::ensure!(
             tool.len() <= 64 && workspace.len() <= 128 && session.len() <= 128,
@@ -247,7 +337,28 @@ impl History {
                     );
                 }
             }
+            if let Some(identity) = completion {
+                let original: Option<String> = tx.query_row("SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END FROM local_completion_receipts WHERE operation_key=?1", [key], |r| r.get(0)).optional()?;
+                let original = original.ok_or_else(|| {
+                    anyhow::anyhow!("completion_operation_already_claimed_no_effect")
+                })?;
+                let original: crate::CompletionIdentity = serde_json::from_str(&original)?;
+                original.validate()?;
+                anyhow::ensure!(original == *identity, "completion_identity_mismatch");
+            }
             return Ok(Claim::Existing(serde_json::from_str(&outcome)?));
+        }
+        if let Some(identity) = completion {
+            tx.execute(
+                "DELETE FROM local_completion_receipts WHERE receipt IS NOT NULL AND expires<=?1",
+                [crate::now()],
+            )?;
+            let (count, pending): (usize,usize) = tx.query_row("SELECT count(*),count(*) FILTER (WHERE receipt IS NULL) FROM local_completion_receipts", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            anyhow::ensure!(
+                count < crate::MAX_COMPLETION_RECEIPTS && pending < crate::MAX_COMPLETION_WATCHES,
+                "completion_history_full_no_effect"
+            );
+            tx.execute("INSERT INTO local_completion_receipts(operation_key,identity,created,expires) VALUES(?1,?2,?3,?4)", params![key,serde_json::to_string(identity)?,crate::now(),crate::now()+3600])?;
         }
         let count: i64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
         // Hard cap preserves at-most-once tombstones. Never evict a claim and later replay input.
@@ -258,6 +369,39 @@ impl History {
         }
         tx.commit()?;
         Ok(Claim::New)
+    }
+    fn restore_completions(&self) -> anyhow::Result<()> {
+        let mut statement = self.0.prepare("SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END,created FROM local_completion_receipts WHERE receipt IS NULL LIMIT 65")?;
+        let pending = statement
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        anyhow::ensure!(
+            pending.len() <= crate::MAX_COMPLETION_WATCHES,
+            "completion_history_full_no_effect"
+        );
+        drop(statement);
+        for (identity, created_at) in pending {
+            let identity: crate::CompletionIdentity = serde_json::from_str(&identity)?;
+            identity.validate()?;
+            let admission = self
+                .get_operation(&identity.scope.operation_id, &identity.connection_id)?
+                .ok_or_else(|| anyhow::anyhow!("completion_not_claimed"))?;
+            let receipt = crate::CompletionReceipt {
+                event_id: identity.event_id(),
+                identity: identity.clone(),
+                admission,
+                outcome: json!({"status":"unknown","reason":"server_restarted"}),
+                created_at,
+                completed_at: None,
+                expires_at: crate::now() + crate::COMPLETION_RECEIPT_TTL,
+            };
+            self.finish_completion(&identity, &receipt)?;
+        }
+        self.0.execute(
+            "DELETE FROM local_completion_receipts WHERE receipt IS NOT NULL AND expires<=?1",
+            [crate::now()],
+        )?;
+        Ok(())
     }
     pub fn finish(&self, id: &str, outcome: &Value, message: &str) -> anyhow::Result<()> {
         validate_operation_id(id)?;

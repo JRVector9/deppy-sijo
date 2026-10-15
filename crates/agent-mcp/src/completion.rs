@@ -214,6 +214,8 @@ struct Registry {
 }
 pub(crate) struct CompletionLane {
     registry: Mutex<Registry>,
+    #[cfg(test)]
+    before_begin: Mutex<Option<(SyncSender<()>, Receiver<()>)>>,
     auth: Weak<Auth>,
     stop: Arc<AtomicBool>,
     redaction: secret::RedactionService,
@@ -232,6 +234,16 @@ pub struct DeferredTransport {
     pub(crate) reserved: Arc<AtomicBool>,
 }
 impl DeferredTransport {
+    #[cfg(test)]
+    pub(crate) fn pause_next_begin(&self) -> (Receiver<()>, SyncSender<()>) {
+        let (entered, entered_rx) = mpsc::sync_channel(1);
+        let (release, release_rx) = mpsc::sync_channel(1);
+        let mut gate = self.lane.before_begin.lock().unwrap();
+        assert!(gate.is_none());
+        *gate = Some((entered, release_rx));
+        (entered_rx, release)
+    }
+
     #[cfg(test)]
     pub(crate) fn retained_result_bytes(&self, stream: &str) -> Option<usize> {
         let registry = self.lane.registry.lock().ok()?;
@@ -377,6 +389,8 @@ impl CompletionLane {
         let (wake, wake_rx) = mpsc::sync_channel(1);
         let lane = Arc::new(Self {
             registry: Mutex::new(Registry::default()),
+            #[cfg(test)]
+            before_begin: Mutex::new(None),
             auth: Arc::downgrade(auth),
             stop,
             redaction,
@@ -426,6 +440,16 @@ impl CompletionLane {
         })
     }
     pub(crate) fn begin(&self, id: &str, reply: Receiver<Result<Value, String>>) -> bool {
+        #[cfg(test)]
+        {
+            let gate = self.before_begin.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.try_send(());
+                if release.recv_timeout(Duration::from_secs(2)).is_err() {
+                    return false;
+                }
+            }
+        }
         let Ok(mut registry) = self.registry.lock() else {
             return false;
         };

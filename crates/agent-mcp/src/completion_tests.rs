@@ -299,6 +299,52 @@ fn completion_stream_late_redaction_preserves_only_real_routing_identity() {
 }
 
 #[test]
+fn completion_stream_closed_after_handoff_does_not_assert_no_effect() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let mut socket = post(&server, &token, &session, "handoff-close");
+    let req = next_request(&server);
+    let deferred = req.deferred.as_ref().unwrap();
+    let (entered, release) = deferred.pause_next_begin();
+    let permit = CompletionPermit::new();
+    let identity = deferred
+        .reserve(scope("handoff-close"), permit.clone())
+        .unwrap();
+    entered.recv_timeout(Duration::from_secs(2)).unwrap();
+    // App may have admitted input after reserve. Close the lane before the HTTP
+    // worker can take its original receiver, without assuming the effect state.
+    permit.revoke();
+    let end = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(event) = server
+            .delivery_events
+            .recv_timeout(Duration::from_millis(50))
+            && event.identity == identity
+            && event.state == CompletionDeliveryState::Closed
+        {
+            break;
+        }
+        assert!(Instant::now() < end, "revoked stream was not closed");
+    }
+    release.try_send(()).unwrap();
+    let mut response = String::new();
+    socket.read_to_string(&mut response).unwrap();
+    let (head, body) = response.split_once("\r\n\r\n").unwrap();
+    assert_eq!(
+        crate::tests::completion_header(head, "content-type"),
+        Some("application/json")
+    );
+    let rpc: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(rpc["id"], 77);
+    let payload: Value =
+        serde_json::from_str(rpc["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["error"], "outcome_unknown_do_not_retry_input");
+    assert_eq!(payload["effect_state"], "unknown");
+    assert_eq!(payload["retryable"], false);
+}
+
+#[test]
 fn completion_stream_bounds_retained_app_result_before_replay() {
     let server = Server::start(0, "", || {}).unwrap();
     let token = server.auth.token_for_user();

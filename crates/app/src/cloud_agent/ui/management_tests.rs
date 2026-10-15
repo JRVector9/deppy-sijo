@@ -124,6 +124,32 @@ fn management_ui_issued_credential_waits_for_actual_authentication() {
 }
 
 #[test]
+fn completion_ui_opt_in_is_visible_default_off_and_requires_read_consent() {
+    let (bridge, _, _, _, _) = connection_fixture();
+    let mut harness = harness(bridge);
+    harness
+        .get_by_label("Review Bot · Credential issued · waiting for authentication")
+        .click();
+    harness.run();
+    harness.get_by_label("Access permissions").click();
+    harness.run();
+
+    let completion = harness.get_by_role_and_label(
+        egui::accesskit::Role::CheckBox,
+        "Receive local task completion",
+    );
+    assert_eq!(
+        completion.accesskit_node().toggled(),
+        Some(egui::accesskit::Toggled::False),
+        "completion return must require a separate owner opt-in"
+    );
+    assert!(
+        completion.accesskit_node().is_disabled(),
+        "completion return requires existing read consent"
+    );
+}
+
+#[test]
 fn management_ui_permissions_and_revoke_affect_only_the_selected_connection() {
     let (bridge, target, review, research, _) = connection_fixture();
     let mut harness = harness(bridge);

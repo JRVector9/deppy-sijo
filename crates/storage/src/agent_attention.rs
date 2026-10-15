@@ -17,7 +17,11 @@ pub fn native_prompt_digest(text: &str) -> String {
         digest.update(b"\n");
         digest.update(part.strip_prefix('\n').unwrap_or(part).as_bytes());
     }
-    format!("{:x}", digest.finalize())
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Independent native boundaries, never the consumed UI `turn_done` flag.

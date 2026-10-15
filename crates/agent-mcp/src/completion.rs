@@ -581,7 +581,7 @@ impl CompletionLane {
         if let Some(result) = &action.result {
             let mut result = result.clone();
             if let Ok(value) = &mut result {
-                redact_display(value, &self.redaction.snapshot());
+                redact_display(value, &self.redaction.snapshot(), true);
             }
             let mut frame = completion_frame(&action.identity, &result);
             if frame.len() > MAX_COMPLETION_EVENT_BYTES {
@@ -633,26 +633,32 @@ struct SocketWrite {
     heartbeat_due: bool,
     result: Option<Result<Value, String>>,
 }
-fn redact_display(value: &mut Value, redaction: &secret::RedactionSnapshot<'_>) {
+fn redact_display(
+    value: &mut Value,
+    redaction: &secret::RedactionSnapshot<'_>,
+    preserve_routing: bool,
+) {
     match value {
         Value::String(text) => *text = redaction.redact_wrapped_text(text),
         Value::Array(values) => {
             for value in values {
-                redact_display(value, redaction);
+                redact_display(value, redaction, false);
             }
         }
         Value::Object(values) => {
             for (key, value) in values {
-                if !matches!(
-                    key.as_str(),
-                    "event_id"
-                        | "operation_id"
-                        | "run_id"
-                        | "session_id"
-                        | "generation"
-                        | "workspace"
-                ) {
-                    redact_display(value, redaction);
+                if !preserve_routing
+                    || !matches!(
+                        key.as_str(),
+                        "event_id"
+                            | "operation_id"
+                            | "run_id"
+                            | "session_id"
+                            | "generation"
+                            | "workspace"
+                    )
+                {
+                    redact_display(value, redaction, false);
                 }
             }
         }

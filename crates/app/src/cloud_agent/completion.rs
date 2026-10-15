@@ -701,6 +701,21 @@ mod tests {
     }
 
     #[test]
+    fn completion_native_end_after_absolute_watch_deadline_is_expired() {
+        let (mut tracker, key, target, mut own) = begun();
+        own.completed.as_mut().unwrap().at_micros = START + WATCH_TIMEOUT_MICROS + 1;
+        let decisions = tracker.observe(&target, &own, true, START + WATCH_TIMEOUT_MICROS + 2);
+        assert_eq!(decisions.len(), 1);
+        assert_eq!(decisions[0].state, LocalCompletionState::Expired);
+        assert_eq!(tracker.state(&key), Some(LocalCompletionState::Expired));
+        assert!(
+            tracker
+                .observe(&target, &own, true, START + WATCH_TIMEOUT_MICROS + 3)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn completion_fast_native_end_requires_own_admission_and_final_rollout_once() {
         let (mut tracker, key, target, own) = begun();
         assert!(tracker.observe(&target, &own, false, START + 4).is_empty());

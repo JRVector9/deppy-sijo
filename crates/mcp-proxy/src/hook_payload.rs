@@ -403,4 +403,35 @@ mod tests {
         assert!(preview.len() <= 256);
         assert!(!preview.contains('\n'));
     }
+
+    #[test]
+    fn completion_full_prompt_digest_distinguishes_identical_display_previews() {
+        let prefix = "shared visible prompt ".repeat(24);
+        let parse = |suffix: &str| {
+            let raw = json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "same-native-session",
+                "prompt": format!("{prefix}{suffix}"),
+            })
+            .to_string();
+            let result = read_classified(raw.as_bytes());
+            assert!(!result.rejected);
+            result.value.expect("valid bounded hook")
+        };
+        let first = parse("first operation");
+        let second = parse("different operation");
+        assert_eq!(first["prompt"], second["prompt"]);
+        assert_ne!(
+            first.get("prompt_digest"),
+            second.get("prompt_digest"),
+            "completion binding must distinguish full prompts beyond the display preview"
+        );
+        let digest = first["prompt_digest"].as_str().expect("full prompt digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            first["prompt_digest"],
+            parse("first operation")["prompt_digest"]
+        );
+    }
 }

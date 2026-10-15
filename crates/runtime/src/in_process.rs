@@ -7314,6 +7314,80 @@ mod tests {
         )
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn completion_actual_input_sequence_covers_local_tracked_and_encoded_batches() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "completion-input-sequence");
+        let session = SessionId(1);
+        let live = Session::spawn_with_spec(
+            session,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        worker.sessions.insert(session, live);
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session,
+            bytes: b"local".to_vec(),
+        });
+        worker.handle_command(RuntimeCommand::WriteInputBatchTracked {
+            session,
+            operation_id: "completion:own-operation".to_owned(),
+            parts: vec![b"cloud prompt".to_vec(), b"\r".to_vec()],
+        });
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session,
+            input: crate::TerminalInput::Text {
+                text: "remote manual input".to_owned(),
+                paste: false,
+            },
+        });
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session,
+            bytes: Vec::new(),
+        });
+        worker.handle_command(RuntimeCommand::WriteInputTracked {
+            session: SessionId(999),
+            operation_id: "completion:rejected-operation".to_owned(),
+            bytes: b"closed session".to_vec(),
+        });
+        let accepted: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| {
+                serde_json::to_value(event)
+                    .unwrap()
+                    .get("SessionInputAccepted")
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(
+            accepted.len(),
+            3,
+            "every actual nonempty accepted batch needs one intervention sequence event"
+        );
+        let sequences: Vec<_> = accepted
+            .iter()
+            .map(|event| event["sequence"].as_u64().unwrap())
+            .collect();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert!(
+            accepted
+                .iter()
+                .all(|event| event["at_micros"].as_i64().unwrap() > 0)
+        );
+        assert!(accepted[0]["operation_id"].is_null());
+        assert_eq!(accepted[1]["operation_id"], "completion:own-operation");
+        assert!(accepted[2]["operation_id"].is_null());
+        assert!(accepted.iter().all(|event| event.get("bytes").is_none()));
+    }
+
     struct UnattachedHarness {
         worker: Worker,
         events: std::sync::mpsc::Receiver<RuntimeEvent>,

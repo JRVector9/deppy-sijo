@@ -1933,10 +1933,11 @@ impl TerminalPreeditState {
         next
     }
 
-    fn view(&self) -> Option<renderer_egui::PreeditView<'_>> {
-        (!self.is_empty()).then_some(renderer_egui::PreeditView {
+    fn view(&self, awaiting_commit: bool) -> Option<renderer_egui::PreeditView<'_>> {
+        (!self.is_empty() || awaiting_commit).then_some(renderer_egui::PreeditView {
             text: &self.text,
             active_range_chars: self.active_range_chars.as_ref(),
+            awaiting_commit,
         })
     }
 }
@@ -7926,9 +7927,25 @@ impl WorkspaceUi {
         }
         let preedit_for_frame = (terminal_ime_active && !text_edit_focused_before_draw)
             .then(|| ui.input(|input| self.preedit.for_frame(session, &input.raw.events)));
+        // AppKit can clear the preview before delivering Commit. Keep the native
+        // composition through that pass and any already-deferred Return, without
+        // retaining cancelled preview text or introducing another wait state.
+        let awaiting_ime_commit = preedit_for_frame.is_some()
+            && (self.preedit.is_active_for(session)
+                || self
+                    .pending_ime_submit
+                    .as_ref()
+                    .is_some_and(|deferred| deferred.for_session(session)))
+            && !ui.input(|input| {
+                input
+                    .raw
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, egui::Event::Ime(egui::ImeEvent::Commit(_))))
+            });
         let preedit = preedit_for_frame
             .as_ref()
-            .and_then(TerminalPreeditState::view);
+            .and_then(|preedit| preedit.view(awaiting_ime_commit));
         // 이 세션의 선택 영역 (정규화)
         let selection_range = self
             .selection
@@ -8235,7 +8252,7 @@ impl WorkspaceUi {
             // The terminal's own first preedit can arrive before this reserved
             // focus is applied. request_focus interrupts IME even for the same
             // widget, so wait until the projected composition has finished.
-            && !preedit_for_frame.as_ref().is_some_and(|preedit| !preedit.is_empty())
+            && preedit.is_none()
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);

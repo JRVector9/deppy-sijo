@@ -155,3 +155,65 @@ fn completion_event_loss_durable_native_finish_preserves_closed_delivery() {
         "durable local completion cannot reopen a closed original transport"
     );
 }
+
+#[test]
+fn completion_event_loss_fences_unadmitted_input_but_returns_unknown_on_original_stream() {
+    let mut fixture = Fixture::new();
+    let mut started = fixture.start("event-loss-unadmitted-input", None);
+    let input_fence = fixture
+        .bridge
+        .completion_input_permit(&started.internal)
+        .unwrap();
+    assert!(input_fence.is_live());
+
+    fixture
+        .bridge
+        .invalidate_completion_runtime(fixture.target.runtime);
+    assert!(
+        !input_fence.is_live(),
+        "event loss left the already-queued PTY command's input fence live"
+    );
+    fixture.admit(
+        &started,
+        Err(runtime::PtyInputRejectReason::AdmissionDenied),
+    );
+    let response = fixture.finish(&mut started);
+    assert_eq!(
+        response["local_completion"]["status"], "unknown",
+        "fencing input must preserve the read-authorized original result stream"
+    );
+    assert_eq!(fixture.receipt(&started).tool_result(), response);
+}
+
+#[test]
+fn completion_event_loss_unrelated_runtime_does_not_block_healthy_native_completion() {
+    let mut fixture = Fixture::new();
+    let mut started = fixture.start("event-loss-independent-runtime", None);
+    let accepted_at = fixture.admit(&started, Ok(()));
+
+    fixture.bridge.set_completion_observation_ready(false);
+    fixture
+        .bridge
+        .set_completion_observation_runtimes(&[(fixture.target.runtime, true), (999, false)]);
+    fixture
+        .bridge
+        .install_native_turns(vec![fixture.completed_proof(&started, accepted_at)]);
+    fixture.bridge.poll_completions();
+    let status = fixture
+        .bridge
+        .completion_status_for_operation(
+            &started.identity.connection_id,
+            &started.identity.scope.session_id,
+            &started.identity.scope.generation,
+            &started.identity.scope.operation_id,
+        )
+        .unwrap();
+    assert_eq!(
+        status.local,
+        LocalCompletionState::Completed,
+        "an unrelated runtime's lost event stream blocked healthy completion evidence"
+    );
+    let response = fixture.finish(&mut started);
+    assert_eq!(response["local_completion"]["status"], "completed");
+    assert_eq!(fixture.receipt(&started).tool_result(), response);
+}

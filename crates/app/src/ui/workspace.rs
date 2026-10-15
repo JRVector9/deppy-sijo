@@ -3249,7 +3249,7 @@ impl WorkspaceUi {
     }
 
     /// App이 저장 세션 복원/전환을 시작할 때 정확한 pane을 다음 터미널 입력 대상으로
-    /// 예약한다. 실제 egui focus 요청은 그 pane의 surface가 렌더되는 첫 프레임에 소비된다.
+    /// 예약한다. 실제 egui focus 요청은 그 pane의 조합을 중단하지 않는 렌더 프레임에 소비된다.
     pub(crate) fn arm_terminal_focus(&mut self, pane: runtime::MuxPaneId) {
         self.explicit_pending_focus = Some(pane.clone());
         self.explicit_pending_focus_observed = self.mux.as_deref().is_some_and(|mux| {
@@ -8232,6 +8232,10 @@ impl WorkspaceUi {
             // input admission. Keep automatic refocus pending for a TextEdit
             // IME batch; explicit pane clicks below still claim focus directly.
             && !text_edit_ime_batch
+            // The terminal's own first preedit can arrive before this reserved
+            // focus is applied. request_focus interrupts IME even for the same
+            // widget, so wait until the projected composition has finished.
+            && !preedit_for_frame.as_ref().is_some_and(|preedit| !preedit.is_empty())
             && self.pending_focus.as_ref() == Some(pane_id)
         {
             let app_armed = self.explicit_pending_focus.as_ref() == Some(pane_id);

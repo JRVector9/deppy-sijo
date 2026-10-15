@@ -78,6 +78,123 @@ fn enter() -> egui::Event {
 }
 
 #[test]
+fn hangul_pending_terminal_refocus_preserves_the_first_preedit_frame() {
+    for transient_focus in [false, true] {
+        let mut trace = TerminalInputHarness::new(SessionId(7));
+        if transient_focus {
+            trace
+                .ui
+                .ctx
+                .memory_mut(|memory| memory.request_focus(egui::Id::new("transient")));
+        }
+        // Session navigation can arm native focus before the first AppKit
+        // preedit reaches the next UI pass. It is the terminal's composition.
+        trace.ui.state_mut().arm_terminal_focus(pane_id("pane"));
+        assert!(trace.frame([preedit_event("ㅎ")]).is_empty());
+        let ime = trace
+            .ui
+            .output()
+            .platform_output
+            .ime
+            .as_ref()
+            .expect("terminal must keep the native IME enabled");
+        assert!(
+            !ime.should_interrupt_composition,
+            "pending terminal refocus interrupted the first Hangul jamo; transient_focus={transient_focus}"
+        );
+        assert_eq!(trace.ui.state().preedit.text, "ㅎ");
+    }
+}
+
+#[test]
+fn hangul_pending_terminal_refocus_waits_through_recomposition_and_commit() {
+    for transient_focus in [false, true] {
+        let session = SessionId(7);
+        let mut trace = TerminalInputHarness::new(session);
+        let terminal_id = trace.ui.ctx.memory(|memory| memory.focused()).unwrap();
+        if transient_focus {
+            trace
+                .ui
+                .ctx
+                .memory_mut(|memory| memory.request_focus(egui::Id::new("transient")));
+        }
+        trace.ui.state_mut().arm_terminal_focus(pane_id("pane"));
+
+        // AppKit updates marked text as a syllable gains/loses its final
+        // consonant. None of those preedit revisions are committed PTY input.
+        for syllable in ["ㅎ", "하", "한", "하", "ㅎ", "하", "한"] {
+            assert!(trace.frame([preedit_event(syllable)]).is_empty());
+            assert_eq!(trace.ui.state().preedit.text, syllable);
+            assert_eq!(trace.ui.state().pending_focus, Some(pane_id("pane")));
+            assert!(
+                trace
+                    .ui
+                    .output()
+                    .platform_output
+                    .ime
+                    .as_ref()
+                    .is_some_and(|ime| !ime.should_interrupt_composition)
+            );
+            // An idle repaint must not consume the reservation between keys.
+            assert!(trace.frame([]).is_empty());
+            assert_eq!(trace.ui.state().pending_focus, Some(pane_id("pane")));
+            assert!(
+                trace
+                    .ui
+                    .output()
+                    .platform_output
+                    .ime
+                    .as_ref()
+                    .is_some_and(|ime| !ime.should_interrupt_composition)
+            );
+        }
+
+        // A completed syllable and the next syllable can share one UI pass.
+        assert_eq!(
+            trace.frame([preedit_event(""), commit_event("한"), preedit_event("ㄱ")]),
+            vec![(session, "한".as_bytes().to_vec())]
+        );
+        assert_eq!(trace.ui.state().pending_focus, Some(pane_id("pane")));
+        assert!(
+            trace
+                .ui
+                .output()
+                .platform_output
+                .ime
+                .as_ref()
+                .is_some_and(|ime| !ime.should_interrupt_composition)
+        );
+        for syllable in ["그", "글"] {
+            assert!(trace.frame([preedit_event(syllable)]).is_empty());
+        }
+        assert_eq!(
+            trace.frame([preedit_event(""), commit_event("글")]),
+            vec![(session, "글".as_bytes().to_vec())]
+        );
+        assert!(trace.ui.state().pending_focus.is_none());
+        assert_eq!(
+            trace.ui.ctx.memory(|memory| memory.focused()),
+            Some(terminal_id)
+        );
+        assert!(trace.frame([]).is_empty());
+        assert!(
+            trace
+                .ui
+                .output()
+                .platform_output
+                .ime
+                .as_ref()
+                .is_some_and(|ime| !ime.should_interrupt_composition)
+        );
+        assert_eq!(trace.frame([enter()]), vec![(session, b"\r".to_vec())]);
+        assert_eq!(
+            trace.frame([egui::Event::Paste("붙여넣기".into())]),
+            vec![(session, "붙여넣기".as_bytes().to_vec())]
+        );
+    }
+}
+
+#[test]
 fn ambiguous_suffix_text_without_native_monitor_stays_available_to_new_pane() {
     let bare_suffix = [commit_event("요."), egui::Event::Text(".".into())];
     assert_eq!(

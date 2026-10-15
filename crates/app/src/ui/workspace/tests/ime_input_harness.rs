@@ -195,6 +195,82 @@ fn hangul_pending_terminal_refocus_waits_through_recomposition_and_commit() {
 }
 
 #[test]
+fn hangul_pending_terminal_refocus_waits_for_commit_after_empty_preedit_and_return() {
+    for transient_focus in [false, true] {
+        let session = SessionId(7);
+        let mut trace = TerminalInputHarness::new(session);
+        if transient_focus {
+            trace
+                .ui
+                .ctx
+                .memory_mut(|memory| memory.request_focus(egui::Id::new("transient")));
+        }
+        trace.ui.state_mut().arm_terminal_focus(pane_id("pane"));
+        assert!(trace.frame([preedit_event("한")]).is_empty());
+        assert!(trace.frame([enter(), preedit_event("")]).is_empty());
+        assert!(
+            trace
+                .ui
+                .output()
+                .platform_output
+                .ime
+                .as_ref()
+                .is_some_and(|ime| !ime.should_interrupt_composition),
+            "clearing the preview before Commit must not interrupt the native composition"
+        );
+        assert_eq!(trace.ui.state().pending_focus, Some(pane_id("pane")));
+        assert!(trace.ui.state().pending_ime_submit.is_some());
+        assert!(trace.frame([]).is_empty());
+        assert_eq!(trace.ui.state().pending_focus, Some(pane_id("pane")));
+        assert!(
+            trace
+                .ui
+                .output()
+                .platform_output
+                .ime
+                .as_ref()
+                .is_some_and(|ime| !ime.should_interrupt_composition)
+        );
+        assert_eq!(
+            trace.frame([commit_event("한")]),
+            vec![(session, "한\r".as_bytes().to_vec())]
+        );
+        assert!(trace.ui.state().pending_focus.is_none());
+        assert!(trace.ui.state().pending_ime_submit.is_none());
+        assert_eq!(
+            trace.frame([egui::Event::Paste("붙여넣기".into())]),
+            vec![(session, "붙여넣기".as_bytes().to_vec())]
+        );
+    }
+}
+
+#[test]
+fn hangul_pending_terminal_refocus_recovers_after_cancelled_preedit() {
+    let mut trace = TerminalInputHarness::new(SessionId(7));
+    trace.ui.state_mut().arm_terminal_focus(pane_id("pane"));
+    assert!(trace.frame([preedit_event("ㅎ")]).is_empty());
+    assert!(trace.frame([preedit_event("")]).is_empty());
+    assert!(
+        trace
+            .ui
+            .output()
+            .platform_output
+            .ime
+            .as_ref()
+            .is_some_and(|ime| !ime.should_interrupt_composition),
+        "an empty preedit alone can precede a delayed Commit"
+    );
+    assert!(trace.frame([]).is_empty());
+    assert!(trace.ui.state().pending_focus.is_none());
+    assert!(trace.ui.state().preedit.is_empty());
+    assert!(trace.ui.state().pending_ime_submit.is_none());
+    assert_eq!(
+        trace.frame([egui::Event::Text(".".into())]),
+        vec![(SessionId(7), b".".to_vec())]
+    );
+}
+
+#[test]
 fn ambiguous_suffix_text_without_native_monitor_stays_available_to_new_pane() {
     let bare_suffix = [commit_event("요."), egui::Event::Text(".".into())];
     assert_eq!(

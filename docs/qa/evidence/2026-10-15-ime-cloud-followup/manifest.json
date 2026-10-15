@@ -110,6 +110,41 @@
     "sha256": "47b1d1549c0dc180e52d14f69f2e3e5ae71217344a4fa3d36c45b0a1e84a7078"
   },
   {
+    "file": "package-result.json",
+    "bytes": 1222,
+    "sha256": "f331469305d77e960c5f24943d1cb0ecde7f4bfeb28f547c01e2f94dcecbbd7c"
+  },
+  {
+    "file": "package.log",
+    "bytes": 3959,
+    "sha256": "d8ba4469ffcc591f33d05bb7cba6f2ab9a489d4b77efc88dc44a6cc7205d886e"
+  },
+  {
+    "file": "pr233-checks.json",
+    "bytes": 3166,
+    "sha256": "112eebb8887002fe19d4fc94d8955c1ae31c4f4272fd3b49b4bc5885ebfcd868"
+  },
+  {
+    "file": "pr233-ci-result.json",
+    "bytes": 856,
+    "sha256": "e99e400e782f0694e2f191748c4cf4e193cd52cdcea83bc1ce12a0f2cecb57f6"
+  },
+  {
+    "file": "pr233-ci.log.gz",
+    "bytes": 249790,
+    "sha256": "647aa6d929b7f709c77f2d1a87c6edb30b0a796e3d03beae9451d39ba562ab76"
+  },
+  {
+    "file": "release-result.json",
+    "bytes": 514,
+    "sha256": "6af973ab86405a2149750cff3242f76f9288074d6f9f14a01a267a713c0a3116"
+  },
+  {
+    "file": "release.log",
+    "bytes": 3079,
+    "sha256": "3339d6911067862c2822c10c0002939dc4a6292025c538ab8ab7050c45ebf6b2"
+  },
+  {
     "file": "terminal-green.log",
     "bytes": 4939,
     "sha256": "8743414a1c61773c72101a65a5b433eb661ee1d34b45034a9ec6be5d7d672935"

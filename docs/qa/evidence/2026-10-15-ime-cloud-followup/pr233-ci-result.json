@@ -1,0 +1,26 @@
+{
+  "pr": 233,
+  "head": "88b2a85024a38a73d1e2b34b488c052f43df65a9",
+  "merge_commit": "e101d64ff47c3d76afb1b04ba64632c61dd17de6",
+  "run_id": 38694499798,
+  "summaries": [
+    {
+      "seconds": 30.986,
+      "run": 673,
+      "passed": 673,
+      "skipped": 4083,
+      "line": "Build, clippy, and test (macOS)\tAgent status ownership and provider replay\t2026-10-15T06:52:53.6506400Z      Summary [  30.986s] 673 tests run: 673 passed, 4083 skipped"
+    },
+    {
+      "seconds": 209.02,
+      "run": 5071,
+      "passed": 5071,
+      "skipped": 134,
+      "line": "Build, clippy, and test (macOS)\tcargo nextest run --workspace\t2026-10-15T06:56:26.1961930Z      Summary [ 209.020s] 5071 tests run: 5071 passed, 134 skipped"
+    }
+  ],
+  "passed_total": 5744,
+  "retry_lines": [],
+  "all_eight_checks_success": true,
+  "skip_counts_not_summed": true
+}

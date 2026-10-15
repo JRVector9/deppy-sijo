@@ -54,7 +54,7 @@ root가 shared app.rs/형식/문서/버전의 단일 소유자다. workers는 �
 
 isolated synthetic fixture와 독립 공식 MCP SDK client로 원 POST→SSE final tool result→끊김→원 stream 재개를 실행한다. 다른 actor/run/session/generation/stream, 중복 hook, 이전 완료, waiter 전 빠른 완료, 로컬에서 배지 읽음, 자식 작업·승인 대기, 입력 거절/불명, 중첩·수동 개입, 권한 폐기/만료/회전/stop, 느린 reader·용량 압력, 재시작 unknown, 늦은 비밀키 등록 마스킹을 검증한다. 기존 JSON 도구 회귀도 실행한다. 실제 외부 계정에 메시지를 보내는 검증은 이번 구현 테스트에 포함하지 않는다.
 
-기능을 사용자용 빌드로 전달하면 마지막 shipped0.12.2보다 높은 **0.13.0**으로 올리고 binary와 macOS bundle 두 version 필드를 검증한다. 사용자 재실행 요청이 없으므로 앱은 종료·실행하지 않는다.
+기능을 사용자용 빌드로 전달하면 마지막 shipped0.12.3보다 높은 **0.13.0**으로 올리고 binary와 macOS bundle 두 version 필드를 검증한다. 사용자 재실행 요청이 없으므로 앱은 종료·실행하지 않는다.
 
 ## 근거
 

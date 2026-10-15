@@ -1,11 +1,11 @@
-# 한글 IME·HTTP 수정 — 로컬 검증 완료, main 반영·0.12.3 빌드 대기, 2026-10-15
+# 한글 IME·HTTP 수정 — main·0.12.3 빌드 완료, 클라우드 완료 알림 설계 대기, 2026-10-15
 
 ## 현재 목표와 작업 위치
 
 - 사용자: 앞선 main 통합/재빌드 최종확인 후 GPT-6.1-Sol/xhigh 서브에이전트 병렬로 GitHub의 한글 IME 해결책을 비교·적용하고, 로컬 작업 완료를 원 클라우드 에이전트에 자동 통지하는 기능 추가.
 - 이전 단계 완료: PR231 제품 main9ed5fba1 /0.12.2 bundle과 signature/archive/CLI·plist version 검증. 완료 증거 PR232도 main86974968에 merge했다. 기존 앱을 종료·실행·재실행하지 않았다.
-- 현재 canonical `/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015`, branch `work/ime-cloud-followups-20261015`, 현재 제품 HEADa4631474, source0.12.3. 원본 nominal/performance dirty와 다른 worktree를 보존한다. stale missing worktree가 점유한 local main ref를 건드리지 말고 **origin/main**을 기준으로 한다.
-- 현재 단계: 제품 source/test 검증 완료. 증거 문서 commit → PR exact-head checks → main merge → 실제 release/package/version 검증이 남았다. 0.12.3 artifact는 아직 없다. 앱 restart 권한 없음.
+- 현재 canonical `/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015`, branch `work/ime-cloud-followups-20261015`, 현재 제품 main e101d64ff47c3d76afb1b04ba64632c61dd17de6, source0.12.3. 원본 nominal/performance dirty와 다른 worktree를 보존한다. stale missing worktree가 점유한 local main ref를 건드리지 말고 **origin/main**을 기준으로 한다.
+- 현재 단계: 제품 source/test·증거 docs88b2a850을 PR233으로 push, exact-head GitHub8checks 모두 SUCCESS 확인 후 main e101d64f에 merge. 검증 head와 main product tree 동일 확인. 실제 main package exit0, CLI와 bundle2version 모두0.12.3/arm64/signature/archive PASS. 새 안정 경로 `target/bundle-0.12.3/Deppy Sijo.app`와 ZIP; package-result.json에 SHA·절대경로·source 기록. 이전0.12.2 artifact 보존. 앱 restart 없음. 이번 단계 최종 문서/evidence commit·PR만 남았고 신규 알림 설계 승인은 대기다.
 
 ## 병렬 작업과 검토
 
@@ -23,11 +23,12 @@
 
 ## 실제 실행 결과와 실패 접근
 
-- IME test-only RED0PASS1FAIL; 첫 gate 후 emptyPreedit/delayedCommit 반례 RED2PASS2FAIL. 최종 Workspace374PASS/0FAIL/2ignored, renderer43PASS/0FAIL/1ignored. real egui UI frame/PT Y intent 회귀이며 실제 사용자 OS IME/PWA 성공 증거는 아니다. 사용자 발생 입력창 질문은 미응답.
+- IME test-only RED0PASS1FAIL; 첫 gate 후 emptyPreedit/delayedCommit 반례 RED2PASS2FAIL. 최종 Workspace374PASS/0FAIL/2ignored, renderer43PASS/0FAIL/1ignored. real egui UI frame/PTY intent 회귀이며 실제 사용자 OS IME/PWA 성공 증거는 아니다. 사용자 발생 입력창 질문은 미응답.
 - Document16PASS/0FAIL/3ignored, exact conflict regression25/25 first-attempt PASS. public save_document의 Conflict/외부 bytes 보존을 실제 검증했다.
 - MCP test-only RED0PASS2FAIL. reader-only 변경은 응답 유실을 해결하지 못해 폐기. 이전 fresh production loopback400요청 중 large early rejection EOF80/80RST(78 header유실), framed71/80오류, valid same-large control40/40완전응답. 최종 canonical fresh0.12.3 production rlib를 재링크한 독립 probe는 **400/400완전응답, reset/error/missing/truncated0**, compile/run/classification 각각0. 상대.d만으로cohort를확정하지않고root 단일Cargo producer+freshmtime+source/rlib SHA를 함께 보존했다.
 - 실제 full workspace at4e89cb1b: `cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1` exit0, 78harness의 마지막 summary 합계 **5743PASS/0FAIL/65ignored**, nested subprocess3개 제외. App3233PASS/39ignored 포함. 그 뒤 a4631474에 cap-test1개만 추가.
 - 최종a4631474: `cargo test --offline --locked -p agent-mcp -- --test-threads=1` **74PASS/0FAIL/1ignored**, exit0. `cargo clippy --offline --locked --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `cargo run --offline --locked -p xtask -- check-boundary`, `... check-deps` 모두 실제 exit0. 앞의 workspace 합계와 focused 결과를 합산하지 않는다.
+- PR233 exact-head88b2a850 GitHub8checks 모두 실제SUCCESS. CI nextest 상태673PASS+나머지5071PASS=5744PASS/0FAIL, retry/FLAKY0. skipped는 서로 다른filter라 합산하지 않았다. CI raw compressedlog·checks·집계 evidence 보존. main merge e101d64ff47c3d76afb1b04ba64632c61dd17de6. root release actual0/1m55s, package actual0; 별도 versioned copy hash equality와 CLI0.12.3/plist2values0.12.3/arm64/codesign deep strict0 검증. local development package, notarized distribution 아님. source/build/package logs/result evidence 보존.
 - 위 테스트는 `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-performance/target CARGO_BUILD_JOBS=2`, root만 실행. fullsession25216/finalsession97416 모두 종료0, 현재 running Cargo 없음. `/private/tmp/deppy-followup-*-20261015.log` 및 final-gates JSON을 evidence에 보관했다.
 - 앞선 commentary에서 MCP 총개수와 PASS를 혼용한 것은 정정했다. 최종 정확값74PASS1ignored. 과거 ship/review는 필수 gstack checklist.md 부재로 완료라고 세지 않았고 직접 peer/source review와 실제 게이트를 사용했다.
 
@@ -35,7 +36,7 @@
 
 - brainstorming skill `/Users/jr/.agents/skills/brainstorming/SKILL.md`의 명시 HARD-GATE: “Do NOT invoke any implementation skill, write any code, scaffold any project, or take any implementation action until you have presented a design and the user has approved it.” 신규 완료 알림은 concrete written spec/self-review 후 async로 권장 원제출SSE/Tasks 대안을 제시했으나 **답변 없음**. no-answer/elapsed time은 승인 아님. 독립 bug repair만 계속했다.
 - 권장 설계: 연결·세션별 opt-in, 적격 submit의 원RPC를 SSE로 유지→검증된 native turn 완료를 같은 actor/operation/run/session/generation/stream으로 durable 반환. 별도 bounded lane, 수동입력 invalidation, current read권한·redaction·상한·replay, socketwrite와 모델ACK 분리. Dot/Meta Muse/Grok Bot 장시간 요청 호환 미검증. 설계 gate가 열리면 writing-plans→명시된3PR로 worker 경계 분리 구현한다.
-- 독립 수정 source는 최종 문서/evidence commit→push/PR→exact-head GitHub 검사→main merge→release build/package→0.12.3 binary/plist/architecture/signature/archive 검증. 0.12.2 artifact를 덮어쓰지 않는다. product source 변동 없이 docs만 바뀌면 검사를 불필요 반복하지 않는다.
+- 독립 수정 source의 main merge와0.12.3 release/package/version/architecture/signature/archive 검증까지 완료. 0.12.2 artifact를 덮어쓰지 않았다. 최종 문서/evidence를 별도 docs-only PR로 기록한다. product source 변동 없이 docs만 바뀌면 검사를 불필요 반복하지 않는다.
 - 실제계정 메시지·사용자DB·키·clipboard·입력기·사용중앱 상태 조작 없음. scripts/dev-run.sh/open.app 금지. binary --version은 GUI/config 초기화 전 종료하는 경로만 사용.
 
 ## 다음 정확 명령
@@ -48,7 +49,8 @@ git status --short --branch
 git diff
 cat docs/qa/evidence/2026-10-15-ime-cloud-followup/final-gates.json
 git diff origin/main --check -- crates Cargo.toml Cargo.lock CHANGELOG.md
-gh pr list --repo JRVector9/deppy-sijo --state open --json number,title,headRefName
+gh pr view 233 --repo JRVector9/deppy-sijo --json state,mergeCommit
+cat docs/qa/evidence/2026-10-15-ime-cloud-followup/package-result.json
 ```
 
 ---

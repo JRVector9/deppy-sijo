@@ -1,0 +1,23 @@
+{
+  "old_version": "0.12.2",
+  "new_version": "0.12.3",
+  "source_commit": "e101d64ff47c3d76afb1b04ba64632c61dd17de6",
+  "tested_pr_head": "88b2a85024a38a73d1e2b34b488c052f43df65a9",
+  "product_tree_matches_tested_head": true,
+  "package_command": "CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-performance/target CARGO_BUILD_JOBS=2 CARGO_NET_OFFLINE=true DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 sh scripts/package-macos.sh",
+  "package_exit_code": 0,
+  "binary_version": "Deppy Sijo 0.12.3",
+  "CFBundleShortVersionString": "0.12.3",
+  "CFBundleVersion": "0.12.3",
+  "architecture": "arm64",
+  "signature_verification_exit_code": 0,
+  "archive_verification_exit_code": 0,
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle-0.12.3/Deppy Sijo.app",
+  "archive": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle-0.12.3/Deppy Sijo.zip",
+  "binary_sha256": "35065c8ad7c0e0f304c9e310df2ac5af7487abd1caa91000a2c43a66571738b5",
+  "archive_sha256": "8a0aceb09b1f4e16893e960c2eb0dfcf92a1c5b107b0be9f4e3d88d2a6cec075",
+  "local_development_package": true,
+  "notarized_distribution": false,
+  "app_launched": false,
+  "app_restarted": false
+}

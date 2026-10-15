@@ -1,0 +1,23 @@
+{
+  "product_source_commit": "f9d7c8a7",
+  "version": "0.13.0",
+  "final_command": "CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-performance/target CARGO_BUILD_JOBS=2 cargo test --offline --locked --no-fail-fast -p deppy-sijo -p agent-mcp completion_ -- --test-threads=1 --nocapture",
+  "exit_code": 0,
+  "app": {
+    "passed": 76,
+    "failed": 0,
+    "ignored": 0
+  },
+  "agent_mcp": {
+    "passed": 18,
+    "failed": 0,
+    "ignored": 1
+  },
+  "log": "deppy-completion-stage11-green-20261015.log.gz",
+  "format_check_exit_code": 0,
+  "diff_check_exit_code": 0,
+  "scope": "synthetic native proof, input guard, exact identity, private durable receipt, original HTTP/SSE integration, revocation, event loss and retention; no real cloud host/model acknowledgement claim",
+  "source_equivalent_head": "80e19fc868802d5283a7d5b245917913fa5cfcd4",
+  "behavior_code_commit": "b980eb3e",
+  "cohort_note": "Executed after b980eb3e with the already-edited0.13.0 Cargo files subsequently committed as f9d7c8a7. The later documentation-only PR head has the same Rust/Cargo source. Final cleanup commit793b74f6 is tested separately by complete workspace and exact-head CI."
+}

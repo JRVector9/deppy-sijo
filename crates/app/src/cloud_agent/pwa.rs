@@ -312,6 +312,7 @@ mod tests {
         let header = format!("Bearer {}", auth.token_for_user().as_str());
         let (reply, receiver) = std::sync::mpsc::sync_channel(1);
         let request = agent_mcp::Request {
+            deferred: None,
             epoch: auth.authenticate(&header, now()).unwrap(),
             principal: auth.authenticate_principal(&header, now()).unwrap(),
             access_key: None,

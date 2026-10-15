@@ -4,6 +4,30 @@ use serde_json::{Value, json};
 fn safe_error_code(error: &str) -> &str {
     match error {
         "busy_no_effect"
+        | "completion_native_proof_unsupported"
+        | "completion_invalid_scope"
+        | "completion_target_busy"
+        | "completion_watch_capacity"
+        | "completion_original_request_required_no_effect"
+        | "completion_transport_required_no_effect"
+        | "invalid_completion_identity_no_effect"
+        | "completion_result_too_large_no_effect"
+        | "completion_revoked_no_effect"
+        | "completion_busy_no_effect"
+        | "completion_capacity_no_effect"
+        | "local_task_busy_no_effect"
+        | "completion_transport_already_reserved_no_effect"
+        | "completion_transport_closed_no_effect"
+        | "completion_history_full_no_effect"
+        | "completion_operation_already_claimed_no_effect"
+        | "completion_result_too_large_unknown"
+        | "completion_identity_mismatch"
+        | "completion_not_claimed"
+        | "completion_receipt_conflict"
+        | "completion_admission_conflict"
+        | "completion_result_too_large"
+        | "invalid_completion_identity"
+        | "invalid_completion_receipt"
         | "poll_budget_no_effect"
         | "timeout_no_effect"
         | "outcome_unknown_do_not_retry_input"
@@ -149,6 +173,8 @@ pub(crate) fn error_payload(error: &str) -> Value {
         && matches!(
             code,
             "busy_no_effect"
+                | "completion_busy_no_effect"
+                | "completion_capacity_no_effect"
                 | "poll_budget_no_effect"
                 | "timeout_no_effect"
                 | "history_busy_no_effect"
@@ -167,6 +193,22 @@ pub(crate) fn normalize_tool_payload(mut payload: Value) -> Value {
         if let Some(error) = object.get("error") {
             let normalized = error_payload(error.as_str().unwrap_or(""));
             object.extend(normalized.as_object().unwrap().clone());
+        }
+        if object.get("local_completion").is_some_and(Value::is_object)
+            && let Some(admission) = object.get("admission").and_then(Value::as_object)
+        {
+            // A later local observation does not change the input's recorded
+            // admission, and returning a result never acknowledges model use.
+            let effect = match admission.get("status").and_then(Value::as_str) {
+                Some("queued") => "queued",
+                Some("rejected") => "none",
+                _ => "unknown",
+            };
+            object.insert("effect_state".into(), json!(effect));
+            object.insert("retry".into(), json!(false));
+            object.insert("retryable".into(), json!(false));
+            object.remove("retry_after_ms");
+            return payload;
         }
         match object.get("status").and_then(Value::as_str) {
             Some("unknown") => {

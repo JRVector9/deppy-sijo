@@ -334,6 +334,7 @@ impl InProcessRuntimeClient {
                     next_id: 1,
                     sessions: std::collections::HashMap::new(),
                     input_reply_probes: std::collections::HashMap::new(),
+                    input_sequences: std::collections::HashMap::new(),
                     resize_epoch: 0,
                     resize_records: std::collections::HashMap::new(),
                     terminal_controls: std::collections::HashMap::new(),
@@ -923,6 +924,7 @@ struct Worker {
     /// 다중 세션 (PR-08 Session Runtime). 세션 로직은 session crate 소관.
     sessions: std::collections::HashMap<SessionId, Session>,
     input_reply_probes: std::collections::HashMap<SessionId, Weak<Mutex<InputReplyBuffer>>>,
+    input_sequences: std::collections::HashMap<SessionId, u64>,
     /// Checked redaction leases are retained for exactly as long as their live/readable session.
     /// A session may need more than one lease when restored dotenv values supplement the resolved
     /// default credential set. Removal/archive drops the complete set and starts grace expiry.
@@ -2068,6 +2070,7 @@ impl Worker {
         self.scrollback_results.remove(&session);
         self.archive_failed.remove(&session);
         self.session_redaction_leases.remove(&session);
+        self.input_sequences.remove(&session);
         let removed = self.sessions.remove(&session);
         if removed.is_some() {
             self.emit_scrollback_result();
@@ -2596,7 +2599,12 @@ impl Worker {
                     operation_id,
                     bytes,
                 } => {
-                    let result = self.admit_input_checked(session, &bytes, Some(&admission));
+                    let result = self.admit_input_batch_for_operation(
+                        session,
+                        &[&bytes],
+                        Some(&admission),
+                        Some(&operation_id),
+                    );
                     self.emit(RuntimeEvent::InputAdmitted {
                         session,
                         operation_id,
@@ -2609,7 +2617,12 @@ impl Worker {
                     parts,
                 } => {
                     let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                    let result = self.admit_input_batch_checked(session, &slices, Some(&admission));
+                    let result = self.admit_input_batch_for_operation(
+                        session,
+                        &slices,
+                        Some(&admission),
+                        Some(&operation_id),
+                    );
                     if result.is_ok()
                         && let Some(probe) = input_reply
                     {
@@ -2689,13 +2702,51 @@ impl Worker {
         admission: Option<&crate::InputAdmission>,
         append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
     ) -> Result<(), pty::PtyInputRejectReason> {
+        self.admit_input_batch_for_operation_with_log_sink(session, parts, admission, None, append)
+    }
+
+    fn admit_input_batch_for_operation(
+        &mut self,
+        session: SessionId,
+        parts: &[&[u8]],
+        admission: Option<&crate::InputAdmission>,
+        operation_id: Option<&str>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
+        self.admit_input_batch_for_operation_with_log_sink(
+            session,
+            parts,
+            admission,
+            operation_id,
+            SessionLog::append_redacted_output,
+        )
+    }
+
+    fn admit_input_batch_for_operation_with_log_sink(
+        &mut self,
+        session: SessionId,
+        parts: &[&[u8]],
+        admission: Option<&crate::InputAdmission>,
+        operation_id: Option<&str>,
+        append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
         if !self.sessions.contains_key(&session) {
             return Err(pty::PtyInputRejectReason::SessionClosed);
         }
-        let at_micros = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
-            .unwrap_or(0);
+        let nonempty = parts.iter().any(|part| !part.is_empty());
+        let next_sequence = self
+            .input_sequences
+            .get(&session)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(pty::PtyInputRejectReason::AdmissionDenied)?;
+        let timestamp = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_micros().min(i64::MAX as u128) as i64)
+                .unwrap_or(0)
+        };
+        let mut at_micros = 0;
         let outcome = if let Some(admission) = admission {
             let mut refreshed = None;
             let admitted = admission.admit(|| {
@@ -2728,6 +2779,10 @@ impl Worker {
                 {
                     return Err(pty::PtyInputRejectReason::AdmissionDenied);
                 }
+                at_micros = timestamp();
+                if at_micros <= 0 {
+                    return Err(pty::PtyInputRejectReason::AdmissionDenied);
+                }
                 Ok(active.write_input_batch(parts))
             });
             if let Some(effects) = refreshed {
@@ -2735,6 +2790,10 @@ impl Worker {
             }
             admitted.ok_or(pty::PtyInputRejectReason::AdmissionDenied)??
         } else {
+            at_micros = timestamp();
+            if at_micros <= 0 {
+                return Err(pty::PtyInputRejectReason::AdmissionDenied);
+            }
             self.sessions
                 .get_mut(&session)
                 .expect("session exists")
@@ -2743,6 +2802,15 @@ impl Worker {
         // The admission lock is gone before detectors/events invoke UI wakes.
         match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
+                if nonempty {
+                    self.input_sequences.insert(session, next_sequence);
+                    self.emit(RuntimeEvent::SessionInputAccepted {
+                        session,
+                        sequence: next_sequence,
+                        operation_id: operation_id.map(str::to_owned),
+                        at_micros,
+                    });
+                }
                 // These two native Codex configuration keys cannot recall or introduce text.
                 // The guard already verified an empty prompt and no existing draft. Keep all
                 // ordinary/history/manual input evidence unchanged; never clear a real draft.
@@ -3177,7 +3245,12 @@ impl Worker {
                 operation_id,
                 bytes,
             } => {
-                let result = self.admit_input(session, &bytes);
+                let result = self.admit_input_batch_for_operation(
+                    session,
+                    &[&bytes],
+                    None,
+                    Some(&operation_id),
+                );
                 self.emit(RuntimeEvent::InputAdmitted {
                     session,
                     operation_id,
@@ -3190,7 +3263,12 @@ impl Worker {
                 parts,
             } => {
                 let slices = parts.iter().map(Vec::as_slice).collect::<Vec<_>>();
-                let result = self.admit_input_batch_checked(session, &slices, None);
+                let result = self.admit_input_batch_for_operation(
+                    session,
+                    &slices,
+                    None,
+                    Some(&operation_id),
+                );
                 self.emit(RuntimeEvent::InputAdmitted {
                     session,
                     operation_id,
@@ -7266,6 +7344,7 @@ mod tests {
                 next_id: 1,
                 sessions: std::collections::HashMap::new(),
                 input_reply_probes: std::collections::HashMap::new(),
+                input_sequences: std::collections::HashMap::new(),
                 resize_epoch: 0,
                 resize_records: std::collections::HashMap::new(),
                 terminal_controls: std::collections::HashMap::new(),
@@ -7312,6 +7391,80 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completion_actual_input_sequence_covers_local_tracked_and_encoded_batches() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "completion-input-sequence");
+        let session = SessionId(1);
+        let live = Session::spawn_with_spec(
+            session,
+            session::SessionKind::Shell,
+            &spec("/bin/cat", &[]),
+            80,
+            24,
+            100,
+        )
+        .unwrap();
+        worker.sessions.insert(session, live);
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session,
+            bytes: b"local".to_vec(),
+        });
+        worker.handle_command(RuntimeCommand::WriteInputBatchTracked {
+            session,
+            operation_id: "completion:own-operation".to_owned(),
+            parts: vec![b"cloud prompt".to_vec(), b"\r".to_vec()],
+        });
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session,
+            input: crate::TerminalInput::Text {
+                text: "remote manual input".to_owned(),
+                paste: false,
+            },
+        });
+        worker.handle_command(RuntimeCommand::WriteInput {
+            session,
+            bytes: Vec::new(),
+        });
+        worker.handle_command(RuntimeCommand::WriteInputTracked {
+            session: SessionId(999),
+            operation_id: "completion:rejected-operation".to_owned(),
+            bytes: b"closed session".to_vec(),
+        });
+        let accepted: Vec<_> = events
+            .try_iter()
+            .filter_map(|event| {
+                serde_json::to_value(event)
+                    .unwrap()
+                    .get("SessionInputAccepted")
+                    .cloned()
+            })
+            .collect();
+        assert_eq!(
+            accepted.len(),
+            3,
+            "every actual nonempty accepted batch needs one intervention sequence event"
+        );
+        let sequences: Vec<_> = accepted
+            .iter()
+            .map(|event| event["sequence"].as_u64().unwrap())
+            .collect();
+        assert_eq!(sequences, vec![1, 2, 3]);
+        assert!(
+            accepted
+                .iter()
+                .all(|event| event["at_micros"].as_i64().unwrap() > 0)
+        );
+        assert!(accepted[0]["operation_id"].is_null());
+        assert_eq!(accepted[1]["operation_id"], "completion:own-operation");
+        assert!(accepted[2]["operation_id"].is_null());
+        assert!(accepted.iter().all(|event| event.get("bytes").is_none()));
     }
 
     struct UnattachedHarness {
@@ -14250,6 +14403,68 @@ mod tests {
             .replay_ansi(&mut ansi.as_bytes())
             .unwrap();
         (worker, group)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn completion_tracked_prompt_accepts_only_positive_codex_editor_evidence() {
+        let (mut worker, group) = scrolled_composer_worker("shell$ ", false);
+        let id = SessionId(1);
+        let hint = "› \x1b[2mAsk Codex to do anything\x1b[0m\r\x1b[2C";
+        for (provider, editor, accepted_draft, expected) in [
+            (crate::AgentPromptKind::Codex, "shell$ ", false, false),
+            (crate::AgentPromptKind::Claude, "❯ ", false, false),
+            (crate::AgentPromptKind::Other, "› ", false, false),
+            (crate::AgentPromptKind::Codex, "› ", false, true),
+            (crate::AgentPromptKind::Codex, hint, false, true),
+            (crate::AgentPromptKind::Codex, "› real draft", false, false),
+            (crate::AgentPromptKind::Codex, hint, true, false),
+            (
+                crate::AgentPromptKind::Codex,
+                "Enter to select\r\n› ",
+                false,
+                false,
+            ),
+        ] {
+            worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .replay_ansi(&mut format!("\x1b[2J\x1b[H{editor}").as_bytes())
+                .unwrap();
+            let detector = worker.detectors.get_mut(&id).unwrap();
+            *detector = session::StatusDetector::new(session::StatusPatterns::compile(
+                None, None, None, None,
+            ));
+            if accepted_draft {
+                detector.on_user_input(b"\x1b[A");
+            }
+            let guard = crate::AgentInputGuard {
+                foreground_process_group: group,
+                provider,
+                intent: crate::AgentInputIntent::TrackedPrompt,
+            };
+            assert_eq!(
+                guard.allows(&worker.sessions[&id], worker.detectors.get(&id)),
+                expected,
+                "tracked prompt editor evidence: provider={provider:?}, draft={accepted_draft}, editor={editor:?}"
+            );
+        }
+        worker
+            .sessions
+            .get_mut(&id)
+            .unwrap()
+            .replay_ansi(&mut format!("\x1b[2J\x1b[H{hint}").as_bytes())
+            .unwrap();
+        let guard = crate::AgentInputGuard {
+            foreground_process_group: group,
+            provider: crate::AgentPromptKind::Codex,
+            intent: crate::AgentInputIntent::AutomaticPrompt,
+        };
+        assert!(
+            !guard.allows(&worker.sessions[&id], worker.detectors.get(&id)),
+            "the existing automatic intent must still reject placeholders"
+        );
     }
 
     #[test]

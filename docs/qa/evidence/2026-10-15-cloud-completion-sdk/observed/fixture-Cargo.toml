@@ -1,0 +1,12 @@
+[package]
+name = "deppy-completion-sdk-fixture"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+agent-mcp = { path = "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp" }
+serde_json = "1"
+
+[patch.crates-io]
+winit = { path = "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/winit-0.30.13" }
+alacritty_terminal = { path = "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/alacritty_terminal-0.26.0" }

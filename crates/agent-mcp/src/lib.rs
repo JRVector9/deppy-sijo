@@ -1,5 +1,11 @@
 //! Local, explicitly shared terminal MCP bridge. All effects stay on the App thread.
+mod completion;
 mod history;
+pub use completion::{
+    COMPLETION_RECEIPT_TTL, CompletionDeliveryEvent, CompletionDeliveryState, CompletionIdentity,
+    CompletionPermit, CompletionReceipt, CompletionScope, DeferredTransport,
+    MAX_COMPLETION_EVENT_BYTES, MAX_COMPLETION_RECEIPTS, MAX_COMPLETION_WATCHES,
+};
 mod management;
 mod oauth;
 mod principal;
@@ -64,13 +70,13 @@ pub fn tools() -> Value {
     for (name, description, extra, required) in [
         (
             "send_text",
-            "Type into the exact shared session only if input is allowed. submit defaults false; true appends Enter. Control characters/newlines are rejected. queued means PTY queue admission, not execution/completion. Never automatically retry an unknown outcome.",
+            "Type into the exact shared session only if input is allowed. submit defaults false; true appends Enter. Control characters/newlines are rejected. queued means PTY queue admission, not execution/completion. When the owner enabled local completion, supported submit:true calls stay pending over SSE until verified completion; configure a long request timeout and resume only the original stream. Never automatically retry an unknown outcome.",
             json!({"text":{"type":"string","description":"Maximum 8192 UTF-8 bytes; no control characters or newlines"},"submit":{"type":"boolean","default":false}}),
             vec!["text"],
         ),
         (
             "paste_text",
-            "Explicitly paste into the exact shared session. Maximum 32768 UTF-8 bytes; JSON/envelope bounds may reject earlier. LF/CRLF and tabs require verified bracketed paste, otherwise rejected. submit defaults false; true sends one separate Enter atomically with the body. Known AI execution/draft/dialog changes reject input. queued means admission, not execution/completion. Never automatically retry unknown input.",
+            "Explicitly paste into the exact shared session. Maximum 32768 UTF-8 bytes; JSON/envelope bounds may reject earlier. LF/CRLF and tabs require verified bracketed paste, otherwise rejected. submit defaults false; true sends one separate Enter atomically with the body. Known AI execution/draft/dialog changes reject input. queued means admission, not execution/completion. Owner-enabled local completion defers supported submit:true results over SSE; long request timeout and original-stream reconnect support are required. Never automatically retry unknown input.",
             json!({"text":{"type":"string","description":"Maximum 32768 UTF-8 bytes; LF, CRLF and tab accepted only with verified bracketed paste. Other controls and ESC rejected."},"submit":{"type":"boolean","default":false}}),
             vec!["text"],
         ),
@@ -159,5 +165,7 @@ pub fn tools() -> Value {
     json!({"tools":result})
 }
 
+#[cfg(test)]
+mod completion_tests;
 #[cfg(test)]
 mod tests;

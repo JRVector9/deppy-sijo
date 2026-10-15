@@ -1,0 +1,22 @@
+warning: patch `winit v0.30.13 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/third_party/winit-0.30.13)` was not used in the crate graph
+help: Check that the patched package version and available features are compatible
+      with the dependency requirements. If the patch has a different version from
+      what is locked in the Cargo.lock file, run `cargo update` to use the new
+      version. This may also occur with an optional dependency that is not enabled.
+   Compiling deppy-core v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/core)
+   Compiling secret v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/secret)
+   Compiling mux v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mux)
+   Compiling pty v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/pty)
+   Compiling persist v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/persist)
+   Compiling terminal v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/terminal)
+   Compiling audit v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/audit)
+   Compiling mcp-store v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/mcp-store)
+   Compiling storage-core v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage-core)
+   Compiling storage v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/storage)
+   Compiling session v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/session)
+   Compiling relay-protocol v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/relay-protocol)
+   Compiling runtime v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/runtime)
+   Compiling web-remote v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/web-remote)
+   Compiling agent-mcp v0.13.0 (/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/crates/agent-mcp)
+   Compiling deppy-completion-sdk-fixture v0.0.0 (/private/tmp/deppy-completion-sdk-20261015.lrtkcP/fixture)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 23.20s

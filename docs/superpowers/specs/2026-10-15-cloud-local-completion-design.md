@@ -1,6 +1,6 @@
 # 로컬 작업 완료를 원래 클라우드 에이전트에 자동 반환
 
-상태: 사용자 설계 검토 대기. 제품 구현은 아직 시작하지 않았다.
+상태: 2026-10-15 사용자 `진행해`로 권장 설계 승인. PR 단위 병렬 구현 시작.
 
 ## 목표와 현재 결함
 
@@ -63,4 +63,4 @@ isolated synthetic fixture와 독립 공식 MCP SDK client로 원 POST→SSE fin
 - [공식 TypeScript SDK v1.x streaming server](https://github.com/modelcontextprotocol/typescript-sdk/blob/v1.x/src/examples/server/simpleStreamableHttp.ts): session/stream과 replay 분리 참고.
 - 현재 소스: `crates/agent-mcp/src/server.rs`, `history.rs`, `management.rs`; `crates/app/src/cloud_agent.rs`; `crates/storage/src/agent_attention.rs`. worker 상세 근거 `/private/tmp/deppy-cloud-completion-design-20261015.md`.
 
-자체 검토: 역할·상한·기존 JSON 호환·수신 의미·미지원·실패 처리를 구체화했다. 미확인 provider 호환을 구현 완료나 전달 보장으로 취급하지 않는다. 신규 기능 코드·테스트·scaffold는 승인 전 작성하지 않는다.
+자체 검토: 역할·상한·기존 JSON 호환·수신 의미·미지원·실패 처리를 구체화했다. 미확인 provider 호환을 구현 완료나 전달 보장으로 취급하지 않는다. 설계 승인을 받았으며 상세 PR 계획에 따라 구현·검증한다.

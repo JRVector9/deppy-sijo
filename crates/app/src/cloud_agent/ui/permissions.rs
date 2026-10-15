@@ -5,6 +5,42 @@ use super::{
 };
 use agent_mcp::{ConnectionState, now};
 
+pub(super) fn completion_status_facts(
+    ui: &mut egui::Ui,
+    catalog: &i18n::Catalog,
+    status: &crate::cloud_agent::CompletionStatusView,
+) {
+    use crate::cloud_agent::completion::LocalCompletionState;
+    use agent_mcp::CompletionDeliveryState;
+    let local = match status.local {
+        LocalCompletionState::AwaitingStart => "cloud.completion_awaiting_start",
+        LocalCompletionState::Working => "cloud.completion_working",
+        LocalCompletionState::Completed => "cloud.completion_completed",
+        LocalCompletionState::Unknown => "cloud.completion_unknown",
+        LocalCompletionState::Unsupported => "cloud.completion_unsupported",
+        LocalCompletionState::Expired => "cloud.completion_expired",
+        LocalCompletionState::Revoked => "cloud.completion_revoked",
+        LocalCompletionState::Rejected => "cloud.completion_rejected",
+    };
+    let delivery = match status.delivery {
+        CompletionDeliveryState::Waiting => "cloud.completion_delivery_waiting",
+        CompletionDeliveryState::Ready => "cloud.completion_delivery_ready",
+        CompletionDeliveryState::ReturnedUnacknowledged => "cloud.completion_delivery_returned",
+        CompletionDeliveryState::Disconnected => "cloud.completion_delivery_disconnected",
+        CompletionDeliveryState::Closed => "cloud.completion_delivery_closed",
+    };
+    layout::fact(
+        ui,
+        &catalog.t("cloud.completion_local", &[]),
+        &catalog.t(local, &[]),
+    );
+    layout::fact(
+        ui,
+        &catalog.t("cloud.completion_delivery", &[]),
+        &catalog.t(delivery, &[]),
+    );
+}
+
 impl CloudAgent {
     pub(super) fn permission_settings(
         &mut self,
@@ -67,6 +103,8 @@ impl CloudAgent {
             });
         });
         layout::hint(ui, catalog.t("cloud.ui.permission_intro", &[]));
+        layout::hint(ui, catalog.t("cloud.completion_hint", &[]));
+        layout::hint(ui, catalog.t("cloud.completion_host_unverified", &[]));
         ui.add_space(12.0);
         let Some(info) = connections
             .iter()
@@ -84,14 +122,15 @@ impl CloudAgent {
             .id_salt("cloud-permission-table-horizontal")
             .auto_shrink([false, true])
             .show(ui, |ui| {
-                ui.set_min_width(710.0);
-                let width = ui.available_width().max(710.0);
+                ui.set_min_width(850.0);
+                let width = ui.available_width().max(850.0);
                 let columns = [
-                    width * 0.38,
-                    width * 0.16,
-                    80.0,
-                    80.0,
-                    width * (1.0 - 0.38 - 0.16) - 160.0,
+                    width * 0.30,
+                    width * 0.14,
+                    64.0,
+                    64.0,
+                    132.0,
+                    width * (1.0 - 0.30 - 0.14) - 260.0,
                 ];
                 let header = ui
                     .allocate_exact_size(egui::vec2(width, 34.0), egui::Sense::hover())
@@ -102,6 +141,7 @@ impl CloudAgent {
                     "cloud.ui.local_state",
                     "cloud.ui.read",
                     "cloud.ui.input",
+                    "cloud.ui.local_completion",
                     "cloud.ui.control",
                 ]
                 .iter()
@@ -112,13 +152,13 @@ impl CloudAgent {
                         egui::Rect::from_min_size(
                             egui::pos2(x, header.top() + 8.0),
                             egui::vec2(
-                                columns[index] - if matches!(index, 2 | 3) { 0.0 } else { 8.0 },
+                                columns[index] - if matches!(index, 2..=4) { 0.0 } else { 8.0 },
                                 24.0,
                             ),
                         ),
                         ("cloud-table-header", index),
                     );
-                    if matches!(index, 2 | 3) {
+                    if matches!(index, 2..=4) {
                         cell.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
                             layout::hint(ui, catalog.t(key, &[]));
                         });
@@ -140,25 +180,25 @@ impl CloudAgent {
                                 ui,
                                 egui::Rect::from_min_size(
                                     egui::pos2(
-                                        x + if matches!(index, 2 | 3) {
+                                        x + if matches!(index, 2..=4) {
                                             (*w - layout::CONTROL_HEIGHT) / 2.0
                                         } else {
                                             0.0
                                         },
                                         rect.top()
-                                            + if matches!(index, 2 | 3) {
+                                            + if matches!(index, 2..=4) {
                                                 (68.0 - layout::CONTROL_HEIGHT) / 2.0
                                             } else {
                                                 6.0
                                             },
                                     ),
                                     egui::vec2(
-                                        if matches!(index, 2 | 3) {
+                                        if matches!(index, 2..=4) {
                                             layout::CONTROL_HEIGHT
                                         } else {
                                             *w - 8.0
                                         },
-                                        if matches!(index, 2 | 3) {
+                                        if matches!(index, 2..=4) {
                                             layout::CONTROL_HEIGHT
                                         } else {
                                             56.0
@@ -256,6 +296,35 @@ impl CloudAgent {
                                 "cloud.permission_saved",
                             );
                         }
+                        let mut completion = active && read && permission.local_completion;
+                        let completion_enabled = active && target.live && read;
+                        let completion_response = cells[4]
+                            .add_enabled_ui(completion_enabled, |ui| {
+                                ui.add_sized(
+                                    egui::vec2(layout::CONTROL_HEIGHT, layout::CONTROL_HEIGHT),
+                                    egui::Checkbox::without_text(&mut completion),
+                                )
+                            })
+                            .inner;
+                        completion_response.widget_info(|| {
+                            egui::WidgetInfo::selected(
+                                egui::WidgetType::Checkbox,
+                                completion_enabled,
+                                completion,
+                                catalog.t("cloud.connection_local_completion", &[]),
+                            )
+                        });
+                        if completion_response.changed() {
+                            result_notice(
+                                state,
+                                self.set_connection_local_completion(
+                                    &info.principal.id,
+                                    &target,
+                                    completion,
+                                ),
+                                "cloud.permission_saved",
+                            );
+                        }
                         let lease = self.connection_lease(&target);
                         let owner = lease
                             .as_ref()
@@ -270,11 +339,11 @@ impl CloudAgent {
                             })
                             .unwrap_or_else(|| catalog.t("cloud.lease_you", &[]));
                         layout::hint(
-                            &mut cells[4],
+                            &mut cells[5],
                             catalog.t("cloud.lease_owner", &[("client", &owner)]),
                         );
                         if let Some(lease) = &lease {
-                            cells[4].response().on_hover_text(catalog.t(
+                            cells[5].response().on_hover_text(catalog.t(
                                 "cloud.lease_expiry",
                                 &[(
                                     "seconds",
@@ -285,7 +354,7 @@ impl CloudAgent {
                         if target.live
                             && (input || lease.is_some())
                             && layout::button_named(
-                                &mut cells[4],
+                                &mut cells[5],
                                 &catalog.t("cloud.ui.reclaim", &[]),
                                 &catalog.t("cloud.session_take_control", &[]),
                             )
@@ -295,11 +364,23 @@ impl CloudAgent {
                             state.notice = Some(("cloud.control_taken", None));
                         }
                         if !target.live {
-                            layout::hint(&mut cells[4], catalog.t("cloud.exited", &[]));
+                            layout::hint(&mut cells[5], catalog.t("cloud.exited", &[]));
                         }
+                        let bottom = if let Some(status) =
+                            self.completion_status_for_target(&info.principal.id, &target)
+                        {
+                            let details = ui
+                                .allocate_exact_size(egui::vec2(width, 68.0), egui::Sense::hover())
+                                .0;
+                            let mut child = layout::child(ui, details, "cloud-completion-status");
+                            completion_status_facts(&mut child, catalog, &status);
+                            details.bottom()
+                        } else {
+                            rect.bottom()
+                        };
                         ui.painter().hline(
                             rect.x_range(),
-                            rect.bottom(),
+                            bottom,
                             egui::Stroke::new(
                                 1.0,
                                 ui.visuals().widgets.noninteractive.bg_stroke.color,

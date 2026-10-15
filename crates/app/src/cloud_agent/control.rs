@@ -11,6 +11,7 @@ pub(super) struct Permission {
     pub generation: String,
     pub read: bool,
     pub input: bool,
+    pub local_completion: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -52,6 +53,7 @@ impl ControlManager {
             .cloned()
             .unwrap_or_else(|| Permission {
                 generation: generation.to_owned(),
+                local_completion: false,
                 read: !self.legacy_revoked
                     && self.legacy_connection.as_deref() == Some(connection)
                     && !self
@@ -93,6 +95,10 @@ impl ControlManager {
             generation: generation.to_owned(),
             read,
             input,
+            local_completion: read
+                && self.permissions.get(&key).is_some_and(|previous| {
+                    previous.generation == generation && previous.local_completion
+                }),
         };
         let changed = self.permissions.get(&key) != Some(&next);
         self.permissions.insert(key, next);
@@ -108,6 +114,40 @@ impl ControlManager {
                 Vec::new()
             },
         )
+    }
+
+    pub fn set_local_completion(
+        &mut self,
+        connection: &str,
+        session: &str,
+        generation: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if !valid_identity(connection, 128)
+            || !valid_identity(session, 128)
+            || !valid_identity(generation, 192)
+        {
+            return Err("invalid_client_permission".into());
+        }
+        let mut permission = self.permission(connection, session, generation);
+        if enabled && !permission.read {
+            return Err("client_read_not_allowed".into());
+        }
+        let key = (connection.to_owned(), session.to_owned());
+        if !self.permissions.contains_key(&key) && self.permissions.len() >= MAX_ACCESS {
+            return Err("client_permission_limit".into());
+        }
+        permission.local_completion = enabled;
+        self.permissions.insert(key, permission);
+        Ok(())
+    }
+
+    pub fn clear_local_completion(&mut self, session: &str) {
+        for ((_, id), permission) in &mut self.permissions {
+            if id == session {
+                permission.local_completion = false;
+            }
+        }
     }
 
     pub fn acquire(
@@ -240,6 +280,9 @@ impl ControlManager {
         let legacy = self.legacy_connection.as_deref();
         self.permissions
             .retain(|(connection, _), _| legacy == Some(connection.as_str()));
+        for permission in self.permissions.values_mut() {
+            permission.local_completion = false;
+        }
         self.take_control()
     }
 
@@ -274,6 +317,63 @@ fn valid_identity(value: &str, max: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completion_consent_requires_read_and_never_grants_input_or_a_lease() {
+        let mut control = ControlManager::with_legacy_connection("legacy");
+        assert!(!control.permission("legacy", "one", "g").local_completion);
+        assert!(
+            control
+                .set_local_completion("bot", "one", "g", true)
+                .is_err()
+        );
+        control.set_access("bot", "one", "g", true, false).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
+        let permission = control.permission("bot", "one", "g");
+        assert!(permission.read && permission.local_completion);
+        assert!(!permission.input);
+        assert!(control.lease("one", 10).is_none());
+        assert!(!control.permission("other", "one", "g").local_completion);
+        assert!(!control.permission("bot", "two", "g").local_completion);
+        assert!(!control.permission("bot", "one", "other").local_completion);
+    }
+
+    #[test]
+    fn completion_consent_survives_input_revoke_but_not_read_generation_or_rotation() {
+        let mut control = ControlManager::with_legacy_connection("legacy");
+        control.set_access("bot", "one", "g", true, true).unwrap();
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
+        let lease = control
+            .acquire("bot", "one", "g", None, 10, 30)
+            .unwrap()
+            .lease;
+        control
+            .set_local_completion("bot", "one", "g", false)
+            .unwrap();
+        assert!(control.owns("bot", "one", "g", None, lease.epoch, 11));
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
+        control.set_access("bot", "one", "g", true, false).unwrap();
+        assert!(control.permission("bot", "one", "g").local_completion);
+        control.set_access("bot", "one", "g", false, false).unwrap();
+        control.set_access("bot", "one", "g", true, false).unwrap();
+        assert!(!control.permission("bot", "one", "g").local_completion);
+        control
+            .set_local_completion("bot", "one", "g", true)
+            .unwrap();
+        control.set_access("bot", "one", "g2", true, false).unwrap();
+        assert!(!control.permission("bot", "one", "g2").local_completion);
+        control
+            .set_local_completion("legacy", "one", "g2", true)
+            .unwrap();
+        control.retire_auth_connections();
+        assert!(!control.permission("legacy", "one", "g2").local_completion);
+    }
 
     #[test]
     fn separate_clients_have_no_implicit_access_and_generation_changes_revoke() {

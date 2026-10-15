@@ -285,6 +285,14 @@ pub enum RuntimeEvent {
         session: SessionId,
         title: Option<String>,
     },
+    /// Actual nonempty PTY queue retention. Counts every input source once per batch;
+    /// permission epochs and queued command admission are not execution evidence.
+    SessionInputAccepted {
+        session: SessionId,
+        sequence: u64,
+        operation_id: Option<String>,
+        at_micros: i64,
+    },
 }
 
 impl RuntimeEvent {
@@ -581,6 +589,7 @@ mod tests {
                 "ResizeDeferred",
                 "TerminalHistoryResult",
                 "SessionTitleChanged",
+                "SessionInputAccepted",
             ]
         );
     }

@@ -4,6 +4,191 @@ use serde::{Deserialize, Serialize};
 
 const STATE_BYTES_MAX: usize = 32 * 1024;
 const REQUESTS_MAX: usize = 64;
+const NATIVE_PROMPT_DIGEST_TTL_MICROS: i64 = 60 * 60 * 1_000_000;
+
+/// Full submitted UTF-8 prompt, with terminal line endings canonicalized only.
+/// Never use the shortened, whitespace-normalized display title for this evidence.
+pub fn native_prompt_digest(text: &str) -> String {
+    let mut digest = Sha256::new();
+    let mut parts = text.split('\r');
+    if let Some(first) = parts.next() {
+        digest.update(first.as_bytes());
+    }
+    for part in parts {
+        digest.update(b"\n");
+        digest.update(part.strip_prefix('\n').unwrap_or(part).as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// Independent native boundaries, never the consumed UI `turn_done` flag.
+/// Only the genuine Codex observer ingestion path supplies this evidence.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTurnProof {
+    pub session_key: String,
+    pub runtime_instance: String,
+    pub native_session_id: String,
+    pub session_generation: i64,
+    pub turn_id: String,
+    pub started_at_micros: i64,
+    pub start_execution_stamp: HookExecutionStamp,
+    #[serde(default)]
+    pub prompt_digest: Option<String>,
+    pub transcript_path: String,
+    pub completed: Option<NativeTurnCompletionProof>,
+    pub completion_revision: i64,
+    pub waiting: bool,
+    pub children_working: bool,
+    pub cancelled: bool,
+    pub ended: bool,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NativeTurnCompletionProof {
+    pub at_micros: i64,
+    pub execution_stamp: HookExecutionStamp,
+}
+
+impl std::fmt::Debug for NativeTurnProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTurnProof")
+            .field("completion_revision", &self.completion_revision)
+            .field("completed", &self.completed.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for NativeTurnCompletionProof {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeTurnCompletionProof")
+            .finish_non_exhaustive()
+    }
+}
+
+impl NativeTurnProof {
+    pub fn is_valid(&self) -> bool {
+        let id = |value: &str| {
+            !value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control)
+        };
+        bounded_session_key_prefix(&self.session_key).is_ok()
+            && id(&self.runtime_instance)
+            && self.runtime_instance.len() <= 128
+            && id(&self.native_session_id)
+            && id(&self.turn_id)
+            && self.session_generation > 0
+            && self.started_at_micros >= self.session_generation
+            && self.start_execution_stamp.is_valid()
+            && self.start_execution_stamp.runtime_instance == self.runtime_instance
+            && self.prompt_digest.as_deref().is_none_or(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            && valid_native_transcript_path(&self.transcript_path, &self.native_session_id)
+            && self.completed.as_ref().is_none_or(|end| {
+                end.at_micros >= self.started_at_micros
+                    && end.execution_stamp.is_valid()
+                    && end.execution_stamp.runtime_instance == self.runtime_instance
+            })
+            && self.completion_revision >= 0
+    }
+}
+
+fn valid_native_transcript_path(path: &str, native: &str) -> bool {
+    let path_ref = Path::new(path);
+    path.len() <= 4096
+        && !path.chars().any(char::is_control)
+        && path_ref.is_absolute()
+        && uuid::Uuid::parse_str(native).is_ok()
+        && path_ref
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("rollout-") && name.ends_with(&format!("-{native}.jsonl"))
+            })
+}
+
+struct NativeTurnObservation<'a> {
+    stamp: &'a HookExecutionStamp,
+    digest: Option<&'a str>,
+    transcript_path: &'a str,
+}
+
+/// Retired sessions are included; ordinary UI fields and revisions are never changed.
+/// The caller throttles this globally bounded maintenance to once per minute per Db.
+pub(super) fn scrub_native_prompt_digests_in(
+    tx: &rusqlite::Transaction<'_>,
+    now_micros: i64,
+) -> anyhow::Result<()> {
+    let cutoff = now_micros.saturating_sub(NATIVE_PROMPT_DIGEST_TTL_MICROS);
+    tx.execute(
+        "UPDATE agent_needs_input SET attention_json=json_set(attention_json,'$.native_turn_proof.prompt_digest',NULL)
+         WHERE rowid IN (
+           SELECT rowid FROM agent_needs_input
+           WHERE CASE WHEN typeof(attention_json)='text'
+               AND length(CAST(attention_json AS BLOB))<=32768 AND json_valid(attention_json)
+             THEN json_type(attention_json,'$.native_turn_proof.prompt_digest')='text'
+               AND json_type(attention_json,'$.native_turn_proof.started_at_micros')='integer'
+               AND json_extract(attention_json,'$.native_turn_proof.started_at_micros')>0
+               AND json_extract(attention_json,'$.native_turn_proof.started_at_micros')<=?1
+             ELSE 0 END
+           LIMIT 256
+         )",
+        [cutoff],
+    )?;
+    Ok(())
+}
+
+/// Exact requested-key projection; malformed optional evidence is omitted, never fatal to UI.
+pub(super) fn native_turn_proofs_in(
+    tx: &rusqlite::Transaction<'_>,
+    keys: &[String],
+    budget: usize,
+) -> anyhow::Result<Vec<NativeTurnProof>> {
+    if keys.is_empty() || budget < std::mem::size_of::<NativeTurnProof>() {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::new();
+    let mut stmt = tx.prepare(
+        "SELECT CASE WHEN typeof(attention_json)='text'
+        AND length(CAST(attention_json AS BLOB))<=32768 THEN attention_json ELSE NULL END
+        FROM agent_needs_input WHERE session_key=?1",
+    )?;
+    for key in keys {
+        let Some(json) = stmt
+            .query_row([key], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten()
+        else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<AttentionState>(&json) else {
+            continue;
+        };
+        let Some(proof) = state.native_turn_proof else {
+            continue;
+        };
+        if !(proof.is_valid()
+            && proof.session_key == *key
+            && state.runtime_instance.as_deref() == Some(&proof.runtime_instance)
+            && state.native_session_id == proof.native_session_id
+            && state.generation == proof.session_generation
+            && state.current_turn.as_ref() == Some(&proof.turn_id))
+        {
+            continue;
+        }
+        result.push(proof);
+        let mut retained = 0;
+        if checked_native_turn_retained_bytes(&mut retained, &result).is_err() || retained > budget
+        {
+            result.pop();
+            result.shrink_to_fit();
+        }
+    }
+    Ok(result)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttentionEventKind {
@@ -89,6 +274,8 @@ struct AttentionState {
     termination_floor: i64,
     #[serde(default)]
     ended: bool,
+    #[serde(default)]
+    native_turn_proof: Option<NativeTurnProof>,
 }
 
 impl AttentionState {
@@ -103,6 +290,9 @@ impl AttentionState {
         self.completed_turn = None;
         self.completed_at_micros = None;
         self.completion_deferred = false;
+        if let Some(proof) = &mut self.native_turn_proof {
+            proof.completed = None;
+        }
         if self.child_completed_at_micros.is_some_and(|end| end <= at) {
             self.child_completed_at_micros = None;
         }
@@ -321,6 +511,41 @@ impl Db {
         key: &str,
         event: &AgentAttentionEvent,
         message: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.record_agent_attention_inner(key, event, message, None)
+    }
+
+    /// Called only by the local Codex observer after capturing its own kernel ancestry.
+    /// Missing evidence retains ordinary UI reducer behavior without minting a proof.
+    pub fn record_agent_attention_with_proof(
+        &self,
+        key: &str,
+        event: &AgentAttentionEvent,
+        stamp: Option<&HookExecutionStamp>,
+        prompt_digest: Option<&str>,
+        transcript_path: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let observation = stamp
+            .zip(transcript_path)
+            .filter(|(stamp, path)| {
+                stamp.is_valid()
+                    && event.runtime_instance.as_deref() == Some(&stamp.runtime_instance)
+                    && valid_native_transcript_path(path, &event.native_session_id)
+            })
+            .map(|(stamp, transcript_path)| NativeTurnObservation {
+                stamp,
+                digest: prompt_digest,
+                transcript_path,
+            });
+        self.record_agent_attention_inner(key, event, None, observation)
+    }
+
+    fn record_agent_attention_inner(
+        &self,
+        key: &str,
+        event: &AgentAttentionEvent,
+        message: Option<&str>,
+        observation: Option<NativeTurnObservation<'_>>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
             message.is_none_or(|text| bounded_text_is_valid(text, BOUNDED_MESSAGE_BYTES_MAX)),
@@ -675,6 +900,7 @@ impl Db {
                 }
             }
             K::TurnStart if latest => {
+                let previous_proof = state.native_turn_proof.take();
                 // 새 사용자 입력은 이전 부모 턴의 미해결 승인보다 강한 진행 증거다.
                 // PostToolUse가 빠졌어도 과거 승인이 새 턴까지 붙어 있지 않게 한다.
                 // 병렬 자식의 질문/승인은 부모 입력으로 해제됐다고 단정할 수 없다.
@@ -705,6 +931,40 @@ impl Db {
                 state.current_turn.clone_from(&event.turn_id);
                 state.turn_cancelled = false;
                 state.clear_completion_for_activity(event.at_micros);
+                state.native_turn_proof = observation.as_ref().and_then(|observation| {
+                    let turn = event.turn_id.as_ref()?;
+                    let digest = observation.digest?;
+                    let mut proof = NativeTurnProof {
+                        session_key: key.to_owned(),
+                        runtime_instance: event.runtime_instance.clone()?,
+                        native_session_id: event.native_session_id.clone(),
+                        session_generation: state.generation,
+                        turn_id: turn.clone(),
+                        started_at_micros: event.at_micros,
+                        start_execution_stamp: observation.stamp.clone(),
+                        prompt_digest: Some(digest.to_owned()),
+                        transcript_path: observation.transcript_path.to_owned(),
+                        completed: None,
+                        completion_revision: revision,
+                        waiting: false,
+                        children_working: false,
+                        cancelled: false,
+                        ended: false,
+                    };
+                    if let Some(previous) = previous_proof.filter(|previous| {
+                        previous.turn_id == *turn
+                            && previous
+                                .prompt_digest
+                                .as_deref()
+                                .is_none_or(|old| old == digest)
+                            && previous.runtime_instance == proof.runtime_instance
+                            && previous.transcript_path == proof.transcript_path
+                    }) {
+                        proof.started_at_micros = previous.started_at_micros;
+                        proof.start_execution_stamp = previous.start_execution_stamp;
+                    }
+                    proof.is_valid().then_some(proof)
+                });
             }
             K::Working if latest || owner.is_some() => {
                 if latest {
@@ -726,6 +986,19 @@ impl Db {
                 }
             }
             K::Completed if latest && !state.turn_cancelled => {
+                if let Some(proof) = &mut state.native_turn_proof {
+                    proof.completed = observation
+                        .as_ref()
+                        .filter(|observation| {
+                            event.turn_id.as_ref() == Some(&proof.turn_id)
+                                && event.at_micros >= proof.started_at_micros
+                                && observation.transcript_path == proof.transcript_path
+                        })
+                        .map(|observation| NativeTurnCompletionProof {
+                            at_micros: event.at_micros,
+                            execution_stamp: observation.stamp.clone(),
+                        });
+                }
                 working = false;
                 state.active_tools.retain(|(id, turn)| {
                     request_owner(id).is_some()
@@ -1029,6 +1302,13 @@ impl Db {
         } else {
             revision
         };
+        if let Some(proof) = &mut state.native_turn_proof {
+            proof.completion_revision = completion_generation;
+            proof.waiting = waiting;
+            proof.children_working = state.children_working;
+            proof.cancelled = state.turn_cancelled;
+            proof.ended = state.ended;
+        }
         let idle_generation = idle_since.and_then(|since| {
             if new_completion {
                 Some(completion_generation.max(state.resolved_at_micros))
@@ -1042,7 +1322,11 @@ impl Db {
                     .map(|completed| completed.max(state.resolved_at_micros))
             }
         });
-        let json = serde_json::to_string(&state)?;
+        let mut json = serde_json::to_string(&state)?;
+        if json.len() > STATE_BYTES_MAX && state.native_turn_proof.take().is_some() {
+            // Optional cloud evidence must never prevent the existing attention update.
+            json = serde_json::to_string(&state)?;
+        }
         anyhow::ensure!(json.len() <= STATE_BYTES_MAX, "agent attention state limit");
         // 보관 시각은 초 단위를 유지하고 완료 소비에는 별도 단조 증가 세대를 쓴다.
         let now = deppy_core::time::unix_secs_i64();
@@ -1180,6 +1464,219 @@ impl Db {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completion_native_proof_survives_ui_ack_and_keeps_independent_boundaries() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("full submitted prompt");
+        for (kind, at) in [
+            (AttentionEventKind::SessionStart, 1),
+            (AttentionEventKind::TurnStart, 2),
+            (AttentionEventKind::Completed, 3),
+        ] {
+            let mut event = event(kind, "", at);
+            event.native_session_id = native.into();
+            event.runtime_instance = Some("runtime-proof".into());
+            event.turn_id = Some("own-turn".into());
+            db.record_agent_attention_with_proof(
+                KEY,
+                &event,
+                Some(&stamp),
+                Some(&digest),
+                Some(&path),
+            )
+            .unwrap();
+        }
+        let revision = db.list_turn_done_sessions().unwrap()[0].1;
+        db.clear_agent_turn_done(KEY, revision).unwrap();
+        assert!(db.list_turn_done_sessions().unwrap().is_empty());
+        let mut job = AgentStateJob::projection(KEY.rsplit_once(':').unwrap().0.to_owned());
+        job.native_turn_keys = vec![KEY.to_owned()];
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        let proof = &snapshot.native_turns[0];
+        assert_eq!(proof.turn_id, "own-turn");
+        assert!(
+            proof.prompt_digest.is_none(),
+            "old temporary digest has expired"
+        );
+        assert_eq!(proof.started_at_micros, 2);
+        assert_eq!(proof.completed.as_ref().unwrap().at_micros, 3);
+        assert_eq!(proof.completion_revision, revision);
+        assert_eq!(proof.start_execution_stamp, stamp);
+        assert_eq!(proof.completed.as_ref().unwrap().execution_stamp, stamp);
+        assert!(!format!("{proof:?}").contains(&path));
+    }
+
+    #[test]
+    fn completion_expired_prompt_digest_is_scrubbed_without_losing_native_capability() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("temporary full prompt digest");
+        for (kind, at) in [
+            (AttentionEventKind::SessionStart, 1),
+            (AttentionEventKind::TurnStart, 2),
+            (AttentionEventKind::Completed, 3),
+        ] {
+            let mut event = event(kind, "", at);
+            event.native_session_id = native.into();
+            event.runtime_instance = Some("runtime-proof".into());
+            event.turn_id = Some("old-turn".into());
+            db.record_agent_attention_with_proof(
+                KEY,
+                &event,
+                Some(&stamp),
+                Some(&digest),
+                Some(&path),
+            )
+            .unwrap();
+        }
+        let read = || -> serde_json::Value {
+            let json: String = db
+                .conn
+                .query_row(
+                    "SELECT attention_json FROM agent_needs_input WHERE session_key=?1",
+                    [KEY],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            serde_json::from_str(&json).unwrap()
+        };
+        let before = read();
+        assert_eq!(before["native_turn_proof"]["prompt_digest"], digest);
+        let mut job = AgentStateJob::projection(KEY.rsplit_once(':').unwrap().0.to_owned());
+        job.native_turn_keys = vec![KEY.to_owned()];
+        job.include_attention = false;
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .native_turns
+                .is_empty()
+        );
+        assert_eq!(read(), before, "omitted attention must not mutate evidence");
+        job.include_attention = true;
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
+        assert_eq!(snapshot.native_turns.len(), 1);
+        assert!(
+            snapshot.native_turns[0].is_valid(),
+            "idle capability survives digest expiry"
+        );
+        let mut expected = before;
+        expected["native_turn_proof"]["prompt_digest"] = serde_json::Value::Null;
+        assert_eq!(read(), expected, "only temporary digest may be scrubbed");
+        assert!(
+            serde_json::to_value(&snapshot.native_turns[0]).unwrap()["prompt_digest"].is_null()
+        );
+    }
+
+    #[test]
+    fn completion_historical_native_proofs_do_not_poison_ordinary_or_selected_live_attention() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let workspace = KEY.rsplit_once(':').unwrap().0;
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("full prompt");
+        let selected = format!("{workspace}:258");
+        for pane in 1..=258 {
+            let key = if pane == 258 {
+                selected.clone()
+            } else {
+                format!("{}:1", uuid::Uuid::from_u128(1000 + pane))
+            };
+            for (kind, at) in [
+                (AttentionEventKind::SessionStart, 1),
+                (AttentionEventKind::TurnStart, 2),
+                (AttentionEventKind::SessionEnd, 3),
+            ] {
+                if pane == 258 && kind == AttentionEventKind::SessionEnd {
+                    continue;
+                }
+                let mut event = event(kind, "", at);
+                event.native_session_id = native.into();
+                event.runtime_instance = Some("runtime-proof".into());
+                event.turn_id = Some("native-turn".into());
+                db.record_agent_attention_with_proof(
+                    &key,
+                    &event,
+                    Some(&stamp),
+                    Some(&digest),
+                    Some(&path),
+                )
+                .unwrap();
+            }
+        }
+        let mut job = AgentStateJob::projection(workspace);
+        job.native_turn_keys = vec![selected.clone()];
+        let snapshot = db
+            .apply_agent_state_job(&job)
+            .expect("historical optional proofs must not break ordinary attention");
+        assert_eq!(snapshot.native_turns.len(), 1);
+        assert_eq!(snapshot.native_turns[0].session_key, selected);
+        assert!(snapshot.native_turns[0].is_valid());
+        assert!(!snapshot.native_turns[0].ended);
+        job.native_turn_keys.clear();
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .native_turns
+                .is_empty()
+        );
+        db.conn.execute("UPDATE agent_needs_input SET attention_json=json_set(attention_json,'$.native_turn_proof.turn_id',NULL) WHERE session_key=?1", [&selected]).unwrap();
+        job.native_turn_keys = vec![selected];
+        assert!(
+            db.apply_agent_state_job(&job)
+                .expect(
+                    "invalid optional native evidence must fail closed without poisoning attention"
+                )
+                .native_turns
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completion_prompt_digest_preserves_unicode_and_normalizes_only_terminal_newlines() {
+        assert_eq!(
+            native_prompt_digest("한글\r\nsecond\rthird"),
+            native_prompt_digest("한글\nsecond\nthird")
+        );
+        assert_ne!(native_prompt_digest(" a "), native_prompt_digest("a"));
+        assert_ne!(native_prompt_digest("é"), native_prompt_digest("e\u{301}"));
+    }
+
     fn waiting_since(db: &Db) -> Option<i64> {
         db.conn
             .query_row(

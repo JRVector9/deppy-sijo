@@ -1,0 +1,11 @@
+{
+  "captured_at_utc": "2026-10-15T10:53:37.426935+00:00",
+  "repository_head": "9ed6c277a53ea51df228744cd6efec7ebeb2466f",
+  "product_source_commit": "f9d7c8a7",
+  "workspace_version": "0.13.0",
+  "git_status_porcelain": "",
+  "scope": "All tracked Rust source files and Cargo manifests/lock selected by git ls-files; not a full source archive or compiled binary hash.",
+  "entries": 650,
+  "capture_relationship": "Captured after the root-reported latest-source quick SDK execution, while root confirmed no source changes and canonical HEAD remained 9ed6c277. Build log separately records package version and successful build.",
+  "source_hash_manifest": "final-source-SHA256SUMS"
+}

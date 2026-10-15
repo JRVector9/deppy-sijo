@@ -42,6 +42,7 @@ impl<'de> Visitor<'de> for Shape {
             // Normalize transport/internal envelopes before consuming the human
             // preview budget. The transient input still has the 8 MiB read cap;
             // only the bounded preview is retained in the metadata object.
+            let digest = storage::native_prompt_digest(value);
             let Some(value) = storage::task_prompt_text(value) else {
                 return Ok(Value::Null);
             };
@@ -59,7 +60,7 @@ impl<'de> Visitor<'de> for Shape {
                     preview.push(c);
                 }
             }
-            return Ok(Value::String(preview.trim().to_owned()));
+            return Ok(serde_json::json!({"preview": preview.trim(), "digest": digest}));
         }
         // 알림 문구와 식별자는 별도 상한을 둔다. 너무 큰 값은 상태에 넣지 않는다.
         Ok(if value.len() <= 4096 {
@@ -75,6 +76,26 @@ impl<'de> Visitor<'de> for Shape {
         while let Some(key) = map.next_key::<String>()? {
             if key.len() > 128 {
                 return Err(serde::de::Error::custom("hook metadata key limit"));
+            }
+            if matches!(self, Self::Hook) && key == "prompt_digest" {
+                return Err(serde::de::Error::custom("reserved prompt evidence"));
+            }
+            if matches!(self, Self::Hook) && key == "prompt" {
+                if result.contains_key(&key) {
+                    return Err(serde::de::Error::custom("duplicate hook metadata"));
+                }
+                let mut value = map.next_value_seed(Self::Preview)?;
+                let preview = value
+                    .get_mut("preview")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                let digest = value
+                    .get_mut("digest")
+                    .map(Value::take)
+                    .unwrap_or(Value::Null);
+                result.insert(key, preview);
+                result.insert("prompt_digest".into(), digest);
+                continue;
             }
             if matches!(self, Self::Hook) && matches!(key.as_str(), "tool_input" | "toolInput") {
                 let alias = if key == "tool_input" { 1 } else { 2 };
@@ -402,5 +423,36 @@ mod tests {
         assert!(preview.starts_with("서로 다른 작업 "));
         assert!(preview.len() <= 256);
         assert!(!preview.contains('\n'));
+    }
+
+    #[test]
+    fn completion_full_prompt_digest_distinguishes_identical_display_previews() {
+        let prefix = "shared visible prompt ".repeat(24);
+        let parse = |suffix: &str| {
+            let raw = json!({
+                "hook_event_name": "UserPromptSubmit",
+                "session_id": "same-native-session",
+                "prompt": format!("{prefix}{suffix}"),
+            })
+            .to_string();
+            let result = read_classified(raw.as_bytes());
+            assert!(!result.rejected);
+            result.value.expect("valid bounded hook")
+        };
+        let first = parse("first operation");
+        let second = parse("different operation");
+        assert_eq!(first["prompt"], second["prompt"]);
+        assert_ne!(
+            first.get("prompt_digest"),
+            second.get("prompt_digest"),
+            "completion binding must distinguish full prompts beyond the display preview"
+        );
+        let digest = first["prompt_digest"].as_str().expect("full prompt digest");
+        assert_eq!(digest.len(), 64);
+        assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(
+            first["prompt_digest"],
+            parse("first operation")["prompt_digest"]
+        );
     }
 }

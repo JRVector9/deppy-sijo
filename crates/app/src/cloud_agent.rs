@@ -2,6 +2,13 @@
 mod access;
 #[cfg(test)]
 mod bridge_tests;
+pub(crate) mod completion;
+mod completion_bridge;
+#[cfg(test)]
+mod completion_event_loss_tests;
+#[cfg(test)]
+mod completion_integration_tests;
+pub(crate) use completion_bridge::CompletionStatusView;
 mod continuity;
 mod control;
 mod management;
@@ -31,6 +38,7 @@ pub struct Target {
     pub local_status_observed_at: Option<u64>,
     pub local_agent_present: bool,
     pub runtime: u64,
+    pub runtime_token: String,
     pub session: runtime::SessionId,
     pub pane: runtime::MuxPaneId,
     pub live: bool,
@@ -98,6 +106,8 @@ struct PendingInput {
     session: runtime::SessionId,
     bytes: usize,
     submit: bool,
+    completion: bool,
+    admission_finalized: bool,
     deadline: std::time::Instant,
     reply: Option<std::sync::mpsc::SyncSender<Result<Value, String>>>,
 }
@@ -114,6 +124,7 @@ struct PendingClaim {
     bytes: Option<Vec<u8>>,
     paste: Option<Vec<Vec<u8>>>,
     require_bracketed_paste: bool,
+    completion: bool,
     submit: bool,
     answer: Option<String>,
     context: agent_mcp::OperationContext,
@@ -155,6 +166,7 @@ pub struct CloudAgent {
     ended_load_failed: bool,
     grants: HashMap<String, Grant>,
     control: control::ControlManager,
+    completion_bridge: completion_bridge::CompletionBridge,
     lease_permits: HashMap<u64, runtime::InputPermit>,
     issued_leases: HashMap<String, secret::RedactionLease>,
     operation_contexts: HashMap<String, agent_mcp::OperationContext>,
@@ -231,6 +243,7 @@ impl CloudAgent {
             control: control::ControlManager::with_legacy_connection(
                 agent_mcp::LEGACY_CONNECTION_ID,
             ),
+            completion_bridge: completion_bridge::CompletionBridge::default(),
             lease_permits: HashMap::new(),
             issued_leases: HashMap::new(),
             operation_contexts: HashMap::new(),
@@ -545,6 +558,8 @@ impl CloudAgent {
         }
     }
     pub fn share(&mut self, t: &Target, shared: bool) {
+        self.revoke_completions(None, Some(&t.id));
+        self.control.clear_local_completion(&t.id);
         let revoked = self.control.revoke_session(&t.id);
         self.revoke_leases(revoked);
         if shared {
@@ -678,6 +693,7 @@ impl CloudAgent {
         }
     }
     fn stop_connection(&mut self) {
+        self.revoke_completions(None, None);
         self.history_start_requested = false;
         self.take_control();
         self.server = None;
@@ -868,6 +884,7 @@ impl CloudAgent {
                 self.error = None;
             }
             Some(Action::Rotate) => {
+                self.revoke_completions(None, None);
                 self.recovery.stop();
                 if let Some(s) = &self.server {
                     s.auth.rotate_at(now());
@@ -929,6 +946,7 @@ impl CloudAgent {
             };
             self.complete_history(completion, &mut send, &mut notices);
         }
+        self.poll_completions();
         self.dispatch_history();
         self.poll_management();
         notices
@@ -1013,7 +1031,12 @@ impl CloudAgent {
                     Err(()) => self.error = Some("history_read_failed".into()),
                 }
             }
-            ResultKind::Claim(result) | ResultKind::ClaimScoped(result) => {
+            ResultKind::FinishCompletion(result) => {
+                self.finish_completion_result(token, ResultKind::FinishCompletion(result));
+            }
+            ResultKind::Claim(result)
+            | ResultKind::ClaimScoped(result)
+            | ResultKind::ClaimCompletion(result) => {
                 let Some(claim) = self.claims.remove(&token) else {
                     return;
                 };
@@ -1021,16 +1044,31 @@ impl CloudAgent {
                     .as_str()
                     .unwrap_or("")
                     .to_owned();
+                let internal = agent_mcp::operation_key(&claim.context.connection_id, &op)
+                    .expect("validated operation context");
                 match result {
                     Err(()) => {
+                        if claim.completion {
+                            self.discard_completion(&internal);
+                        }
                         let _ = claim.request.reply.try_send(Err(
                             "operation_conflict_or_history_unavailable_no_effect".into(),
                         ));
                     }
                     Ok(Claim::Existing(outcome)) => {
-                        let _ = claim.request.reply.try_send(Ok(outcome));
+                        if claim.completion {
+                            self.discard_completion(&internal);
+                            let _ = claim.request.reply.try_send(Err(
+                                "completion_original_request_required_no_effect".into(),
+                            ));
+                        } else {
+                            let _ = claim.request.reply.try_send(Ok(outcome));
+                        }
                     }
                     Ok(Claim::New) => {
+                        if claim.completion {
+                            self.completion_claimed(&internal);
+                        }
                         let internal = agent_mcp::operation_key(&claim.context.connection_id, &op)
                             .expect("validated operation context");
                         self.operation_contexts
@@ -1101,7 +1139,7 @@ impl CloudAgent {
         send: &mut impl FnMut(&Target, Effect) -> Result<(), String>,
     ) {
         let input = claim.bytes.is_some() || claim.paste.is_some();
-        let paste = claim.paste.is_some();
+        let paste = claim.paste.is_some() || claim.completion;
         let valid_auth = self.server.as_ref().is_some_and(|s| {
             std::sync::Arc::ptr_eq(&s.auth, &claim.auth) && claim.request.live(&s.auth)
         });
@@ -1138,19 +1176,33 @@ impl CloudAgent {
         let valid_grant = self.grants.get(&claim.target.id).is_some_and(|g| {
             g.incarnation == claim.grant && (!input || g.input_epoch == claim.input_epoch)
         });
-        if !valid_auth || !valid_target || !valid_grant || !valid_client || !valid_lease {
+        if !valid_auth
+            || !valid_target
+            || !valid_grant
+            || !valid_client
+            || !valid_lease
+            || (claim.completion && !self.completion_can_dispatch(&op))
+        {
             let code = if !valid_auth {
                 "expired_or_revoked_request_no_effect"
             } else {
                 "session_or_permission_changed_no_effect"
             };
+            let outcome = json!({"status":"rejected","error":code,"retry":false});
             self.finish_operation(
-                op,
-                json!({"status":"rejected","error":code,"retry":false}),
+                op.clone(),
+                outcome.clone(),
                 String::new(),
-                Some(claim.request.reply),
+                (!claim.completion).then_some(claim.request.reply),
                 None,
             );
+            if claim.completion {
+                self.record_completion_admission(
+                    &op,
+                    outcome,
+                    Err(runtime::PtyInputRejectReason::AdmissionDenied),
+                );
+            }
             return;
         }
         if input {
@@ -1159,6 +1211,7 @@ impl CloudAgent {
                     .paste
                     .as_ref()
                     .map_or(0, |parts| parts.iter().map(Vec::len).sum());
+            let completion_permit = self.completion_input_permit(&op);
             let auth = claim.auth;
             let epoch = claim.request.epoch;
             let access_key = claim.request.access_key;
@@ -1172,12 +1225,18 @@ impl CloudAgent {
             });
             let mut admission =
                 runtime::InputAdmission::new(claim.permit, claim.request.deadline, move |write| {
-                    if continuity::input_current(accepted_clock)
+                    if completion_permit
+                        .as_ref()
+                        .is_none_or(agent_mcp::CompletionPermit::is_live)
+                        && continuity::input_current(accepted_clock)
                         && lease_expires.is_none_or(|expiry| now() < expiry)
                         && execution.is_none_or(AgentExecutionIdentity::is_current)
                     {
                         auth.admit_current_access(epoch, access_key.as_deref(), &mut || {
-                            if continuity::input_current(accepted_clock)
+                            if completion_permit
+                                .as_ref()
+                                .is_none_or(agent_mcp::CompletionPermit::is_live)
+                                && continuity::input_current(accepted_clock)
                                 && lease_expires.is_none_or(|expiry| now() < expiry)
                                 && execution.is_none_or(AgentExecutionIdentity::is_current)
                             {
@@ -1188,7 +1247,9 @@ impl CloudAgent {
                 });
             if let Some(execution) = execution {
                 admission =
-                    admission.with_agent_guard(execution.input_guard_for(if claim.submit {
+                    admission.with_agent_guard(execution.input_guard_for(if claim.completion {
+                        runtime::AgentInputIntent::TrackedPrompt
+                    } else if claim.submit {
                         runtime::AgentInputIntent::ExplicitPrompt
                     } else {
                         runtime::AgentInputIntent::ExplicitAppend
@@ -1219,18 +1280,35 @@ impl CloudAgent {
                             session: claim.target.session,
                             bytes: size,
                             submit: claim.submit,
+                            completion: claim.completion,
+                            admission_finalized: false,
                             deadline: claim.request.deadline,
-                            reply: Some(claim.request.reply),
+                            reply: (!claim.completion).then_some(claim.request.reply),
                         },
                     );
                 }
-                Err(code) => self.finish_operation(
-                    op,
-                    json!({"status":"rejected","error":code,"retry":false}),
-                    String::new(),
-                    Some(claim.request.reply),
-                    None,
-                ),
+                Err(code) => {
+                    let code = if claim.completion {
+                        "pty_dispatch_rejected".to_owned()
+                    } else {
+                        code
+                    };
+                    let outcome = json!({"status":"rejected","error":code,"retry":false});
+                    self.finish_operation(
+                        op.clone(),
+                        outcome.clone(),
+                        String::new(),
+                        (!claim.completion).then_some(claim.request.reply),
+                        None,
+                    );
+                    if claim.completion {
+                        self.record_completion_admission(
+                            &op,
+                            outcome,
+                            Err(runtime::PtyInputRejectReason::AdmissionDenied),
+                        );
+                    }
+                }
             }
         } else {
             let message = claim.answer.unwrap_or_default();
@@ -1248,10 +1326,25 @@ impl CloudAgent {
             );
         }
     }
+    #[cfg(test)]
     pub fn observe_input(&mut self, runtime: u64, events: &[runtime::RuntimeEvent]) {
+        self.observe_input_with_integrity(runtime, events, true);
+    }
+    pub(crate) fn observe_input_with_integrity(
+        &mut self,
+        runtime: u64,
+        events: &[runtime::RuntimeEvent],
+        sequence_current: bool,
+    ) {
+        if !sequence_current {
+            self.invalidate_completion_runtime(runtime);
+        }
         self.observe_screen_events(runtime, events, now());
         self.observe_history(runtime, events);
         for event in events {
+            if sequence_current {
+                self.observe_completion_event(runtime, event);
+            }
             let runtime::RuntimeEvent::InputAdmitted {
                 session,
                 operation_id,
@@ -1268,6 +1361,9 @@ impl CloudAgent {
                 continue;
             }
             let p = self.pending.remove(operation_id).unwrap();
+            if p.completion && p.admission_finalized {
+                continue;
+            }
             let outcome = match result {
                 Ok(()) => {
                     json!({"status":"queued","admission":"pty_queue","bytes":p.bytes,"submit":p.submit,"retry":false,"completion":"not_confirmed"})
@@ -1279,13 +1375,33 @@ impl CloudAgent {
                     json!({"status":"rejected","error":match reason { runtime::PtyInputRejectReason::QueueFull => "pty_queue_full", runtime::PtyInputRejectReason::SessionClosed => "pty_session_closed", runtime::PtyInputRejectReason::WriterUnavailable => "pty_writer_unavailable", runtime::PtyInputRejectReason::PayloadTooLarge => "pty_input_too_large", runtime::PtyInputRejectReason::AdmissionDenied => "pty_admission_revoked", runtime::PtyInputRejectReason::AdmissionUnknown => unreachable!() },"retry":false})
                 }
             };
-            self.finish_operation(operation_id.clone(), outcome, String::new(), p.reply, None);
+            self.finish_operation(
+                operation_id.clone(),
+                outcome.clone(),
+                String::new(),
+                p.reply,
+                None,
+            );
+            self.record_completion_admission(operation_id, outcome, *result);
         }
     }
     pub fn expire_pending(&mut self) {
         let revoked = self.control.expire(now());
         self.revoke_leases(revoked);
         self.expire_history_queries();
+        let timed_out: Vec<_> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| Instant::now() >= p.deadline && p.completion && !p.admission_finalized)
+            .map(|(op, _)| op.clone())
+            .collect();
+        for op in timed_out {
+            if let Some(pending) = self.pending.get_mut(&op) {
+                pending.admission_finalized = true;
+            }
+            self.record_completion_admission(&op, json!({"status":"unknown","error":"pty_admission_unknown","retry":false,"completion":"not_confirmed"}), Err(runtime::PtyInputRejectReason::AdmissionUnknown));
+        }
+        self.poll_completions();
         self.pending.retain(|_, p| {
             let expired = Instant::now() >= p.deadline;
             if expired && let Some(reply) = p.reply.take() {
@@ -1301,6 +1417,9 @@ impl CloudAgent {
             .collect();
         for op in abandoned {
             if let Some(pending) = self.pending.remove(&op) {
+                if pending.completion && pending.admission_finalized {
+                    continue;
+                }
                 self.finish_operation(
                     op,
                     json!({"status":"unknown","retry":false,"completion":"not_confirmed"}),
@@ -1592,21 +1711,50 @@ impl CloudAgent {
             run_id,
             generation: target.generation.clone(),
         };
-        let token = self.operation_token();
-        let job = Job::ClaimScoped {
-            id: op.clone(),
-            tool: req.tool.clone(),
-            args: std::mem::take(&mut req.args),
-            workspace: target.workspace.clone(),
-            session: target.id.clone(),
-            context: context.clone(),
+        let tracked = submit
+            && matches!(req.tool.as_str(), "send_text" | "paste_text")
+            && self
+                .connection_permission(&req.principal.id, &target)
+                .local_completion;
+        let completion_identity = if tracked {
+            Some(self.reserve_completion(
+                req,
+                &target,
+                &context,
+                req.args["text"].as_str().ok_or("invalid_text")?,
+            )?)
+        } else {
+            None
         };
-        self.history
-            .request(token, job)
-            .map_err(|_| "busy_no_effect")?;
+        let internal = agent_mcp::operation_key(&context.connection_id, &context.operation_id)
+            .map_err(|_| "invalid_operation_id")?;
+        let token = self.operation_token();
+        let job = if let Some(identity) = completion_identity {
+            Job::ClaimCompletion {
+                tool: req.tool.clone(),
+                args: std::mem::take(&mut req.args),
+                identity,
+            }
+        } else {
+            Job::ClaimScoped {
+                id: op.clone(),
+                tool: req.tool.clone(),
+                args: std::mem::take(&mut req.args),
+                workspace: target.workspace.clone(),
+                session: target.id.clone(),
+                context: context.clone(),
+            }
+        };
+        if self.history.request(token, job).is_err() {
+            if tracked {
+                self.discard_completion(&internal);
+            }
+            return Err("busy_no_effect".into());
+        }
         let grant = &self.grants[&target.id];
         // Retain only operation_id in App, not another full copy of request arguments.
         let stored_request = Request {
+            deferred: None,
             epoch: req.epoch,
             principal: req.principal.clone(),
             access_key: req.access_key.clone(),
@@ -1638,6 +1786,7 @@ impl CloudAgent {
                 bytes,
                 paste,
                 require_bracketed_paste,
+                completion: tracked,
                 submit,
                 answer,
                 context,
@@ -1803,6 +1952,7 @@ impl Target {
             local_status_observed_at: None,
             local_agent_present: false,
             runtime: 1,
+            runtime_token: "fixture-runtime".into(),
             session: runtime::SessionId(1),
             pane: runtime::MuxPaneId::new(),
             live: true,
@@ -1941,6 +2091,7 @@ mod integration_tests {
         let (reply, rx) = mpsc::sync_channel(1);
         (
             Request {
+                deferred: None,
                 epoch,
                 principal: auth
                     .authenticate_principal(
@@ -3243,6 +3394,7 @@ mod guarded_input_tests {
                 .unwrap();
             let (reply, rx) = mpsc::sync_channel(1);
             let mut req = Request {
+                deferred: None,
                 epoch,
                 principal: auth
                     .authenticate_principal(
@@ -3288,6 +3440,7 @@ mod guarded_input_tests {
                 .unwrap();
             }
             let lease_recheck = Request {
+                deferred: None,
                 epoch: req.epoch,
                 principal: req.principal.clone(),
                 access_key: req.access_key.clone(),
@@ -3701,6 +3854,7 @@ mod http_end_to_end_tests {
             .unwrap();
         let (reply, receipt) = mpsc::sync_channel(1);
         let req = Request {
+            deferred: None,
             epoch,
             principal: auth
                 .authenticate_principal(

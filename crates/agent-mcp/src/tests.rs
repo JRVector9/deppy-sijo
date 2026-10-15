@@ -1,5 +1,131 @@
 use super::*;
 
+pub(super) fn completion_http(
+    server: &Server,
+    token: &str,
+    method: &str,
+    extra: &str,
+    body: Option<Value>,
+) -> (u16, String, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+        .unwrap();
+    let body = body.map(|body| body.to_string()).unwrap_or_default();
+    write!(stream, "{method} /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", server.addr, body.len()).unwrap();
+    let mut head = Vec::new();
+    while !head.ends_with(b"\r\n\r\n") {
+        assert!(head.len() < 8192, "response head exceeded fixture bound");
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8(head).unwrap();
+    let status = head.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let length = completion_header(&head, "content-length")
+        .unwrap()
+        .parse::<usize>()
+        .unwrap();
+    assert!(length <= 4 * 1024 * 1024);
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    (status, head, String::from_utf8(body).unwrap())
+}
+
+pub(super) fn completion_header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.eq_ignore_ascii_case(name).then_some(value.trim())
+    })
+}
+
+pub(super) fn completion_initialize(server: &Server, token: &str) -> String {
+    let (status, head, body) = completion_http(
+        server,
+        token,
+        "POST",
+        "",
+        Some(
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"synthetic-completion-client","version":"1"}}}),
+        ),
+    );
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(serde_json::from_str::<Value>(&body).unwrap()["id"], 1);
+    completion_header(&head, "mcp-session-id")
+        .expect("initialize must issue an authenticated host session for original-stream ownership")
+        .to_owned()
+}
+
+#[test]
+fn completion_transport_initialize_separates_hosts_sharing_one_credential() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let first = completion_initialize(&server, &token);
+    let second = completion_initialize(&server, &token);
+    assert_ne!(first, second, "a credential is not a transport session");
+    for session in [first, second] {
+        assert!(session.len() >= 32 && session.len() <= 128);
+        assert!(session.bytes().all(|byte| (0x21..=0x7e).contains(&byte)));
+    }
+}
+
+#[test]
+fn completion_transport_foreign_actor_cannot_reuse_initialized_host_session() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = completion_initialize(&server, &token);
+    let (_, other_token) = server
+        .auth
+        .mint_manual_connection("Another synthetic actor", true, now())
+        .unwrap();
+    let body = json!({"jsonrpc":"2.0","id":2,"method":"tools/list"});
+    let header = format!("MCP-Session-Id: {session}\r\n");
+    assert_eq!(
+        completion_http(&server, &other_token, "POST", &header, Some(body.clone())).0,
+        404,
+        "host session ownership must be checked before dispatch"
+    );
+    let (status, _, response) = completion_http(&server, &token, "POST", &header, Some(body));
+    assert_eq!(status, 200);
+    assert_eq!(
+        serde_json::from_str::<Value>(&response).unwrap()["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .len(),
+        14,
+        "ordinary JSON discovery retains all existing tools"
+    );
+    assert!(server.requests.try_recv().is_err());
+}
+
+#[test]
+fn completion_transport_unknown_original_stream_cursor_is_not_a_subscription() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = completion_initialize(&server, &token);
+    let headers = format!(
+        "MCP-Session-Id: {session}\r\nLast-Event-ID: 09c446dc-7080-4895-baf1-6d2d81fc4604:0\r\n"
+    );
+    assert_eq!(
+        completion_http(&server, &token, "GET", &headers, None).0,
+        404,
+        "unknown or foreign stream cursors cannot subscribe to completion results"
+    );
+    assert_eq!(
+        completion_http(
+            &server,
+            &token,
+            "GET",
+            &format!("MCP-Session-Id: {session}\r\n"),
+            None
+        )
+        .0,
+        405,
+        "there is no unsolicited completion broadcast"
+    );
+}
+
 #[test]
 fn pr9_explicit_paste_is_discovered_with_no_implicit_submit() {
     let discovery = tools();

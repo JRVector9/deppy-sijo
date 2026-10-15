@@ -238,6 +238,7 @@ impl CloudAgent {
             target.title.clear();
         }
         let retained = Request {
+            deferred: None,
             epoch: req.epoch,
             principal: req.principal.clone(),
             access_key: req.access_key.clone(),
@@ -994,6 +995,7 @@ mod tests {
         let (reply, rx) = mpsc::sync_channel(1);
         (
             Request {
+                deferred: None,
                 epoch: auth.authenticate(&header, now()).unwrap(),
                 principal: auth.authenticate_principal(&header, now()).unwrap(),
                 access_key: None,

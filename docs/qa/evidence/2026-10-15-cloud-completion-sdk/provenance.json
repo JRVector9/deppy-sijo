@@ -1,0 +1,52 @@
+{
+  "recorded_at": "2026-10-15",
+  "fixture_kind": "synthetic loopback transport with in-memory History; no GUI, PTY, native proof, real host or account",
+  "observed_run": {
+    "result": "observed/result-long-61s.json",
+    "build_log": "observed/build.log",
+    "build_log_modified_at": "2026-10-15T19:38:42+09:00",
+    "result_modified_at": "2026-10-15T19:40:48+09:00",
+    "workspace_version_from_build_log": "0.12.3",
+    "relevant_transport_commit": "d21117dc4d1caad9fbfae3e2e2910d7684122430",
+    "source_cohort": "after bounded replay-cache/post-handoff effect fix, before canonical completion payload normalization",
+    "source_snapshot_caveat": "Build output records paths and package versions but no HEAD or source hashes. The relevant commit is cohort context, not proof of the complete working tree compiled. Exact run-time source snapshot and full workspace hash were not captured.",
+    "later_canonicalization_commit": "882cd848",
+    "original_npm_manifest_used_range": "^1.32.1",
+    "locked_sdk_version": "1.32.1",
+    "locked_sdk_integrity": "sha512-2DdE+SJDtzLEEWzY1ZjY7Q+VcPhcV1KisD3zI4u0XZyktsjHum1mwbMI+JaulUBi2OZk+KJAi2uPXzxichPkdw==",
+    "runner": "observed/verify-original-long.mjs",
+    "runner_sha256": "7c33db2133646a208a8f617618e27b4cf72160cb52228f2dd8d9e277474e5dfb",
+    "cargo_lock_provenance": "No Cargo lock digest was captured during the earlier 61-second execution; exact equality with its run-time lock is not independently established."
+  },
+  "portable_copy": {
+    "fixture_sources": "fixture-main.rs and observed/verify-original-long.mjs preserve the earlier executed private sources. verify.mjs copies the later private runner with canonical queued effect_state and retry/retryable=false assertions; that revised runner was not used for the observed 61s result.",
+    "npm_changes": "Only root package name/version/private metadata and exact SDK requirement were pinned for portability. Dependency versions, resolved URLs and integrity entries match observed/package-lock.json.",
+    "cargo": "Generate an external manifest against the selected absolute REPO, with both repository vendor patches; seed its lock from that repository Cargo.lock. The first external build may prune the copied lock. No Cargo manifest or source is changed in the repository.",
+    "execution_status": "Both private runtime results are preserved separately. Portable preparation instructions were syntax/structure checked; the committed portable layout has not itself been built or run. The latest runner bytes match the private runner used by the root-reported latest-source quick execution."
+  },
+  "latest_source_run": {
+    "result": "observed/result-final-quick.json",
+    "build_log": "observed/final-build.log",
+    "stderr": "observed/final-stderr.log",
+    "repository_head": "9ed6c277a53ea51df228744cd6efec7ebeb2466f",
+    "product_source_commit": "f9d7c8a7",
+    "workspace_version_from_build_log": "0.13.0",
+    "canonical_payload_assertions": [
+      "effect_state=queued",
+      "retry=false",
+      "retryable=false"
+    ],
+    "source_provenance": "observed/final-source.json",
+    "long_delay_ms": 750,
+    "exceeds_default_60s": false,
+    "limitation": "This latest-source gate is the quick synthetic run. The 61-second execution belongs only to the earlier pre-canonical cohort.",
+    "cargo_lock_provenance": "Root regenerated the private fixture lock for 0.13.0 before this build. The preserved observed/fixture-Cargo.lock snapshot lists 0.12.3 and is not the final build lock."
+  },
+  "cargo_lock_snapshot": {
+    "artifact": "observed/fixture-Cargo.lock",
+    "workspace_version_in_file": "0.12.3",
+    "sha256": "ad450db6463b9a85127e18001e5508cf3a039eb1eae984c047e3b9fb71e24d12",
+    "capture": "Copied during documentation preparation before root replaced the private lock for the final build; the evidence file remains unchanged.",
+    "run_time_equality": "Not independently recorded for the earlier 61-second execution; does not represent the final 0.13.0 build lock."
+  }
+}

@@ -11,7 +11,10 @@ pub use project_keys::{
 mod agent_attention;
 #[path = "workspace_identity.rs"]
 mod workspace_identity;
-pub use agent_attention::{AgentAttentionEvent, AttentionEventKind};
+pub use agent_attention::{
+    AgentAttentionEvent, AttentionEventKind, NativeTurnCompletionProof, NativeTurnProof,
+    native_prompt_digest,
+};
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -74,6 +77,7 @@ impl std::fmt::Debug for EnvValue {
 pub struct Db {
     conn: Connection,
     authorization_db_identity: String,
+    native_digest_cleanup_at: std::cell::Cell<Option<i64>>,
 }
 
 pub use crate::task_prompt::{task_prompt_is_displayable, task_prompt_text};
@@ -1221,6 +1225,8 @@ pub struct AgentStateJob {
     /// Projects waiting and completed-turn attention state. False performs no query or output
     /// allocation for either section.
     pub include_attention: bool,
+    /// Optional native completion evidence for these exact bounded live session keys only.
+    pub native_turn_keys: Vec<String>,
     /// Projects persisted PTY-to-agent bindings for the active workspace. False performs no query
     /// or output allocation for this section. Binding mutations remain atomic regardless.
     pub include_agent_sessions: bool,
@@ -1305,6 +1311,7 @@ impl AgentStateJob {
             work_turn_mutations: Vec::new(),
             include_hook_status: true,
             include_attention: true,
+            native_turn_keys: Vec::new(),
             include_agent_sessions: true,
             include_global_agent_sessions: false,
             include_structured_threads: true,
@@ -1337,6 +1344,7 @@ impl std::fmt::Debug for AgentStateJob {
             .field("work_turn_mutation_count", &self.work_turn_mutations.len())
             .field("include_hook_status", &self.include_hook_status)
             .field("include_attention", &self.include_attention)
+            .field("native_turn_key_count", &self.native_turn_keys.len())
             .field("include_agent_sessions", &self.include_agent_sessions)
             .field(
                 "include_structured_threads",
@@ -1380,6 +1388,8 @@ pub struct AgentStateSnapshot {
     pub turn_done_sessions: Vec<(String, i64)>,
     /// Confirmed idle episodes: key, Unix seconds, and independent microsecond boundary generation.
     pub idle_sessions: Vec<(String, i64, i64)>,
+    /// Genuine native-turn evidence; independent of UI acknowledgement and global across warm runtimes.
+    pub native_turns: Vec<NativeTurnProof>,
     /// hook 기반 "작업 중" 세션 키(v32) — clear 이벤트(UserPromptSubmit/PreToolUse)가
     /// 기록. 전역이며 부모 단독 신호는2분 후 만료한다. 자식 lifecycle은 종료까지 유지한다.
     pub working_sessions: Vec<String>,
@@ -1406,6 +1416,7 @@ impl std::fmt::Debug for AgentStateSnapshot {
             .field("response_session_count", &self.response_sessions.len())
             .field("turn_done_session_count", &self.turn_done_sessions.len())
             .field("idle_session_count", &self.idle_sessions.len())
+            .field("native_turn_count", &self.native_turns.len())
             .field("working_session_count", &self.working_sessions.len())
             .field("agent_session_count", &self.agent_sessions.len())
             .field(
@@ -2780,6 +2791,10 @@ fn canonicalize_agent_state_job(job: &mut AgentStateJob) {
         canonicalize_agent_state_string(workspace_id);
     }
     canonicalize_agent_state_vec(&mut job.structured_workspace_ids);
+    for key in &mut job.native_turn_keys {
+        canonicalize_agent_state_string(key);
+    }
+    canonicalize_agent_state_vec(&mut job.native_turn_keys);
 
     if let Some(reconcile) = &mut job.binding_reconcile {
         for pane_id in &mut reconcile.live_pane_ids {
@@ -2896,6 +2911,10 @@ fn agent_state_job_retained_bytes(
     for workspace_id in &job.structured_workspace_ids {
         checked_agent_state_string_capacity(&mut total, workspace_id)?;
     }
+    checked_agent_state_vec_allocation(&mut total, &job.native_turn_keys)?;
+    for key in &job.native_turn_keys {
+        checked_agent_state_string_capacity(&mut total, key)?;
+    }
     if let Some(reconcile) = &job.binding_reconcile {
         checked_agent_state_vec_allocation(&mut total, &reconcile.live_pane_ids)?;
         for pane_id in &reconcile.live_pane_ids {
@@ -2964,6 +2983,32 @@ fn agent_state_job_retained_bytes(
     Ok(total)
 }
 
+fn checked_native_turn_retained_bytes(
+    total: &mut usize,
+    native_turns: &Vec<NativeTurnProof>,
+) -> Result<(), AgentStatePreparationErrorCode> {
+    checked_agent_state_vec_allocation(total, native_turns)?;
+    for proof in native_turns {
+        for value in [
+            &proof.session_key,
+            &proof.runtime_instance,
+            &proof.native_session_id,
+            &proof.turn_id,
+            &proof.transcript_path,
+        ] {
+            checked_agent_state_string_capacity(total, value)?;
+        }
+        checked_agent_state_optional_string_capacity(total, &proof.prompt_digest)?;
+        for stamp in std::iter::once(&proof.start_execution_stamp)
+            .chain(proof.completed.as_ref().map(|end| &end.execution_stamp))
+        {
+            checked_agent_state_string_capacity(total, &stamp.runtime_instance)?;
+            checked_agent_state_vec_allocation(total, &stamp.ancestors)?;
+        }
+    }
+    Ok(())
+}
+
 fn agent_state_snapshot_retained_bytes(
     snapshot: &AgentStateSnapshot,
 ) -> Result<usize, AgentStatePreparationErrorCode> {
@@ -3006,6 +3051,7 @@ fn agent_state_snapshot_retained_bytes(
     for (key, _, _) in &snapshot.idle_sessions {
         checked_agent_state_string_capacity(&mut total, key)?;
     }
+    checked_native_turn_retained_bytes(&mut total, &snapshot.native_turns)?;
     checked_agent_state_vec_allocation(&mut total, &snapshot.working_sessions)?;
     for session_key in &snapshot.working_sessions {
         checked_agent_state_string_capacity(&mut total, session_key)?;
@@ -3082,6 +3128,17 @@ fn validate_agent_state_job(job: &AgentStateJob) -> anyhow::Result<String> {
     let workspace_prefix = format!("{}:", job.workspace_id);
 
     let mut retained_input_bytes = job.workspace_id.len();
+    anyhow::ensure!(job.native_turn_keys.len() <= 256, AGENT_STATE_INPUT_INVALID);
+    let mut native_keys = std::collections::HashSet::with_capacity(job.native_turn_keys.len());
+    for key in &job.native_turn_keys {
+        anyhow::ensure!(
+            bounded_session_key_prefix(key).is_ok() && native_keys.insert(key.as_str()),
+            AGENT_STATE_INPUT_INVALID
+        );
+        retained_input_bytes = retained_input_bytes
+            .checked_add(key.len())
+            .ok_or_else(|| anyhow::anyhow!(AGENT_STATE_INPUT_INVALID))?;
+    }
     anyhow::ensure!(
         !job.structured_workspace_ids.is_empty()
             && job.structured_workspace_ids.len() <= AGENT_STATE_STRUCTURED_WORKSPACE_MAX,
@@ -5546,6 +5603,7 @@ impl Db {
         Ok(Self {
             conn,
             authorization_db_identity,
+            native_digest_cleanup_at: std::cell::Cell::new(None),
         })
     }
 
@@ -5555,6 +5613,7 @@ impl Db {
         Ok(Self {
             conn,
             authorization_db_identity: format!("memory:{}", uuid::Uuid::new_v4()),
+            native_digest_cleanup_at: std::cell::Cell::new(None),
         })
     }
 
@@ -8946,6 +9005,29 @@ impl Db {
             logical_retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
+        let digest_cleanup_at = snapshot_epoch
+            .filter(|now| {
+                job.include_attention
+                    && self
+                        .native_digest_cleanup_at
+                        .get()
+                        .is_none_or(|last| *now >= last.saturating_add(60))
+            })
+            .filter(|now| now.checked_mul(1_000_000).is_some())
+            .filter(|now| {
+                agent_attention::scrub_native_prompt_digests_in(&tx, *now * 1_000_000).is_ok()
+            });
+        let native_turns = if job.include_attention {
+            agent_attention::native_turn_proofs_in(
+                &tx,
+                &job.native_turn_keys,
+                job.snapshot_bytes_max
+                    .saturating_sub(logical_retained_bytes),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         let hook_sessions = if let Some((hook_probe, _, sql_limit, snapshot_epoch)) =
             &hook_status_probes
@@ -9366,6 +9448,7 @@ impl Db {
             response_sessions,
             turn_done_sessions,
             idle_sessions,
+            native_turns,
             working_sessions,
             agent_sessions,
             global_agent_sessions,
@@ -9404,14 +9487,22 @@ impl Db {
                 return Err(error.into());
             }
         }
-        let actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
+        let mut actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        if actual_retained_bytes > job.snapshot_bytes_max && !snapshot.native_turns.is_empty() {
+            snapshot.native_turns = Vec::new();
+            actual_retained_bytes = agent_state_snapshot_retained_bytes(&snapshot)
+                .map_err(|_| anyhow::anyhow!(AGENT_STATE_SNAPSHOT_INVALID))?;
+        }
         anyhow::ensure!(
             actual_retained_bytes <= job.snapshot_bytes_max,
             AGENT_STATE_SNAPSHOT_INVALID
         );
         tx.commit()
             .map_err(|_| anyhow::anyhow!(AGENT_STATE_PERSIST_FAILED))?;
+        if let Some(now) = digest_cleanup_at {
+            self.native_digest_cleanup_at.set(Some(now));
+        }
         Ok(snapshot)
     }
 
@@ -17142,6 +17233,7 @@ mod tests {
             include_attention: true,
             include_agent_sessions: true,
             include_global_agent_sessions: true,
+            native_turn_keys: vec![marker.to_owned()],
             include_structured_threads: true,
             include_archived_threads: true,
             include_work_history: true,
@@ -17168,6 +17260,7 @@ mod tests {
             response_sessions: vec![marker.to_owned()],
             turn_done_sessions: vec![(marker.to_owned(), i64::MAX)],
             idle_sessions: vec![(marker.to_owned(), 0, 1)],
+            native_turns: Vec::new(),
             working_sessions: vec![marker.to_owned()],
             agent_sessions: reconcile.desired_bindings.clone(),
             archived_agent_resume: vec![ArchivedAgentResumeRow {

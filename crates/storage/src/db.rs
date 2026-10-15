@@ -1224,6 +1224,8 @@ pub struct AgentStateJob {
     /// Projects waiting and completed-turn attention state. False performs no query or output
     /// allocation for either section.
     pub include_attention: bool,
+    /// Optional native completion evidence for these exact bounded live session keys only.
+    pub native_turn_keys: Vec<String>,
     /// Projects persisted PTY-to-agent bindings for the active workspace. False performs no query
     /// or output allocation for this section. Binding mutations remain atomic regardless.
     pub include_agent_sessions: bool,
@@ -1308,6 +1310,7 @@ impl AgentStateJob {
             work_turn_mutations: Vec::new(),
             include_hook_status: true,
             include_attention: true,
+            native_turn_keys: Vec::new(),
             include_agent_sessions: true,
             include_global_agent_sessions: false,
             include_structured_threads: true,
@@ -1340,6 +1343,7 @@ impl std::fmt::Debug for AgentStateJob {
             .field("work_turn_mutation_count", &self.work_turn_mutations.len())
             .field("include_hook_status", &self.include_hook_status)
             .field("include_attention", &self.include_attention)
+            .field("native_turn_key_count", &self.native_turn_keys.len())
             .field("include_agent_sessions", &self.include_agent_sessions)
             .field(
                 "include_structured_threads",
@@ -17185,6 +17189,7 @@ mod tests {
             include_attention: true,
             include_agent_sessions: true,
             include_global_agent_sessions: true,
+            native_turn_keys: vec![marker.to_owned()],
             include_structured_threads: true,
             include_archived_threads: true,
             include_work_history: true,

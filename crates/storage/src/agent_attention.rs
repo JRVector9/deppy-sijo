@@ -1470,11 +1470,9 @@ mod tests {
         let revision = db.list_turn_done_sessions().unwrap()[0].1;
         db.clear_agent_turn_done(KEY, revision).unwrap();
         assert!(db.list_turn_done_sessions().unwrap().is_empty());
-        let snapshot = db
-            .apply_agent_state_job(&AgentStateJob::projection(
-                KEY.rsplit_once(':').unwrap().0.to_owned(),
-            ))
-            .unwrap();
+        let mut job = AgentStateJob::projection(KEY.rsplit_once(':').unwrap().0.to_owned());
+        job.native_turn_keys = vec![KEY.to_owned()];
+        let snapshot = db.apply_agent_state_job(&job).unwrap();
         let proof = &snapshot.native_turns[0];
         assert_eq!(proof.turn_id, "own-turn");
         assert_eq!(proof.prompt_digest, digest);
@@ -1535,6 +1533,7 @@ mod tests {
         let before = read();
         assert_eq!(before["native_turn_proof"]["prompt_digest"], digest);
         let mut job = AgentStateJob::projection(KEY.rsplit_once(':').unwrap().0.to_owned());
+        job.native_turn_keys = vec![KEY.to_owned()];
         job.include_attention = false;
         assert!(
             db.apply_agent_state_job(&job)
@@ -1555,6 +1554,77 @@ mod tests {
         assert_eq!(read(), expected, "only temporary digest may be scrubbed");
         assert!(
             serde_json::to_value(&snapshot.native_turns[0]).unwrap()["prompt_digest"].is_null()
+        );
+    }
+
+    #[test]
+    fn completion_historical_native_proofs_do_not_poison_ordinary_or_selected_live_attention() {
+        use deppy_core::process_identity::{ProcessBirth, ProcessIdentity};
+        let db = Db::open_in_memory().unwrap();
+        let workspace = KEY.rsplit_once(':').unwrap().0;
+        let native = "00000000-0000-0000-0000-000000000002";
+        let path = format!("/isolated/rollout-test-{native}.jsonl");
+        let stamp = HookExecutionStamp {
+            runtime_instance: "runtime-proof".into(),
+            ancestors: vec![ProcessIdentity {
+                pid: 7,
+                birth: ProcessBirth {
+                    seconds: 8,
+                    microseconds: 9,
+                },
+            }],
+        };
+        let digest = native_prompt_digest("full prompt");
+        let selected = format!("{workspace}:258");
+        for pane in 1..=258 {
+            let key = format!("{workspace}:{pane}");
+            for (kind, at) in [
+                (AttentionEventKind::SessionStart, 1),
+                (AttentionEventKind::TurnStart, 2),
+                (AttentionEventKind::SessionEnd, 3),
+            ] {
+                if pane == 258 && kind == AttentionEventKind::SessionEnd {
+                    continue;
+                }
+                let mut event = event(kind, "", at);
+                event.native_session_id = native.into();
+                event.runtime_instance = Some("runtime-proof".into());
+                event.turn_id = Some("native-turn".into());
+                db.record_agent_attention_with_proof(
+                    &key,
+                    &event,
+                    Some(&stamp),
+                    Some(&digest),
+                    Some(&path),
+                )
+                .unwrap();
+            }
+        }
+        let mut job = AgentStateJob::projection(workspace);
+        job.native_turn_keys = vec![selected.clone()];
+        let snapshot = db
+            .apply_agent_state_job(&job)
+            .expect("historical optional proofs must not break ordinary attention");
+        assert_eq!(snapshot.native_turns.len(), 1);
+        assert_eq!(snapshot.native_turns[0].session_key, selected);
+        assert!(snapshot.native_turns[0].is_valid());
+        assert!(!snapshot.native_turns[0].ended);
+        job.native_turn_keys.clear();
+        assert!(
+            db.apply_agent_state_job(&job)
+                .unwrap()
+                .native_turns
+                .is_empty()
+        );
+        db.conn.execute("UPDATE agent_needs_input SET attention_json=json_set(attention_json,'$.native_turn_proof.turn_id',NULL) WHERE session_key=?1", [&selected]).unwrap();
+        job.native_turn_keys = vec![selected];
+        assert!(
+            db.apply_agent_state_job(&job)
+                .expect(
+                    "invalid optional native evidence must fail closed without poisoning attention"
+                )
+                .native_turns
+                .is_empty()
         );
     }
 

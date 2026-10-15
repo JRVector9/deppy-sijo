@@ -3141,6 +3141,54 @@ mod tests {
     }
 
     #[test]
+    fn completion_accepted_input_remote_roundtrips_and_rejects_invalid_evidence() {
+        let event = |session, sequence, operation_id: Option<&str>, at_micros| {
+            RuntimeEvent::SessionInputAccepted {
+                session: SessionId(session),
+                sequence,
+                operation_id: operation_id.map(str::to_owned),
+                at_micros,
+            }
+        };
+        for operation in [None, Some("@internal:operation-1"), Some("raw_operation")] {
+            let valid = event(1, u64::MAX, operation, 1);
+            for codec in [Codec::Plain, Codec::Delta] {
+                let frame = codec.encode_event(&valid).unwrap();
+                let DecodedEvent::Event(decoded) = codec.decode_event(&frame).unwrap() else {
+                    panic!("accepted input decoded as viewport");
+                };
+                validate_event(&decoded).unwrap();
+                assert!(matches!(
+                    decoded,
+                    RuntimeEvent::SessionInputAccepted {
+                        session: SessionId(1),
+                        sequence: u64::MAX,
+                        at_micros: 1,
+                        ..
+                    }
+                ));
+            }
+        }
+        for invalid in [
+            event(0, 1, None, 1),
+            event(1, 0, None, 1),
+            event(1, 1, None, 0),
+            event(1, 1, None, -1),
+            event(1, 1, Some(""), 1),
+            event(1, 1, Some("@"), 1),
+            event(1, 1, Some("bad operation"), 1),
+            event(1, 1, Some("bad\noperation"), 1),
+            event(1, 1, Some("bad\0operation"), 1),
+            event(1, 1, Some(&"a".repeat(129)), 1),
+        ] {
+            assert!(
+                validate_event(&invalid).is_err(),
+                "invalid accepted input evidence: {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
     fn durable_event_barrier_remote_codecs_roundtrip_and_reject_invalid_payloads() {
         let command = RuntimeCommand::DurableEventBarrier { correlation_id: 91 };
         let event = RuntimeEvent::DurableEventBarrierReached { correlation_id: 91 };

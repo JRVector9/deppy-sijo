@@ -1054,6 +1054,27 @@ mod deadline_tests {
     }
 
     #[test]
+    fn untrusted_cleanup_length_cannot_consume_beyond_byte_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut body = vec![b'x'; MAX_UNREAD_REQUEST_BYTES];
+        body.push(b'z');
+        client.write_all(&body).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        close_response(
+            &mut stream,
+            usize::MAX,
+            Instant::now() + Duration::from_secs(1),
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut remaining = [0];
+        stream.read_exact(&mut remaining).unwrap();
+        assert_eq!(remaining, [b'z']);
+    }
+
+    #[test]
     fn dripping_bytes_do_not_extend_total_read_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();

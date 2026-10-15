@@ -10,6 +10,10 @@ use std::path::Path;
 
 const PRUNE_ANSWERS_SQL: &str = "UPDATE operations SET message='' WHERE tool='notify' AND message<>'' AND id NOT IN (SELECT operation_id FROM answer_completion ORDER BY sequence DESC LIMIT 100)";
 
+fn completion_sql_time(value: u64) -> anyhow::Result<i64> {
+    i64::try_from(value).map_err(|_| anyhow::anyhow!("invalid_completion_receipt"))
+}
+
 pub struct History(Connection);
 #[derive(Debug, PartialEq)]
 pub enum Claim {
@@ -178,7 +182,7 @@ impl History {
             "UPDATE operations SET outcome=?2 WHERE id=?1",
             params![key, admission],
         )?;
-        tx.execute("UPDATE local_completion_receipts SET receipt=?2,expires=?3 WHERE operation_key=?1 AND receipt IS NULL", params![key,record,receipt.expires_at])?;
+        tx.execute("UPDATE local_completion_receipts SET receipt=?2,expires=?3 WHERE operation_key=?1 AND receipt IS NULL", params![key,record,completion_sql_time(receipt.expires_at)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -190,7 +194,7 @@ impl History {
         let key = operation_key(&identity.connection_id, &identity.scope.operation_id)?;
         let row: Option<(String, Option<String>)> = self.0.query_row(
             "SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END,CASE WHEN receipt IS NULL OR length(CAST(receipt AS BLOB))<=4096 THEN receipt ELSE CAST(0 AS BLOB) END FROM local_completion_receipts WHERE operation_key=?1 AND expires>?2",
-            params![key,crate::now()], |r| Ok((r.get(0)?,r.get(1)?)),
+            params![key,completion_sql_time(crate::now())?], |r| Ok((r.get(0)?,r.get(1)?)),
         ).optional()?;
         let Some((stored_identity, record)) = row else {
             return Ok(None);
@@ -351,14 +355,15 @@ impl History {
         if let Some(identity) = completion {
             tx.execute(
                 "DELETE FROM local_completion_receipts WHERE receipt IS NOT NULL AND expires<=?1",
-                [crate::now()],
+                [completion_sql_time(crate::now())?],
             )?;
-            let (count, pending): (usize,usize) = tx.query_row("SELECT count(*),count(*) FILTER (WHERE receipt IS NULL) FROM local_completion_receipts", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
+            let (count, pending): (i64,i64) = tx.query_row("SELECT count(*),count(*) FILTER (WHERE receipt IS NULL) FROM local_completion_receipts", [], |r| Ok((r.get(0)?,r.get(1)?)))?;
             anyhow::ensure!(
-                count < crate::MAX_COMPLETION_RECEIPTS && pending < crate::MAX_COMPLETION_WATCHES,
+                count < i64::try_from(crate::MAX_COMPLETION_RECEIPTS)?
+                    && pending < i64::try_from(crate::MAX_COMPLETION_WATCHES)?,
                 "completion_history_full_no_effect"
             );
-            tx.execute("INSERT INTO local_completion_receipts(operation_key,identity,created,expires) VALUES(?1,?2,?3,?4)", params![key,serde_json::to_string(identity)?,crate::now(),crate::now()+3600])?;
+            tx.execute("INSERT INTO local_completion_receipts(operation_key,identity,created,expires) VALUES(?1,?2,?3,?4)", params![key,serde_json::to_string(identity)?,completion_sql_time(crate::now())?,completion_sql_time(crate::now().saturating_add(3600))?])?;
         }
         let count: i64 = tx.query_row("SELECT count(*) FROM operations", [], |r| r.get(0))?;
         // Hard cap preserves at-most-once tombstones. Never evict a claim and later replay input.
@@ -373,7 +378,7 @@ impl History {
     fn restore_completions(&self) -> anyhow::Result<()> {
         let mut statement = self.0.prepare("SELECT CASE WHEN length(CAST(identity AS BLOB))<=2048 THEN identity END,created FROM local_completion_receipts WHERE receipt IS NULL LIMIT 65")?;
         let pending = statement
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, u64>(1)?)))?
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
             .collect::<Result<Vec<_>, _>>()?;
         anyhow::ensure!(
             pending.len() <= crate::MAX_COMPLETION_WATCHES,
@@ -391,7 +396,7 @@ impl History {
                 identity: identity.clone(),
                 admission,
                 outcome: json!({"status":"unknown","reason":"server_restarted"}),
-                created_at,
+                created_at: u64::try_from(created_at)?,
                 completed_at: None,
                 expires_at: crate::now() + crate::COMPLETION_RECEIPT_TTL,
             };
@@ -399,7 +404,7 @@ impl History {
         }
         self.0.execute(
             "DELETE FROM local_completion_receipts WHERE receipt IS NOT NULL AND expires<=?1",
-            [crate::now()],
+            [completion_sql_time(crate::now())?],
         )?;
         Ok(())
     }

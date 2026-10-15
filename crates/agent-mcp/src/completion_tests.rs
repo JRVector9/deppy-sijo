@@ -408,7 +408,10 @@ fn completion_ledger_aged_restart_retains_receipt_from_terminalization_time() {
         let db = rusqlite::Connection::open(&path).unwrap();
         db.execute(
             "UPDATE local_completion_receipts SET created=?1,expires=?2",
-            rusqlite::params![original_created, original_created + 3600],
+            rusqlite::params![
+                i64::try_from(original_created).unwrap(),
+                i64::try_from(original_created + 3600).unwrap()
+            ],
         )
         .unwrap();
     }
@@ -460,7 +463,7 @@ fn completion_ledger_terminal_capacity_prunes_only_expired_private_receipts() {
             .execute(
                 "UPDATE local_completion_receipts SET expires=?1 WHERE operation_key=?2",
                 rusqlite::params![
-                    now() - 1,
+                    i64::try_from(now() - 1).unwrap(),
                     operation_key(&first.connection_id, &first.scope.operation_id).unwrap()
                 ],
             )

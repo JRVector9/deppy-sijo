@@ -232,6 +232,18 @@ pub struct DeferredTransport {
     pub(crate) reserved: Arc<AtomicBool>,
 }
 impl DeferredTransport {
+    #[cfg(test)]
+    pub(crate) fn retained_result_bytes(&self, stream: &str) -> Option<usize> {
+        let registry = self.lane.registry.lock().ok()?;
+        registry
+            .streams
+            .get(stream)?
+            .result
+            .as_ref()
+            .and_then(|result| serde_json::to_vec(result).ok())
+            .map(|bytes| bytes.len())
+    }
+
     pub fn reserve(
         &self,
         scope: CompletionScope,

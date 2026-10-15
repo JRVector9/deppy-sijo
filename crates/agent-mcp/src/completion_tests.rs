@@ -299,6 +299,33 @@ fn completion_stream_late_redaction_preserves_only_real_routing_identity() {
 }
 
 #[test]
+fn completion_stream_bounds_retained_app_result_before_replay() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let session = crate::tests::completion_initialize(&server, &token);
+    let socket = post(&server, &token, &session, "bounded-cache");
+    let req = next_request(&server);
+    let deferred = req.deferred.as_ref().unwrap();
+    let identity = deferred
+        .reserve(scope("bounded-cache"), CompletionPermit::new())
+        .unwrap();
+    let mut reader = sse_head(socket);
+    event(&mut reader);
+    req.reply
+        .try_send(Ok(json!({"display":"x".repeat(64 * 1024)})))
+        .unwrap();
+    let final_event = event(&mut reader);
+    assert!(final_event.contains("completion_result_too_large_unknown"));
+    let retained = deferred
+        .retained_result_bytes(&identity.stream_id)
+        .expect("returned original result remains available for owned replay");
+    assert!(
+        retained <= MAX_COMPLETION_EVENT_BYTES,
+        "oversized App result must not remain in the bounded replay cache: {retained} bytes"
+    );
+}
+
+#[test]
 fn completion_stream_reserve_budgets_maximum_original_result_before_effect() {
     let mut boundary = None;
     for length in 1..=128 {

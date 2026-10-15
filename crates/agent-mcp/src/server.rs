@@ -2,8 +2,8 @@ use crate::{AuthKind, ConnectionInfo, ConnectionState, LEGACY_CONNECTION_ID, Pri
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::{BufReader, Read},
-    net::{SocketAddr, TcpListener, TcpStream},
+    io::{BufReader, Read, Write},
+    net::{Shutdown, SocketAddr, TcpListener, TcpStream},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -18,6 +18,10 @@ use zeroize::Zeroizing;
 
 pub const TOKEN_TTL: u64 = 24 * 60 * 60;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024;
+const MAX_UNREAD_REQUEST_BYTES: usize = http::MAX_HEAD_BYTES + MAX_REQUEST_BODY_BYTES;
+const REJECT_CLOSE_TIMEOUT: Duration = Duration::from_millis(100);
+const BUSY_CLOSE_TIMEOUT: Duration = Duration::from_millis(10);
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -506,11 +510,19 @@ impl Server {
                             }
                             let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
                             if active.load(Ordering::Acquire) >= 4 {
-                                let _ = http::write_response_with_headers(
-                                    &mut stream,
+                                let deadline = Instant::now() + BUSY_CLOSE_TIMEOUT;
+                                if http::write_response_with_headers(
+                                    &mut DeadlineWriter {
+                                        stream: &mut stream,
+                                        deadline,
+                                    },
                                     &busy_response(),
                                     &[("Retry-After".into(), "1".into())],
-                                );
+                                )
+                                .is_ok()
+                                {
+                                    close_response(&mut stream, MAX_UNREAD_REQUEST_BYTES, deadline);
+                                }
                                 continue;
                             }
                             active.fetch_add(1, Ordering::AcqRel);
@@ -607,13 +619,80 @@ fn handle(
     tx: &SyncSender<Request>,
     wake: &dyn Fn(),
 ) {
-    let mut headers = Vec::new();
-    let response = process(stream, addr, public, auth, tx, wake, &mut headers);
-    let _ = http::write_response_with_headers(stream, &response, &headers);
+    let mut metadata = ResponseMetadata {
+        headers: Vec::new(),
+        unread_bytes: MAX_UNREAD_REQUEST_BYTES,
+    };
+    let response = process(stream, addr, public, auth, tx, wake, &mut metadata);
+    if http::write_response_with_headers(stream, &response, &metadata.headers).is_ok() {
+        close_response(
+            stream,
+            metadata.unread_bytes,
+            Instant::now() + REJECT_CLOSE_TIMEOUT,
+        );
+    }
 }
+
+struct ResponseMetadata {
+    headers: Vec<(String, String)>,
+    unread_bytes: usize,
+}
+
+/// Closing a socket with an unread request body can reset it and discard the
+/// error response. Send FIN first, then discard only a bounded remainder. Never
+/// wait for the peer's EOF or trust an unbounded Content-Length during cleanup.
+fn close_response(stream: &mut TcpStream, mut remaining: usize, deadline: Instant) {
+    if stream.shutdown(Shutdown::Write).is_err() {
+        return;
+    }
+    remaining = remaining.min(MAX_UNREAD_REQUEST_BYTES);
+    let mut bytes = [0; 8192];
+    while remaining > 0 {
+        let Some(left) = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+        else {
+            break;
+        };
+        if stream.set_read_timeout(Some(left)).is_err() {
+            break;
+        }
+        let len = remaining.min(bytes.len());
+        match stream.read(&mut bytes[..len]) {
+            Ok(0) => break,
+            Ok(read) => remaining -= read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+}
+
+struct DeadlineWriter<'a> {
+    stream: &'a mut TcpStream,
+    deadline: Instant,
+}
+impl Write for DeadlineWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "response_deadline")
+            })?;
+        self.stream.set_write_timeout(Some(remaining))?;
+        self.stream.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
 struct DeadlineReader<'a> {
     stream: &'a mut TcpStream,
     deadline: Instant,
+    bytes_read: usize,
 }
 impl Read for DeadlineReader<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
@@ -623,8 +702,26 @@ impl Read for DeadlineReader<'_> {
             .filter(|d| !d.is_zero())
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "request_deadline"))?;
         self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(bytes)
+        let read = self.stream.read(bytes)?;
+        self.bytes_read = self.bytes_read.saturating_add(read);
+        Ok(read)
     }
+}
+
+fn read_body(
+    reader: &mut BufReader<DeadlineReader<'_>>,
+    len: usize,
+    metadata: &mut ResponseMetadata,
+) -> Result<Vec<u8>, http::HeadError> {
+    let before = reader.get_ref().bytes_read;
+    let body = http::read_body(reader, len);
+    metadata.unread_bytes = metadata
+        .unread_bytes
+        .saturating_sub(reader.get_ref().bytes_read.saturating_sub(before));
+    if body.is_ok() {
+        metadata.unread_bytes = 0;
+    }
+    body
 }
 
 fn process(
@@ -634,15 +731,30 @@ fn process(
     auth: &Auth,
     tx: &SyncSender<Request>,
     wake: &dyn Fn(),
-    headers: &mut Vec<(String, String)>,
+    metadata: &mut ResponseMetadata,
 ) -> Response {
     let mut reader = BufReader::new(DeadlineReader {
         stream,
         deadline: Instant::now() + REQUEST_TIMEOUT,
+        bytes_read: 0,
     });
     let Ok(head) = http::read_request_head(&mut reader) else {
         return Response::plain(400, "invalid_request");
     };
+    metadata.unread_bytes =
+        if head.header("transfer-encoding").is_none() && head.header_count("content-length") == 1 {
+            head.content_length().map_or(MAX_REQUEST_BODY_BYTES, |len| {
+                len.saturating_sub(reader.buffer().len())
+                    .min(MAX_REQUEST_BODY_BYTES)
+            })
+        } else if head.header("transfer-encoding").is_none()
+            && head.header_count("content-length") == 0
+            && head.method != "POST"
+        {
+            0
+        } else {
+            MAX_REQUEST_BODY_BYTES
+        };
     let local = addr.to_string();
     let localhost = format!("localhost:{}", addr.port());
     if head.header_count("host") != 1
@@ -677,19 +789,19 @@ fn process(
             let Some(len) = head.content_length().filter(|l| *l <= 8192) else {
                 return Response::plain(413, "body_size");
             };
-            let Ok(body) = http::read_body(&mut reader, len) else {
+            let Ok(body) = read_body(&mut reader, len, metadata) else {
                 return Response::plain(400, "truncated_body");
             };
             body
         } else {
             vec![]
         };
-        return auth.oauth_route(&head, &body, &base, headers, wake);
+        return auth.oauth_route(&head, &body, &base, &mut metadata.headers, wake);
     }
     if head.path != "/mcp" || !head.query.is_empty() {
         return Response::plain(404, "not_found");
     }
-    headers.push((
+    metadata.headers.push((
         "WWW-Authenticate".into(),
         format!("Bearer resource_metadata=\"{base}/.well-known/oauth-protected-resource/mcp\""),
     ));
@@ -729,11 +841,11 @@ fn process(
     }
     let Some(len) = head
         .content_length()
-        .filter(|len| *len > 0 && *len <= 64 * 1024)
+        .filter(|len| *len > 0 && *len <= MAX_REQUEST_BODY_BYTES)
     else {
         return Response::plain(413, "body_size");
     };
-    let Ok(body) = http::read_body(&mut reader, len) else {
+    let Ok(body) = read_body(&mut reader, len, metadata) else {
         return Response::plain(400, "truncated_body");
     };
     let Ok(v) = serde_json::from_slice::<Value>(&body) else {
@@ -804,7 +916,7 @@ fn process(
                     | "get_operation"
             );
             if !auth.begin_call(&principal.id, poll, epoch) {
-                headers.push(("Retry-After".into(), "1".into()));
+                metadata.headers.push(("Retry-After".into(), "1".into()));
                 return tool_response(id, Err("poll_budget_no_effect".into()));
             }
             let connection_id = principal.id.clone();
@@ -821,7 +933,7 @@ fn process(
             };
             if tx.try_send(req).is_err() {
                 auth.end_call(&connection_id, poll, epoch);
-                headers.push(("Retry-After".into(), "1".into()));
+                metadata.headers.push(("Retry-After".into(), "1".into()));
                 return tool_response(id, Err("busy_no_effect".into()));
             }
             wake();
@@ -878,6 +990,69 @@ fn json_response(v: Value) -> Response {
 mod deadline_tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn completed_bodies_and_bodyless_discovery_skip_cleanup_wait() {
+        let auth = Auth::new_at(now());
+        let token = auth.token_for_user();
+        let token = token.as_str();
+        for (method, path, body, status) in [
+            (
+                "POST",
+                "/mcp",
+                r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#,
+                200,
+            ),
+            ("POST", "/mcp", "{invalid-json", 200),
+            ("POST", "/oauth/token", "invalid=form", 415),
+            ("GET", "/.well-known/oauth-protected-resource/mcp", "", 200),
+            ("GET", "/mcp", "", 405),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let mut client = TcpStream::connect(addr).unwrap();
+            let length = if method == "POST" {
+                format!("Content-Length: {}\r\n", body.len())
+            } else {
+                String::new()
+            };
+            write!(client, "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\n{length}\r\n{body}").unwrap();
+            let (mut stream, _) = listener.accept().unwrap();
+            let (tx, _rx) = mpsc::sync_channel(1);
+            let mut metadata = ResponseMetadata {
+                headers: Vec::new(),
+                unread_bytes: MAX_UNREAD_REQUEST_BYTES,
+            };
+            assert_eq!(
+                process(&mut stream, addr, "", &auth, &tx, &|| {}, &mut metadata).status,
+                status,
+                "{method} {path}"
+            );
+            assert_eq!(metadata.unread_bytes, 0, "{method} {path}");
+        }
+    }
+
+    #[test]
+    fn dripping_body_does_not_extend_cleanup_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let writer = thread::spawn(move || {
+            let mut stream = TcpStream::connect(addr).unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        let start = Instant::now();
+        close_response(&mut stream, usize::MAX, start + Duration::from_millis(50));
+        assert!(start.elapsed() < Duration::from_millis(350));
+        drop(stream);
+        writer.join().unwrap();
+    }
+
     #[test]
     fn dripping_bytes_do_not_extend_total_read_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -896,6 +1071,7 @@ mod deadline_tests {
         let mut reader = DeadlineReader {
             stream: &mut stream,
             deadline: start + Duration::from_millis(50),
+            bytes_read: 0,
         };
         let mut bytes = [0; 100];
         assert!(reader.read_exact(&mut bytes).is_err());

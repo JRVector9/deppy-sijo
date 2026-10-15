@@ -78,23 +78,18 @@ fn pr9_actual_http_dispatch_preserves_paste_args_and_envelope_budget() {
 }
 
 fn http_call_addr(addr: std::net::SocketAddr, token: &str, body: Value) -> (u16, String) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
     let body = body.to_string();
     write!(stream, "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
-    // An oversized declared body is refused before body reading; do not create a TCP reset by sending it.
+    // This size check needs only the header; unread-body delivery is tested separately.
     if body.len() <= 64 * 1024 {
         stream.write_all(body.as_bytes()).unwrap();
     }
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    (
-        response.split_whitespace().nth(1).unwrap().parse().unwrap(),
-        response.split_once("\r\n\r\n").unwrap().1.to_owned(),
-    )
+    framed_http_response(&mut stream).unwrap()
 }
 
 #[test]
@@ -191,20 +186,14 @@ fn claimed_operations_survive_restart_and_cannot_be_reexecuted() {
 }
 
 fn http_call(server: &Server, token: &str, extra: &str, body: serde_json::Value) -> (u16, String) {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut stream = std::net::TcpStream::connect(server.addr).unwrap();
     stream
         .set_read_timeout(Some(std::time::Duration::from_secs(5)))
         .unwrap();
     let body = body.to_string();
     write!(stream,"POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n{}",server.addr,token,body.len(),extra,body).unwrap();
-    let mut response = String::new();
-    stream.read_to_string(&mut response).unwrap();
-    let status = response.split_whitespace().nth(1).unwrap().parse().unwrap();
-    (
-        status,
-        response.split_once("\r\n\r\n").unwrap().1.to_owned(),
-    )
+    framed_http_response(&mut stream).unwrap()
 }
 
 fn framed_http_response(reader: &mut impl std::io::Read) -> std::io::Result<(u16, String)> {

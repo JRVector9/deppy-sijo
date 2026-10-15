@@ -240,6 +240,16 @@ impl Tracker {
             .values_mut()
             .filter(|watch| watch.target.session_id == target.session_id)
         {
+            if now_micros >= watch.created_at.saturating_add(WATCH_TIMEOUT_MICROS) {
+                terminal.push((
+                    watch.key.clone(),
+                    LocalCompletionState::Expired,
+                    "completion_watch_expired",
+                    None,
+                    None,
+                ));
+                continue;
+            }
             let fail = if watch.target != *target
                 || !matches_proof(target, proof)
                 || proof.session_generation != watch.native_generation

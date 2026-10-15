@@ -98,7 +98,9 @@ fn prompt_payload(native: &str, transcript: &Path, prompt: &str) -> serde_json::
 fn completion_codex_observer_preserves_actual_prompt_and_independent_execution_boundaries() {
     let fixture = HookFixture::new();
     let native = uuid::Uuid::new_v4().to_string();
-    let transcript = fixture.root.join(format!("rollout-fixture-{native}.jsonl"));
+    let directory = fixture.root.join(".codex/sessions");
+    std::fs::create_dir_all(&directory).unwrap();
+    let transcript = directory.join(format!("rollout-fixture-{native}.jsonl"));
     std::fs::write(
         &transcript,
         format!(

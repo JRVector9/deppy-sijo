@@ -481,6 +481,7 @@ pub struct UiState {
     requested_terminal_target: Option<RouteTarget>,
     requested_task_target: Option<RouteTarget>,
     drafts: BTreeMap<RouteTarget, String>,
+    draft_versions: BTreeMap<RouteTarget, u64>,
     settings_draft: Option<(String, ProjectConfig)>,
     settings_error: Option<String>,
     ime_composing: bool,
@@ -488,10 +489,22 @@ pub struct UiState {
 }
 
 impl UiState {
+    pub(crate) fn draft_version(&self, target: &RouteTarget) -> u64 {
+        self.draft_versions.get(target).copied().unwrap_or_default()
+    }
+    pub(super) fn note_draft_edit(&mut self, target: &RouteTarget) {
+        let version = self.draft_versions.entry(target.clone()).or_default();
+        *version = version.saturating_add(1);
+    }
     pub fn clear_draft(&mut self, target: &RouteTarget) {
-        self.drafts.remove(target);
+        if self.drafts.remove(target).is_some() {
+            self.note_draft_edit(target);
+        }
     }
     pub fn set_draft(&mut self, target: RouteTarget, text: String) {
+        if self.draft(&target) != text {
+            self.note_draft_edit(&target);
+        }
         self.drafts.insert(target, text);
     }
     pub fn draft(&self, target: &RouteTarget) -> &str {

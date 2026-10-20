@@ -399,6 +399,13 @@ fn task_detail(
     match state.detail_tab {
         DetailTab::Work => {
             title(ui, snapshot, &t.activity);
+            if t.reconcile_remote.enabled
+                && action(ui, snapshot, "원래 요청 상태만 확인", &t.reconcile_remote)
+            {
+                intents.push(Intent::ReconcileRemote {
+                    target: t.target.clone(),
+                });
+            }
             if t.attempt_id.is_some()
                 && t.target.session_id.is_some()
                 && action(ui, snapshot, "워커 실행 종료 · 용량 반환", &t.close_worker)

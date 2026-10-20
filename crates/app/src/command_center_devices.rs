@@ -418,10 +418,14 @@ impl App {
                         host.devices.policies.extend(policies);
                     }
                     for receipt in receipts {
-                        remote::launch_receipt(host, receipt);
+                        if !remote::reconcile::launch_receipt(host, &receipt) {
+                            remote::launch_receipt(host, receipt);
+                        }
                     }
                     for receipt in inputs {
-                        if !remote::sessions::input_receipt(host, &receipt) {
+                        if !remote::reconcile::input_receipt(host, &receipt)
+                            && !remote::sessions::input_receipt(host, &receipt)
+                        {
                             remote::input_receipt(host, receipt);
                         }
                     }
@@ -430,7 +434,8 @@ impl App {
                     }
                 }
                 RemoteDeviceOutcome::Failed { request_id, code } => {
-                    if remote::sessions::failed(host, request_id, false)
+                    if remote::reconcile::failed(host, request_id)
+                        || remote::sessions::failed(host, request_id, false)
                         || remote::failed(host, request_id)
                     {
                         host.devices.finish_remote(request_id);
@@ -443,6 +448,7 @@ impl App {
                     }
                 }
                 RemoteDeviceOutcome::ObservationUnknown { correlation } => {
+                    remote::reconcile::failed(host, correlation.request_id);
                     remote::unknown(host, &correlation);
                     remote::sessions::failed(host, correlation.request_id, true);
                     let matches = host
@@ -478,7 +484,9 @@ impl App {
                     verified,
                 } => remote::launch_pending(host, request_id, lease, verified),
                 RemoteDeviceOutcome::LaunchReceipt(receipt) => {
-                    remote::launch_receipt(host, receipt)
+                    if !remote::reconcile::launch_receipt(host, &receipt) {
+                        remote::launch_receipt(host, receipt);
+                    }
                 }
                 RemoteDeviceOutcome::ExecutionObserved {
                     request_id,
@@ -506,7 +514,9 @@ impl App {
                     }
                 }
                 RemoteDeviceOutcome::InputReceipt(receipt) => {
-                    if !remote::sessions::input_receipt(host, &receipt) {
+                    if !remote::reconcile::input_receipt(host, &receipt)
+                        && !remote::sessions::input_receipt(host, &receipt)
+                    {
                         remote::input_receipt(host, receipt);
                     }
                 }

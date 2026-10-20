@@ -137,6 +137,8 @@ pub struct RemoteTerminal {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(skip)]
+    pub reconcile_remote: Capability,
     #[serde(default)]
     pub remote_terminal: Option<RemoteTerminal>,
     #[serde(default)]
@@ -298,6 +300,10 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    #[serde(skip)]
+    ReconcileRemote {
+        target: RouteTarget,
+    },
     ObserveRemoteSession {
         target: RouteTarget,
     },

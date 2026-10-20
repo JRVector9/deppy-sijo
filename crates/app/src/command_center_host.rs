@@ -138,6 +138,7 @@ pub(super) struct CommandCenterHost {
     remotes: BTreeMap<String, remote::Pending>,
     remote_sessions: remote::sessions::Sessions,
     local_closes: local_close::Closes,
+    reconciles: remote::reconcile::Queries,
     worktrees: wm::task_worktree::TaskWorktreeWorker,
     pending_configs: BTreeMap<String, (String, cc::ProjectConfig)>,
     installed: BTreeMap<u64, launch::Installed>,
@@ -176,6 +177,7 @@ impl CommandCenterHost {
             remotes: BTreeMap::new(),
             remote_sessions: Default::default(),
             local_closes: Default::default(),
+            reconciles: Default::default(),
             worktrees: {
                 let ctx = ctx.clone();
                 wm::task_worktree::TaskWorktreeWorker::new(move || ctx.request_repaint())
@@ -663,11 +665,12 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
+                    reconcile_remote:remote::reconcile::capability(host,&target),
                     remote_terminal:remote::sessions::public_terminal(host,&target,&mut remote_terminal_budget),
                     close_worker: if remote_target {remote::sessions::close_cap(host,&target)} else {local_close::capability(host,&target)},
                     selected_assignment: assignment::selected(task, &assignment_choices),
                     create_worker: if task.execution_device.is_some() {
-                        if ready && matches!(p.confirmed,Some(assignment::Confirmed::Mixed(_))) && ready_tasks.contains(&task.id) && !remote::workspace_preparing(host,&ws.id) && !remote::workspace_unknown(host,&ws.id) && task.execution_device.as_ref().is_some_and(|id|host.devices.can_execute(&ws.id,id)) && !config.use_worktrees && host.devices.policies.iter().any(|d|Some(&d.registration().id)==task.execution_device.as_ref() && d.registration().workspace_id.0==ws.id && d.validate_fresh().is_ok()) {yes()} else {no("배정안·기기 권한·실행 용량을 확인해 주세요. 원격 워크트리는 서버 소유 증명이 필요합니다.")}
+                        if ready && !remote::reconcile::has_idle(host,task) && matches!(p.confirmed,Some(assignment::Confirmed::Mixed(_))) && ready_tasks.contains(&task.id) && !remote::workspace_preparing(host,&ws.id) && !remote::workspace_unknown(host,&ws.id) && task.execution_device.as_ref().is_some_and(|id|host.devices.can_execute(&ws.id,id)) && !config.use_worktrees && host.devices.policies.iter().any(|d|Some(&d.registration().id)==task.execution_device.as_ref() && d.registration().workspace_id.0==ws.id && d.validate_fresh().is_ok()) {yes()} else {no("배정안·기기 권한·실행 용량을 확인해 주세요. 원격 워크트리는 서버 소유 증명이 필요합니다.")}
                     } else if ready
                         && p.confirmed.is_some()
                         && p.state().can_dispatch(&task.id)
@@ -682,7 +685,7 @@ impl App {
                     } else {
                         no("배정안 확인과 현재 작업·폴더 상태를 먼저 확인해 주세요.")
                     },
-                    attempt_id: attempt.map(|a| a.id.0.clone()),
+                    attempt_id: attempt.map(|a| a.id.0.clone()).or_else(||remote::reconcile::idle_attempt(host,task)),
                     result_report: if ready && attempt.is_some() && !remote::handoff_pending(host,&target) {
                         yes()
                     } else {
@@ -721,7 +724,7 @@ impl App {
                         .map(|a| a.folder.clone())
                         .unwrap_or_else(|| task.execution_device.as_ref().map(|id| host.devices.policies.iter().find(|d| d.registration().id==*id && d.registration().workspace_id==task.workspace_id).map(|d| d.registration().folder.clone()).unwrap_or_else(|| "등록한 원격 폴더를 확인해 주세요.".into())).unwrap_or_else(|| config.folder.clone())),
                     state: work_state(task.state),
-                    activity: remote::sessions::status(host,&target).unwrap_or_else(||format!("{:?}", task.state)),
+                    activity: remote::reconcile::activity(host,task).or_else(||remote::sessions::status(host,&target)).unwrap_or_else(||format!("{:?}", task.state)),
                     result: task.result.as_ref().map(|r| bounded(&r.summary, 2048)),
                     result_revision: task.result.as_ref().map(|r| r.revision.0.to_string()),
                     terminal: if live.is_some() || remote_target {
@@ -1057,6 +1060,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::CloseWorker {target,attempt_id}=>return if remote::sessions::is_target(host,&target){remote::sessions::begin(host,id,&target,None,Some(&attempt_id))}else{local_close::begin(host,id,&target,&attempt_id)},
+            cc::Intent::ReconcileRemote {target}=>return remote::reconcile::begin(host,id,&target),
             cc::Intent::InstallPlanJson { workspace_id, json } => {
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let request = p.request.as_ref().ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
@@ -1161,6 +1165,7 @@ impl App {
             && !remote::sessions::pending(&host)
             && !remote::sessions::has_watches(&host)
             && !local_close::has_pending(&host)
+            && !remote::reconcile::pending(&host)
             && host
                 .projects
                 .values()
@@ -1461,6 +1466,7 @@ impl App {
         self.pump_command_center_remote(&mut host);
         self.pump_command_center_remote_sessions(&mut host, visible);
         self.pump_command_center_local_closes(&mut host);
+        self.pump_command_center_reconcile(&mut host);
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
             && let Some((id, intent)) = host.pending.pop_front()

@@ -26,6 +26,8 @@ struct ActionRecord {
     attempt: work::AttemptId,
     binding: work::RuntimeBinding,
     config_revision: work::ConfigRevision,
+    #[serde(default)]
+    unassigned_idle: bool,
     kind: Kind,
     outcome: Outcome,
     accepted_sequence: Option<u64>,
@@ -155,7 +157,10 @@ fn action_current(project: &Project, record: &ActionRecord) -> bool {
     (record.kind == Kind::Close || project.snapshot.config.revision == record.config_revision)
         && project.snapshot.tasks.iter().any(|t| {
             Some(&t.id.0) == record.target.task_id.as_ref()
-                && t.current_attempt_id.as_ref() == Some(&record.attempt)
+                && (t.current_attempt_id.as_ref() == Some(&record.attempt)
+                    || record.unassigned_idle
+                        && record.kind == Kind::Close
+                        && t.current_attempt_id.is_none())
                 && (record.kind == Kind::Close
                     || matches!(
                         t.state,
@@ -165,11 +170,12 @@ fn action_current(project: &Project, record: &ActionRecord) -> bool {
                             | work::WorkState::WaitingInput
                     ))
         })
-        && project.snapshot.attempts.iter().any(|a| {
-            a.id == record.attempt
-                && a.runtime_binding.as_ref() == Some(&record.binding)
-                && a.config.revision == record.config_revision
-        })
+        && (record.unassigned_idle && record.kind == Kind::Close
+            || project.snapshot.attempts.iter().any(|a| {
+                a.id == record.attempt
+                    && a.runtime_binding.as_ref() == Some(&record.binding)
+                    && a.config.revision == record.config_revision
+            }))
 }
 fn store(project: &mut Project, record: &ActionRecord) -> Result<(), String> {
     set_draft(
@@ -233,7 +239,7 @@ fn blocked(host: &CommandCenterHost, target: &cc::RouteTarget) -> bool {
         })
     })
 }
-fn closed(host: &CommandCenterHost, key: &str) -> bool {
+pub(in super::super) fn closed(host: &CommandCenterHost, key: &str) -> bool {
     host.remote_sessions
         .views
         .get(key)
@@ -276,7 +282,7 @@ pub(in super::super) fn close_cap(
         no("이미 종료된 원격 실행입니다.")
     } else if target_pending(host, target) || pending.pending() || blocked(host, target) {
         no("실제 원격 응답 또는 미확인 종료를 먼저 확인해 주세요.")
-    } else if pending.execution.is_some() {
+    } else if pending.execution.is_some() || pending.record.phase == Phase::ObservedIdle {
         yes()
     } else {
         no("현재 원격 실행의 프로세스·권한 증명이 필요합니다.")
@@ -343,6 +349,7 @@ pub(in super::super) fn begin(
             .clone()
             .ok_or("실행 바인딩이 없습니다.")?,
         config_revision: pending.record.config_revision,
+        unassigned_idle: pending.record.phase == Phase::ObservedIdle,
         kind: if text.is_some() {
             Kind::Input
         } else {
@@ -542,6 +549,38 @@ pub(in super::super) fn input_receipt(
         ),
     }
     true
+}
+pub(in super::super) fn uncertain_input(
+    host: &CommandCenterHost,
+    target: &cc::RouteTarget,
+) -> Option<(String, ExecutionLease)> {
+    host.remote_sessions
+        .actions
+        .iter()
+        .find(|(_, a)| {
+            a.record.target == *target
+                && a.record.kind == Kind::Input
+                && a.record.outcome == Outcome::Unknown
+                && a.stage == ActionStage::Done
+        })
+        .map(|(id, a)| (id.clone(), a.lease.clone()))
+}
+pub(in super::super) fn reconciled_input(
+    host: &mut CommandCenterHost,
+    id: &str,
+    receipt: &RemoteInputReceipt,
+) {
+    let Some(action) = host.remote_sessions.actions.get_mut(id).filter(|a| {
+        a.record.kind == Kind::Input
+            && a.record.outcome == Outcome::Unknown
+            && a.lease == receipt.lease
+            && a.record.operation == receipt.operation_id
+    }) else {
+        return;
+    };
+    action.stage = ActionStage::Await;
+    action.token = receipt.request_id;
+    input_receipt(host, receipt);
 }
 pub(in super::super) fn close_receipt(host: &mut CommandCenterHost, receipt: RemoteCloseReceipt) {
     let id = &receipt.operation_id.0;
@@ -1002,6 +1041,7 @@ mod tests {
             attempt: pending.record.attempt_id.clone(),
             binding: pending.record.binding.clone().unwrap(),
             config_revision: pending.record.config_revision,
+            unassigned_idle: false,
             kind,
             outcome: Outcome::Requested,
             accepted_sequence: None,

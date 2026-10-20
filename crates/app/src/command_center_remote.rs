@@ -2,6 +2,8 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 use wm::devices::{ExecutionLease, VerifiedExecutionLease};
+#[path = "command_center_remote_reconcile.rs"]
+pub(super) mod reconcile;
 #[path = "command_center_remote_sessions.rs"]
 pub(super) mod sessions;
 
@@ -34,6 +36,7 @@ pub(super) enum Phase {
     Admitted,
     Rejected,
     Unknown,
+    ObservedIdle,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Record {
@@ -99,6 +102,21 @@ impl Pending {
 }
 pub(super) fn target_for(host: &CommandCenterHost, task: &work::Task) -> Option<cc::RouteTarget> {
     let project = host.projects.get(&task.workspace_id.0)?;
+    if task.current_attempt_id.is_none()
+        && let Some((id, _)) = host.remotes.iter().find(|(_, p)| {
+            p.record.task_id == task.id
+                && p.record.workspace == task.workspace_id
+                && p.record.phase == Phase::ObservedIdle
+                && p.record.binding.is_some()
+                && p.lease.is_some()
+        })
+    {
+        return Some(cc::RouteTarget {
+            workspace_id: task.workspace_id.0.clone(),
+            task_id: Some(task.id.0.clone()),
+            session_id: Some(format!("remote:{id}")),
+        });
+    }
     let attempt = project
         .snapshot
         .attempts

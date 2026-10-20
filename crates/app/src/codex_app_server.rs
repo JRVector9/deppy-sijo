@@ -393,8 +393,50 @@ fn session_event_retained_bytes(event: &AgentSessionEvent) -> usize {
     }
 }
 
-/// A running local App Server process. It owns one writer worker and two reader
-/// threads; all JSON-RPC writes occur on the worker to preserve message order.
+/// Immutable provider request content, retained without duplicating command text in the worker.
+pub(crate) fn approval_request_fingerprint(approval: &AgentApproval) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update([match approval.kind {
+        AgentApprovalKind::CommandExecution => 0,
+        AgentApprovalKind::FileChange => 1,
+    }]);
+    for value in [
+        Some(approval.request_key.as_str()),
+        Some(&approval.thread_id),
+        Some(&approval.turn_id),
+        Some(&approval.item_id),
+        approval.reason.as_deref(),
+        approval.command.as_deref(),
+        approval.cwd.as_deref(),
+    ] {
+        digest.update([u8::from(value.is_some())]);
+        let value = value.unwrap_or("");
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// Retained authority for one deferred approval response. The callback must be nonblocking.
+type ApprovalAdmitter = dyn Fn(&mut dyn FnMut()) -> bool + Send + Sync;
+pub(crate) struct ApprovalResponseGuard {
+    admit: Box<ApprovalAdmitter>,
+}
+impl std::fmt::Debug for ApprovalResponseGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ApprovalResponseGuard { REDACTED }")
+    }
+}
+impl ApprovalResponseGuard {
+    pub(crate) fn new(admit: impl Fn(&mut dyn FnMut()) -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            admit: Box::new(admit),
+        }
+    }
+}
+
+/// A running local App Server process. All JSON-RPC writes use its single worker.
 pub struct CodexAppServerClient {
     commands: SyncSender<ClientCommand>,
     events: Arc<EventBacklog>,
@@ -649,10 +691,23 @@ impl CodexAppServerClient {
         request_key: String,
         decision: AgentApprovalDecision,
     ) -> anyhow::Result<()> {
+        self.respond_approval_guarded(session_id, request_key, decision, None, None)
+    }
+
+    pub(crate) fn respond_approval_guarded(
+        &self,
+        session_id: AgentSessionId,
+        request_key: String,
+        decision: AgentApprovalDecision,
+        expected: Option<[u8; 32]>,
+        guard: Option<ApprovalResponseGuard>,
+    ) -> anyhow::Result<()> {
         self.send(ClientCommand::RespondApproval {
             session_id,
             request_key,
             decision,
+            expected,
+            guard,
         })
     }
 
@@ -884,6 +939,8 @@ enum ClientCommand {
         session_id: AgentSessionId,
         request_key: String,
         decision: AgentApprovalDecision,
+        expected: Option<[u8; 32]>,
+        guard: Option<ApprovalResponseGuard>,
     },
     #[allow(dead_code)] // Constructed by the phase-2 public API consumer.
     ListThreads {
@@ -1124,7 +1181,10 @@ enum PendingRequest {
 
 #[derive(Debug)]
 struct ServerRequest {
+    fingerprint: [u8; 32],
     session_id: AgentSessionId,
+    thread_id: String,
+    turn_id: String,
     id: Value,
 }
 
@@ -1187,6 +1247,8 @@ impl WorkerState {
                         bytes
                             .saturating_add(key.len())
                             .saturating_add(request.session_id.len())
+                            .saturating_add(request.thread_id.len())
+                            .saturating_add(request.turn_id.len())
                             .saturating_add(rpc_key(&request.id).len())
                     }),
             )
@@ -1291,7 +1353,19 @@ fn worker_loop(
 
             match commands.recv_timeout(Duration::from_millis(20)) {
                 Ok(command) => {
-                    handle_client_command(command, &mut stdin, &mut state, &events, &repaint)
+                    if matches!(&command, ClientCommand::RespondApproval { .. }) {
+                        drain_incoming(
+                            &incoming_rx,
+                            &mut stdin,
+                            &mut state,
+                            &events,
+                            &repaint,
+                            &mut stderr_seen,
+                        );
+                    }
+                    if !state.stop_requested && !stop_requested.load(Ordering::Acquire) {
+                        handle_client_command(command, &mut stdin, &mut state, &events, &repaint);
+                    }
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -1495,7 +1569,10 @@ fn handle_client_command(
     events: &EventBacklog,
     repaint: &egui::Context,
 ) {
-    let preserves_lifecycle_on_error = matches!(&command, ClientCommand::SteerTurn { .. });
+    let preserves_lifecycle_on_error = matches!(
+        &command,
+        ClientCommand::SteerTurn { .. } | ClientCommand::RespondApproval { .. }
+    );
     let target = match &command {
         ClientCommand::StartSession { session_id, .. }
         | ClientCommand::SubmitTurn { session_id, .. }
@@ -1646,7 +1723,17 @@ fn handle_client_command(
             session_id,
             request_key,
             decision,
-        } => respond_approval(stdin, state, &session_id, &request_key, decision),
+            expected,
+            guard,
+        } => respond_approval(
+            stdin,
+            state,
+            &session_id,
+            &request_key,
+            decision,
+            expected,
+            guard.as_ref(),
+        ),
         ClientCommand::ListThreads {
             cursor,
             limit,
@@ -1946,6 +2033,8 @@ fn respond_approval(
     session_id: &AgentSessionId,
     request_key: &str,
     decision: AgentApprovalDecision,
+    expected: Option<[u8; 32]>,
+    guard: Option<&ApprovalResponseGuard>,
 ) -> anyhow::Result<()> {
     let Some(request) = state.server_requests.get(request_key) else {
         anyhow::bail!("해당 승인 요청이 이미 해소되었습니다");
@@ -1954,10 +2043,31 @@ fn respond_approval(
         &request.session_id == session_id,
         "다른 세션의 승인 요청에는 응답할 수 없습니다"
     );
-    write_message(
-        stdin,
-        &json!({"id": request.id, "result": {"decision": decision.wire_value()}}),
-    )
+    anyhow::ensure!(
+        state.session_to_thread.get(session_id) == Some(&request.thread_id)
+            && state.session_to_turn.get(session_id) == Some(&request.turn_id),
+        "승인 요청의 실행 턴이 바뀌었습니다"
+    );
+    anyhow::ensure!(
+        expected.is_none_or(|expected| expected == request.fingerprint),
+        "승인 요청의 내용이 바뀌었습니다"
+    );
+    let message = json!({"id": request.id, "result": {"decision": decision.wire_value()}});
+    if guard.is_some() || expected.is_some() {
+        let local = ApprovalResponseGuard::new(|effect| {
+            effect();
+            true
+        });
+        let guard = guard.unwrap_or(&local);
+        let mut bytes = serde_json::to_vec(&message)?;
+        bytes.push(b'\n');
+        stdin.write_guarded_approval_frame(&bytes, guard)?;
+    } else {
+        write_message(stdin, &message)?;
+    }
+    // Only one decision may be written for this exact provider request.
+    state.server_requests.remove(request_key);
+    Ok(())
 }
 
 fn request_thread_list(
@@ -2999,15 +3109,36 @@ fn handle_server_request(
     let additional_identifier_bytes = request_key
         .len()
         .saturating_mul(2)
-        .saturating_add(session_id.len());
+        .saturating_add(session_id.len())
+        .saturating_add(thread_id.len())
+        .saturating_add(turn_id.len());
     if !state.can_retain_identifier_bytes(additional_identifier_bytes) {
         let _ = write_server_error(stdin, id, -32000, "identifier_backpressure");
         return;
     }
+    let approval = AgentApproval {
+        request_key: request_key.clone(),
+        kind,
+        thread_id: thread_id.to_owned(),
+        turn_id: turn_id.to_owned(),
+        item_id: item_id.to_owned(),
+        reason: params
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        command: params
+            .get("command")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
+    };
     state.server_requests.insert(
         request_key.clone(),
         ServerRequest {
+            fingerprint: approval_request_fingerprint(&approval),
             session_id: session_id.clone(),
+            thread_id: thread_id.to_owned(),
+            turn_id: turn_id.to_owned(),
             id: id.clone(),
         },
     );
@@ -3015,24 +3146,7 @@ fn handle_server_request(
         events,
         repaint,
         session_id,
-        AgentSessionEvent::ApprovalRequested {
-            approval: AgentApproval {
-                request_key: request_key.clone(),
-                kind,
-                thread_id: thread_id.to_owned(),
-                turn_id: turn_id.to_owned(),
-                item_id: item_id.to_owned(),
-                reason: params
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                command: params
-                    .get("command")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
-                cwd: params.get("cwd").and_then(Value::as_str).map(str::to_owned),
-            },
-        },
+        AgentSessionEvent::ApprovalRequested { approval },
     );
     if !accepted {
         state.server_requests.remove(&request_key);
@@ -3096,6 +3210,58 @@ impl AppServerStdin {
             stream,
             stop_requested,
         })
+    }
+
+    /// An approval frame is atomic and small: never hold the origin fence during pipe polling.
+    /// Revocation before the actual write leaves the shared connection and request intact.
+    fn write_guarded_approval_frame(
+        &mut self,
+        bytes: &[u8],
+        guard: &ApprovalResponseGuard,
+    ) -> anyhow::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: stream owns this live pipe; querying its atomic-write bound has no side effects.
+            let limit = unsafe { libc::fpathconf(self.stream.as_raw_fd(), libc::_PC_PIPE_BUF) };
+            anyhow::ensure!(
+                limit > 0 && bytes.len() <= limit as usize,
+                "approval_frame_not_atomic"
+            );
+            anyhow::ensure!(
+                !self.stop_requested.load(Ordering::Acquire),
+                "app-server stopped"
+            );
+            let mut write = None;
+            let current = (guard.admit)(&mut || {
+                write = Some(self.stream.write(bytes));
+            });
+            anyhow::ensure!(current, "approval authority expired");
+            match write.ok_or_else(|| anyhow::anyhow!("approval authority withheld"))? {
+                Ok(count) if count == bytes.len() => Ok(()),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // Do not wait while provider cancellation/replacement is queued. A new
+                    // explicit response revalidates the current request through the worker.
+                    anyhow::bail!(
+                        "승인 응답 연결이 혼잡합니다. 현재 요청을 다시 확인한 뒤 재시도해 주세요."
+                    )
+                }
+                _ => {
+                    self.stop_requested.store(true, Ordering::Release);
+                    anyhow::bail!("approval atomic write failed")
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (bytes, guard);
+            anyhow::bail!("guarded approval writes are unavailable on this platform")
+        }
     }
 
     fn write_frame(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -3204,6 +3370,176 @@ fn emit_transport_error(events: &EventBacklog, repaint: &egui::Context, message:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_center_approval_worker_fences_owner_turn_content_and_revocation_at_write() {
+        use std::io::Read as _;
+        let mut command = Command::new("cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+        let mut output = child.child_mut().stdout.take().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut stdin =
+            AppServerStdin::new(child.child_mut().stdin.take().unwrap(), stopped.clone()).unwrap();
+        let mut state = WorkerState::default();
+        state
+            .session_to_thread
+            .insert("owner".into(), "thread".into());
+        state.session_to_turn.insert("owner".into(), "turn".into());
+        state.server_requests.insert(
+            "key".into(),
+            ServerRequest {
+                session_id: "owner".into(),
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+                id: json!(42),
+                fingerprint: [1; 32],
+            },
+        );
+        let answer = AgentApprovalDecision::Accept;
+        assert!(
+            respond_approval(
+                &mut stdin,
+                &mut state,
+                &"other".into(),
+                "key",
+                answer,
+                Some([1; 32]),
+                None
+            )
+            .is_err()
+        );
+        state
+            .session_to_turn
+            .insert("owner".into(), "new-turn".into());
+        assert!(
+            respond_approval(
+                &mut stdin,
+                &mut state,
+                &"owner".into(),
+                "key",
+                answer,
+                Some([1; 32]),
+                None
+            )
+            .is_err()
+        );
+        state.session_to_turn.insert("owner".into(), "turn".into());
+        assert!(
+            respond_approval(
+                &mut stdin,
+                &mut state,
+                &"owner".into(),
+                "key",
+                answer,
+                Some([2; 32]),
+                None
+            )
+            .is_err()
+        );
+        let revoked = ApprovalResponseGuard::new(|_| false);
+        assert!(
+            respond_approval(
+                &mut stdin,
+                &mut state,
+                &"owner".into(),
+                "key",
+                answer,
+                Some([1; 32]),
+                Some(&revoked)
+            )
+            .is_err()
+        );
+        assert!(!stopped.load(Ordering::Acquire));
+        assert!(state.server_requests.contains_key("key"));
+        let allowed = ApprovalResponseGuard::new(|effect| {
+            effect();
+            true
+        });
+        respond_approval(
+            &mut stdin,
+            &mut state,
+            &"owner".into(),
+            "key",
+            answer,
+            Some([1; 32]),
+            Some(&allowed),
+        )
+        .unwrap();
+        assert!(
+            respond_approval(
+                &mut stdin,
+                &mut state,
+                &"owner".into(),
+                "key",
+                answer,
+                Some([1; 32]),
+                Some(&allowed)
+            )
+            .is_err()
+        );
+        drop(stdin);
+        let mut text = String::new();
+        output.read_to_string(&mut text).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "failed or duplicate decisions must never reach the pipe"
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(text.trim()).unwrap(),
+            json!({"id":42,"result":{"decision":answer.wire_value()}})
+        );
+        child.terminate();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_center_approval_pipe_backpressure_returns_without_stopping_transport() {
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "sleep 10"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+        let stopped = Arc::new(AtomicBool::new(false));
+        let mut stdin =
+            AppServerStdin::new(child.child_mut().stdin.take().unwrap(), stopped.clone()).unwrap();
+        loop {
+            match stdin.stream.write(&[0; 4096]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("{error}"),
+            }
+        }
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = calls.clone();
+        let guard = ApprovalResponseGuard::new(move |effect| {
+            if observed.fetch_add(1, Ordering::SeqCst) == 0 {
+                effect();
+                true
+            } else {
+                false
+            }
+        });
+        assert!(
+            stdin
+                .write_guarded_approval_frame(b"{}\n", &guard)
+                .unwrap_err()
+                .to_string()
+                .contains("혼잡")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(!stopped.load(Ordering::Acquire));
+        child.terminate();
+    }
 
     #[test]
     fn app_server_args_기본은_오버라이드_없이_고정_argv다() {

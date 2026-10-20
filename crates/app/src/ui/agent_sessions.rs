@@ -624,6 +624,37 @@ impl PendingThreadRequest {
     }
 }
 
+/// Opaque UI handle binds the displayed evidence as well as the provider's request identity.
+/// A reused RPC key or changed command must never approve a different question.
+pub(crate) fn command_center_approval_id(
+    session: &AgentSession,
+    approval: &crate::agent_session::AgentApproval,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    let kind = format!("{:?}", approval.kind);
+    for value in [
+        session.workspace_id.as_deref().unwrap_or(""),
+        &session.id,
+        &approval.thread_id,
+        &approval.turn_id,
+        &approval.item_id,
+        &approval.request_key,
+        &kind,
+        approval.command.as_deref().unwrap_or(""),
+        approval.cwd.as_deref().unwrap_or(""),
+        approval.reason.as_deref().unwrap_or(""),
+    ] {
+        digest.update((value.len() as u64).to_le_bytes());
+        digest.update(value.as_bytes());
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 /// App-owned UI/controller for one shared local Codex App Server connection.
 pub struct AgentSessionsUi {
     open: bool,
@@ -694,6 +725,7 @@ pub struct AgentSessionsUi {
     localized_session_errors: HashMap<AgentSessionId, CatalogMessage>,
     /// Latest render generation for exact stale-action rejection.
     frame_generation: u64,
+    command_center_approval_revision: u64,
 }
 
 impl AgentSessionsUi {
@@ -749,6 +781,7 @@ impl AgentSessionsUi {
             ),
             localized_session_errors: HashMap::new(),
             frame_generation: 0,
+            command_center_approval_revision: 0,
         }
     }
 
@@ -833,6 +866,74 @@ impl AgentSessionsUi {
             .iter()
             .map(|session| session.id.clone())
             .collect()
+    }
+
+    /// Exact live requests for the owning workspace. Never infer ownership from selection/title.
+    pub(crate) fn command_center_pending_approvals<'a>(
+        &'a self,
+        workspace_id: &'a str,
+    ) -> impl Iterator<Item = (&'a AgentSession, &'a crate::agent_session::AgentApproval)> {
+        self.sessions
+            .iter()
+            .filter(move |session| {
+                session.workspace_id.as_deref() == Some(workspace_id)
+                    && session.status == AgentSessionStatus::AwaitingApproval
+            })
+            .flat_map(|session| {
+                session
+                    .approvals
+                    .iter()
+                    .filter(move |approval| {
+                        session.thread_id.as_deref() == Some(approval.thread_id.as_str())
+                            && session.turn_id.as_deref() == Some(approval.turn_id.as_str())
+                    })
+                    .map(move |approval| (session, approval))
+            })
+    }
+
+    pub(crate) fn command_center_approvals_revision(&self) -> (u64, bool) {
+        (self.command_center_approval_revision, self.client.is_some())
+    }
+
+    pub(crate) fn command_center_approval_connected(&self) -> bool {
+        self.client.is_some()
+    }
+
+    /// Respond to exactly the displayed request, independently of the selected surface.
+    pub(crate) fn respond_command_center_approval(
+        &mut self,
+        workspace_id: &str,
+        session_id: &str,
+        approval_id: &str,
+        decision: AgentApprovalDecision,
+        guard: Option<crate::codex_app_server::ApprovalResponseGuard>,
+        ctx: &egui::Context,
+    ) -> anyhow::Result<()> {
+        let (_, approval) = self
+            .command_center_pending_approvals(workspace_id)
+            .find(|(session, approval)| {
+                session.id == session_id
+                    && command_center_approval_id(session, approval) == approval_id
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "승인 요청이 바뀌었거나 현재 프로젝트의 요청이 아닙니다. 다시 확인해 주세요."
+                )
+            })?;
+        self.client
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Codex App Server is not connected"))?
+            .respond_approval_guarded(
+                session_id.to_owned(),
+                approval.request_key.clone(),
+                decision,
+                Some(crate::codex_app_server::approval_request_fingerprint(
+                    approval,
+                )),
+                guard,
+            )?;
+        ctx.request_repaint();
+        Ok(())
     }
 
     /// fleet 뷰용 라이브 구조화(App Server) 세션 요약. Off(중단/종료)는 제외해 "지금
@@ -1191,6 +1292,8 @@ impl AgentSessionsUi {
             local_session_id: session_id.clone(),
         })?;
         self.remove_persisted_row(&session_id);
+        self.command_center_approval_revision =
+            self.command_center_approval_revision.wrapping_add(1);
         self.sessions.retain(|session| session.id != session_id);
         self.localized_session_errors.remove(&session_id);
         self.pending_thread_requests
@@ -1931,6 +2034,8 @@ impl AgentSessionsUi {
                     }
                     self.attached_threads.remove(&session_id);
                     self.remove_persisted_row(&session_id);
+                    self.command_center_approval_revision =
+                        self.command_center_approval_revision.wrapping_add(1);
                     self.sessions.retain(|session| session.id != session_id);
                     self.localized_session_errors.remove(&session_id);
                     if self.selected_session.as_deref() == Some(session_id.as_str()) {
@@ -3590,6 +3695,21 @@ impl AgentSessionsUi {
     }
 
     fn apply_session_event(&mut self, session_id: &str, event: AgentSessionEvent) {
+        if matches!(
+            &event,
+            AgentSessionEvent::ApprovalRequested { .. }
+                | AgentSessionEvent::ApprovalResolved { .. }
+                | AgentSessionEvent::ThreadStarted { .. }
+                | AgentSessionEvent::TurnStarted { .. }
+                | AgentSessionEvent::TurnCompleted { .. }
+                | AgentSessionEvent::ThreadStatusChanged { .. }
+                | AgentSessionEvent::Failed { .. }
+                | AgentSessionEvent::Stopped
+        ) {
+            self.command_center_approval_revision =
+                self.command_center_approval_revision.wrapping_add(1);
+        }
+
         // Any event delivered by the runtime promotes a DB-synthesized row into controller-owned
         // state. It must survive an authoritative catalog refresh even when the event itself leaves
         // the visible lifecycle in `Stopped`.
@@ -4253,6 +4373,120 @@ mod tests {
             command: Some("cargo test".to_owned()),
             cwd: None,
         }
+    }
+
+    fn command_center_approval_session() -> AgentSession {
+        let mut session = AgentSession::new(
+            "approval-app".into(),
+            "Review changes".into(),
+            Some("/repo".into()),
+        );
+        session.workspace_id = Some("workspace-a".into());
+        session.apply(AgentSessionEvent::ThreadStarted {
+            thread_id: "thread-1".into(),
+        });
+        session.apply(AgentSessionEvent::TurnStarted {
+            turn_id: "turn-1".into(),
+        });
+        session.apply(AgentSessionEvent::ApprovalRequested {
+            approval: approval("request-one"),
+        });
+        session
+    }
+
+    #[test]
+    fn command_center_approval_projects_real_requests_for_exact_owner_only() {
+        let mut ui = AgentSessionsUi::new();
+        ui.sessions.push(command_center_approval_session());
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-a")
+                .map(|(_, a)| a.request_key.as_str())
+                .collect::<Vec<_>>(),
+            ["request-one"]
+        );
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-b").count(),
+            0
+        );
+        ui.sessions[0].turn_id = Some("turn-2".into());
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-a").count(),
+            0
+        );
+        ui.sessions[0].turn_id = Some("turn-1".into());
+        ui.sessions[0].thread_id = Some("replacement-thread".into());
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-a").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn command_center_approval_keeps_multiple_exact_requests_without_selecting_another_session() {
+        let mut ui = AgentSessionsUi::new();
+        let mut session = command_center_approval_session();
+        session.apply(AgentSessionEvent::ApprovalRequested {
+            approval: approval("request-two"),
+        });
+        ui.sessions.push(session);
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-a").count(),
+            2
+        );
+        assert!(ui.selected_surface.is_none());
+        ui.sessions[0].status = AgentSessionStatus::Stopped;
+        assert_eq!(
+            ui.command_center_pending_approvals("workspace-a").count(),
+            0
+        );
+    }
+
+    #[test]
+    fn command_center_approval_rejects_stale_handle_and_other_workspace_before_transport() {
+        let mut ui = AgentSessionsUi::new();
+        ui.sessions.push(command_center_approval_session());
+        let id = command_center_approval_id(&ui.sessions[0], &ui.sessions[0].approvals[0]);
+        let ctx = egui::Context::default();
+        let exact = ui
+            .respond_command_center_approval(
+                "workspace-a",
+                "approval-app",
+                &id,
+                AgentApprovalDecision::Accept,
+                None,
+                &ctx,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(exact.contains("not connected"));
+        assert!(
+            ui.respond_command_center_approval(
+                "workspace-b",
+                "approval-app",
+                &id,
+                AgentApprovalDecision::Accept,
+                None,
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("승인 요청이 바뀌")
+        );
+        ui.sessions[0].approvals[0].command = Some("different command".into());
+        assert!(
+            ui.respond_command_center_approval(
+                "workspace-a",
+                "approval-app",
+                &id,
+                AgentApprovalDecision::Accept,
+                None,
+                &ctx
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("승인 요청이 바뀌")
+        );
+        assert!(ui.selected_surface.is_none());
     }
 
     #[test]

@@ -480,6 +480,21 @@ mod tests {
         assert_eq!(value["projects"][0]["main_input"]["enabled"], true);
     }
     #[test]
+    fn work_pending_project_approvals_require_independent_approval_permission() {
+        let snapshot = json!({"projects":[{"id":"w","pending_approvals":[{"target":{"workspace_id":"w","session_id":"exact"},"session_title":"owner","approval":{"id":"real","command":"private command","action":{"enabled":true}}}]}]});
+        for input in [false, true] {
+            let frame: Value =
+                serde_json::from_str(&encode_frame(&snapshot, input, false).unwrap()).unwrap();
+            assert!(frame["snapshot"]["projects"][0]["pending_approvals"][0]["approval"].is_null());
+        }
+        let frame: Value =
+            serde_json::from_str(&encode_frame(&snapshot, false, true).unwrap()).unwrap();
+        assert_eq!(
+            frame["snapshot"]["projects"][0]["pending_approvals"][0]["approval"]["command"],
+            "private command"
+        );
+    }
+    #[test]
     fn work_projection_is_bounded_and_null_clears_layout() {
         assert!(encode_frame(&json!(null), false, false).is_ok());
         assert!(encode_frame(&json!({"projects":[],"token":"secret"}), true, true).is_err());

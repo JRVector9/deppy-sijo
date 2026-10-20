@@ -377,6 +377,7 @@ fn session_event_retained_bytes(event: &AgentSessionEvent) -> usize {
         AgentSessionEvent::ApprovalRequested { approval } => approval
             .request_key
             .len()
+            .saturating_add(approval.command_center_scope.as_ref().map_or(0, |_| 32))
             .saturating_add(approval.thread_id.len())
             .saturating_add(approval.turn_id.len())
             .saturating_add(approval.item_id.len())
@@ -397,6 +398,14 @@ fn session_event_retained_bytes(event: &AgentSessionEvent) -> usize {
 pub(crate) fn approval_request_fingerprint(approval: &AgentApproval) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
+    digest.update([u8::from(approval.command_center_scope.is_some())]);
+    digest.update(
+        approval
+            .command_center_scope
+            .as_deref()
+            .copied()
+            .unwrap_or_default(),
+    );
     digest.update([match approval.kind {
         AgentApprovalKind::CommandExecution => 0,
         AgentApprovalKind::FileChange => 1,
@@ -1353,17 +1362,23 @@ fn worker_loop(
 
             match commands.recv_timeout(Duration::from_millis(20)) {
                 Ok(command) => {
-                    if matches!(&command, ClientCommand::RespondApproval { .. }) {
-                        drain_incoming(
+                    if let ClientCommand::RespondApproval { session_id, .. } = &command
+                        && !drain_incoming(
                             &incoming_rx,
                             &mut stdin,
                             &mut state,
                             &events,
                             &repaint,
                             &mut stderr_seen,
-                        );
+                        )
+                    {
+                        emit_session(&events, &repaint, session_id.clone(), AgentSessionEvent::ControlError { message: "승인 상태 갱신이 밀려 있습니다. 현재 요청을 다시 확인한 뒤 재시도해 주세요.".into() });
+                        continue;
                     }
-                    if !state.stop_requested && !stop_requested.load(Ordering::Acquire) {
+                    if !state.stop_requested
+                        && !stop_requested.load(Ordering::Acquire)
+                        && !events.overflowed()
+                    {
                         handle_client_command(command, &mut stdin, &mut state, &events, &repaint);
                     }
                 }
@@ -1534,7 +1549,7 @@ fn drain_incoming(
     events: &EventBacklog,
     repaint: &egui::Context,
     stderr_seen: &mut bool,
-) {
+) -> bool {
     for _ in 0..INCOMING_DRAIN_PER_TICK {
         match incoming.try_recv() {
             Ok(Incoming::Json(message)) => {
@@ -1557,9 +1572,10 @@ fn drain_incoming(
                 state.stop_requested = true;
             }
             Ok(Incoming::Stderr) => *stderr_seen = true,
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return true,
         }
     }
+    false
 }
 
 fn handle_client_command(
@@ -3046,6 +3062,51 @@ fn handle_notification(
     }
 }
 
+/// Fail closed for provider variants whose execution scope is not shown by CHECK.
+fn command_center_approval_scope(params: &Value, kind: AgentApprovalKind) -> Option<Box<[u8; 32]>> {
+    use sha2::{Digest, Sha256};
+    let object = params.as_object()?;
+    const KEYS: &[&str] = &[
+        "approvalId",
+        "command",
+        "commandActions",
+        "cwd",
+        "environmentId",
+        "itemId",
+        "kind",
+        "networkApprovalContext",
+        "proposedExecpolicyAmendment",
+        "proposedNetworkPolicyAmendments",
+        "reason",
+        "startedAtMs",
+        "threadId",
+        "turnId",
+    ];
+    if kind != AgentApprovalKind::CommandExecution
+        || object.keys().any(|key| !KEYS.contains(&key.as_str()))
+        || params
+            .get("kind")
+            .is_some_and(|value| value.as_str() != Some("command"))
+        || !params["environmentId"].is_null()
+        || !params["networkApprovalContext"].is_null()
+        || params
+            .get("command")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+        || params
+            .get("cwd")
+            .and_then(Value::as_str)
+            .is_none_or(|value| value.trim().is_empty())
+    {
+        return None;
+    }
+    // Hash the entire request, including callback/scope/advisory fields. Unknown fields
+    // cannot silently gain local-command authority after a provider schema change.
+    Some(Box::new(
+        Sha256::digest(serde_json::to_vec(params).ok()?).into(),
+    ))
+}
+
 fn handle_server_request(
     message: Value,
     stdin: &mut AppServerStdin,
@@ -3117,6 +3178,7 @@ fn handle_server_request(
         return;
     }
     let approval = AgentApproval {
+        command_center_scope: command_center_approval_scope(params, kind),
         request_key: request_key.clone(),
         kind,
         thread_id: thread_id.to_owned(),
@@ -3370,6 +3432,96 @@ fn emit_transport_error(events: &EventBacklog, repaint: &egui::Context, message:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn command_center_approval_real_provider_parser_preserves_supported_scope_and_fences_variants()
+    {
+        let mut command = Command::new("cat");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_process_group(&mut command);
+        let mut child = ChildTreeGuard::new(command.spawn().unwrap());
+        let mut stdin = AppServerStdin::new(
+            child.child_mut().stdin.take().unwrap(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .unwrap();
+        let mut state = WorkerState::default();
+        state
+            .thread_to_session
+            .insert("thread".into(), "session".into());
+        let params = json!({"threadId":"thread","turnId":"turn","itemId":"item","command":"cargo test","cwd":"/repo","reason":"test","startedAtMs":10});
+        let events = EventBacklog::default();
+        let ctx = egui::Context::default();
+        for (index, (key, value)) in [
+            ("kind", json!("command")),
+            ("kind", json!("writeStdin")),
+            ("environmentId", json!("remote-env")),
+            (
+                "networkApprovalContext",
+                json!({"host":"example.test","protocol":"https"}),
+            ),
+            ("futureAuthority", json!(true)),
+            ("cwd", Value::Null),
+            ("command", json!("")),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut variant = params.clone();
+            variant[key] = value;
+            handle_server_request(
+                json!({"id":index,"method":"item/commandExecution/requestApproval","params":variant}),
+                &mut stdin,
+                &mut state,
+                &events,
+                &ctx,
+            );
+            let event = events.drain().pop().unwrap();
+            let CodexAppServerEvent::Session {
+                event: AgentSessionEvent::ApprovalRequested { approval },
+                ..
+            } = event
+            else {
+                panic!("real parser must emit the actual approval")
+            };
+            assert_eq!(
+                approval.command_center_scope.is_some(),
+                index == 0,
+                "scope variant {key}"
+            );
+        }
+        let original =
+            command_center_approval_scope(&params, AgentApprovalKind::CommandExecution).unwrap();
+        let mut callback = params.clone();
+        callback["approvalId"] = json!("different-callback");
+        assert_ne!(
+            Some(original),
+            command_center_approval_scope(&callback, AgentApprovalKind::CommandExecution)
+        );
+        assert!(command_center_approval_scope(&params, AgentApprovalKind::FileChange).is_none());
+        // A cancellation past the bounded drain cannot be skipped to approve stale state.
+        let (tx, rx) = mpsc::sync_channel(INCOMING_DRAIN_PER_TICK + 1);
+        for _ in 0..INCOMING_DRAIN_PER_TICK {
+            tx.send(Incoming::Stderr).unwrap();
+        }
+        tx.send(Incoming::Json(
+            json!({"method":"serverRequest/resolved","params":{"threadId":"thread","requestId":0}}),
+        ))
+        .unwrap();
+        assert!(!drain_incoming(
+            &rx, &mut stdin, &mut state, &events, &ctx, &mut false
+        ));
+        assert!(state.server_requests.contains_key("0"));
+        assert!(drain_incoming(
+            &rx, &mut stdin, &mut state, &events, &ctx, &mut false
+        ));
+        assert!(!state.server_requests.contains_key("0"));
+        child.terminate();
+    }
 
     #[cfg(unix)]
     #[test]

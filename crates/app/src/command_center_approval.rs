@@ -33,7 +33,8 @@ impl App {
                 .as_deref()
                 .or(session.cwd.as_deref())
                 .unwrap_or("폴더 정보 없음");
-            let supported = request.kind == AgentApprovalKind::CommandExecution
+            let supported = request.command_center_scope.is_some()
+                && request.kind == AgentApprovalKind::CommandExecution
                 && directory.len() <= 1024
                 && command.len() <= MAX_COMMAND_BYTES
                 && command.len() + directory.len() + 512 <= *budget
@@ -44,6 +45,8 @@ impl App {
                 no("현재 App Server 연결이 없습니다. 원문 세션을 다시 연결해 주세요.")
             } else if request.kind == AgentApprovalKind::FileChange {
                 no("파일 변경 원문은 실제 세션의 승인 화면에서 확인해 주세요.")
+            } else if request.command_center_scope.is_none() {
+                no("실행 환경·네트워크·입력 승인 범위는 실제 세션의 승인 화면에서 확인해 주세요.")
             } else if !supported {
                 no("승인 원문이 길거나 불완전합니다. 실제 세션의 승인 화면에서 확인해 주세요.")
             } else {

@@ -632,6 +632,9 @@ pub(crate) fn command_center_approval_id(
 ) -> String {
     use sha2::{Digest, Sha256};
     let mut digest = Sha256::new();
+    digest.update(crate::codex_app_server::approval_request_fingerprint(
+        approval,
+    ));
     let kind = format!("{:?}", approval.kind);
     for value in [
         session.workspace_id.as_deref().unwrap_or(""),
@@ -920,6 +923,10 @@ impl AgentSessionsUi {
                     "승인 요청이 바뀌었거나 현재 프로젝트의 요청이 아닙니다. 다시 확인해 주세요."
                 )
             })?;
+        anyhow::ensure!(
+            approval.command_center_scope.is_some(),
+            "이 승인 범위는 실제 세션에서 확인해 주세요."
+        );
         self.client
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Codex App Server is not connected"))?
@@ -4364,6 +4371,7 @@ mod tests {
 
     fn approval(key: &str) -> AgentApproval {
         AgentApproval {
+            command_center_scope: Some(Box::new([1; 32])),
             request_key: key.to_owned(),
             kind: AgentApprovalKind::CommandExecution,
             thread_id: "thread-1".to_owned(),

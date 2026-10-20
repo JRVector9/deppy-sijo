@@ -395,6 +395,8 @@ impl AgentItem {
 /// JSON-RPC ID remains in the transport; the UI only handles the opaque key.
 #[derive(PartialEq, Eq)]
 pub struct AgentApproval {
+    /// Exact plain-local command scope; absent means Command Center must defer to the original session.
+    pub command_center_scope: Option<Box<[u8; 32]>>,
     pub request_key: String,
     pub kind: AgentApprovalKind,
     pub thread_id: String,
@@ -1520,6 +1522,7 @@ mod tests {
         });
         session.apply(AgentSessionEvent::ApprovalRequested {
             approval: AgentApproval {
+                command_center_scope: None,
                 request_key: "request-1".to_owned(),
                 kind: AgentApprovalKind::CommandExecution,
                 thread_id: "thread-1".to_owned(),
@@ -1855,6 +1858,7 @@ mod tests {
             });
             session.apply(AgentSessionEvent::ApprovalRequested {
                 approval: AgentApproval {
+                    command_center_scope: None,
                     request_key: "same-approval".to_owned(),
                     kind: AgentApprovalKind::CommandExecution,
                     thread_id: "thread-1".to_owned(),
@@ -1939,6 +1943,7 @@ mod tests {
     fn debug_and_diagnostics_redact_hostile_content() {
         let secret = "Bearer super-secret-token";
         let approval = AgentApproval {
+            command_center_scope: None,
             request_key: "request-1".to_owned(),
             kind: AgentApprovalKind::CommandExecution,
             thread_id: "thread-1".to_owned(),
@@ -1970,6 +1975,7 @@ mod tests {
         for index in 0..=MAX_PENDING_APPROVALS {
             session.apply(AgentSessionEvent::ApprovalRequested {
                 approval: AgentApproval {
+                    command_center_scope: None,
                     request_key: format!("request-{index}"),
                     kind: AgentApprovalKind::CommandExecution,
                     thread_id: "thread-1".to_owned(),
@@ -1993,6 +1999,7 @@ mod tests {
         let mut exact = AgentSession::new("local-1".to_owned(), "bounded".to_owned(), None);
         exact.apply(AgentSessionEvent::ApprovalRequested {
             approval: AgentApproval {
+                command_center_scope: None,
                 request_key: "request-exact".to_owned(),
                 kind: AgentApprovalKind::CommandExecution,
                 thread_id: "thread-1".to_owned(),
@@ -2012,6 +2019,7 @@ mod tests {
         let mut oversized = AgentSession::new("local-2".to_owned(), "bounded".to_owned(), None);
         oversized.apply(AgentSessionEvent::ApprovalRequested {
             approval: AgentApproval {
+                command_center_scope: None,
                 request_key: "request-oversized".to_owned(),
                 kind: AgentApprovalKind::CommandExecution,
                 thread_id: "thread-1".to_owned(),

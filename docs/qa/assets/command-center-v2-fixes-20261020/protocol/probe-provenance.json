@@ -1,0 +1,27 @@
+{
+  "baseline_revision": "8e8a3937",
+  "baseline_source_sha256": {
+    "crates/app/src/agent_session.rs": "0cfd526b9043fe8a844259828593528165c98edda447abab7f9702ed42630de1",
+    "crates/app/src/codex_app_server.rs": "3270284d106ef97b6f2470ba077e702fea83ac5663758015fd2dba2b8036ec5c"
+  },
+  "green_revision": "integration working tree after scope/bounded-drain/overflow correction",
+  "green_source_sha256": {
+    "crates/app/src/agent_session.rs": "a8c4fe43d26e6fbbe1d801d1d06ec8f0eea46533a6f17d635640661d9119f078",
+    "crates/app/src/codex_app_server.rs": "e6b35814fefff31a46a15fb5f6817cf923617ce86ddd6a53b50b21473829325a"
+  },
+  "rustc": "rustc 1.96.1 (31fca3adb 2026-06-26)",
+  "dependencies": {
+    "anyhow": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libanyhow-c83e308520a2d00c.rlib",
+    "serde_json": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libserde_json-2404458be2c381a8.rlib",
+    "egui": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libegui-74f4a9322b4057de.rlib",
+    "secret": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libsecret-7c2e041183397669.rlib",
+    "sha2": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libsha2-57b46d617c3e4855.rlib",
+    "libc": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/liblibc-4c1b1b253e0653ec.rlib",
+    "uuid": "/Users/jr/Desktop/projects/deppy-sijo-cc-fix-workflow-20261020/target/debug/deps/libuuid-9227b186e9b18d93.rlib"
+  },
+  "red_pattern": "independent_scope_review",
+  "green_patterns": [
+    "independent_",
+    "command_center_approval"
+  ]
+}

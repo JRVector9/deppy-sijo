@@ -1,0 +1,31 @@
+
+running 3 tests
+test codex_app_server::independent_scope_review::independent_execution_environment_must_not_share_local_authority ... FAILED
+test codex_app_server::independent_scope_review::independent_network_scope_must_not_share_plain_command_authority ... FAILED
+test codex_app_server::independent_scope_review::independent_write_stdin_must_not_share_plain_command_authority ... FAILED
+
+failures:
+
+failures:
+    codex_app_server::independent_scope_review::independent_execution_environment_must_not_share_local_authority
+    codex_app_server::independent_scope_review::independent_network_scope_must_not_share_plain_command_authority
+    codex_app_server::independent_scope_review::independent_write_stdin_must_not_share_plain_command_authority
+
+test result: FAILED. 0 passed; 3 failed; 0 ignored; 0 measured; 64 filtered out; finished in 0.00s
+
+
+thread 'codex_app_server::independent_scope_review::independent_execution_environment_must_not_share_local_authority' (179247043) panicked at /private/tmp/deppy-cc-f07-durable-red-20261020/codex_app_server.rs:4718:9:
+assertion `left != right` failed: provider scope changed, so stale plain-command confirmation must not remain valid
+  left: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]
+ right: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+thread 'codex_app_server::independent_scope_review::independent_network_scope_must_not_share_plain_command_authority' (179247069) panicked at /private/tmp/deppy-cc-f07-durable-red-20261020/codex_app_server.rs:4718:9:
+assertion `left != right` failed: provider scope changed, so stale plain-command confirmation must not remain valid
+  left: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]
+ right: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]
+
+thread 'codex_app_server::independent_scope_review::independent_write_stdin_must_not_share_plain_command_authority' (179247082) panicked at /private/tmp/deppy-cc-f07-durable-red-20261020/codex_app_server.rs:4718:9:
+assertion `left != right` failed: provider scope changed, so stale plain-command confirmation must not remain valid
+  left: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]
+ right: [120, 171, 196, 10, 252, 60, 196, 239, 144, 193, 224, 113, 52, 148, 158, 21, 167, 39, 209, 7, 212, 32, 200, 158, 39, 137, 182, 185, 16, 12, 36, 39]

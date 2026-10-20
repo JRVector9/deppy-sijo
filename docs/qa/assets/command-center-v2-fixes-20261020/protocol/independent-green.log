@@ -1,0 +1,8 @@
+
+running 4 tests
+test codex_app_server::independent_control_review::independent_actual_approval_control_failure_preserves_lifecycle ... ok
+test codex_app_server::independent_scope_review::independent_execution_environment_must_not_share_local_authority ... ok
+test codex_app_server::independent_scope_review::independent_network_scope_must_not_share_plain_command_authority ... ok
+test codex_app_server::independent_scope_review::independent_write_stdin_must_not_share_plain_command_authority ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 64 filtered out; finished in 0.01s

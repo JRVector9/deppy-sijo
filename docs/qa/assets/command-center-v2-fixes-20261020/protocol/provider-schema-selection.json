@@ -1,0 +1,222 @@
+{
+  "provider": "codex-cli 0.163.0",
+  "generated_with": "codex app-server generate-json-schema --out /private/tmp/deppy-cc-f07-protocol-review-20261020",
+  "note": "Selected exact schema fields; omitted definitions are not a full validation schema. Original full-file SHA256 values follow. No listening server or provider session started.",
+  "full_file_sha256": {
+    "CommandExecutionRequestApprovalParams.json": "16a71816c2d66e319c2c4aa83dd636dfdc43c61e72b6d5475e421ce08d8e6558",
+    "CommandExecutionRequestApprovalResponse.json": "6d0767113e22f311381809b6b236b0dde2b99b01992879c26bf7b1ea0e003cb7",
+    "v2/ServerRequestResolvedNotification.json": "4f03d586a5af04edd912cad08cc97eceb658e7e06744565e6d41a93e04a55966"
+  },
+  "request_properties": {
+    "approvalId": {
+      "description": "Unique identifier for this specific approval callback.\n\nFor regular shell/unified_exec approvals, this is null.\n\nFor zsh-exec-bridge subcommand approvals, multiple callbacks can belong to one parent `itemId`, so `approvalId` is a distinct opaque callback id (a UUID) used to disambiguate routing. Stdin approvals also use a distinct callback id; inspect `kind` to distinguish them.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "command": {
+      "description": "The command to be executed.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "cwd": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/LegacyAppPathString"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "The command's working directory."
+    },
+    "environmentId": {
+      "default": null,
+      "description": "Environment in which the command will run.",
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "kind": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/CommandExecutionApprovalKind"
+        }
+      ],
+      "default": "command",
+      "description": "Kind of action under review. Defaults to `command` for older servers."
+    },
+    "networkApprovalContext": {
+      "anyOf": [
+        {
+          "$ref": "#/definitions/NetworkApprovalContext"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Optional context for a managed-network approval prompt."
+    },
+    "startedAtMs": {
+      "description": "Unix timestamp (in milliseconds) when this approval request started.",
+      "format": "int64",
+      "type": "integer"
+    }
+  },
+  "request_required": [
+    "itemId",
+    "startedAtMs",
+    "threadId",
+    "turnId"
+  ],
+  "scope_definitions": {
+    "CommandExecutionApprovalKind": {
+      "description": "Distinguishes a command approval from input sent to an existing terminal.",
+      "enum": [
+        "command",
+        "writeStdin"
+      ],
+      "type": "string"
+    },
+    "NetworkApprovalContext": {
+      "properties": {
+        "host": {
+          "type": "string"
+        },
+        "protocol": {
+          "$ref": "#/definitions/NetworkApprovalProtocol"
+        }
+      },
+      "required": [
+        "host",
+        "protocol"
+      ],
+      "type": "object"
+    },
+    "NetworkApprovalProtocol": {
+      "enum": [
+        "http",
+        "https",
+        "socks5Tcp",
+        "socks5Udp"
+      ],
+      "type": "string"
+    }
+  },
+  "decisions": {
+    "oneOf": [
+      {
+        "description": "User approved the command.",
+        "enum": [
+          "accept"
+        ],
+        "type": "string"
+      },
+      {
+        "description": "User approved the command and future prompts in the same session-scoped approval cache should run without prompting.",
+        "enum": [
+          "acceptForSession"
+        ],
+        "type": "string"
+      },
+      {
+        "additionalProperties": false,
+        "description": "User approved the command, and wants to apply the proposed execpolicy amendment so future matching commands can run without prompting.",
+        "properties": {
+          "acceptWithExecpolicyAmendment": {
+            "properties": {
+              "execpolicy_amendment": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "execpolicy_amendment"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "acceptWithExecpolicyAmendment"
+        ],
+        "title": "AcceptWithExecpolicyAmendmentCommandExecutionApprovalDecision",
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "User chose a persistent network policy rule (allow/deny) for this host.",
+        "properties": {
+          "applyNetworkPolicyAmendment": {
+            "properties": {
+              "network_policy_amendment": {
+                "$ref": "#/definitions/NetworkPolicyAmendment"
+              }
+            },
+            "required": [
+              "network_policy_amendment"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "applyNetworkPolicyAmendment"
+        ],
+        "title": "ApplyNetworkPolicyAmendmentCommandExecutionApprovalDecision",
+        "type": "object"
+      },
+      {
+        "description": "User denied the command. The agent will continue the turn.",
+        "enum": [
+          "decline"
+        ],
+        "type": "string"
+      },
+      {
+        "description": "User denied the command. The turn will also be immediately interrupted.",
+        "enum": [
+          "cancel"
+        ],
+        "type": "string"
+      }
+    ]
+  },
+  "response_required": [
+    "decision"
+  ],
+  "resolved_notification": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "definitions": {
+      "RequestId": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "format": "int64",
+            "type": "integer"
+          }
+        ]
+      }
+    },
+    "properties": {
+      "requestId": {
+        "$ref": "#/definitions/RequestId"
+      },
+      "threadId": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "requestId",
+      "threadId"
+    ],
+    "title": "ServerRequestResolvedNotification",
+    "type": "object"
+  }
+}

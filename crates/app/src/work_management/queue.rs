@@ -39,11 +39,11 @@ pub fn ready_tasks(
         if !config.use_worktrees {
             let mut conflict = false;
             for attempt in &active {
-                if let Some(other) = state.tasks.iter().find(|t| t.id == attempt.task_id) {
-                    if scopes_conflict(task, other)? {
-                        conflict = true;
-                        break;
-                    }
+                if let Some(other) = state.tasks.iter().find(|t| t.id == attempt.task_id)
+                    && scopes_conflict(task, other)?
+                {
+                    conflict = true;
+                    break;
                 }
             }
             for other in &selected {

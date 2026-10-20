@@ -1,3 +1,51 @@
+# Command Center v2 — 별도 브랜치·PR 계획 준비, 2026-10-20
+
+## Current objective / status
+
+사용자 요청은 채택한 1안 발전형 시안을 별도 브랜치에 적용하되 **먼저 PR 단위 계획을 보고**하는 것이다. 현재 계획 작성·소스 경계 검토까지 완료했으며 제품 구현은 시작하지 않았다. 아래 과거 cloud release 기록은 이 기능의 구현 결과가 아니다.
+
+- 새 작업 폴더: `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`.
+- 통합 브랜치: `feat/agent-command-center-v2-20261020`.
+- fetch 후 base/HEAD/origin/main: `f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679`, source version0.13.0.
+- 기존 `/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015`의 settings/cloud 미커밋 변경과 nominal dirty tree는 보존했다. 새 작업에 제품 변경을 복사하지 않았다.
+
+## Completed / modified files
+
+- `docs/superpowers/plans/2026-10-20-command-center-v2-implementation.md`: 9개 제품 PR, 파일 경계·의존 관계·계약·실패 시나리오·검증 명령·완료 기준.
+- `docs/mockups/multi-agent-command-center{,-v2}-2026-10-20.html`, `docs/superpowers/specs/2026-10-20-command-center-v2-design.md`: 기존 승인 디자인을 byte 단위 그대로 복사한 참조 원본.
+- `docs/design/command-center-v2/`: desktop dark/light·mobile 참조3개와 SHA manifest. HTML 디자인 증거이며 네이티브 구현 증거가 아니다.
+- `docs/qa/2026-10-20-command-center-v2-planning.md`, 이 handoff. 현재 문서 변경은 아직 커밋하지 않았다.
+
+## Key decisions
+
+- Rust/egui와 기존 runtime/storage를 유지한다. UI는 snapshot/intent를 사용한다. task/attempt/submission을 분리하고 동일 workspace/provider의 세션도 격리한다.
+- PR1계약 → PR2저장 → PR3시안 화면 → PR4로컬 배정 → PR5메인 조율 → PR6승인·결과·Git → PR7기기 → PR8PWA → PR9통합 검증·빌드.
+- PR1~9는 이 통합 브랜치를 base로 검토/병합한다. main 중간 병합 없음. 최종 main PR·출시는 후속 사용자 지시 범위에서 다룬다.
+- 시안의 fixture를 실제 실행·인가·DB schema로 취급하지 않는다. provider capability와 Relay viewer/실행 worker 차이를 유지한다.
+- 앱 재실행 권한 없음. 이번 단계 버전 변경/빌드/실행도 없다. 기능 출시 시 최신 shipped보다 높은 minor version과 binary/plist 검증 필수.
+
+## Actual checks / failed approaches
+
+- SHA manifest6개 일치, 상대 링크1개 존재, PR 본문9개/placeholder0개 확인. source diff against base의 crates/Cargo 출력0.
+- 새 작업 폴더 `git diff --check`와 기존 폴더 handoff 범위 검사 모두 exit0. 새 계획/QA Markdown2개 공백·마지막 개행 검사 통과.
+- 기존 코드와 DB migration을 읽어 경계를 검토했다. 제품 테스트·Clippy·빌드·화면 실행 검증은 이번에 하지 않았다.
+- 최초 경로 탐색의 `ui.rs`/`crates/xtask`는 존재하지 않아 각각 `ui/mod.rs`/root `xtask`로 바로잡았다. 제품 오류나 테스트 실패로 세지 않는다.
+
+## Remaining / exact next commands
+
+현재 단계의 다음 행동은 계획 보고다. 제품 PR1은 아직 미착수다. 보고 후 실행 단계에서는 먼저 다음 문서를 읽고 PR1 작업 브랜치를 이 통합 브랜치에서 분기한다. 사용자 요청 없이 push/main merge/restart를 하지 않는다.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020
+git status --short
+git diff --check
+cat AGENTS.md
+cat docs/superpowers/plans/2026-10-20-command-center-v2-implementation.md
+git switch -c feat/command-center-pr01-contracts
+```
+
+---
+
 # 최종 인계 — 제품 완료, 증거 PR236
 
 - 제품 구현·교차리뷰·실제 검증·main 반영·0.13.0 package 검증은 모두 완료됐다. 제품PR235/main0b54b888, 검증headfa2c2489. 상세명령/수치/미검증범위는 바로아래와 QAguide/package-result.json을 기준으로 한다. 새제품수정·재빌드·재실행은 필요하지 않다.

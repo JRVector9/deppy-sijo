@@ -1,3 +1,12 @@
+# Current release checkpoint — 0.15.1 rebuild/restart and approved preview requested
+
+- User explicitly requested rebuilding, restarting and reopening the approved HTML design in the current task. This authorizes1normal app replacement now; no main merge/push. Worktree `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`.
+- Prior sourcef79f35c7, product fix46f9938a. Checked35 accessible worktree Cargo versions and local installed/versioned bundles; latest0.15.0. Patch0.15.0→0.15.1 updates canonical Cargo workspace version and27 inherited lock entries. Preserve inheritance and previous artifacts.
+- Current objective: build app/proxy, prepare pinned cloudflared, sign separate local development bundle0.15.1, verify CLI/both plist versions and signatures, normally quit exact oldPID87668 and launch new bundle with opt-in, verify live UI; reopen approved `docs/mockups/multi-agent-command-center-v2-2026-10-20.html` in visible browser.
+- Modified: Cargo.toml/Cargo.lock/CHANGELOG plus this handoff. Prior product regressions146PASS/1ignored and Chrome237checksPASS remain actual previous-phase results; version-only rebuild pending, do not claim success yet.
+- Failed approach: comparison report filename was recalled as fidelity-comparison.md; actual companion is fidelity-composer.md. Approved HTML verified through extension spec. No build or launch failure.
+- Exact next commands: `CARGO_BUILD_JOBS=2 cargo build --offline --locked -p deppy-sijo -p mcp-proxy`; `python3 scripts/prepare-cloudflared.py --output target/debug/deppy-cloudflared`; adapt prior versioned local-bundle.py to0.15.1; verify package before quit/open.
+
 # Current checkpoint — duplicate main-agent choices fixed and verified, 2026-10-20
 
 - Objective completed: fix the user's repeated `claude` options in native project settings. Worktree `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`; original nominal dirty tree untouched. No new app launch/release/push/main merge in this fix phase.

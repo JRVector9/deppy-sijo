@@ -1,5 +1,10 @@
 # Changelog
 
+## [0.15.1] - 2026-10-20
+
+- Show each main agent and worker provider once in project settings while preserving every model and reasoning-effort option.
+- Local signed development rebuild on the separate Command Center branch.
+
 ## [0.15.0] - 2026-10-20
 
 - Keep the main composer editable before binding, configure the main agent from the composer, and preserve drafts through configuration and late replies.

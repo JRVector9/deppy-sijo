@@ -404,19 +404,13 @@ impl InProcessRuntimeClient {
         &self,
         host: Option<crate::remote_worker::RemoteWorkerHost>,
     ) -> anyhow::Result<()> {
-        let mut slot = self
-            .remote_worker
-            .lock()
-            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
-        if let Some(host) = &host {
-            anyhow::ensure!(
-                host.config.grant_epoch > slot.grant_floor,
-                "remote_worker_grant_epoch_stale"
-            );
-            slot.grant_floor = host.config.grant_epoch;
+        self.remote_worker_control().configure(host)
+    }
+    pub fn remote_worker_control(&self) -> crate::remote_worker::RemoteWorkerControl {
+        crate::remote_worker::RemoteWorkerControl {
+            slot: Arc::clone(&self.remote_worker),
+            wake: self.worker_thread.clone(),
         }
-        slot.host = host;
-        Ok(())
     }
 
     pub fn remote_worker_wake(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
@@ -2991,10 +2985,32 @@ impl Worker {
                 return;
             }
         };
+        let retired_pending: usize = slot
+            .retired
+            .iter()
+            .map(|host| host.pending.len())
+            .sum::<usize>()
+            + slot.notifications.len();
+        let disabled_result = if request.identity.incarnation.as_str() == self.instance_token
+            && request.identity.grant_epoch <= slot.grant_floor
+        {
+            R::ObservationUnknown
+        } else {
+            R::Rejected { code: E::Disabled }
+        };
+        if request.identity.incarnation.as_str() == self.instance_token
+            && request.identity.grant_epoch < slot.grant_floor
+        {
+            self.emit(RuntimeEvent::RemoteWorkResolved {
+                identity: request.identity,
+                result: R::ObservationUnknown,
+            });
+            return;
+        }
         let Some(host) = slot.host.as_mut() else {
             self.emit(RuntimeEvent::RemoteWorkResolved {
                 identity: request.identity,
-                result: R::Rejected { code: E::Disabled },
+                result: disabled_result,
             });
             return;
         };
@@ -3012,7 +3028,7 @@ impl Worker {
             }
             return;
         }
-        if host.pending.len() >= 32 {
+        if host.pending.len() + retired_pending >= 32 {
             self.emit(RuntimeEvent::RemoteWorkResolved {
                 identity: request.identity,
                 result: R::Rejected { code: E::Capacity },
@@ -3033,9 +3049,35 @@ impl Worker {
         let Ok(mut slot) = shared.lock() else {
             return;
         };
-        let Some(host) = slot.host.as_mut() else {
-            return;
-        };
+        for (identity, result) in std::mem::take(&mut slot.notifications) {
+            self.emit(RuntimeEvent::RemoteWorkResolved { identity, result });
+        }
+        let mut retired = std::mem::take(&mut slot.retired);
+        for host in &mut retired {
+            self.poll_remote_host(host);
+        }
+        slot.retired = retired
+            .into_iter()
+            .filter(|host| !host.pending.is_empty())
+            .collect();
+        if let Some(host) = slot.host.as_mut() {
+            let pending = std::mem::take(&mut host.pending);
+            for work in pending {
+                match self.progress_remote_work(&work.request, host, work.phase) {
+                    Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
+                        identity: work.request.identity,
+                        result,
+                    }),
+                    Progress::Pending(phase) => host.pending.push(PendingWork {
+                        request: work.request,
+                        phase,
+                    }),
+                }
+            }
+        }
+    }
+    fn poll_remote_host(&mut self, host: &mut crate::remote_worker::RemoteWorkerHost) {
+        use crate::remote_worker::{PendingWork, Progress};
         let pending = std::mem::take(&mut host.pending);
         for work in pending {
             match self.progress_remote_work(&work.request, host, work.phase) {
@@ -3077,7 +3119,7 @@ impl Worker {
             return P::Complete(reject(E::WrongWorker));
         }
         if id.grant_epoch != host.config.grant_epoch {
-            return P::Complete(reject(E::GrantChanged));
+            return P::Complete(R::ObservationUnknown);
         }
         if request.folder != host.folder || request.folder_anchor != host.anchor {
             return P::Complete(reject(E::FolderChanged));
@@ -3117,7 +3159,7 @@ impl Worker {
                 .launcher
                 .prepare(profile, request.initial_prompt.as_deref())
                 .map_err(|_| E::Invalid)?;
-            if !matches!(command, RuntimeCommand::SpawnAgent { .. })
+            if !matches!(&command, RuntimeCommand::SpawnAgent {command,..} if std::path::Path::new(command).is_absolute())
                 || crate::command::prepare_runtime_command_for_retention_internal(&mut command)
                     .is_err()
             {

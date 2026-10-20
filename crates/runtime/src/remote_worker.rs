@@ -125,10 +125,52 @@ pub struct RemoteWorkerConfig {
     pub max_workers: u8,
     pub profiles: Vec<RemoteWorkerProfile>,
 }
+#[derive(Clone)]
+pub struct RemoteWorkerControl {
+    pub(crate) slot: Arc<std::sync::Mutex<RemoteWorkerSlot>>,
+    pub(crate) wake: Option<std::thread::Thread>,
+}
+impl RemoteWorkerControl {
+    /// Install from a host setup worker after all filesystem/template work completes.
+    pub fn configure(&self, host: Option<RemoteWorkerHost>) -> anyhow::Result<()> {
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+        if let Some(host) = &host {
+            anyhow::ensure!(
+                host.config.grant_epoch > slot.grant_floor,
+                "remote_worker_grant_epoch_stale"
+            );
+            slot.grant_floor = host.config.grant_epoch;
+        }
+        if let Some(mut previous) = slot.host.take() {
+            let pending = std::mem::take(&mut previous.pending);
+            for work in pending {
+                match work.phase {
+                    PendingPhase::Resolve(_) => previous.pending.push(work),
+                    PendingPhase::Claim => slot
+                        .notifications
+                        .push((work.request.identity, RemoteWorkResult::ObservationUnknown)),
+                }
+            }
+            if !previous.pending.is_empty() {
+                slot.retired.push(previous);
+            }
+        }
+        slot.host = host;
+        if let Some(wake) = &self.wake {
+            wake.unpark();
+        }
+        Ok(())
+    }
+}
 #[derive(Default)]
 pub(crate) struct RemoteWorkerSlot {
     pub(crate) host: Option<RemoteWorkerHost>,
     pub(crate) grant_floor: u64,
+    pub(crate) retired: Vec<RemoteWorkerHost>,
+    pub(crate) notifications: Vec<(RemoteWorkIdentity, RemoteWorkResult)>,
 }
 pub(crate) enum PendingPhase {
     Claim,
@@ -428,11 +470,12 @@ mod tests {
             key_der: signing_key.serialize_der(),
         }
     }
-    fn worker(
+    fn worker_with_launcher(
         root: &std::path::Path,
         id: &str,
         journal: Arc<dyn RemoteWorkJournal>,
-    ) -> (RemoteRuntimeServer, String) {
+        launcher: Arc<dyn RemoteWorkLauncher>,
+    ) -> (RemoteRuntimeServer, String, RemoteWorkerControl) {
         std::fs::create_dir_all(root).unwrap();
         let backend = InProcessRuntimeClient::try_new_with_resolver(
             5,
@@ -455,12 +498,13 @@ mod tests {
                         max_workers: 2,
                         profiles: vec![profile()],
                     },
-                    Arc::new(Launcher),
+                    launcher,
                     journal,
                 )
                 .unwrap(),
             ))
             .unwrap();
+        let control = backend.remote_worker_control();
         let identity = identity();
         let pin = identity.fingerprint();
         (
@@ -472,7 +516,23 @@ mod tests {
             )
             .unwrap(),
             pin,
+            control,
         )
+    }
+    fn worker_with_control(
+        root: &std::path::Path,
+        id: &str,
+        journal: Arc<dyn RemoteWorkJournal>,
+    ) -> (RemoteRuntimeServer, String, RemoteWorkerControl) {
+        worker_with_launcher(root, id, journal, Arc::new(Launcher))
+    }
+    fn worker(
+        root: &std::path::Path,
+        id: &str,
+        journal: Arc<dyn RemoteWorkJournal>,
+    ) -> (RemoteRuntimeServer, String) {
+        let (server, pin, _) = worker_with_control(root, id, journal);
+        (server, pin)
     }
     fn wait_event(
         rx: &RuntimeEventReceiver,
@@ -743,6 +803,140 @@ mod tests {
                 ..
             }
         ));
+        drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct ResolveGate {
+        gate: std::sync::atomic::AtomicBool,
+        inner: Journal,
+    }
+    impl RemoteWorkJournal for ResolveGate {
+        fn claim(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim> {
+            self.inner.claim(request)
+        }
+        fn resolve(
+            &self,
+            request: &RemoteWorkRequest,
+            result: &RemoteWorkResult,
+        ) -> anyhow::Result<bool> {
+            if self.gate.load(std::sync::atomic::Ordering::SeqCst) {
+                self.inner.resolve(request, result)
+            } else {
+                Ok(false)
+            }
+        }
+    }
+    #[test]
+    fn remote_compute_revoke_during_result_commit_never_claims_known_unsent() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-revoke-resolve-{}", uuid::Uuid::new_v4()));
+        let journal = Arc::new(ResolveGate {
+            gate: std::sync::atomic::AtomicBool::new(false),
+            inner: Journal::default(),
+        });
+        let (server, pin, control) = worker_with_control(&root, "revoked", journal.clone());
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+                .unwrap();
+        let rx = client.subscribe();
+        let proof = inspect(&client, &rx);
+        let request = request(&proof, "revoked-op");
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request.clone(),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        while !root.join("launches").exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        control.configure(None).unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork { request })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::ObservationUnknown,
+                ..
+            }
+        ));
+        journal
+            .gate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            wait_event(&rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched {
+                    session: SessionId(1),
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(root.join("launches")).unwrap(),
+            "launch"
+        );
+        drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct RelativeLauncher;
+    impl RemoteWorkLauncher for RelativeLauncher {
+        fn prepare(
+            &self,
+            profile: &RemoteWorkerProfile,
+            prompt: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            let mut launch = Launcher.prepare(profile, prompt)?;
+            if let RuntimeCommand::SpawnAgent { command, .. } = &mut launch {
+                *command = "sh".into();
+            }
+            Ok(launch)
+        }
+    }
+    #[test]
+    fn remote_compute_relative_executable_is_rejected_before_process_creation() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-relative-launch-{}", uuid::Uuid::new_v4()));
+        let (server, pin, _) = worker_with_launcher(
+            &root,
+            "relative",
+            Arc::new(Journal::default()),
+            Arc::new(RelativeLauncher),
+        );
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+                .unwrap();
+        let rx = client.subscribe();
+        let proof = inspect(&client, &rx);
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request(&proof, "relative-op"),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Rejected {
+                    code: RemoteWorkError::Invalid
+                },
+                ..
+            }
+        ));
+        assert!(!root.join("launches").exists());
         drop(client);
         server.shutdown();
         std::fs::remove_dir_all(root).unwrap();

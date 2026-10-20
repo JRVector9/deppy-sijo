@@ -1,5 +1,14 @@
 # Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
 
+## Latest checkpoint — reconciliation and Relay integration
+
+- Root `f3657039`: runtime read-only query `5c878022`→`856b132b`, native query `be812c00`→`f3657039`, Relay bridge `74e633f0`→`71d37b17`. Unknown 원operation을 SELECT/query하며 새 launch/input을 만들지 않는다. launch 생성 확인은 ObservedIdle+Stage::Done, 초기 지시·assignment 생성은 하지 않는다. immutable request가 없는 재시작은 Unknown을 보존한다.
+- UI owner actual native filter79 PASS/0 FAIL/1 ignored `/private/tmp/deppy-cc-reconcile-host-green-20261020.log`. Storage owner final actual storage26 PASS, runtime420 PASS/0 FAIL/1 ignored, strict runtime/storage alltargetsClippy PASS, App31 PASS `/private/tmp/deppy-cc-pr07-reconcile-final-20261020-results.json`.
+- Relay actual Node17 PASS 및 실제 production browser pairing/encrypted view 회귀 RED→GREEN. Root actual production tests **5 PASS/0 FAIL/0 ignored**, `cargo test --offline --locked -p web-remote --test command_center_chrome --test relay_shell_chrome --test pwa_unified_chrome --test mobile_shell_chrome -- --ignored --test-threads=1`, `/private/tmp/deppy-cc-final-production-browser-20261020.log`. Relay의 outbound는 exact ObserveRemoteSession만 추가하며 mutating CC는 차단한다.
+- cc_contracts가 Root shared1a573907을 독립 Chrome 재검사 **106 assertions PASS**(`/private/tmp/deppy-cc-shared-1a573907-independent.log`), ACK 유실 후2nd 관측 전송 및 hidden snapshot120/70 위치 유지 직접 확인, 남은 actionable 결함 없음. cc_storage local exactClose26a03021도 독립 리뷰 차단 결함 없음; native reconcile 추가 리뷰 진행 중.
+- Root 실제 fmt/boundary PASS at856b132b, i18n-check PASS(`/private/tmp/deppy-cc-integrated-i18n-20261020.log`). 중간 native 버튼 통합 전 Reconcile job dead_code warning은 최종 strictClippy에서 확인한다. 760px/font1.25 projectheader 설정 버튼이 오른쪽 잘리는 실제PNG 발견, cc_ui가 boundedlayout 회귀·수정 중이다.
+- 다음: UI clipping 마지막commit 통합 후 sourcefreeze; root 전체 gate. `/private/tmp/deppy-cc-final-gates-20261020.py`는 root target/jobs2, fmt→boundary→deps→i18n→strictworkspaceClippy→workspace nofailfast/serialtests. 이전 runtime timing flaky evidence 때문에 finaltests serial로 실행한다. 실패는 원인별 수정·기록하며 pass로 합산하지 않는다. 사용자 앱 stop/start·mainmerge·push·릴리스 없음.
+
 ## Latest checkpoint — read-only remote terminal / local exact close
 
 - Root HEAD `26a03021`: exact owned local close `5fb89b54`→`26a03021` 통합. UI owner actual command_center75 PASS/0 FAIL/1 ignored, check --tests PASS; 실제 원operation/런타임/attempt/소유권 불일치 거부와 unknown 종료 재요청 차단을 포함한다. 기존 수동 연결 세션은 원안 종료 기능으로 안내한다.

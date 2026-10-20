@@ -17,10 +17,32 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet};
 
+#[path = "work_management_remote.rs"]
+mod remote_operations;
+pub use remote_operations::{RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationResult};
+
 pub const COMMAND_CENTER_FILE_NAME: &str = "command-center-v2.sqlite3";
 
 const APPLICATION_ID: i64 = 0x4443_4332;
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
+const REMOTE_SCHEMA: &str = r#"
+CREATE TABLE work_remote_operations (
+ workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
+ operation_id TEXT NOT NULL CHECK(length(CAST(operation_id AS BLOB)) BETWEEN 1 AND 128),
+ attempt_id TEXT NOT NULL CHECK(length(CAST(attempt_id AS BLOB)) BETWEEN 1 AND 128),
+ identity BLOB NOT NULL CHECK(typeof(identity)='blob' AND length(identity)<=2048),
+ result BLOB CHECK(result IS NULL OR (typeof(result)='blob' AND length(result)<=1024)),
+ PRIMARY KEY(workspace_id,operation_id), UNIQUE(workspace_id,attempt_id)
+);
+"#;
+fn source_digest(version: i64) -> String {
+    let mut hash = Sha256::new();
+    hash.update(SCHEMA.as_bytes());
+    if version >= 2 {
+        hash.update(REMOTE_SCHEMA.as_bytes());
+    }
+    digest_hex(&hash.finalize())
+}
 const SCHEMA: &str = r#"
 CREATE TABLE work_store_meta (id INTEGER PRIMARY KEY CHECK(id=1), format TEXT NOT NULL, schema_digest TEXT NOT NULL, source_digest TEXT NOT NULL);
 INSERT INTO work_store_meta VALUES(1, 'deppy-command-center-v2', '', '');
@@ -429,12 +451,10 @@ impl CommandCenterStore {
         )?;
         if application_id == 0 && version == 0 && tables == 0 {
             tx.execute_batch(SCHEMA)?;
+            tx.execute_batch(REMOTE_SCHEMA)?;
             tx.execute(
                 "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
-                rusqlite::params![
-                    schema_digest(&tx)?,
-                    digest_hex(&Sha256::digest(SCHEMA.as_bytes()))
-                ],
+                rusqlite::params![schema_digest(&tx)?, source_digest(SCHEMA_VERSION)],
             )?;
             tx.pragma_update(None, "application_id", APPLICATION_ID)?;
             tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
@@ -444,7 +464,7 @@ impl CommandCenterStore {
                 "unrecognized Command Center sidecar"
             );
             anyhow::ensure!(
-                version == SCHEMA_VERSION,
+                version == 1 || version == SCHEMA_VERSION,
                 "unsupported Command Center sidecar version"
             );
             let format: Option<(String, String, String)> = tx
@@ -459,10 +479,18 @@ impl CommandCenterStore {
             };
             anyhow::ensure!(
                 format == "deppy-command-center-v2"
-                    && source == digest_hex(&Sha256::digest(SCHEMA.as_bytes()))
+                    && source == source_digest(version)
                     && digest == schema_digest(&tx)?,
                 "invalid Command Center sidecar schema"
             );
+            if version == 1 {
+                tx.execute_batch(REMOTE_SCHEMA)?;
+                tx.execute(
+                    "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
+                    rusqlite::params![schema_digest(&tx)?, source_digest(SCHEMA_VERSION)],
+                )?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            }
         }
         tx.commit()?;
         conn.pragma_update(None, "journal_mode", "WAL")?;

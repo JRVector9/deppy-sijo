@@ -1,6 +1,9 @@
 //! A persisted send claim is never automatic permission to replay after reconnect.
+#[path = "remote_journal.rs"]
+mod journal;
 use super::devices::ExecutionLease;
 use deppy_core::work_management::{OperationId, RuntimeBinding};
+pub(crate) use journal::AsyncRemoteJournal;
 
 pub const REMOTE_DELIVERY_MAX: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq)]

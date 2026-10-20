@@ -407,11 +407,11 @@ fn settle(host: &mut CommandCenterHost, id: &str, outcome: Outcome, detail: &str
     action.record.outcome = outcome;
     action.stage = ActionStage::Done;
     host.devices.finish_remote(action.token);
-    if let Some(project) = host.projects.get_mut(&action.record.target.workspace_id) {
-        if let Err(error) = store(project, &action.record) {
-            project.storage_blocked = true;
-            host.status = error;
-        }
+    if let Some(project) = host.projects.get_mut(&action.record.target.workspace_id)
+        && let Err(error) = store(project, &action.record)
+    {
+        project.storage_blocked = true;
+        host.status = error;
     }
     if outcome == Outcome::Admitted
         && clear_admitted_draft(&mut host.ui, &action.record.target, &action.draft)
@@ -582,7 +582,7 @@ pub(in super::super) fn close_receipt(host: &mut CommandCenterHost, receipt: Rem
                 "정확한 원격 워커의 프로세스 종료와 실행 용량 반환을 확인했습니다. 작업 결과·검증 기록은 보존합니다.",
             );
         }
-        runtime::remote_input::RemoteSessionCloseResult::Rejected { .. } => settle(
+        runtime::remote_input::RemoteSessionCloseResult::Rejected => settle(
             host,
             id,
             Outcome::Rejected,

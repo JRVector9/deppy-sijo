@@ -151,7 +151,7 @@ fn client_liveness_expired(tracker: &liveness::LivenessTracker, now: Instant) ->
 }
 
 /// 상수 시간 비교 — 토큰 길이/내용의 타이밍 누설 방지.
-fn token_matches(expected: &str, provided: &[u8]) -> bool {
+pub(crate) fn token_matches(expected: &str, provided: &[u8]) -> bool {
     let expected = expected.as_bytes();
     if expected.len() != provided.len() {
         return false;
@@ -788,6 +788,13 @@ fn drain_receiver_into_outbound(
     receiver: &RuntimeEventReceiver,
     outbound: &mut OutboundEventQueue,
 ) -> Result<OutboundDrain, OutboundOverflow> {
+    drain_receiver_into_outbound_filtered(receiver, outbound, |_| true)
+}
+fn drain_receiver_into_outbound_filtered(
+    receiver: &RuntimeEventReceiver,
+    outbound: &mut OutboundEventQueue,
+    allow: impl Fn(&RuntimeEvent) -> bool,
+) -> Result<OutboundDrain, OutboundOverflow> {
     // RuntimeEventReceiver::drain과 같은 happens-before 계약: viewport slot을 먼저 take하고,
     // 상태 채널을 비운 뒤, 상태 이벤트를 먼저 enqueue한다. 이렇게 하면 Spawned/MuxUpdated가
     // 같은 tick의 Viewport보다 먼저 durable queue에 들어간다.
@@ -827,7 +834,11 @@ fn drain_receiver_into_outbound(
                 | RuntimeEvent::SessionStatusViewChanged { .. }
                 | RuntimeEvent::SessionTitleChanged { .. },
             ) => {}
-            Ok(event) => outbound.enqueue(event)?,
+            Ok(event) => {
+                if allow(&event) {
+                    outbound.enqueue(event)?;
+                }
+            }
             Err(TryRecvError::Empty) => break,
             Err(TryRecvError::Disconnected) => {
                 source = OutboundDrain::SourceClosed;
@@ -835,11 +846,10 @@ fn drain_receiver_into_outbound(
             }
         }
     }
-    for event in viewports {
-        outbound.enqueue(event)?;
-    }
-    for event in history_results {
-        outbound.enqueue(event)?;
+    for event in viewports.into_iter().chain(history_results) {
+        if allow(&event) {
+            outbound.enqueue(event)?;
+        }
     }
     Ok(source)
 }
@@ -1335,7 +1345,9 @@ fn serve_connection_tls(
 
     let mut dec = FrameDecoder::new();
     // Phase 1: TLS 핸드셰이크 + ClientHello + ServerHello (AUTH/handshake timeout 안에서).
-    let Some(codec) = tls_server_handshake(&mut conn, &mut sock, &mut dec, auth_token, stop) else {
+    let Some((codec, scope)) =
+        tls_server_handshake(&mut conn, &mut sock, &mut dec, auth_token, stop, backend)
+    else {
         let _ = sock.shutdown(Shutdown::Both);
         return;
     };
@@ -1350,7 +1362,7 @@ fn serve_connection_tls(
     let mut heartbeat = liveness::OutboundHeartbeatTracker::new(Instant::now(), HEARTBEAT_INTERVAL);
 
     'main: loop {
-        if stop.load(Ordering::SeqCst) {
+        if stop.load(Ordering::SeqCst) || scope.as_ref().is_some_and(|s| !s.is_current()) {
             break;
         }
         let mut progressed = false;
@@ -1372,6 +1384,9 @@ fn serve_connection_tls(
                         }
                         match codec.decode_command(&frame) {
                             Ok(DecodedCommand::Command(command)) => {
+                                if scope.as_ref().is_some_and(|s| !s.allows_command(&command)) {
+                                    break 'main;
+                                }
                                 if let Err(reason) = validate_command(&command) {
                                     tracing::warn!("remote 명령 검증 실패({reason}), 접속 종료");
                                     break 'main;
@@ -1381,6 +1396,9 @@ fn serve_connection_tls(
                                 }
                             }
                             Ok(DecodedCommand::RequestKeyframe(session)) => {
+                                if scope.is_some() {
+                                    break 'main;
+                                }
                                 keyframe_requests.push(session);
                             }
                             Err(e) => {
@@ -1423,7 +1441,9 @@ fn serve_connection_tls(
         for session in keyframe_requests.drain(..) {
             last_sent.remove(&session);
         }
-        match drain_receiver_into_outbound(&receiver, &mut outbound) {
+        match drain_receiver_into_outbound_filtered(&receiver, &mut outbound, |e| {
+            scope.as_ref().is_none_or(|s| s.allows_event(e))
+        }) {
             Ok(OutboundDrain::Open) => {}
             Ok(OutboundDrain::SourceClosed) => break,
             Err(OutboundOverflow::DurableFull) => {
@@ -1498,7 +1518,8 @@ fn tls_server_handshake(
     dec: &mut FrameDecoder,
     auth_token: &str,
     stop: &Arc<AtomicBool>,
-) -> Option<Codec> {
+    backend: &Arc<InProcessRuntimeClient>,
+) -> Option<(Codec, Option<crate::remote_access::RemoteConnectionScope>)> {
     let deadline = Instant::now() + TLS_HANDSHAKE_TIMEOUT;
     // ClientHello 프레임을 받을 때까지 TLS I/O 구동.
     let hello_frame = loop {
@@ -1528,10 +1549,20 @@ fn tls_server_handshake(
             return None;
         }
     };
-    if !token_matches(auth_token, &hello.token) {
-        tracing::warn!("remote TLS 인증 실패 — 접속 거부");
-        return None;
-    }
+    let scope = if token_matches(auth_token, &hello.token) {
+        None
+    } else {
+        match backend
+            .remote_worker_control()
+            .authenticate_scoped_token(&hello.token)
+        {
+            Some(scope) => Some(scope),
+            None => {
+                tracing::warn!("remote TLS 인증 실패 — 접속 거부");
+                return None;
+            }
+        }
+    };
     let features = SERVER_FEATURES & hello.features;
     let server_hello = ServerHello {
         proto_version: PROTO_VERSION,
@@ -1554,7 +1585,7 @@ fn tls_server_handshake(
         }
         std::thread::sleep(TLS_IDLE_SLEEP);
     }
-    Some(Codec::from_features(features))
+    Some((Codec::from_features(features), scope))
 }
 
 /// pump가 한 이벤트를 접속 코덱으로 프레임 payload로 만든다.

@@ -150,6 +150,13 @@ impl RemoteWorkerControl {
             );
             slot.grant_floor = host.config.grant_epoch;
         }
+        // Invalidate established connections only after all replacement preconditions pass.
+        if let Some(access) = slot.access.take() {
+            access.revoke();
+        }
+        slot.access = host
+            .as_ref()
+            .map(|h| crate::remote_access::ScopedRemoteAccess::new(&h.config));
         if let Some(mut previous) = slot.host.take() {
             let pending = std::mem::take(&mut previous.pending);
             for work in pending {
@@ -169,6 +176,34 @@ impl RemoteWorkerControl {
             wake.unpark();
         }
         Ok(())
+    }
+    /// Copy on a setup worker. Reuses the current grant token; never rotates on Copy.
+    /// The exact expected tuple prevents publishing a newer grant with stale UI metadata.
+    pub fn issue_scoped_token(
+        &self,
+        device_id: &str,
+        workspace_id: &WorkspaceId,
+        grant_epoch: u64,
+    ) -> anyhow::Result<secret::SecretString> {
+        let slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+        slot.access
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("remote_worker_disabled"))?
+            .credential(device_id, workspace_id, grant_epoch)
+    }
+    pub(crate) fn authenticate_scoped_token(
+        &self,
+        provided: &[u8],
+    ) -> Option<crate::remote_access::RemoteConnectionScope> {
+        self.slot
+            .lock()
+            .ok()?
+            .access
+            .as_ref()?
+            .authenticate(provided, Arc::downgrade(&self.slot))
     }
     /// Trusted host setup only; never callable by a runtime wire command.
     pub fn grant_attempt_folder(
@@ -248,6 +283,7 @@ pub struct AttemptFolderGrant {
 pub(crate) struct RemoteWorkerSlot {
     pub(crate) host: Option<RemoteWorkerHost>,
     pub(crate) grant_floor: u64,
+    pub(crate) access: Option<crate::remote_access::ScopedRemoteAccess>,
     pub(crate) retired: Vec<RemoteWorkerHost>,
     pub(crate) notifications: Vec<(RemoteWorkIdentity, RemoteWorkResult)>,
 }
@@ -690,6 +726,77 @@ mod tests {
         }
     }
     #[test]
+    fn scoped_tls_token_filters_unrelated_events_and_denies_raw_commands() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-scoped-access-{}", uuid::Uuid::new_v4()));
+        let (server, pin, control) =
+            worker_with_control(&root, "scoped", Arc::new(Journal::default()));
+        let workspace = WorkspaceId("workspace-scoped".into());
+        let token = control.issue_scoped_token("scoped", &workspace, 1).unwrap();
+        assert_eq!(
+            token.expose(),
+            control
+                .issue_scoped_token("scoped", &workspace, 1)
+                .unwrap()
+                .expose()
+        );
+        assert!(control.issue_scoped_token("other", &workspace, 1).is_err());
+        assert!(control.issue_scoped_token("scoped", &workspace, 2).is_err());
+        let admin = RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+            .unwrap();
+        let admin_events = admin.subscribe();
+        let scoped =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), token.expose(), &pin).unwrap();
+        let scoped_events = scoped.subscribe();
+        let _ = inspect(&scoped, &scoped_events);
+        admin
+            .send_command(RuntimeCommand::RequestMuxSnapshot)
+            .unwrap();
+        wait_event(&admin_events, |e| {
+            matches!(e, RuntimeEvent::MuxUpdated { .. })
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            scoped_events
+                .drain()
+                .iter()
+                .all(|e| matches!(e, RuntimeEvent::RemoteWorkerObserved { .. })),
+            "scoped connection leaked unrelated runtime events"
+        );
+        let mut raw = Launcher.prepare(&profile(), None).unwrap();
+        if let RuntimeCommand::SpawnAgent { command, args, .. } = &mut raw {
+            *command = "/bin/sleep".into();
+            *args = vec!["1".into()];
+        }
+        scoped.send_command(raw).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        while !scoped_events.is_disconnected() && Instant::now() < until {
+            scoped_events.drain();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            scoped_events.is_disconnected(),
+            "scoped raw spawn must disconnect"
+        );
+        assert!(
+            admin_events
+                .drain()
+                .iter()
+                .all(|e| !matches!(e, RuntimeEvent::AgentSpawned { .. })),
+            "scoped token bypassed profile/folder grant"
+        );
+        assert_eq!(inspect(&admin, &admin_events).active_workers, 0);
+        control.configure(None).unwrap();
+        assert!(control.issue_scoped_token("scoped", &workspace, 1).is_err());
+        assert!(
+            RemoteRuntimeClient::attach_tls(server.local_addr(), token.expose(), &pin).is_err()
+        );
+        drop(scoped);
+        drop(admin);
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
     fn remote_compute_two_pinned_tls_workers_are_isolated_and_lost_reply_does_not_respawn() {
         let root =
             std::env::temp_dir().join(format!("deppy-remote-compute-{}", uuid::Uuid::new_v4()));
@@ -857,6 +964,102 @@ mod tests {
         ) -> anyhow::Result<bool> {
             self.inner.resolve(request, result)
         }
+    }
+    #[test]
+    fn scoped_tls_revoke_fences_connected_peers_and_delayed_claims_before_replacement() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-scoped-revoke-{}", uuid::Uuid::new_v4()));
+        let journal = Arc::new(GatedJournal {
+            gate: std::sync::atomic::AtomicBool::new(false),
+            inner: Journal::default(),
+        });
+        let (server, pin, control) = worker_with_control(&root, "fenced", journal.clone());
+        let workspace = WorkspaceId("workspace-fenced".into());
+        let token = control.issue_scoped_token("fenced", &workspace, 1).unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), token.expose(), &pin).unwrap();
+        let rx = client.subscribe();
+        let caps = inspect(&client, &rx);
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request(&caps, "delayed-scoped-op"),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(3);
+        while control
+            .slot
+            .lock()
+            .unwrap()
+            .host
+            .as_ref()
+            .unwrap()
+            .pending
+            .is_empty()
+        {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let replacement = || {
+            RemoteWorkerHost::new(
+                RemoteWorkerConfig {
+                    device_id: "fenced".into(),
+                    workspace_id: workspace.clone(),
+                    folder: root.clone(),
+                    grant_epoch: 2,
+                    max_workers: 2,
+                    profiles: vec![profile()],
+                },
+                Arc::new(Launcher),
+                journal.clone(),
+            )
+            .unwrap()
+        };
+        assert!(
+            control.configure(Some(replacement())).is_err(),
+            "active pending grant cannot be replaced"
+        );
+        assert_eq!(
+            token.expose(),
+            control
+                .issue_scoped_token("fenced", &workspace, 1)
+                .unwrap()
+                .expose(),
+            "failed replacement must preserve existing credential"
+        );
+        control.configure(None).unwrap();
+        journal
+            .gate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        control.configure(Some(replacement())).unwrap();
+        let fresh = control.issue_scoped_token("fenced", &workspace, 2).unwrap();
+        assert_ne!(token.expose(), fresh.expose());
+        assert!(control.issue_scoped_token("fenced", &workspace, 1).is_err());
+        assert!(
+            RemoteRuntimeClient::attach_tls(server.local_addr(), token.expose(), &pin).is_err()
+        );
+        let until = Instant::now() + Duration::from_secs(3);
+        while !rx.is_disconnected() && Instant::now() < until {
+            rx.drain();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            rx.is_disconnected(),
+            "revocation must retire established scoped connection"
+        );
+        let fresh_client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), fresh.expose(), &pin).unwrap();
+        let fresh_events = fresh_client.subscribe();
+        let current = inspect(&fresh_client, &fresh_events);
+        assert_eq!(current.grant_epoch, 2);
+        assert_eq!(current.active_workers, 0);
+        assert!(
+            !root.join("launches").exists(),
+            "revoked pending claim must never spawn later"
+        );
+        drop(client);
+        drop(fresh_client);
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn remote_compute_pending_journal_keeps_runtime_responsive_without_early_spawn_or_ack() {
@@ -1337,7 +1540,11 @@ mod tests {
             .profiles[0]
             .agent
             .provider = "claude".into();
-        let client = RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &pin).unwrap();
+        let scoped_token = control
+            .issue_scoped_token("a", &WorkspaceId("workspace-a".into()), 1)
+            .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(a.local_addr(), scoped_token.expose(), &pin).unwrap();
         let events = client.subscribe();
         let caps = inspect(&client, &events);
         let mut work = request(&caps, "input-launch");

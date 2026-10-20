@@ -24,6 +24,7 @@ pub mod known_hosts;
 mod persistence;
 mod protocol;
 mod remote;
+mod remote_access;
 pub mod remote_input;
 pub mod remote_worker;
 mod resource_monitor;

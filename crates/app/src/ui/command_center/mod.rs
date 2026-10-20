@@ -972,7 +972,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot) -> Vec<
             );
         }
         if let Some(monitor) = layout.monitor {
-            region(ui, monitor, c.bg, "cc-monitor", 16.0, |ui| {
+            region(ui, monitor, c.bg, "cc-monitor", 0.0, |ui| {
                 workers::monitor(ui, state, snapshot, p, &mut intents)
             });
         }
@@ -1030,13 +1030,12 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot) -> Vec<
                     drawer,
                     colors(snapshot).bg,
                     "cc-drawer-content",
-                    16.0,
+                    if left { 16.0 } else { 0.0 },
                     |ui| {
-                        if ui.button(text(snapshot, "close")).clicked() {
-                            state.left_drawer = false;
-                            state.right_drawer = false;
-                        }
                         if left {
+                            if ui.button(text(snapshot, "close")).clicked() {
+                                state.left_drawer = false;
+                            }
                             workers::projects(ui, state, snapshot, &mut intents);
                         } else {
                             workers::monitor(ui, state, snapshot, p, &mut intents);
@@ -1062,6 +1061,10 @@ fn header(
         ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
     }
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+        if l.mobile {
+            ui.spacing_mut().item_spacing.x = 4.0;
+            ui.spacing_mut().button_padding.x = 2.0;
+        }
         if !l.mobile {
             ui.add_space(76.0);
             ui.label(
@@ -1075,12 +1078,53 @@ fn header(
             ui.add_space(10.0);
             ui.label(egui::RichText::new("D").color(colors(snapshot).accent));
         }
-        let actions_width =
-            if l.mobile { 110.0 } else { 172.0 } * snapshot.font_scale.clamp(1.0, 2.0);
+        let scale = snapshot.font_scale.clamp(0.75, 2.0);
+        let actions_width = if l.mobile {
+            ui.painter()
+                .layout_no_wrap(
+                    text(snapshot, "original").into(),
+                    egui::FontId::proportional(10.0 * scale),
+                    colors(snapshot).text,
+                )
+                .size()
+                .x
+                + 12.0
+        } else {
+            172.0 * scale
+        };
+        let nav_width = (ui.available_width() - actions_width).max(100.0);
+        let mut nav_font_size = if l.mobile { 11.0 } else { 13.0 } * scale;
+        if l.mobile {
+            let labels = [
+                text(snapshot, "main").to_owned(),
+                format!(
+                    "{} {}",
+                    text(snapshot, "tasks"),
+                    p.map_or(0, |p| p.tasks.len())
+                ),
+                text(snapshot, "terminal").into(),
+                text(snapshot, "devices").into(),
+                text(snapshot, "history").into(),
+            ];
+            let text_width: f32 = labels
+                .iter()
+                .map(|label| {
+                    ui.painter()
+                        .layout_no_wrap(
+                            label.clone(),
+                            egui::FontId::proportional(nav_font_size),
+                            colors(snapshot).text,
+                        )
+                        .size()
+                        .x
+                })
+                .sum();
+            nav_font_size *= ((nav_width - 36.0) / text_width).min(1.0);
+        }
         egui::ScrollArea::horizontal()
             .id_salt("cc-navigation")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
-            .max_width((ui.available_width() - actions_width).max(100.0))
+            .max_width(nav_width)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     for (view, key) in [
@@ -1098,11 +1142,15 @@ fn header(
                             text(snapshot, key).to_owned()
                         };
                         let nav = ui.add(
-                            egui::Button::new(egui::RichText::new(label).color(if active {
-                                colors(snapshot).text
-                            } else {
-                                colors(snapshot).muted
-                            }))
+                            egui::Button::new(
+                                egui::RichText::new(label)
+                                    .size(nav_font_size)
+                                    .color(if active {
+                                        colors(snapshot).text
+                                    } else {
+                                        colors(snapshot).muted
+                                    }),
+                            )
                             .frame(false),
                         );
                         if active {
@@ -1157,7 +1205,16 @@ fn header(
                 dark_mode: !snapshot.dark_mode,
             });
         }
-        if ui.small_button(text(snapshot, "original")).clicked() {
+        if ui
+            .small_button(
+                egui::RichText::new(text(snapshot, "original")).size(if l.mobile {
+                    10.0 * scale
+                } else {
+                    11.0 * scale
+                }),
+            )
+            .clicked()
+        {
             intents.push(Intent::UseOriginalLayout);
         }
     });

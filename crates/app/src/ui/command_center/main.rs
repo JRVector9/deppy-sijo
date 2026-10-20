@@ -196,34 +196,18 @@ fn home(
                 ),
             );
         }
-        for (i, t) in p
-            .tasks
-            .iter()
-            .filter(|t| t.target.workspace_id == p.id)
-            .enumerate()
-        {
-            rule(ui, snapshot);
-            ui.horizontal(|ui| {
-                weak(ui, snapshot, format!("{:02}", i + 1));
-                ui.vertical(|ui| {
-                    if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(format!("{} · {}", t.role, t.title)).strong(),
-                            )
-                            .frame(false)
-                            .wrap(),
-                        )
-                        .clicked()
-                        && let Some(id) = &t.target.task_id
-                    {
-                        state.select_task(id.clone());
-                    }
-                    weak(ui, snapshot, &t.scope);
-                    weak(ui, snapshot, format!("{} · {}", t.provider, t.device));
-                });
-            });
-        }
+        ui.add_space(16.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            for (i, t) in p
+                .tasks
+                .iter()
+                .filter(|t| t.target.workspace_id == p.id)
+                .enumerate()
+            {
+                assignment_row(ui, state, snapshot, i, t);
+            }
+        });
         if !p.tasks.is_empty() {
             rule(ui, snapshot);
             weak(
@@ -705,6 +689,105 @@ fn task_detail(
     }
 }
 
+fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i: usize, t: &Task) {
+    let scale = snapshot.font_scale.clamp(0.75, 2.0);
+    let mobile = state.last_layout.is_some_and(|l| l.mobile);
+    let (number_w, owner_w, gap) = if mobile {
+        (18.0, 76.0, 7.0)
+    } else {
+        (24.0, 104.0, 12.0)
+    };
+    let title_w = (ui.available_width() - number_w - owner_w - 2.0 * gap).max(1.0);
+    let line = egui::Stroke::new(1.0, colors(snapshot).line);
+    let mut owner_left = 0.0;
+    let response = egui::Frame::NONE
+        .inner_margin(egui::Margin::symmetric(0, 12))
+        .show(ui, |ui| {
+            ui.set_min_height(38.0 * scale);
+            ui.spacing_mut().item_spacing = egui::vec2(gap, 3.0);
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(number_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:02}", i + 1))
+                                .size(10.0 * scale)
+                                .color(colors(snapshot).muted),
+                        );
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(title_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(title_w);
+                        let label = format!("{} · {}", t.role, t.title);
+                        let response = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&label).size(12.0 * scale).strong(),
+                            )
+                            .wrap()
+                            .sense(egui::Sense::click()),
+                        );
+                        response.widget_info(|| {
+                            egui::WidgetInfo::labeled(
+                                egui::WidgetType::Button,
+                                ui.is_enabled(),
+                                &label,
+                            )
+                        });
+                        if response.clicked()
+                            && let Some(id) = &t.target.task_id
+                        {
+                            state.select_task(id.clone());
+                        }
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&t.scope)
+                                    .size((if mobile { 9.0 } else { 10.0 }) * scale)
+                                    .color(colors(snapshot).muted),
+                            )
+                            .wrap(),
+                        );
+                    },
+                );
+                owner_left = ui.next_widget_position().x;
+                ui.allocate_ui_with_layout(
+                    egui::vec2(owner_w, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.set_width(owner_w);
+                        ui.horizontal(|ui| {
+                            ui.add_space(if mobile { 8.0 } else { 12.0 });
+                            ui.vertical(|ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&t.provider).size(11.0 * scale),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&t.device)
+                                            .size(10.0 * scale)
+                                            .color(colors(snapshot).muted),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        });
+                    },
+                );
+            });
+        })
+        .response;
+    ui.painter()
+        .hline(response.rect.x_range(), response.rect.top(), line);
+    ui.painter()
+        .vline(owner_left, response.rect.y_range().shrink(12.0), line);
+}
+
 fn history(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
@@ -901,6 +984,7 @@ pub(super) fn composer(
                         enabled,
                         egui::TextEdit::multiline(draft)
                             .id(id)
+                            .frame(egui::Frame::NONE)
                             .desired_width(f32::INFINITY)
                             .desired_rows(if state.composer_focused { 4 } else { 2 })
                             .hint_text(hint)
@@ -942,29 +1026,33 @@ pub(super) fn composer(
                         } else {
                             &target_label
                         };
-                        ui.add_sized(
-                            [
-                                ((available - 24.0) - 72.0 * snapshot.font_scale).max(1.0),
-                                34.0,
-                            ],
-                            egui::Label::new(egui::RichText::new(caption).small().color(
-                                if too_long {
-                                    colors(snapshot).red
-                                } else {
-                                    colors(snapshot).muted
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            clicked = ui
+                                .add_enabled(
+                                    can_send,
+                                    egui::Button::new(text(snapshot, "send"))
+                                        .fill(colors(snapshot).accent),
+                                )
+                                .clicked();
+                            ui.with_layout(
+                                egui::Layout::left_to_right(egui::Align::Center),
+                                |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(caption).small().color(
+                                                if too_long {
+                                                    colors(snapshot).red
+                                                } else {
+                                                    colors(snapshot).muted
+                                                },
+                                            ),
+                                        )
+                                        .truncate(),
+                                    )
+                                    .on_hover_text(caption);
                                 },
-                            ))
-                            .halign(egui::Align::Min)
-                            .truncate(),
-                        )
-                        .on_hover_text(caption);
-                        clicked = ui
-                            .add_enabled(
-                                can_send,
-                                egui::Button::new(text(snapshot, "send"))
-                                    .fill(colors(snapshot).accent),
-                            )
-                            .clicked();
+                            );
+                        });
                     });
                     if (clicked || enter)
                         && can_send

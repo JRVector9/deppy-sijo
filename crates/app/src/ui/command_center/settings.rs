@@ -10,6 +10,25 @@ pub(super) fn show(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
+    let width = ui.available_width().min(620.0);
+    let bounds = egui::Rect::from_min_size(
+        ui.next_widget_position(),
+        egui::vec2(width, ui.available_height()),
+    );
+    ui.scope_builder(egui::UiBuilder::new().max_rect(bounds), |ui| {
+        ui.set_width(width);
+        ui.spacing_mut().interact_size.y = 36.0 * snapshot.font_scale.clamp(1.0, 2.0);
+        form(ui, state, snapshot, p, intents);
+    });
+}
+
+fn form(
+    ui: &mut egui::Ui,
+    state: &mut UiState,
+    snapshot: &Snapshot,
+    p: &Project,
+    intents: &mut Vec<Intent>,
+) {
     ui.heading(text(snapshot, "settings"));
     ui.add_space(8.0);
     popup::notice(ui, text(snapshot, "settings_note"), popup::NoticeTone::Info);
@@ -23,12 +42,22 @@ pub(super) fn show(
         state.settings_error = None;
     }
     let (_, draft) = state.settings_draft.as_mut().unwrap();
-    ui.set_max_width(ui.available_width().min(620.0));
+    let input_h = 36.0 * snapshot.font_scale.clamp(1.0, 2.0);
     field(ui, snapshot, "name", |ui| {
-        ui.add(egui::TextEdit::singleline(&mut draft.name).desired_width(f32::INFINITY));
+        ui.add_sized(
+            [ui.available_width(), input_h],
+            egui::TextEdit::singleline(&mut draft.name)
+                .desired_width(f32::INFINITY)
+                .vertical_align(egui::Align::Center),
+        );
     });
     field(ui, snapshot, "directory", |ui| {
-        ui.add(egui::TextEdit::singleline(&mut draft.directory).desired_width(f32::INFINITY));
+        ui.add_sized(
+            [ui.available_width(), input_h],
+            egui::TextEdit::singleline(&mut draft.directory)
+                .desired_width(f32::INFINITY)
+                .vertical_align(egui::Align::Center),
+        );
     });
     field(ui, snapshot, "main_binding", |ui| {
         let selected = p

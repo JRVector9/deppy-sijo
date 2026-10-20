@@ -147,7 +147,6 @@ pub(super) fn show(
     intents: &mut Vec<Intent>,
 ) {
     ui.heading(text(snapshot, "devices"));
-    super::server::show(ui, state, snapshot, p, intents);
     if snapshot.devices.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_devices"));
     }
@@ -173,6 +172,11 @@ pub(super) fn show(
             });
         }
     }
+    egui::CollapsingHeader::new("이 컴퓨터에서 프로젝트 실행 · TLS 연결 설정")
+        .id_salt("cc-server-execution-settings")
+        .show(ui, |ui| {
+            super::server::show(ui, state, snapshot, p, intents)
+        });
     let setup = &mut state.device_setup;
     if setup.form.workspace_id != p.id {
         setup.form = SetupForm::for_project(p);

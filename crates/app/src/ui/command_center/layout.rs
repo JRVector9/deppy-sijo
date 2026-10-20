@@ -123,7 +123,7 @@ impl LayoutRects {
             310.0
         };
         egui::Rect::from_min_max(
-            egui::pos2(self.screen.right() - width, self.projectbar.bottom()),
+            egui::pos2(self.screen.right() - width, self.header.bottom()),
             egui::pos2(self.screen.right(), self.footer.top()),
         )
     }

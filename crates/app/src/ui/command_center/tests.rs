@@ -157,6 +157,311 @@ fn rich_fixture() -> Snapshot {
     snapshot
 }
 
+fn use_korean_font(harness: &mut egui_kittest::Harness<'_, impl Sized>) {
+    if let Ok(font) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
+        let mut fonts = egui::FontDefinitions::default();
+        fonts
+            .font_data
+            .insert("cc-cjk".into(), egui::FontData::from_owned(font).into());
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "cc-cjk".into());
+        harness.ctx.set_fonts(fonts);
+    }
+}
+
+#[test]
+fn verification_failed_retry_uses_host_capability_and_exact_task() {
+    for enabled in [true, false] {
+        let mut snapshot = rich_fixture();
+        let task = &mut snapshot.projects[0].tasks[0];
+        task.state = TaskState::VerificationFailed;
+        task.device = "remote TLS worker".into();
+        task.eligible_sessions.clear();
+        task.create_worker = Capability {
+            enabled,
+            reason: "host admission reason".into(),
+        };
+        let target = task.target.clone();
+        let mut initial = HarnessState::default();
+        initial.ui.open_task(target.clone());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1000.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                initial,
+            );
+        harness.run();
+        let retry = harness.get_by_label("새 워커 생성 후 배정");
+        assert_eq!(!retry.accesskit_node().is_disabled(), enabled);
+        if enabled {
+            retry.click();
+        }
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .intents
+                .contains(&Intent::CreateWorker { target }),
+            enabled
+        );
+    }
+}
+
+#[test]
+fn pending_structured_approval_uses_exact_request_and_host_capability() {
+    for enabled in [true, false] {
+        let mut snapshot = rich_fixture();
+        snapshot.projects[0].tasks.clear();
+        let target = RouteTarget {
+            workspace_id: "project-a".into(),
+            session_id: Some("exact-appserver-session".into()),
+            task_id: None,
+        };
+        snapshot.projects[0]
+            .pending_approvals
+            .push(PendingApproval {
+                target: target.clone(),
+                session_title: "Structured Codex".into(),
+                approval: Approval {
+                    id: "exact-request-key".into(),
+                    command: "cargo test --offline".into(),
+                    directory: "/projects/a".into(),
+                    scope: "프로젝트 폴더의 명령 실행".into(),
+                    action: Capability {
+                        enabled,
+                        reason: "현재 소유자를 다시 확인해 주세요".into(),
+                    },
+                },
+            });
+        let mut foreign = snapshot.projects[0].pending_approvals[0].clone();
+        foreign.target.workspace_id = "other-project".into();
+        foreign.approval.command = "must not render foreign request".into();
+        snapshot.projects[0].pending_approvals.push(foreign);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1200.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                HarnessState::default(),
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("must not render foreign request")
+                .is_none()
+        );
+        assert!(harness.query_by_label("cargo test --offline").is_some());
+        let allow = harness.get_by_label("이번 명령 허용");
+        assert_eq!(!allow.accesskit_node().is_disabled(), enabled);
+        if enabled {
+            allow.click();
+        }
+        harness.run();
+        assert_eq!(
+            harness.state().intents.contains(&Intent::Approval {
+                target: target.clone(),
+                approval_id: "exact-request-key".into(),
+                allow: true
+            }),
+            enabled
+        );
+        if enabled {
+            harness.get_by_label("허용 안 함").click();
+            harness.run();
+            assert!(harness.state().intents.contains(&Intent::Approval {
+                target,
+                approval_id: "exact-request-key".into(),
+                allow: false
+            }));
+        }
+    }
+}
+
+#[test]
+fn old_project_snapshot_without_pending_approvals_remains_readable() {
+    let value = serde_json::to_value(&rich_fixture().projects[0]).unwrap();
+    let mut old = value.as_object().unwrap().clone();
+    old.remove("pending_approvals");
+    let restored: Project = serde_json::from_value(old.into()).unwrap();
+    assert!(restored.pending_approvals.is_empty());
+}
+
+#[test]
+fn approved_assignment_density_and_owner_column_are_visible() {
+    for width in [1440.0, 1280.0, 1000.0, 760.0, 390.0] {
+        for scale in [1.0, 1.25] {
+            let snapshot = Snapshot {
+                font_scale: scale,
+                ..rich_fixture()
+            };
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, 900.0))
+                .build_ui_state(
+                    |ui, state| {
+                        show(ui, state, &snapshot);
+                    },
+                    UiState::default(),
+                );
+            use_korean_font(&mut harness);
+            harness.run();
+            let first = harness.get_by_label("구현 · 구현 작업").rect();
+            let second = harness.get_by_label("리뷰 · 리뷰 작업").rect();
+            assert!(
+                second.top() - first.top() <= 78.0 * scale,
+                "compact approved rows at {width}/{scale}: {first:?} {second:?}"
+            );
+            let content = harness.state().last_layout.unwrap().content;
+            let owner = harness
+                .get_all_by_label("Codex")
+                .find(|n| {
+                    let r = n.rect();
+                    content.contains(r.center())
+                        && r.center().y >= first.top()
+                        && r.center().y < second.top()
+                })
+                .expect("provider in dedicated owner column");
+            assert!(
+                owner.rect().left() > first.right(),
+                "owner stays beside title at {width}/{scale}"
+            );
+        }
+    }
+}
+
+#[test]
+fn mobile_primary_tabs_are_all_visible_at_both_font_sizes() {
+    for scale in [1.0, 1.25] {
+        let snapshot = Snapshot {
+            font_scale: scale,
+            ..rich_fixture()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(390.0, 844.0))
+            .build_ui_state(
+                |ui, state| {
+                    show(ui, state, &snapshot);
+                },
+                UiState::default(),
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        let header = harness.state().last_layout.unwrap().header;
+        let rollback = harness.get_by_label("기존 화면").rect();
+        for label in ["메인 에이전트", "작업 3", "터미널", "에이전트·기기", "이력"]
+        {
+            let tab = harness
+                .get_all_by_label(label)
+                .find(|n| header.contains(n.rect().center()))
+                .expect(label);
+            assert!(
+                header.contains_rect(tab.rect()) && tab.rect().right() < rollback.left(),
+                "visible {label} at {scale}: {:?} / {rollback:?}",
+                tab.rect()
+            );
+        }
+    }
+}
+
+#[test]
+fn settings_fields_follow_approved_width_and_touch_height() {
+    for (width, scale) in [(1440.0, 1.0), (1280.0, 1.25), (760.0, 1.25), (390.0, 1.0)] {
+        let snapshot = Snapshot {
+            font_scale: scale,
+            ..rich_fixture()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 900.0))
+            .build_ui_state(
+                |ui, state| {
+                    show(ui, state, &snapshot);
+                },
+                UiState {
+                    active_workspace: snapshot.selected_workspace_id.clone(),
+                    view: View::Settings,
+                    ..Default::default()
+                },
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        let field = harness
+            .get_all_by_value("/projects/a")
+            .find(|n| n.accesskit_node().role() == egui::accesskit::Role::TextInput)
+            .expect("settings directory input")
+            .rect();
+        assert!(
+            field.width() <= 620.5,
+            "bounded settings column at {width}: {field:?}"
+        );
+        assert!(
+            field.height() >= 36.0 * scale - 0.5,
+            "36px settings input at {width}: {field:?}"
+        );
+    }
+}
+
+#[test]
+fn worker_drawer_header_and_footer_remain_visible_with_many_workers() {
+    for width in [1440.0, 1000.0, 760.0, 390.0] {
+        let mut snapshot = rich_fixture();
+        snapshot.manage_devices.enabled = true;
+        snapshot.font_scale = 1.25;
+        let task = snapshot.projects[0].tasks[0].clone();
+        for i in 0..20 {
+            let mut task = task.clone();
+            task.target.task_id = Some(format!("extra-{i}"));
+            snapshot.projects[0].tasks.push(task);
+        }
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 900.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                HarnessState {
+                    ui: UiState {
+                        active_workspace: snapshot.selected_workspace_id.clone(),
+                        right_drawer: width <= 1050.0,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        let layout = harness.state().ui.last_layout.unwrap();
+        let panel = layout.monitor.unwrap_or_else(|| layout.right_drawer());
+        if layout.monitor_is_drawer {
+            assert_eq!(panel.top(), layout.header.bottom());
+            let close = harness.get_by_label("닫기").rect();
+            let heading = harness
+                .get_all_by_label("작업자")
+                .find(|n| panel.contains(n.rect().center()))
+                .unwrap()
+                .rect();
+            assert!(
+                (close.center().y - heading.center().y).abs() < 10.0,
+                "close shares monitor header"
+            );
+        }
+        let footer = harness.get_by_label("기기 관리").rect();
+        assert!(
+            panel.contains_rect(footer) && panel.bottom() - footer.bottom() < 26.0,
+            "persistent device footer at {width}: {footer:?} / {panel:?}"
+        );
+        harness.get_by_label("기기 관리").click();
+        harness.run();
+        assert!(harness.state().intents.contains(&Intent::ManageDevices {
+            workspace_id: Some("project-a".into())
+        }));
+    }
+}
+
 #[test]
 fn headless_width_theme_font_matrix_preserves_readable_content_and_drawer_bounds() {
     for width in [1440.0, 1280.0, 1000.0, 760.0, 390.0] {
@@ -245,6 +550,36 @@ fn actual_send_button_retains_draft_and_exact_target() {
             .count(),
         2
     );
+}
+
+#[test]
+fn composer_target_stays_left_and_send_stays_at_right_edge() {
+    for width in [1440.0, 390.0] {
+        let snapshot = rich_fixture();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 900.0))
+            .build_ui_state(
+                |ui, state| {
+                    show(ui, state, &snapshot);
+                },
+                UiState::default(),
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        let composer = harness.state().last_layout.unwrap().composer;
+        let send = harness.get_by_label("전송").rect();
+        let caption = harness
+            .get_by_label("프로젝트 A / 메인 에이전트 Codex")
+            .rect();
+        assert!(
+            composer.right() - send.right() <= 33.0,
+            "send at right edge: {send:?} / {composer:?}"
+        );
+        assert!(
+            caption.left() - composer.left() <= 33.0,
+            "exact target at left edge: {caption:?}"
+        );
+    }
 }
 
 #[test]
@@ -364,89 +699,190 @@ fn rollback_is_a_visible_native_button_at_mobile_width() {
 fn command_center_render_evidence() {
     let output = std::env::var_os("DEPPY_CC_EVIDENCE_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::PathBuf::from("/private/tmp/deppy-command-center-native-evidence-20261020")
-        });
+        .unwrap_or_else(|| "/private/tmp/deppy-cc-native-fix-20261020/screenshots".into());
     std::fs::create_dir_all(&output).unwrap();
-    for (name, width, scale, dark, left, right) in [
-        ("desktop-dark", 1440.0, 1.0, true, false, false),
-        ("desktop-light", 1440.0, 1.0, false, false, false),
-        ("medium", 1280.0, 1.25, true, false, false),
-        ("workers-drawer", 1000.0, 1.0, true, false, true),
-        ("narrow", 760.0, 1.25, true, false, false),
-        ("mobile", 390.0, 1.0, true, false, false),
-        ("mobile-projects", 390.0, 1.25, false, true, false),
-        ("mobile-workers", 390.0, 1.25, true, false, true),
-        ("devices-desktop", 1440.0, 1.0, true, false, false),
-        ("devices-mobile", 390.0, 1.0, true, false, false),
-    ] {
-        let mut snapshot = rich_fixture();
-        snapshot.font_scale = scale;
-        snapshot.dark_mode = dark;
-        let device_view = name.starts_with("devices-");
-        if device_view {
-            let enabled = || Capability {
-                enabled: true,
-                reason: String::new(),
-            };
-            snapshot.server_execution = ServerExecutionSetup {
-                running: true,
-                endpoint: "127.0.0.1:4270".into(),
-                fingerprint: vec!["ab"; 32].join(":"),
-                status: "이 컴퓨터의 선택한 프로젝트 실행을 허용했습니다.".into(),
-                workspace_id: snapshot.selected_workspace_id.clone(),
-                exported_workspace_id: Some("controller-project".into()),
-                folder: "/projects/command-center".into(),
-                agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
-                requested_agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
-                allow: enabled(),
-                revoke: enabled(),
-                copy: enabled(),
-                ..Default::default()
-            };
+    let mut metrics = Vec::new();
+    for width in [1440.0, 1280.0, 1000.0, 760.0, 390.0] {
+        for scale in [1.0, 1.25] {
+            for dark in [true, false] {
+                let mut modes = vec!["main", "settings", "empty", "no-project", "devices"];
+                if width <= 1050.0 {
+                    modes.push("workers");
+                }
+                if width <= 760.0 {
+                    modes.push("projects");
+                }
+                for mode in modes {
+                    let mut snapshot = approved_visual_fixture();
+                    snapshot.font_scale = scale;
+                    snapshot.dark_mode = dark;
+                    if mode == "empty" {
+                        snapshot.projects[0].tasks.clear();
+                        snapshot.projects[0].goal.clear();
+                        snapshot.projects[0].main_summary.clear();
+                    } else if mode == "no-project" {
+                        snapshot.projects.clear();
+                        snapshot.selected_workspace_id = None;
+                    }
+                    let initial = UiState {
+                        active_workspace: snapshot.selected_workspace_id.clone(),
+                        view: match mode {
+                            "settings" => View::Settings,
+                            "devices" => View::Devices,
+                            _ => View::Main,
+                        },
+                        left_drawer: mode == "projects",
+                        right_drawer: mode == "workers",
+                        ..Default::default()
+                    };
+                    let height = if width == 390.0 { 844.0 } else { 900.0 };
+                    let mut harness = egui_kittest::Harness::builder()
+                        .with_size(egui::vec2(width, height))
+                        .build_ui_state(
+                            |ui, state| {
+                                // The harness supplies a default CentralPanel margin; render the actual app surface at the exact viewport size.
+                                let rect = ui.ctx().viewport_rect();
+                                let mut surface =
+                                    ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                                surface.set_clip_rect(rect);
+                                show(&mut surface, state, &snapshot);
+                            },
+                            initial,
+                        );
+                    use_korean_font(&mut harness);
+                    harness.remove_cursor();
+                    harness.run();
+                    let name = format!(
+                        "{mode}-{}-{}-font{}",
+                        width as u32,
+                        if dark { "dark" } else { "light" },
+                        (scale * 100.0) as u32
+                    );
+                    let l = harness.state().last_layout.unwrap();
+                    let rect = |r: egui::Rect| [r.left(), r.top(), r.right(), r.bottom()];
+                    let title = harness
+                        .query_by_label("구현 · 결제 화면 구현")
+                        .map(|n| rect(n.rect()));
+                    metrics.push(serde_json::json!({"name": name, "width": width, "height": height, "scale": scale, "dark": dark, "screen": rect(l.screen), "header": rect(l.header), "drawer": rect(l.right_drawer()), "assignment_title": title}));
+                    harness
+                        .render()
+                        .expect("offscreen native egui rendering")
+                        .save(output.join(format!("{name}.png")))
+                        .unwrap();
+                    eprintln!("NATIVE_CC_EVIDENCE {name}");
+                }
+            }
         }
-        let initial = UiState {
-            view: if device_view {
-                View::Devices
-            } else {
-                View::Main
-            },
-            active_workspace: snapshot.selected_workspace_id.clone(),
-            left_drawer: left,
-            right_drawer: right,
-            ..Default::default()
-        };
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(width, 900.0))
-            .build_ui_state(
-                |ui, state| {
-                    show(ui, state, &snapshot);
-                },
-                initial,
-            );
-        if let Ok(font) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cc-cjk".into(), egui::FontData::from_owned(font).into());
-            fonts
-                .families
-                .entry(egui::FontFamily::Proportional)
-                .or_default()
-                .insert(0, "cc-cjk".into());
-            harness.ctx.set_fonts(fonts);
-        }
-        harness.remove_cursor();
-        harness.run();
-        let image = harness.render().expect("offscreen native egui rendering");
-        image.save(output.join(format!("{name}.png"))).unwrap();
-        eprintln!(
-            "NATIVE_CC_EVIDENCE {name} {}x{} scale={scale} path={}",
-            image.width(),
-            image.height(),
-            output.display()
-        );
     }
+    std::fs::write(
+        output.join("metrics.json"),
+        serde_json::to_vec_pretty(&metrics).unwrap(),
+    )
+    .unwrap();
+}
+
+fn approved_visual_fixture() -> Snapshot {
+    let mut snapshot = rich_fixture();
+    snapshot.manage_devices.enabled = true;
+    snapshot.add_project.enabled = true;
+    let p = &mut snapshot.projects[0];
+    p.name = "nomorevibe".into();
+    p.directory = "~/projects/nomorevibe".into();
+    p.config.name = p.name.clone();
+    p.config.directory = p.directory.clone();
+    p.main_model = "GPT-6.1-Sol".into();
+    p.config.model = p.main_model.clone();
+    p.goal = "모바일 결제 화면을 개선하고, 리뷰와 동작 검증까지 진행해 줘.".into();
+    p.main_summary = "메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 확인할 수 있습니다.".into();
+    p.available_providers = vec!["Codex".into(), "Claude".into()];
+    p.available_models = vec![p.main_model.clone()];
+    p.available_efforts = vec!["xhigh".into()];
+    p.available_automation = vec!["배정 전 확인".into()];
+    p.save_settings.enabled = true;
+    for (i, (title, scope, provider, device, activity, time)) in [
+        (
+            "결제 화면 구현",
+            "결제 요약·버튼·좁은 화면",
+            "Claude",
+            "이 Mac",
+            "결제 요약과 버튼 간격을 수정하고 있습니다.",
+            "14:21",
+        ),
+        (
+            "독립 코드 리뷰",
+            "변경 범위·예외 처리 검토",
+            "Codex",
+            "gpu3090",
+            "중복 제출과 실패 응답 처리 검토를 마쳤습니다.",
+            "14:24",
+        ),
+        (
+            "모바일 동작 검증",
+            "구현 완료 후 시나리오 확인",
+            "Codex",
+            "gpu3090",
+            "모바일 mock 검증 명령의 범위 확인을 기다립니다. 구현·리뷰 결과 이후 실행합니다.",
+            "14:23",
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let task = &mut p.tasks[i];
+        task.title = title.into();
+        task.scope = scope.into();
+        task.provider = provider.into();
+        task.device = device.into();
+        task.activity = activity.into();
+        task.observed_at = time.into();
+    }
+    snapshot.devices = ["이 Mac", "gpu3090", "휴대폰"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, name)| Device {
+            id: format!("visual-device-{i}"),
+            name: name.into(),
+            description: if i == 2 {
+                "원격 관측".into()
+            } else {
+                "프로젝트 실행 기기".into()
+            },
+            capabilities: if i == 2 {
+                "상태·승인·결과 확인".into()
+            } else {
+                "Codex · Claude".into()
+            },
+            connection: "연결됨".into(),
+            connected: true,
+            ..Default::default()
+        })
+        .collect();
+    snapshot.execution_setup.enabled = true;
+    snapshot.server_execution = ServerExecutionSetup {
+        running: true,
+        endpoint: "127.0.0.1:4270".into(),
+        fingerprint: vec!["ab"; 32].join(":"),
+        status: "이 컴퓨터의 선택한 프로젝트 실행을 허용했습니다.".into(),
+        workspace_id: snapshot.selected_workspace_id.clone(),
+        exported_workspace_id: Some("controller-project".into()),
+        folder: "/projects/command-center".into(),
+        agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
+        requested_agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
+        allow: Capability {
+            enabled: true,
+            ..Default::default()
+        },
+        revoke: Capability {
+            enabled: true,
+            ..Default::default()
+        },
+        copy: Capability {
+            enabled: true,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    snapshot
 }
 
 #[test]
@@ -608,124 +1044,4 @@ fn plan_review_assignment_picker_emits_exact_native_profile_and_revision() {
         serde_json::to_value(intent).is_err(),
         "native trust assignment cannot arrive as unauthenticated JSON"
     );
-}
-
-#[test]
-fn verification_failed_retry_uses_host_capability_and_exact_task() {
-    for enabled in [true, false] {
-        let mut snapshot = rich_fixture();
-        let task = &mut snapshot.projects[0].tasks[0];
-        task.state = TaskState::VerificationFailed;
-        task.device = "remote TLS worker".into();
-        task.eligible_sessions.clear();
-        task.create_worker = Capability {
-            enabled,
-            reason: "host admission reason".into(),
-        };
-        let target = task.target.clone();
-        let mut initial = HarnessState::default();
-        initial.ui.open_task(target.clone());
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1440.0, 1000.0))
-            .build_ui_state(
-                |ui, state: &mut HarnessState| {
-                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
-                },
-                initial,
-            );
-        harness.run();
-        let retry = harness.get_by_label("새 워커 생성 후 배정");
-        assert_eq!(!retry.accesskit_node().is_disabled(), enabled);
-        if enabled {
-            retry.click();
-        }
-        harness.run();
-        assert_eq!(
-            harness
-                .state()
-                .intents
-                .contains(&Intent::CreateWorker { target }),
-            enabled
-        );
-    }
-}
-
-#[test]
-fn pending_structured_approval_uses_exact_request_and_host_capability() {
-    for enabled in [true, false] {
-        let mut snapshot = rich_fixture();
-        snapshot.projects[0].tasks.clear();
-        let target = RouteTarget {
-            workspace_id: "project-a".into(),
-            session_id: Some("exact-appserver-session".into()),
-            task_id: None,
-        };
-        snapshot.projects[0]
-            .pending_approvals
-            .push(PendingApproval {
-                target: target.clone(),
-                session_title: "Structured Codex".into(),
-                approval: Approval {
-                    id: "exact-request-key".into(),
-                    command: "cargo test --offline".into(),
-                    directory: "/projects/a".into(),
-                    scope: "프로젝트 폴더의 명령 실행".into(),
-                    action: Capability {
-                        enabled,
-                        reason: "현재 소유자를 다시 확인해 주세요".into(),
-                    },
-                },
-            });
-        let mut foreign = snapshot.projects[0].pending_approvals[0].clone();
-        foreign.target.workspace_id = "other-project".into();
-        foreign.approval.command = "must not render foreign request".into();
-        snapshot.projects[0].pending_approvals.push(foreign);
-        let mut harness = egui_kittest::Harness::builder()
-            .with_size(egui::vec2(1440.0, 1200.0))
-            .build_ui_state(
-                |ui, state: &mut HarnessState| {
-                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
-                },
-                HarnessState::default(),
-            );
-        harness.run();
-        assert!(
-            harness
-                .query_by_label("must not render foreign request")
-                .is_none()
-        );
-        assert!(harness.query_by_label("cargo test --offline").is_some());
-        let allow = harness.get_by_label("이번 명령 허용");
-        assert_eq!(!allow.accesskit_node().is_disabled(), enabled);
-        if enabled {
-            allow.click();
-        }
-        harness.run();
-        assert_eq!(
-            harness.state().intents.contains(&Intent::Approval {
-                target: target.clone(),
-                approval_id: "exact-request-key".into(),
-                allow: true
-            }),
-            enabled
-        );
-        if enabled {
-            harness.get_by_label("허용 안 함").click();
-            harness.run();
-            assert!(harness.state().intents.contains(&Intent::Approval {
-                target,
-                approval_id: "exact-request-key".into(),
-                allow: false
-            }));
-        }
-    }
-}
-
-#[test]
-fn old_project_snapshot_without_pending_approvals_remains_readable() {
-    let value = serde_json::to_value(&rich_fixture().projects[0]).unwrap();
-    let mut old = value.as_object().unwrap().clone();
-    old.remove("pending_approvals");
-    let restored: Project = serde_json::from_value(old.into()).unwrap();
-    assert!(restored.pending_approvals.is_empty());
 }

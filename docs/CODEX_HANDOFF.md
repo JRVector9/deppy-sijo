@@ -1,5 +1,18 @@
 # Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
 
+## Latest checkpoint — native server / scoped remote input integration
+
+- 현재 HEAD `b07e24e3`; 이후 기록보다 이 checkpoint를 우선한다. `fc320b47` 원격 launch/input native host 연결, `1f529af0` reducer/repository Clippy 개선, `b07e24e3` DB commit 전 speculative registry fence 회수 결함 수정까지 통합했다. 앞선 `912c3f14` PWA budget 개선도 커밋됐고 최종 browser93 assertions PASS다.
+- Root 미커밋: `command_center_server.rs`, `ui/command_center/server.rs`, `app.rs`, `command_center_host.rs`, `command_center_launch.rs`, native DTO/device 화면. TLS listener와 프로젝트 실행 허용을 분리하고 로컬 프로젝트와 controller 프로젝트 ID를 명시 매핑한다. 실제 epoch는 settings worker에서 durable monotonic counter로 발급한다. native server 설정과 copy intent는 serde skip이며 토큰은 snapshot/DB에 저장하지 않는다.
+- 독립 리뷰가 HIGH 결함을 발견했다: 이 미커밋 copy가 기존 unrestricted `server.auth_token()`을 내보낸다. **현재 상태를 안전한 프로젝트 제한 연결로 배포/완료 보고하면 안 된다.** cc_storage가 별도 scoped credential/handshake command·event 필터와 revoke 시 기존 연결 무효화를 구현한다. Root는 off-frame `RemoteWorkerControl::issue_scoped_token(device_id, workspace_id, grant_epoch)`만 사용하도록 변경 중이다. pending/unknown 변경 중 copy 금지와 exact response identity 검증도 필요하다.
+- Root 실제 server 단위 검사: `cargo test --offline --locked -p deppy-sijo command_center_host::server::tests -- --test-threads=1` **3 PASS / 0 FAIL**, `/private/tmp/deppy-cc-server-grant-actual-green-20261020.log`. 앞선 필터 `command_center_server`는 alias 불일치로 **0 tests**였으며 테스트 통과 증거로 세지 않는다. 최초 두 compile 시도는 당시 미통합 Snapshot.inputs/intent arms 누락으로 실패했다.
+- Root 추가 RED: server copy pending/error regression 최초 missing `copy_grant` compile RED(`/private/tmp/deppy-cc-server-copy-red-20261020.log`); 구현은 scoped API 도착 후 실행한다. web readonly close/revoke capability는 실제1 FAIL→1 PASS(`/private/tmp/deppy-cc-web-newcaps-{red,green}-20261020.log`), `ec18c05a`로 커밋했다.
+- cc_ui `a07738d8`를 직접 diff review 후 `d45d71af`로 통합했다. lateRejected-after-Admitted terminal receipt를 불변으로 유지하며 중복/역순 응답이 실제 수락 상태를 downgrade하지 못한다. 관련 source 실제63 PASS/1 ignored다.
+- cc_ui는 최신 실제 focused62 PASS/1ignored 후 lateRejected-after-Admitted 회귀 수정 중이다. 이후 실제 원격 viewport/composer/explicit Close native 연결 담당. strict App Clippy44개 실패는 아직 최종 통과 아님.
+- cc_storage는 실제 runtime417 PASS/1ignored 및 strict runtime Clippy 통과 cohort 이후 ObserveSession wire34/정확한 소유 worker Close/새 scoped TLS token을 추가 중이다. 새 source의 최종 전체 gate는 아직 실행 전이다. `RemoteExecutionLedger`의 사용되지 않는 오래된 중복 API는 제거하고 production journal/controller 회귀를 유지한다.
+- cc_contracts는 모델 동일하게 root server race/권한 경계와 unknown 원operation 조회 복구 설계를 독립 리뷰 중이다. immutable assignment 없이 현재 task로 과거 입력을 재구성하지 않고 불확실 실행은 자동 replay하지 않는다.
+- 모든 Cargo target은 worktree별 독점: root의 `target`, cc_ui 자체 `target`, cc_storage만 performance `target` 사용/jobs2. final fmt/boundary/deps/i18n/strictworkspaceClippy/fullworkspace/offscreen은 source freeze 후 실행한다. app 실행·main merge·push·제품 release는 하지 않았다.
+
 ## Current objective / authorization
 
 승인한 1안 발전형 HTML과 9개 PR 계획을 독립 기능 브랜치에 구현한다. 사용자가 병렬 개발과 즉시 원안 복구를 요청했으며 최신 메시지에서도 병렬 진행을 재확인했다. GPT-6.1-Sol/xhigh 서브에이전트 3명과 root가 각 파일 경계를 나눠 작업 중이다. **전체 작업은 아직 완료되지 않았다.** main 병합/push/앱 stop·launch·restart 권한은 없으며 실제 하지 않았다.

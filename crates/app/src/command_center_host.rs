@@ -132,6 +132,7 @@ pub(super) struct CommandCenterHost {
     requested_loads: BTreeMap<String, String>,
     launches: BTreeMap<String, launch::Pending>,
     remotes: BTreeMap<String, remote::Pending>,
+    remote_sessions: remote::sessions::Sessions,
     worktrees: wm::task_worktree::TaskWorktreeWorker,
     pending_configs: BTreeMap<String, (String, cc::ProjectConfig)>,
     installed: BTreeMap<u64, launch::Installed>,
@@ -168,6 +169,7 @@ impl CommandCenterHost {
             requested_loads: BTreeMap::new(),
             launches: BTreeMap::new(),
             remotes: BTreeMap::new(),
+            remote_sessions: Default::default(),
             worktrees: {
                 let ctx = ctx.clone();
                 wm::task_worktree::TaskWorktreeWorker::new(move || ctx.request_repaint())
@@ -621,6 +623,10 @@ impl App {
                         ..Default::default()
                     });
                 target.task_id = Some(task.id.0.clone());
+                if let Some(remote_target) = remote::target_for(host, task) {
+                    target = remote_target;
+                }
+                let remote_target = remote::sessions::is_target(host, &target);
                 let eligible: Vec<_> = host
                     .live
                     .iter()
@@ -649,6 +655,7 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
+                    close_worker: if remote_target {remote::sessions::close_cap(host,&target)} else {no("현재 소유한 원격 워커가 없습니다.")},
                     selected_assignment: assignment::selected(task, &assignment_choices),
                     create_worker: if task.execution_device.is_some() {
                         if ready && matches!(p.confirmed,Some(assignment::Confirmed::Mixed(_))) && ready_tasks.contains(&task.id) && !remote::workspace_preparing(host,&ws.id) && !remote::workspace_unknown(host,&ws.id) && task.execution_device.as_ref().is_some_and(|id|host.devices.can_execute(&ws.id,id)) && !config.use_worktrees && host.devices.policies.iter().any(|d|Some(&d.registration().id)==task.execution_device.as_ref() && d.registration().workspace_id.0==ws.id && d.validate_fresh().is_ok()) {yes()} else {no("배정안·기기 권한·실행 용량을 확인해 주세요. 원격 워크트리는 서버 소유 증명이 필요합니다.")}
@@ -691,7 +698,7 @@ impl App {
                         .unwrap_or_default(),
                     terminal_session_id: live.and_then(|l| l.watch.clone()),
                     eligible_sessions: eligible,
-                    target,
+                    target: target.clone(),
                     title: bounded(&task.title, 256),
                     role: task.role.clone(),
                     scope: bounded(&task.scope, 1024),
@@ -703,12 +710,12 @@ impl App {
                         .unwrap_or_else(|| "이 컴퓨터".into()),
                     directory: attempt
                         .map(|a| a.folder.clone())
-                        .unwrap_or_else(|| config.folder.clone()),
+                        .unwrap_or_else(|| task.execution_device.as_ref().map(|id| host.devices.policies.iter().find(|d| d.registration().id==*id && d.registration().workspace_id==task.workspace_id).map(|d| d.registration().folder.clone()).unwrap_or_else(|| "등록한 원격 폴더를 확인해 주세요.".into())).unwrap_or_else(|| config.folder.clone())),
                     state: work_state(task.state),
-                    activity: format!("{:?}", task.state),
+                    activity: remote::sessions::status(host,&target).unwrap_or_else(||format!("{:?}", task.state)),
                     result: task.result.as_ref().map(|r| bounded(&r.summary, 2048)),
                     result_revision: task.result.as_ref().map(|r| r.revision.0.to_string()),
-                    terminal: if live.is_some() {
+                    terminal: if live.is_some() || remote_target {
                         yes()
                     } else {
                         no("이 작업에 연결된 현재 실행이 없습니다.")
@@ -718,7 +725,7 @@ impl App {
                     } else {
                         no("실행 폴더를 확인할 수 없습니다.")
                     },
-                    input: if live.is_some_and(|l| l.capture.prompt.is_some()) {
+                    input: if remote_target {remote::sessions::input_cap(host,&target)} else if live.is_some_and(|l| l.capture.prompt.is_some()) {
                         yes()
                     } else {
                         no("이 작업에 연결된 입력 대상이 없습니다.")
@@ -922,6 +929,11 @@ impl App {
             }
             navigation @ (cc::Intent::OpenSession(_) | cc::Intent::OpenGit(_) | cc::Intent::OpenHistory(_)) => {
                 let (target, tab_kind) = match navigation { cc::Intent::OpenGit(t) => (t, cc::DetailTab::Git), cc::Intent::OpenHistory(t) => (t, cc::DetailTab::History), cc::Intent::OpenSession(t) => (t, cc::DetailTab::Terminal), _ => unreachable!() };
+                if remote::sessions::is_target(host,&target){
+                    if tab_kind!=cc::DetailTab::Terminal {return Err("원격 Git·이력 조회는 아직 제공되지 않습니다. 실제 터미널 화면을 사용해 주세요.".into());}
+                    if target.task_id.is_some(){host.ui.open_task(target);host.ui.detail_tab=cc::DetailTab::Terminal;}else{host.ui.open_terminal(target);}
+                    return Ok(());
+                }
                 let route = host.route(&target).ok_or("실행 대상이 바뀌었습니다. 현재 세션을 다시 선택해 주세요.")?.clone();
                 match &route.capture.target {
                     FleetTarget::Pty { tab, pane, .. } => {
@@ -994,6 +1006,7 @@ impl App {
             }
             cc::Intent::Submit { target, text } => {
                 work::validate_input(&text).map_err(|e| e.to_string())?;
+                if remote::sessions::is_target(host,&target){return remote::sessions::begin(host,id,&target,Some(text),None);}
                 if host.inputs.values().any(|pending| pending.target == target) { return Err("이 대상의 입력 승인 응답을 기다리고 있습니다. 자동 재전송하지 않습니다.".into()); }
                 let live = host.route(&target).ok_or("입력 대상의 현재 실행을 확인할 수 없습니다.")?.clone();
                 if live.capture.prompt.is_none() { return Err("현재 세션은 상관관계가 확인된 입력 승인 경로를 지원하지 않습니다.".into()); }
@@ -1026,6 +1039,7 @@ impl App {
                 host.save(&target.workspace_id,Some(after),None)?;
                 return Ok(());
             }
+            cc::Intent::CloseWorker {target,attempt_id}=>return remote::sessions::begin(host,id,&target,None,Some(&attempt_id)),
             cc::Intent::InstallPlanJson { workspace_id, json } => {
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let request = p.request.as_ref().ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
@@ -1127,6 +1141,7 @@ impl App {
             && !host.devices.has_pending()
             && host.launches.values().all(|l| l.finished())
             && !host.remotes.values().any(|p| p.pending())
+            && !remote::sessions::pending(&host)
             && host
                 .projects
                 .values()
@@ -1425,6 +1440,7 @@ impl App {
         self.pump_command_center_observations(&mut host);
         self.pump_command_center_launches(&mut host);
         self.pump_command_center_remote(&mut host);
+        self.pump_command_center_remote_sessions(&mut host, visible);
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
             && let Some((id, intent)) = host.pending.pop_front()
@@ -1509,6 +1525,15 @@ impl App {
                     project.create_main = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
                     for task in &mut project.tasks {
                         task.create_worker = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
+                        task.close_worker = no("이 컴퓨터에서 워커 실행을 종료해 주세요.");
+                        if task
+                            .target
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|s| s.starts_with("remote:"))
+                        {
+                            task.input = no("이 컴퓨터에서 원격 실행에 입력해 주세요.");
+                        }
                     }
                 }
                 serde_json::to_value(remote)
@@ -1702,6 +1727,20 @@ impl App {
             .set_agent_send_presets(self.config.ui.agent_send_presets.clone());
         let events: Vec<_> = self.active.pending_events.drain(..).collect();
         let mut rendered = false;
+        let remote_rendered = host
+            .ui
+            .terminal_rect
+            .zip(host.ui.terminal_target.clone())
+            .is_some_and(|(rect, target)| {
+                remote::sessions::render(
+                    &mut host,
+                    ui,
+                    rect,
+                    &target,
+                    &self.config.terminal,
+                    self.config.ui.ui_scale,
+                )
+            });
         if let Some((rect, route)) = slot
             && route.capture.workspace == self.active.id
             && let FleetTarget::Pty { tab, pane, session } = &route.capture.target
@@ -1752,7 +1791,8 @@ impl App {
             }
         }
         if !rendered {
-            if let Some(target) = host.ui.terminal_target.clone()
+            if !remote_rendered
+                && let Some(target) = host.ui.terminal_target.clone()
                 && host.route(&target).is_some()
                 && !host
                     .pending
@@ -1902,6 +1942,7 @@ fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
         | cc::Intent::RetryStorage { workspace_id } => Some(workspace_id),
         cc::Intent::SetTaskAssignment { target, .. }
         | cc::Intent::CreateWorker { target }
+        | cc::Intent::CloseWorker { target, .. }
         | cc::Intent::Submit { target, .. }
         | cc::Intent::DraftChanged { target, .. }
         | cc::Intent::DispatchTask { target }

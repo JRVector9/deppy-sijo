@@ -399,6 +399,15 @@ fn task_detail(
     match state.detail_tab {
         DetailTab::Work => {
             title(ui, snapshot, &t.activity);
+            if t.close_worker.enabled
+                && action(ui, snapshot, "워커 실행 종료 · 용량 반환", &t.close_worker)
+                && let Some(attempt_id) = &t.attempt_id
+            {
+                intents.push(Intent::CloseWorker {
+                    target: t.target.clone(),
+                    attempt_id: attempt_id.clone(),
+                });
+            }
             if t.state == TaskState::PlanReview {
                 let choices: Vec<_> = snapshot
                     .execution_setup

@@ -125,6 +125,8 @@ pub struct Approval {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub close_worker: Capability,
     #[serde(skip)]
     pub selected_assignment: Option<String>,
     #[serde(default)]
@@ -279,6 +281,11 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    #[serde(skip)]
+    CloseWorker {
+        target: RouteTarget,
+        attempt_id: String,
+    },
     #[serde(skip)]
     SetTaskAssignment {
         target: RouteTarget,

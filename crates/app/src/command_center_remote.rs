@@ -2,6 +2,8 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 use wm::devices::{ExecutionLease, VerifiedExecutionLease};
+#[path = "command_center_remote_sessions.rs"]
+pub(super) mod sessions;
 
 #[derive(Clone)]
 pub(super) struct EffectFence(Arc<std::sync::Mutex<bool>>);
@@ -95,6 +97,27 @@ impl Pending {
         self.stage != Stage::Done
     }
 }
+pub(super) fn target_for(host: &CommandCenterHost, task: &work::Task) -> Option<cc::RouteTarget> {
+    let project = host.projects.get(&task.workspace_id.0)?;
+    let attempt = project
+        .snapshot
+        .attempts
+        .iter()
+        .find(|a| Some(&a.id) == task.current_attempt_id.as_ref())?;
+    let (id, _) = host.remotes.iter().find(|(_, p)| {
+        p.record.workspace == task.workspace_id
+            && p.record.task_id == task.id
+            && Some(&p.record.attempt_id) == task.current_attempt_id.as_ref()
+            && p.record.binding.is_some()
+            && p.record.binding == attempt.runtime_binding
+            && p.lease.is_some()
+    })?;
+    Some(cc::RouteTarget {
+        workspace_id: task.workspace_id.0.clone(),
+        task_id: Some(task.id.0.clone()),
+        session_id: Some(format!("remote:{id}")),
+    })
+}
 pub(super) fn workspace_unknown(host: &CommandCenterHost, workspace: &str) -> bool {
     host.remotes
         .values()
@@ -110,9 +133,10 @@ pub(super) fn workspace_preparing(host: &CommandCenterHost, workspace: &str) -> 
             .any(|p| p.record.workspace.0 == workspace && p.preparing())
 }
 pub(super) fn handoff_pending(host: &CommandCenterHost, target: &cc::RouteTarget) -> bool {
-    host.inputs
-        .values()
-        .any(|p| p.target.workspace_id == target.workspace_id && p.target.task_id == target.task_id)
+    sessions::target_pending(host, target)
+        || host.inputs.values().any(|p| {
+            p.target.workspace_id == target.workspace_id && p.target.task_id == target.task_id
+        })
         || host.remotes.values().any(|p| {
             p.pending()
                 && p.record.workspace.0 == target.workspace_id
@@ -120,9 +144,11 @@ pub(super) fn handoff_pending(host: &CommandCenterHost, target: &cc::RouteTarget
         })
 }
 pub(super) fn project_pending(host: &CommandCenterHost, workspace: &str) -> bool {
-    host.inputs
-        .values()
-        .any(|input| input.target.workspace_id == workspace)
+    sessions::project_pending(host, workspace)
+        || host
+            .inputs
+            .values()
+            .any(|input| input.target.workspace_id == workspace)
         || host
             .remotes
             .values()
@@ -203,6 +229,7 @@ pub(super) fn restore(host: &mut CommandCenterHost, workspace: &str) {
             },
         );
     }
+    sessions::restore(host, workspace);
 }
 fn settle(host: &mut CommandCenterHost, id: &str, unknown: bool, detail: &str) {
     let Some(mut pending) = host.remotes.remove(id) else {
@@ -937,7 +964,7 @@ mod tests {
         captured.with_current(&mut || calls += 1);
         assert_eq!(calls, 1);
     }
-    fn host_with_pending(stage: Stage) -> (CommandCenterHost, ExecutionLease, String) {
+    pub(super) fn host_with_pending(stage: Stage) -> (CommandCenterHost, ExecutionLease, String) {
         let (mut project, mut assignment) = super::super::tests::attempted();
         let (mut record, mut lease) = fixture();
         record.operation_id = assignment.attempt.operation_id.clone();
@@ -989,6 +1016,29 @@ mod tests {
             },
         );
         (host, lease, id)
+    }
+    #[test]
+    fn remote_route_is_opaque_and_matches_only_current_attempt_binding() {
+        let (mut host, _, id) = host_with_pending(Stage::Done);
+        let task = host.projects["workspace-a"].snapshot.tasks[0].clone();
+        let target = target_for(&host, &task).expect("owned remote route");
+        assert_eq!(target.workspace_id, "workspace-a");
+        assert_eq!(target.task_id.as_deref(), Some(task.id.0.as_str()));
+        assert_eq!(target.session_id, Some(format!("remote:{id}")));
+        assert!(
+            host.route(&target).is_none(),
+            "never a local FleetTarget alias"
+        );
+        host.projects
+            .get_mut("workspace-a")
+            .unwrap()
+            .snapshot
+            .attempts[0]
+            .runtime_binding
+            .as_mut()
+            .unwrap()
+            .execution_generation += 1;
+        assert!(target_for(&host, &task).is_none());
     }
     #[test]
     fn launch_reply_requires_exact_lease_and_never_reapplies_after_transition() {

@@ -410,6 +410,7 @@ impl App {
                     receipts,
                     policies,
                     inputs,
+                    sessions,
                 } => {
                     if host.devices.poll_workspace.as_deref() == Some(&workspace_id.0) {
                         host.devices.poll_workspace = None;
@@ -423,11 +424,18 @@ impl App {
                         remote::launch_receipt(host, receipt);
                     }
                     for receipt in inputs {
-                        remote::input_receipt(host, receipt);
+                        if !remote::sessions::input_receipt(host, &receipt) {
+                            remote::input_receipt(host, receipt);
+                        }
+                    }
+                    for observation in sessions {
+                        remote::sessions::session_observed(host, None, observation);
                     }
                 }
                 RemoteDeviceOutcome::Failed { request_id, code } => {
-                    if remote::failed(host, request_id) {
+                    if remote::sessions::failed(host, request_id, false)
+                        || remote::failed(host, request_id)
+                    {
                         host.devices.finish_remote(request_id);
                     } else if let Some(request) = take_request(&mut host.devices, request_id, None)
                     {
@@ -439,6 +447,7 @@ impl App {
                 }
                 RemoteDeviceOutcome::ObservationUnknown { correlation } => {
                     remote::unknown(host, &correlation);
+                    remote::sessions::failed(host, correlation.request_id, true);
                     let matches = host
                         .devices
                         .request
@@ -479,13 +488,38 @@ impl App {
                     lease,
                     execution,
                     verified,
-                } => remote::observed(host, request_id, lease, execution, verified),
+                } => {
+                    if !remote::sessions::observed(
+                        host,
+                        request_id,
+                        &lease,
+                        execution.clone(),
+                        verified.clone(),
+                    ) {
+                        remote::observed(host, request_id, lease, execution, verified);
+                    }
+                }
                 RemoteDeviceOutcome::InputPending {
                     request_id,
                     lease,
                     operation_id,
-                } => remote::input_pending(host, request_id, &lease, &operation_id),
-                RemoteDeviceOutcome::InputReceipt(receipt) => remote::input_receipt(host, receipt),
+                } => {
+                    if !remote::sessions::input_pending(host, request_id, &lease, &operation_id) {
+                        remote::input_pending(host, request_id, &lease, &operation_id);
+                    }
+                }
+                RemoteDeviceOutcome::InputReceipt(receipt) => {
+                    if !remote::sessions::input_receipt(host, &receipt) {
+                        remote::input_receipt(host, receipt);
+                    }
+                }
+                RemoteDeviceOutcome::SessionObserved {
+                    request_id,
+                    observation,
+                } => remote::sessions::session_observed(host, Some(request_id), *observation),
+                RemoteDeviceOutcome::CloseReceipt(receipt) => {
+                    remote::sessions::close_receipt(host, receipt)
+                }
             }
             if previous_views
                 .as_ref()

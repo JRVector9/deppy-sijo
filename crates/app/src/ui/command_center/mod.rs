@@ -223,6 +223,8 @@ pub struct Project {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Device {
+    #[serde(default)]
+    pub revoke: Capability,
     pub id: String,
     pub name: String,
     pub description: String,

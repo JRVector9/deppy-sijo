@@ -149,8 +149,7 @@ pub(super) fn show(
                 colors(snapshot).red
             }),
         );
-        if device.id != "local"
-            && device.can_execute
+        if device.revoke.enabled
             && snapshot.execution_setup.enabled
             && ui.small_button("실행 허용 회수").clicked()
         {
@@ -269,6 +268,7 @@ pub(super) fn show(
         rule(ui, snapshot);
         ui.label(egui::RichText::new(format!("{} · 연결 확인됨", candidate.name)).strong());
         for (label, value) in [
+            ("기기 ID", &candidate.device_id),
             ("연결 주소", &candidate.endpoint),
             ("인증서 지문", &candidate.pinned_fingerprint),
             ("작업 폴더", &candidate.folder),

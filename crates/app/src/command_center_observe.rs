@@ -25,6 +25,7 @@ pub(super) struct Observations {
     sequences: std::collections::HashMap<(u64, runtime::SessionId), u64>,
     watches: BTreeMap<String, Watch>,
     delayed: BTreeMap<String, Delayed>,
+    reads_inflight: std::collections::BTreeSet<String>,
 }
 impl Observations {
     pub fn new(ctx: &egui::Context) -> Self {
@@ -36,7 +37,11 @@ impl Observations {
             sequences: std::collections::HashMap::new(),
             watches: BTreeMap::new(),
             delayed: BTreeMap::new(),
+            reads_inflight: std::collections::BTreeSet::new(),
         }
+    }
+    pub(super) fn has_pending(&self) -> bool {
+        !self.watches.is_empty() || !self.delayed.is_empty() || !self.reads_inflight.is_empty()
     }
     fn begin(
         &mut self,
@@ -438,6 +443,7 @@ impl App {
         }
         if let Some(response) = host.observations.worker.try_recv() {
             let id = response.job.identity.operation_id.0.clone();
+            host.observations.reads_inflight.remove(&id);
             if let Some(watch) = host.observations.watches.get_mut(&id) {
                 watch.reading = false;
             }
@@ -530,7 +536,10 @@ impl App {
                     && let Some(job) = poll.job
                 {
                     match host.observations.worker.try_request(job) {
-                        Ok(()) => watch.reading = true,
+                        Ok(()) => {
+                            watch.reading = true;
+                            host.observations.reads_inflight.insert(id.clone());
+                        }
                         Err(error) => {
                             let _ = error.into_job();
                         }
@@ -618,6 +627,20 @@ fn install_turn(host: &mut CommandCenterHost, turn: ObservedTurn) {
     let exact = current_identity(host, &watch).as_ref() == Some(&turn.identity)
         && watch.identity == turn.identity;
     if !exact {
+        if let Some(attempt) = &watch.identity.attempt_id {
+            if let Some(p) = host.projects.get_mut(&watch.route.workspace_id) {
+                // The old completed payload is discarded; only the still-current exact attempt
+                // loses observation. A replacement attempt is never changed by this response.
+                let _ = apply_user_work_event(
+                    p,
+                    &watch.route,
+                    &attempt.0,
+                    work::WorkEventKind::ObservationLost,
+                    "실행 캡처나 설정이 바뀌어 이전 턴의 관측을 종료했습니다.".into(),
+                );
+            }
+        }
+        host.publication_dirty = true;
         host.status = "이전 실행의 턴 응답을 현재 작업에 적용하지 않았습니다.".into();
         return;
     }
@@ -764,6 +787,79 @@ mod tests {
         host.projects.get_mut("workspace-a").unwrap().snapshot.tasks[0].current_attempt_id =
             Some(work::AttemptId::new());
         assert!(current_identity(&host, &watch).is_none());
+    }
+    #[test]
+    fn rollback_keeps_pending_observation_or_final_reader_reaping_active() {
+        let (mut host, watch, _) = fixture();
+        assert!(!host.observations.has_pending());
+        let id = watch.identity.operation_id.0.clone();
+        host.observations.watches.insert(id.clone(), watch);
+        assert!(host.observations.has_pending());
+        host.observations.watches.clear();
+        host.observations.reads_inflight.insert(id);
+        assert!(host.observations.has_pending());
+    }
+    #[test]
+    fn stale_completed_text_only_loses_observation_for_the_same_current_attempt() {
+        let (mut host, watch, _) = fixture();
+        let identity = watch.identity.clone();
+        let id = identity.operation_id.0.clone();
+        host.projects
+            .get_mut("workspace-a")
+            .unwrap()
+            .snapshot
+            .config
+            .revision = work::ConfigRevision(2);
+        host.observations.watches.insert(id, watch);
+        install_turn(
+            &mut host,
+            ObservedTurn {
+                identity,
+                state: LocalCompletionState::Completed,
+                reason: "fixture stale final",
+                turn_id: Some("actual-old-turn".into()),
+                sequence: Some(1),
+                text: Some("must not become result".into()),
+                proof: None,
+            },
+        );
+        assert_eq!(
+            host.projects["workspace-a"].snapshot.tasks[0].state,
+            work::WorkState::ObservationUnknown
+        );
+        assert!(
+            host.projects["workspace-a"].snapshot.tasks[0]
+                .result
+                .is_none()
+        );
+        let (mut host, watch, _) = fixture();
+        let identity = watch.identity.clone();
+        host.projects.get_mut("workspace-a").unwrap().snapshot.tasks[0].current_attempt_id =
+            Some(work::AttemptId::new());
+        host.observations
+            .watches
+            .insert(identity.operation_id.0.clone(), watch);
+        install_turn(
+            &mut host,
+            ObservedTurn {
+                identity,
+                state: LocalCompletionState::Completed,
+                reason: "fixture old attempt",
+                turn_id: None,
+                sequence: Some(1),
+                text: Some("stale".into()),
+                proof: None,
+            },
+        );
+        assert_eq!(
+            host.projects["workspace-a"].snapshot.tasks[0].state,
+            work::WorkState::Queued
+        );
+        assert!(
+            host.projects["workspace-a"].snapshot.tasks[0]
+                .result
+                .is_none()
+        );
     }
     #[test]
     fn native_identity_timeout_is_known_unsent_and_frees_dispatch_capacity() {

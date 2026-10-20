@@ -34013,7 +34013,23 @@ impl App {
         let submit = !matches!(origin, PromptDeliveryOrigin::SelectedPaste);
         let admission = execution.map(|execution| {
             let deadline = std::time::Instant::now() + PROMPT_ADMISSION_TIMEOUT;
-            if let PromptDeliveryOrigin::FollowUp { queued } = &origin {
+            if let PromptDeliveryOrigin::CommandCenter { operation_id, .. } = &origin
+                && let Some(permit) = self.command_center_input_permit(operation_id)
+            {
+                let intent = if automatic {
+                    runtime::AgentInputIntent::AutomaticPrompt
+                } else {
+                    runtime::AgentInputIntent::ExplicitPrompt
+                };
+                runtime::InputAdmission::new(runtime::InputPermit::new(), deadline, move |admit| {
+                    permit.with_current(&mut || {
+                        if execution.is_current() {
+                            admit();
+                        }
+                    });
+                })
+                .with_agent_guard(execution.input_guard_for(intent))
+            } else if let PromptDeliveryOrigin::FollowUp { queued } = &origin {
                 followup_input_admission(queued, deadline)
             } else if submit {
                 execution.input_admission(automatic, deadline)

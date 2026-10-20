@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 use storage::work_management as stored;
 use unicode_normalization::UnicodeNormalization as _;
 use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
+#[path = "command_center_devices.rs"]
+mod devices;
 #[path = "command_center_launch.rs"]
 pub(super) mod launch;
 #[path = "command_center_switch.rs"]
@@ -130,6 +132,7 @@ pub(super) struct CommandCenterHost {
     execution_bindings: Vec<(Capture, work::RuntimeBinding, work::AgentSelection)>,
     next_grant_epoch: u64,
     observations: observe::Observations,
+    devices: devices::Devices,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
@@ -153,7 +156,7 @@ impl CommandCenterHost {
             routes: routes::RouteRegistry::new(uuid::Uuid::new_v4().to_string()),
             live: vec![],
             projects: BTreeMap::new(),
-            repository: RepositoryWorker::new(data_dir, move || wake.request_repaint()),
+            repository: RepositoryWorker::new(data_dir.clone(), move || wake.request_repaint()),
             flight: None,
             next_token: 0,
             requested_loads: BTreeMap::new(),
@@ -167,6 +170,7 @@ impl CommandCenterHost {
             execution_bindings: vec![],
             next_grant_epoch: 0,
             observations: observe::Observations::new(ctx),
+            devices: devices::Devices::new(data_dir.clone(), ctx),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -768,8 +772,20 @@ impl App {
             connection: "로컬".into(),
             connected: true,
             can_execute: true,
+            revoke: no("로컬 실행 환경은 기기 권한 회수 대상이 아닙니다."),
         });
+        host.devices.project(&mut snapshot, &self.active.id);
         snapshot
+    }
+    pub(super) fn command_center_input_permit(
+        &self,
+        id: &str,
+    ) -> Option<Arc<web_remote::cloud::CloudControlPermit>> {
+        self.command_center
+            .as_ref()?
+            .remote_permits
+            .get(id)
+            .cloned()
     }
     pub(crate) fn command_center_remote_intent(
         &mut self,
@@ -840,9 +856,11 @@ impl App {
             );
         }
         match intent {
-            cc::Intent::ConnectExecutionDevice { .. } | cc::Intent::GrantExecutionDevice { .. } | cc::Intent::RevokeExecutionDevice { .. } => return Err("기기 실행 연결을 준비 중입니다. 기존 세션은 계속 사용할 수 있습니다.".into()),
             cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
             cc::Intent::CreateWorker {target} => return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref()),
+            cc::Intent::ConnectExecutionDevice {workspace_id,request_id}=>return self.connect_command_center_device(host,id,&workspace_id,request_id),
+            cc::Intent::GrantExecutionDevice {workspace_id,candidate_id,profile_ids,max_workers}=>return self.grant_command_center_device(host,id,&workspace_id,&candidate_id,profile_ids,max_workers),
+            cc::Intent::RevokeExecutionDevice {workspace_id,device_id}=>return self.revoke_command_center_device(host,id,&workspace_id,&device_id),
             cc::Intent::LoadProject { workspace_id } => {
                 let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded {
@@ -864,7 +882,7 @@ impl App {
                 self.pending_settings_config_apply = true;
             }
             cc::Intent::AddProject => { self.command_center_layout.use_original(); self.open_workspace_add_dialog(WorkspaceAddPurpose::SwitchRuntime); }
-            cc::Intent::ManageDevices { .. } => { self.command_center_layout.use_original(); self.settings_open = true; self.settings_category = ui::settings::Category::CloudAgents; }
+            cc::Intent::ManageDevices { .. } => {host.ui.view=cc::View::Devices;}
             cc::Intent::SelectProject { workspace_id } => {
                 if !host.projects.contains_key(&workspace_id) { return Err("프로젝트가 더 이상 존재하지 않습니다.".into()); }
                 self.stage_workspace_controller_action(WorkspaceControllerAction::SwitchWorkspace(workspace_id));
@@ -1062,6 +1080,8 @@ impl App {
             && host.pending.is_empty()
             && host.requested_loads.is_empty()
             && host.inputs.is_empty()
+            && !host.observations.has_pending()
+            && !host.devices.has_pending()
             && host.launches.values().all(|l| l.finished())
             && host
                 .projects
@@ -1352,6 +1372,7 @@ impl App {
                 }
             }
         }
+        self.pump_command_center_devices(&mut host, visible);
         self.pump_command_center_observations(&mut host);
         self.pump_command_center_launches(&mut host);
         // Mutations are staged by render and run here, through the same guarded host pipeline.

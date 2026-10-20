@@ -649,3 +649,83 @@ fn verification_failed_retry_uses_host_capability_and_exact_task() {
         );
     }
 }
+
+#[test]
+fn pending_structured_approval_uses_exact_request_and_host_capability() {
+    for enabled in [true, false] {
+        let mut snapshot = rich_fixture();
+        snapshot.projects[0].tasks.clear();
+        let target = RouteTarget {
+            workspace_id: "project-a".into(),
+            session_id: Some("exact-appserver-session".into()),
+            task_id: None,
+        };
+        snapshot.projects[0]
+            .pending_approvals
+            .push(PendingApproval {
+                target: target.clone(),
+                session_title: "Structured Codex".into(),
+                approval: Approval {
+                    id: "exact-request-key".into(),
+                    command: "cargo test --offline".into(),
+                    directory: "/projects/a".into(),
+                    scope: "프로젝트 폴더의 명령 실행".into(),
+                    action: Capability {
+                        enabled,
+                        reason: "현재 소유자를 다시 확인해 주세요".into(),
+                    },
+                },
+            });
+        let mut foreign = snapshot.projects[0].pending_approvals[0].clone();
+        foreign.target.workspace_id = "other-project".into();
+        foreign.approval.command = "must not render foreign request".into();
+        snapshot.projects[0].pending_approvals.push(foreign);
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1200.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                HarnessState::default(),
+            );
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("must not render foreign request")
+                .is_none()
+        );
+        assert!(harness.query_by_label("cargo test --offline").is_some());
+        let allow = harness.get_by_label("이번 명령 허용");
+        assert_eq!(!allow.accesskit_node().is_disabled(), enabled);
+        if enabled {
+            allow.click();
+        }
+        harness.run();
+        assert_eq!(
+            harness.state().intents.contains(&Intent::Approval {
+                target: target.clone(),
+                approval_id: "exact-request-key".into(),
+                allow: true
+            }),
+            enabled
+        );
+        if enabled {
+            harness.get_by_label("허용 안 함").click();
+            harness.run();
+            assert!(harness.state().intents.contains(&Intent::Approval {
+                target,
+                approval_id: "exact-request-key".into(),
+                allow: false
+            }));
+        }
+    }
+}
+
+#[test]
+fn old_project_snapshot_without_pending_approvals_remains_readable() {
+    let value = serde_json::to_value(&rich_fixture().projects[0]).unwrap();
+    let mut old = value.as_object().unwrap().clone();
+    old.remove("pending_approvals");
+    let restored: Project = serde_json::from_value(old.into()).unwrap();
+    assert!(restored.pending_approvals.is_empty());
+}

@@ -257,13 +257,24 @@ fn home(
         .iter()
         .filter(|t| t.target.workspace_id == p.id && t.state.needs_attention())
         .collect();
-    if !attention.is_empty() {
+    let pending_approvals: Vec<_> = p
+        .pending_approvals
+        .iter()
+        .filter(|request| {
+            request.target.workspace_id == p.id && request.target.session_id.is_some()
+        })
+        .collect();
+    if !attention.is_empty() || !pending_approvals.is_empty() {
         rule(ui, snapshot);
         thread(ui, snapshot, "CHECK", |ui| {
             title(
                 ui,
                 snapshot,
-                &format!("{} {}", text(snapshot, "needs_check"), attention.len()),
+                &format!(
+                    "{} {}",
+                    text(snapshot, "needs_check"),
+                    attention.len() + pending_approvals.len()
+                ),
             );
             weak(ui, snapshot, text(snapshot, "check_help"));
             ui.horizontal_wrapped(|ui| {
@@ -281,6 +292,56 @@ fn home(
                     }
                 }
             });
+            for request in pending_approvals {
+                ui.push_id(
+                    (
+                        &request.target.workspace_id,
+                        &request.target.session_id,
+                        &request.approval.id,
+                    ),
+                    |ui| {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {}",
+                                text(snapshot, "approval_title"),
+                                request.session_title
+                            ))
+                            .strong(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&request.approval.command).monospace(),
+                            )
+                            .wrap()
+                            .selectable(true),
+                        );
+                        weak(ui, snapshot, &request.approval.directory);
+                        weak(ui, snapshot, &request.approval.scope);
+                        ui.horizontal_wrapped(|ui| {
+                            for (allow, key) in [(true, "allow_once"), (false, "deny")] {
+                                if action(
+                                    ui,
+                                    snapshot,
+                                    text(snapshot, key),
+                                    &request.approval.action,
+                                ) {
+                                    intents.push(Intent::Approval {
+                                        target: request.target.clone(),
+                                        approval_id: request.approval.id.clone(),
+                                        allow,
+                                    });
+                                }
+                            }
+                        });
+                        if !request.approval.action.enabled
+                            && !request.approval.action.reason.is_empty()
+                        {
+                            weak(ui, snapshot, &request.approval.action.reason);
+                        }
+                    },
+                );
+            }
         });
     }
     if !p.history.is_empty() {

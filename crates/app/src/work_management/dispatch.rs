@@ -115,29 +115,6 @@ impl DeliveryLedger {
         self.records.push((assignment, DeliveryState::Durable));
         Ok(())
     }
-    /// An unacknowledged recovered record is observation-unknown, never sendable.
-    pub fn restore(
-        &mut self,
-        assignment: DispatchAssignment,
-        stage: DeliveryState,
-    ) -> Result<(), ValidationError> {
-        let operation = assignment.attempt.operation_id.clone();
-        if self.stage(&operation).is_some() {
-            return Err(ValidationError("delivery already tracked".into()));
-        }
-        self.record_durable(assignment)?;
-        self.records
-            .iter_mut()
-            .find(|(a, _)| a.attempt.operation_id == operation)
-            .unwrap()
-            .1 = match stage {
-            DeliveryState::Durable | DeliveryState::Sent | DeliveryState::Uncertain => {
-                DeliveryState::Uncertain
-            }
-            other => other,
-        };
-        Ok(())
-    }
     /// The host persists this claim as uncertain/sent before touching the runtime.
     pub fn claim_send(&mut self, operation: &OperationId) -> bool {
         let Some((_, stage)) = self
@@ -762,6 +739,42 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn work_management_dispatch_restored_attempt_identity_never_rebuilds_sendable_payload() {
+        let (mut state, cfg, policy, goal) = fixture();
+        let token = ConfirmedPlan::confirm(&mut state, &goal, &cfg, &policy).unwrap();
+        let req = request(&state.tasks[0], &policy);
+        let prepared = ready(
+            prepare_dispatch(
+                &state,
+                &DeliveryLedger::default(),
+                &token,
+                req.clone(),
+                &cfg,
+                &policy,
+            )
+            .unwrap(),
+        );
+        state = prepared.next_state;
+        drop(prepared.assignment);
+        let attempt_id = state.attempts[0].id.clone();
+        state.tasks[0].state = WorkState::ObservationUnknown;
+        state.attempts[0].state = WorkState::ObservationUnknown;
+        let before = format!("{state:?}");
+        let mut empty = DeliveryLedger::default();
+        assert!(matches!(
+            prepare_dispatch(&state, &empty, &token, req.clone(), &cfg, &policy).unwrap(),
+            PrepareOutcome::Existing { attempt_id: found, delivery: DeliveryState::Uncertain }
+                if found == attempt_id
+        ));
+        assert!(empty.records.is_empty());
+        assert!(!empty.claim_send(&req.operation_id));
+        let mut changed = req;
+        changed.runtime_binding.execution_generation += 1;
+        assert!(prepare_dispatch(&state, &empty, &token, changed, &cfg, &policy).is_err());
+        assert_eq!(format!("{state:?}"), before);
+    }
+
+    #[test]
     fn work_management_dispatch_preallocated_attempt_matches_durable_launch_identity() {
         let (mut state, cfg, policy, goal) = fixture();
         let token = ConfirmedPlan::confirm(&mut state, &goal, &cfg, &policy).unwrap();
@@ -1008,7 +1021,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn work_management_dispatch_dependency_gate_and_restored_receipts_keep_exact_execution() {
+    fn work_management_dispatch_dependency_gate_and_uncertain_receipts_keep_exact_execution() {
         let (mut state, cfg, policy, goal) = fixture();
         let source = state.tasks[0].id.clone();
         let child = state.tasks[1].id.clone();
@@ -1029,10 +1042,10 @@ pub(crate) mod tests {
         state = prepared.next_state;
         let assignment = prepared.assignment;
         let mut ledger = DeliveryLedger::default();
-        ledger
-            .restore(assignment.clone(), DeliveryState::Sent)
-            .unwrap();
+        ledger.record_durable(assignment.clone()).unwrap();
         let op = &assignment.attempt.operation_id;
+        assert!(ledger.claim_send(op));
+        ledger.mark_uncertain(op);
         assert_eq!(ledger.stage(op), Some(DeliveryState::Uncertain));
         assert!(!ledger.claim_send(op));
         assert!(!ledger.note_admitted(

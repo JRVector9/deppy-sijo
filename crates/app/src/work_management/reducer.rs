@@ -123,6 +123,7 @@ impl ProjectWorkState {
         }
         Ok(())
     }
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub fn begin_attempt(
         &mut self,

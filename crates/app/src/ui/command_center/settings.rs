@@ -61,6 +61,7 @@ fn form(
     } else {
         5.0
     });
+    let saved_key = egui::Id::new(("cc-project-settings-own-save", &p.id));
     if state
         .settings_draft
         .as_ref()
@@ -68,8 +69,22 @@ fn form(
     {
         state.settings_draft = Some((p.id.clone(), p.config.clone()));
         state.settings_error = None;
+        ui.ctx()
+            .data_mut(|data| data.remove::<ProjectConfig>(saved_key));
     }
     let (_, draft) = state.settings_draft.as_mut().unwrap();
+    let saved = ui
+        .ctx()
+        .data_mut(|data| data.get_temp::<ProjectConfig>(saved_key));
+    if saved
+        .as_ref()
+        .is_some_and(|saved| saved.revision != p.config.revision && same_config(saved, &p.config))
+    {
+        // Rebase only our acknowledged save; keep edits made while it was pending.
+        draft.revision.clone_from(&p.config.revision);
+        ui.ctx()
+            .data_mut(|data| data.remove::<ProjectConfig>(saved_key));
+    }
     field(ui, snapshot, "name", |ui| {
         input(ui, snapshot, &mut draft.name);
     });
@@ -313,16 +328,31 @@ fn form(
                     workspace_id: p.id.clone(),
                     config: draft.clone(),
                 });
+                ui.ctx()
+                    .data_mut(|data| data.insert_temp(saved_key, draft.clone()));
                 state.settings_error = None;
             }
         }
         cancel = ghost_button(ui, snapshot, text(snapshot, "cancel"), 34.0, 13.0).clicked();
     });
     if cancel {
+        ui.ctx()
+            .data_mut(|data| data.remove::<ProjectConfig>(saved_key));
         state.settings_draft = None;
         state.settings_error = None;
         state.view = View::Main;
     }
+}
+
+fn same_config(saved: &ProjectConfig, current: &ProjectConfig) -> bool {
+    let mut saved = saved.clone();
+    saved.revision.clone_from(&current.revision);
+    saved.worker_providers.sort();
+    saved.worker_providers.dedup();
+    let mut current = current.clone();
+    current.worker_providers.sort();
+    current.worker_providers.dedup();
+    saved == current
 }
 
 fn input(ui: &mut egui::Ui, snapshot: &Snapshot, value: &mut String) {

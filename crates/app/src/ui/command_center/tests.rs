@@ -440,6 +440,92 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
     assert!(harness.state().intents.is_empty());
 }
 
+#[test]
+fn settings_save_confirmation_rebases_newer_edits_only_for_its_own_saved_config() {
+    struct State {
+        ui: UiState,
+        snapshot: Snapshot,
+        intents: Vec<Intent>,
+    }
+    for own_confirmation in [false, true] {
+        let mut snapshot = approved_visual_fixture();
+        snapshot.projects[0].config.revision = "1".into();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1100.0))
+            .build_ui_state(
+                |ui, state: &mut State| {
+                    state
+                        .intents
+                        .extend(show(ui, &mut state.ui, &state.snapshot));
+                },
+                State {
+                    ui: UiState {
+                        active_workspace: snapshot.selected_workspace_id.clone(),
+                        view: View::Settings,
+                        ..Default::default()
+                    },
+                    snapshot,
+                    intents: Vec::new(),
+                },
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        harness.get_by_label("저장").click();
+        harness.run();
+        let saved = harness
+            .state()
+            .intents
+            .iter()
+            .find_map(|intent| match intent {
+                Intent::SaveProject { config, .. } => Some(config.clone()),
+                _ => None,
+            })
+            .expect("explicit save A");
+        harness
+            .get_all_by_value("Codex")
+            .find(|node| node.accesskit_node().role() == egui::accesskit::Role::ComboBox)
+            .unwrap()
+            .click();
+        harness.run();
+        harness.get_by_label("Claude").click();
+        harness.run();
+        harness.state_mut().snapshot.projects[0].config = saved;
+        harness.state_mut().snapshot.projects[0].config.revision = "2".into();
+        if !own_confirmation {
+            harness.state_mut().snapshot.projects[0].config.name = "external project change".into();
+        }
+        harness.run();
+        harness.get_by_label("저장").click();
+        harness.run();
+        let latest = harness
+            .state()
+            .intents
+            .iter()
+            .rev()
+            .find_map(|intent| match intent {
+                Intent::SaveProject { config, .. } => Some(config),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            latest.provider, "Claude",
+            "newer local edit B must survive confirmation of A"
+        );
+        assert_eq!(
+            latest.revision,
+            if own_confirmation { "2" } else { "1" },
+            "only a matching own save may advance the CAS revision"
+        );
+        assert!(
+            harness
+                .state()
+                .intents
+                .iter()
+                .all(|intent| matches!(intent, Intent::SaveProject { .. }))
+        );
+    }
+}
+
 fn rich_fixture() -> Snapshot {
     let mut snapshot = fixture();
     snapshot.status = "로컬 snapshot · 실행 상태는 관측된 근거만 표시".into();

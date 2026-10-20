@@ -80,7 +80,9 @@ impl VerifiedExecutionDevice {
     }
 }
 #[derive(Debug, Clone)]
-pub(crate) struct VerifiedExecutionLease {
+pub(crate) struct VerifiedExecutionLease(Arc<VerifiedLeaseData>);
+#[derive(Debug)]
+struct VerifiedLeaseData {
     lease: ExecutionLease,
     registration: RegisteredDevice,
     observed_at: std::time::Instant,
@@ -88,14 +90,14 @@ pub(crate) struct VerifiedExecutionLease {
 }
 impl VerifiedExecutionLease {
     pub(crate) fn registration(&self) -> &RegisteredDevice {
-        &self.registration
+        &self.0.registration
     }
     pub(crate) fn lease(&self) -> &ExecutionLease {
-        &self.lease
+        &self.0.lease
     }
     pub(crate) fn validate_fresh(&self) -> Result<(), DeviceUnavailable> {
-        (self.fence.load(Ordering::Acquire)
-            && self.observed_at.elapsed()
+        (self.0.fence.load(Ordering::Acquire)
+            && self.0.observed_at.elapsed()
                 <= std::time::Duration::from_millis(EXECUTION_FRESHNESS_MS))
         .then_some(())
         .ok_or(DeviceUnavailable::Stale)
@@ -197,6 +199,21 @@ impl DeviceRegistry {
         now_ms: u64,
     ) -> Result<VerifiedExecutionLease, DeviceUnavailable> {
         self.validate_lease(lease, now_ms)?;
+        self.mint_verified_lease(lease, now_ms)
+    }
+    pub(crate) fn verified_execution_lease(
+        &self,
+        lease: &ExecutionLease,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionLease, DeviceUnavailable> {
+        self.validate_execution_lease(lease, now_ms)?;
+        self.mint_verified_lease(lease, now_ms)
+    }
+    fn mint_verified_lease(
+        &self,
+        lease: &ExecutionLease,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionLease, DeviceUnavailable> {
         let entry = self
             .entries
             .iter()
@@ -209,14 +226,14 @@ impl DeviceRegistry {
         let age = now_ms
             .checked_sub(*observed)
             .ok_or(DeviceUnavailable::Stale)?;
-        Ok(VerifiedExecutionLease {
+        Ok(VerifiedExecutionLease(Arc::new(VerifiedLeaseData {
             lease: lease.clone(),
             registration: entry.registration.clone(),
             fence: Arc::clone(&entry.fence),
             observed_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(age))
                 .ok_or(DeviceUnavailable::Stale)?,
-        })
+        })))
     }
     pub fn revoke(&mut self, id: &str) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.registration.id == id) {
@@ -487,15 +504,14 @@ impl DeviceRegistry {
                 return Err(DeviceUnavailable::Invalid);
             }
         }
-        if let Some((previous, observed_at)) = &entry.observation {
-            if proof.connection_epoch < previous.connection_epoch
+        if let Some((previous, observed_at)) = &entry.observation
+            && (proof.connection_epoch < previous.connection_epoch
                 || now_ms < *observed_at
                 || (proof.connection_epoch == previous.connection_epoch
                     && (proof.incarnation != previous.incarnation
-                        || proof.lease_epoch < previous.lease_epoch))
-            {
-                return Err(DeviceUnavailable::Conflict);
-            }
+                        || proof.lease_epoch < previous.lease_epoch)))
+        {
+            return Err(DeviceUnavailable::Conflict);
         }
         let same_identity = entry.observation.as_ref().is_some_and(|(previous, _)| {
             previous.device_id == proof.device_id
@@ -506,7 +522,6 @@ impl DeviceRegistry {
                 && previous.folder == proof.folder
                 && previous.folder_anchor == proof.folder_anchor
                 && previous.grant_epoch == proof.grant_epoch
-                && previous.lease_epoch == proof.lease_epoch
                 && previous.profiles == proof.profiles
                 && previous.max_workers == proof.max_workers
         });
@@ -556,11 +571,11 @@ impl DeviceRegistry {
         if !entry.registration.allowed_agents.contains(&request.agent) {
             return Err(DeviceUnavailable::UnsupportedAgent);
         }
-        let profile = proof
-            .profiles
-            .iter()
-            .find(|p| p.agent == request.agent)
-            .ok_or(DeviceUnavailable::UnsupportedAgent)?;
+        let mut matching = proof.profiles.iter().filter(|p| p.agent == request.agent);
+        let profile = matching.next().ok_or(DeviceUnavailable::UnsupportedAgent)?;
+        if matching.next().is_some() {
+            return Err(DeviceUnavailable::UnsupportedAgent);
+        }
         let reserved = self
             .leases
             .iter()
@@ -711,6 +726,22 @@ mod tests {
         }
     }
     #[test]
+    fn same_agent_profile_aliases_never_choose_an_unapproved_profile() {
+        let mut registry = DeviceRegistry::default();
+        let device = registration();
+        registry.register(device.clone()).unwrap();
+        let mut observed = proof(&device);
+        observed.profiles.push(WorkerProfile {
+            id: "another-profile".into(),
+            agent: device.allowed_agents[0].clone(),
+        });
+        registry.observe(observed, 10).unwrap();
+        assert_eq!(
+            registry.reserve(request(&device), 10),
+            Err(DeviceUnavailable::UnsupportedAgent)
+        );
+    }
+    #[test]
     fn verified_device_and_lease_clones_are_revoked_by_live_registry_changes() {
         let mut registry = DeviceRegistry::default();
         let device = registration();
@@ -730,7 +761,15 @@ mod tests {
         let mut heartbeat = proof(&device);
         heartbeat.active_workers = 1;
         heartbeat.active_operation_ids = vec![lease.request.operation_id.clone()];
+        heartbeat.lease_epoch += 1;
         registry.observe(heartbeat, 11).unwrap();
+        assert_eq!(
+            registry
+                .verified_execution_lease(&lease, 11)
+                .unwrap()
+                .lease(),
+            &lease
+        );
         assert!(
             policy.validate_fresh().is_ok(),
             "capacity heartbeat cannot retire an unchanged identity"

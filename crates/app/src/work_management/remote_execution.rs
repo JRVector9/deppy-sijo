@@ -11,9 +11,7 @@ pub enum DeliveryStatus {
     Durable,
     Sent,
     Running(RuntimeBinding),
-    Rejected,
     ObservationUnknown,
-    Finished,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteDelivery {
@@ -40,13 +38,12 @@ impl RemoteExecutionLedger {
         }
         let mut ledger = Self::default();
         for mut record in records {
-            if let DeliveryStatus::Running(binding) = &record.status {
-                if binding.incarnation != record.lease.incarnation
+            if let DeliveryStatus::Running(binding) = &record.status
+                && (binding.incarnation != record.lease.incarnation
                     || binding.execution_generation == 0
-                    || binding.session_id.0 == 0
-                {
-                    return Err(DeliveryError::Invalid);
-                }
+                    || binding.session_id.0 == 0)
+            {
+                return Err(DeliveryError::Invalid);
             }
             if ledger.records.iter().any(|r| {
                 r.lease.request.operation_id == record.lease.request.operation_id

@@ -49,7 +49,7 @@ impl RuntimeSecretResolver for Resolver {
         anyhow::bail!("fixture has no launch secrets")
     }
 }
-struct Launcher;
+pub(crate) struct Launcher;
 impl RemoteWorkLauncher for Launcher {
     fn prepare(
         &self,
@@ -85,6 +85,25 @@ pub(crate) fn worker_for_workspace(
     id: &str,
     workspace: &str,
 ) -> (RemoteRuntimeServer, String) {
+    worker_for_workspace_with_launcher(
+        root,
+        id,
+        workspace,
+        Arc::new(Launcher),
+        AgentSelection {
+            provider: "fixture".into(),
+            model: None,
+            effort: None,
+        },
+    )
+}
+pub(crate) fn worker_for_workspace_with_launcher(
+    root: &Path,
+    id: &str,
+    workspace: &str,
+    launcher: Arc<dyn RemoteWorkLauncher>,
+    agent: AgentSelection,
+) -> (RemoteRuntimeServer, String) {
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(root.join("metadata.sqlite3"), b"legacy untouched").unwrap();
     let backend = InProcessRuntimeClient::try_new_with_resolver(
@@ -114,14 +133,10 @@ pub(crate) fn worker_for_workspace(
                     max_workers: 2,
                     profiles: vec![RemoteWorkerProfile {
                         id: "fixture-profile".into(),
-                        agent: AgentSelection {
-                            provider: "fixture".into(),
-                            model: None,
-                            effort: None,
-                        },
+                        agent,
                     }],
                 },
-                Arc::new(Launcher),
+                launcher,
                 journal,
             )
             .unwrap(),

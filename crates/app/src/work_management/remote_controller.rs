@@ -6,6 +6,10 @@ use super::devices::{
 use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::{AttemptId, OperationId, RuntimeIncarnationId};
+use runtime::remote_input::{
+    RemoteExecutionProof, RemoteTaskInputReply, RemoteTaskInputRequest, RemoteTaskInputResult,
+    RemoteTaskTarget,
+};
 use runtime::remote_worker::{
     RemoteWorkIdentity, RemoteWorkRequest, RemoteWorkResult, RemoteWorkerCapabilities,
 };
@@ -52,10 +56,11 @@ pub(crate) struct RemoteDeviceCandidate {
 }
 /// Host-only, operation-bound authority. The callback must hold its own revocation fence
 /// through the action. Neither the callback nor any credential crosses a wire or enters storage.
+type SendAuthorizer = dyn Fn(&mut dyn FnMut()) + Send + Sync;
 pub(crate) struct RemoteSendAuthority {
     operation_id: OperationId,
     deadline: Instant,
-    authorize: Arc<dyn Fn(&mut dyn FnMut()) + Send + Sync>,
+    authorize: Arc<SendAuthorizer>,
 }
 impl RemoteSendAuthority {
     pub(crate) fn new(
@@ -75,6 +80,13 @@ impl RemoteSendAuthority {
             deadline,
             authorize: Arc::new(authorize),
         })
+    }
+    fn deadline_unix_ms(&self) -> Option<u64> {
+        let remaining = self
+            .deadline
+            .checked_duration_since(Instant::now())?
+            .as_millis();
+        runtime::remote_input::unix_millis()?.checked_add(u64::try_from(remaining).ok()?)
     }
     fn admit<T>(&self, operation: &OperationId, action: impl FnOnce() -> T) -> Option<T> {
         if operation != &self.operation_id || Instant::now() >= self.deadline {
@@ -112,6 +124,20 @@ pub(crate) enum RemoteDeviceJob {
         request_id: u64,
         workspace_id: WorkspaceId,
         device_id: String,
+    },
+    ObserveExecution {
+        request_id: u64,
+        lease: ExecutionLease,
+        session: deppy_core::SessionId,
+        execution_generation: u64,
+    },
+    DeliverInput {
+        request_id: u64,
+        lease: ExecutionLease,
+        execution: Box<RemoteExecutionProof>,
+        operation_id: OperationId,
+        prompt: String,
+        authority: RemoteSendAuthority,
     },
     ReserveLaunch {
         request_id: u64,
@@ -157,6 +183,7 @@ pub(crate) enum RemoteDeviceOutcome {
         devices: Vec<DeviceView>,
         receipts: Vec<RemoteLaunchReceipt>,
         policies: Vec<VerifiedExecutionDevice>,
+        inputs: Vec<RemoteInputReceipt>,
     },
     Revoked {
         request_id: u64,
@@ -168,6 +195,18 @@ pub(crate) enum RemoteDeviceOutcome {
         verified: VerifiedExecutionLease,
     },
     LaunchReceipt(RemoteLaunchReceipt),
+    ExecutionObserved {
+        request_id: u64,
+        lease: ExecutionLease,
+        execution: Option<Box<RemoteExecutionProof>>,
+        verified: Option<VerifiedExecutionLease>,
+    },
+    InputPending {
+        request_id: u64,
+        lease: ExecutionLease,
+        operation_id: OperationId,
+    },
+    InputReceipt(RemoteInputReceipt),
     Failed {
         request_id: u64,
         code: RemoteDeviceError,
@@ -178,6 +217,19 @@ pub(crate) struct RemoteLaunchReceipt {
     pub request_id: u64,
     pub lease: ExecutionLease,
     pub result: RemoteWorkResult,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteInputAcceptance {
+    pub sequence: u64,
+    pub at_micros: i64,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteInputReceipt {
+    pub request_id: u64,
+    pub lease: ExecutionLease,
+    pub operation_id: OperationId,
+    pub result: RemoteTaskInputResult,
+    pub accepted: Option<RemoteInputAcceptance>,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteDeviceCorrelation {
@@ -216,7 +268,7 @@ impl RemoteDeviceWorker {
     pub(crate) fn try_submit(
         &mut self,
         job: RemoteDeviceJob,
-    ) -> Result<(), LazyWorkerSubmitError<RemoteDeviceJob>> {
+    ) -> Result<(), Box<LazyWorkerSubmitError<RemoteDeviceJob>>> {
         let correlation = match &job {
             RemoteDeviceJob::Inspect { setup } => RemoteDeviceCorrelation {
                 request_id: setup.request_id,
@@ -245,6 +297,22 @@ impl RemoteDeviceWorker {
                 attempt_id: None,
                 operation_id: None,
                 candidate_id: Some(candidate_id.clone()),
+            },
+            RemoteDeviceJob::ObserveExecution {
+                request_id, lease, ..
+            }
+            | RemoteDeviceJob::DeliverInput {
+                request_id, lease, ..
+            } => RemoteDeviceCorrelation {
+                request_id: *request_id,
+                workspace_id: Some(lease.request.workspace_id.clone()),
+                device_id: Some(lease.request.device_id.clone()),
+                attempt_id: Some(lease.request.attempt_id.clone()),
+                operation_id: Some(match &job {
+                    RemoteDeviceJob::DeliverInput { operation_id, .. } => operation_id.clone(),
+                    _ => lease.request.operation_id.clone(),
+                }),
+                candidate_id: None,
             },
             RemoteDeviceJob::ReserveLaunch {
                 request_id,
@@ -281,7 +349,7 @@ impl RemoteDeviceWorker {
                 }
             }
         };
-        self.worker.try_request(job)?;
+        self.worker.try_request(job).map_err(Box::new)?;
         self.pending = Some(correlation);
         Ok(())
     }
@@ -591,6 +659,208 @@ mod tests {
         drop(restored);
         a.shutdown();
         b.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct PromptLauncher;
+    impl runtime::remote_worker::RemoteWorkLauncher for PromptLauncher {
+        fn prepare(
+            &self,
+            profile: &runtime::remote_worker::RemoteWorkerProfile,
+            prompt: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            let mut command = super::super::remote_execution::journal::tls_tests::Launcher
+                .prepare(profile, prompt)?;
+            if let RuntimeCommand::SpawnAgent { args, .. } = &mut command {
+                *args=vec!["-c".into(),"stty raw -echo; printf '\\033[?2004h❯ '; dd bs=1 count=25 of=accepted 2>/dev/null; sleep 2".into()];
+            }
+            Ok(command)
+        }
+    }
+    #[test]
+    fn remote_controller_delivers_only_captured_guarded_input_and_preserves_actual_receipt() {
+        use super::super::remote_execution::journal::tls_tests::worker_for_workspace_with_launcher;
+        let root =
+            std::env::temp_dir().join(format!("deppy-controller-input-{}", uuid::Uuid::new_v4()));
+        let workspace = WorkspaceId("workspace-input".into());
+        let agent = AgentSelection {
+            provider: "claude".into(),
+            model: None,
+            effort: None,
+        };
+        let (server, pin) = worker_for_workspace_with_launcher(
+            &root.join("worker"),
+            "input-device",
+            &workspace.0,
+            Arc::new(PromptLauncher),
+            agent.clone(),
+        );
+        let mut worker =
+            RemoteDeviceWorker::new(root.join("controller"), Arc::new(Secrets::default()), || {});
+        let folder = std::fs::canonicalize(root.join("worker"))
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        worker
+            .try_submit(RemoteDeviceJob::Inspect {
+                setup: RemoteDeviceSetup {
+                    request_id: 1,
+                    name: "Input worker".into(),
+                    endpoint: server.local_addr(),
+                    pinned_fingerprint: pin,
+                    workspace_id: workspace.clone(),
+                    expected_folder: folder.clone(),
+                    auth_token: SecretString::new(server.auth_token().into()),
+                },
+            })
+            .unwrap();
+        let RemoteDeviceOutcome::Candidate { candidate, .. } = outcome(&mut worker) else {
+            panic!("candidate missing")
+        };
+        worker
+            .try_submit(RemoteDeviceJob::Grant {
+                request_id: 2,
+                candidate_id: candidate.candidate_id,
+                allowed_profile_ids: vec!["fixture-profile".into()],
+                max_workers: 2,
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome(&mut worker),
+            RemoteDeviceOutcome::Granted { .. }
+        ));
+        let request = LeaseRequest {
+            device_id: "input-device".into(),
+            workspace_id: workspace.clone(),
+            attempt_id: AttemptId::new(),
+            operation_id: OperationId::new(),
+            folder,
+            agent,
+        };
+        worker
+            .try_submit(RemoteDeviceJob::ReserveLaunch {
+                request_id: 3,
+                authority: native_authority(&request.operation_id),
+                request,
+                initial_prompt: None,
+            })
+            .unwrap();
+        let RemoteDeviceOutcome::LaunchPending {
+            lease, verified, ..
+        } = outcome(&mut worker)
+        else {
+            panic!("launch not pending")
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        let (session, execution_generation) = loop {
+            worker
+                .try_submit(RemoteDeviceJob::Poll {
+                    workspace_id: workspace.clone(),
+                })
+                .unwrap();
+            if let RemoteDeviceOutcome::Snapshot { receipts, .. } = outcome(&mut worker)
+                && let Some(RemoteLaunchReceipt {
+                    result:
+                        RemoteWorkResult::Launched {
+                            session,
+                            execution_generation,
+                        },
+                    ..
+                }) = receipts.first()
+            {
+                break (*session, *execution_generation);
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let execution = loop {
+            worker
+                .try_submit(RemoteDeviceJob::ObserveExecution {
+                    request_id: 4,
+                    lease: lease.clone(),
+                    session,
+                    execution_generation,
+                })
+                .unwrap();
+            if let RemoteDeviceOutcome::ExecutionObserved {
+                request_id: 4,
+                execution: Some(proof),
+                verified: Some(verified),
+                ..
+            } = outcome(&mut worker)
+            {
+                assert_eq!(verified.lease(), &lease);
+                assert!(verified.validate_fresh().is_ok());
+                break proof;
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        let input_operation = OperationId::new();
+        worker
+            .try_submit(RemoteDeviceJob::DeliverInput {
+                request_id: 5,
+                lease: lease.clone(),
+                execution: execution.clone(),
+                operation_id: input_operation.clone(),
+                prompt: "bounded task".into(),
+                authority: native_authority(&input_operation),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome(&mut worker),
+            RemoteDeviceOutcome::InputPending { .. }
+        ));
+        let receipt = loop {
+            worker
+                .try_submit(RemoteDeviceJob::Poll {
+                    workspace_id: workspace.clone(),
+                })
+                .unwrap();
+            if let RemoteDeviceOutcome::Snapshot { inputs, .. } = outcome(&mut worker)
+                && let Some(receipt) = inputs.first()
+            {
+                break receipt.clone();
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(receipt.request_id, 5);
+        assert_eq!(receipt.operation_id, input_operation);
+        assert_eq!(receipt.result, RemoteTaskInputResult::Admitted);
+        assert_eq!(receipt.accepted.as_ref().unwrap().sequence, 1);
+        assert!(receipt.accepted.as_ref().unwrap().at_micros > 0);
+        worker
+            .try_submit(RemoteDeviceJob::DeliverInput {
+                request_id: 6,
+                lease: lease.clone(),
+                execution,
+                operation_id: input_operation.clone(),
+                prompt: "bounded task".into(),
+                authority: native_authority(&input_operation),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome(&mut worker),
+            RemoteDeviceOutcome::InputReceipt(RemoteInputReceipt {
+                result: RemoteTaskInputResult::Admitted,
+                ..
+            })
+        ));
+        assert_eq!(
+            std::fs::read(root.join("worker/accepted")).unwrap(),
+            b"\x1b[200~bounded task\x1b[201~\r"
+        );
+        drop(worker);
+        let until = Instant::now() + Duration::from_secs(2);
+        while verified.validate_fresh().is_ok() {
+            assert!(
+                Instant::now() < until,
+                "dropping route owner must revoke proof clones"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        server.shutdown();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,3 +1,64 @@
+# Command Center v2 — 병렬 구현 통합 진행, 2026-10-20
+
+## Current objective / authorization
+
+사용자가 승인한9개 PR 계획을 GPT-6.1-Sol/xhigh 서브에이전트3개로 병렬 구현 중이다. 원안으로 즉시 화면·소스를 복구할 수 있어야 한다. main 병합/push/앱 종료·실행·재시작 권한 없음. 실제 하지 않았다. 아래 과거 기록은 현재 기능 검증 결과로 취급하지 않는다.
+
+## Isolation / design decisions
+
+- Root `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`.
+- 기준 f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679/source0.13.0. rollback branch `rollback/command-center-pre-v2-20261020`, annotated tag `command-center-pre-v2-20261020` 동일 source. 기존 dirty tree 보존.
+- 기본 기존 화면, `DEPPY_COMMAND_CENTER_V2=1` 명시 opt-in. 기존 화면 전환/재진입은 작업자 프로세스를 종료하지 않는다. `docs/command-center-rollback.md`.
+- metadata DB/migration 불변. 별도 `command-center-v2.sqlite3`, lazy bounded worker에서만 접근. 새 코드 출시 시 버전 증가 필수이며 현재는 개발/검사 source0.13.0, 배포 아님.
+- Core task/attempt/submission/operation/runtime identity 분리, 명시 계획 확인, durable 저장 후 입력, 실제 admission만 ACK. 종료/timeout을 성공으로 표시하지 않음. remoteCloudControlPermit 비직렬화 권한을 저장 대기 뒤 효과 직전까지 재검증.
+- 원격 atomic worker는 host-granted 열린 디렉터리 fd + 실제 profile로 spawn. macOS `/dev/fd/<dirfd>` chdir가 ENOTDIR인 사실을 실제 fixture로 확인해 repo-vendored portable-pty0.9.0에 child fchdir 추가. global cache 수정/경로 fallback 없음.
+
+## Integrated / modified
+
+- PR1 core38733f30/eb8c770b, reducer6afdcd8c/dc44fa4a; PR2 isolated sidecarc411be79; helper worker/routes/layout7a6e73a9.
+- PR3 nativeleafa60e6da+6d6dc1b7; PR4 guarded puredispatch0ff23a08; PR5 validatedplanner/provider/orchestrationea56da0f; PR7 bounded registry1548dd27+review569f2d29; reserved attempt identity9d432b5e.
+- PR8 web authenticated bounded projections8d46b74e/16d8dbc7 + deferred authority1e9212f4; i18n105keys29e098b1; shared PWAleafb04fa50f.
+- Native hostd0943fa6 (agent9f2e69f2): exact Fleet routes, explicitmain, savedproject policy, durable→trackedPTY input, no fabricated Running/result; actual existing terminal/Git/history render slots. Followup result/approval/auto-new-worker pending.
+- Vendored owned directorydad77127 (agentf2b8589c). Async runtime atomicspawn/journal still agent tree, not root integrated.
+- Root PWA b2ff5bda: shell loopback+Relay bundle imports, fullviewport parent, reachable original-shell/reopen toggle, terminal back restores Command Center+draft, updated4existing Chrome asset fixtures/new production-bundle test. New report/verify wire pending DTO.
+
+## Actual checks / failed approaches
+
+- Core20PASS; sidecar20PASS/strictClippyPASS; pure reducer+dispatch+planner standalone32PASS; layout2PASS/routes3PASS/lazyrepository1PASS (metadata fixture unchanged).
+- Native leaf latest10PASS1ignored; offscreen1PASS/8PNGs (fixture egui, not liveApp). Initial App `cargo check --tests` PASS; host filter13PASS. Followup current App checking undercc_ui.
+- web priorfull398PASS1ignored beforelast2tests; work_8PASS actualWS auth/opaque Korean/revocation/read-only. strictwebClippyPASS beforelatestpermit/tests. Deferred permit1PASS policy/revocation/deadline/disconnect. First permit RED was missingAPI compile failure, not behavioral regression.
+- Root realChrome sharedPWA79PASS; RelayNode16PASS. Productionbundle Chrome1PASS (13checks exactroute/NFC/queue!=ACK/newer draft/terminalroundtrip/fullviewport/rollback+reopen). First test failed because wait condition observed disabled=false before firstsnapshot, corrected test wait for actual project row; no product gate weakened.
+- Relay artifact build+verify exit0 in `/private/tmp/deppy-cc-relay-build-20261020` reservedexample origins/test artifact only, deployment blocked. Root syntax Node/sh/diffcheck exit0.
+- cc_storage actual fixture ownedfd2PASS; real two-worker pinnedTLS1PASS (same sessionnumber/exactruntimeisolation/disconnectaftereffect/idempotentreconnect); async Pendingjournal runtime2PASS (RED earlyACK0PASS1FAIL ->GREEN) only agenttree, not wholefeature proof.
+- Logs `/private/tmp/deppy-cc-{authority-green,production-shell2,leaf-browser-root,relay-node,relay-build}-20261020.log`.
+- Full current App/workspace/strictClippy/boundary/deps/finalbrowsercohort/releasepackage NOT complete. No live provider request or user DB change.
+
+## Latest verified integration
+
+- PR8b2ff5bda actual fullweb402PASS1ignored, 7realChrome testsPASS (newproductionbundle/Relay/기존mobile4targets), strictweballtargetsClippyPASS. Sharedleaf86assertionsPASS including exactresultattempt/revision/manualforms newerACKdraft/fontscale/read-only. Fixture first font expected desktop21px while mobile19px corrected responsive expectation, productCSS unchanged.
+- Native followupf87c4565→23f89353 integrated: actual host17PASS, native11PASS1ignored, transactionrollback/ignoredconfirmationreject/warmcwdscope/reviewstaterestore/deferredpermit. New report/verify remote nativeallowlist followscc_ui nextcommit; rootworkwire+PWAformsready.
+- Runtime reviewae304a74 integrated (revoked Pending Resolve retained; currentincarnationstalegrant Unknown; absbinaryrequired). Actual agentruntime4PASS incl revoke-during-result-journalcommit. Sidecarjournal/schema2 adapter + host launch integration pending.
+
+## Ownership / remaining / exact next commands
+
+- cc_ui `/Users/jr/Desktop/projects/deppy-sijo-cc-ui-20261020`: App host, app.rs, nativeDTO. Current result/verify/staleattempt/recovery/deferredpermit followup, then automaticnewworker/profile/worktree/actualproviderhooks. Uses root integration Cargo target/jobs2; root no concurrent heavy Cargo.
+- cc_storage `/Users/jr/Desktop/projects/deppy-sijo-cc-devices-20261020`: remote atomicspawn+asyncjournal+sidecar migration2; twoTLSfixtures. Uses performance target/jobs2. Root reviewedvendor; remainingruntime/journal commitreview.
+- cc_contracts `/Users/jr/Desktop/projects/deppy-sijo-cc-pwa-20261020`: preallocatedidentity committed, now independentnativehost review. No root edits.
+- Root: PWA production/Relay tests+wireallowlist afterDTO, reviewedsequentialcherrypick, docs/version/finalgates. Do not mark entireplancomplete until automaticlocal/remote execution, correctresultsource, approvals/recovery and actual checks match requirements.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020
+git status --short
+git diff --check
+cat AGENTS.md
+cat docs/superpowers/plans/2026-10-20-command-center-v2-implementation.md
+# Only after agent Cargo slot is released and all integration is frozen:
+python3 /private/tmp/deppy-cc-final-gates-20261020.py
+# Current task does not authorize dev-run.sh or App launch.
+```
+
+---
+
 # Command Center v2 — 별도 브랜치·PR 계획 준비, 2026-10-20
 
 ## Current objective / status

@@ -14,14 +14,14 @@
 
 2026-10-20 후속 실행 지시: 사용자가 서브에이전트 병렬 개발과 즉시 원안 복구를 요청했다. 원안 tag/branch와 기능 스위치를 유지한다. **PR2 저장은 기존 metadata DB migration 대신 별도 `command-center-v2.sqlite3` 보조 DB로 변경한다.** workspace 참조는 host가 기존 workspace ID로 검증하며, 보조 DB 내부 goal/task/attempt의 FK·unique·revision 계약은 유지한다. 이는 원안 앱의 DB schema 호환성을 보존하기 위한 변경이다. 아래 최초 계획의 전역 migration 지시는 이 수정으로 대체한다.
 
-- 현재는 **계획·시안 기준 고정 단계**다. 제품 코드 구현과 실제 PR 생성은 시작하지 않았다.
+- 현재는 **승인된 계획의 병렬 구현·통합 검증 단계**다. 제품 변경은 통합 기능 브랜치에서 PR 범위별 로컬 커밋으로 관리하며, 실제 GitHub PR 생성/push/main 병합은 하지 않았다.
 - 통합 브랜치: `feat/agent-command-center-v2-20261020`.
 - 작업 폴더: `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`.
 - 기준: `git fetch origin` 후 확인한 `origin/main`의 `f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679`.
 - 별도 settings/cloud 작업 폴더의 미커밋 변경은 포함하지 않는다. 필요한 수정이 main에 병합되면 PR 경계에서 최신 main을 반영하고 관련 회귀를 다시 확인한다.
 - 각 PR은 `feat/command-center-pr01-contracts`부터 `feat/command-center-pr09-release`까지 별도 브랜치로 만들고 **통합 브랜치 `feat/agent-command-center-v2-20261020`를 base로 한다**. 선행 PR이 이 브랜치에 병합된 뒤 다음 PR을 분기한다. 독립 PR의 선행 개발이 필요하면 stacked PR의 base를 명시한다. PR1~9 중간 결과를 main에 직접 병합하지 않는다.
 - 통합 브랜치에서 최종 검토 후 main 대상 통합 PR을 준비한다. main 병합·출시는 별도 사용자 지시 범위에서 진행하며 이번 계획 보고에 포함하지 않는다.
-- 사용자 요청은 먼저 PR 계획 보고이므로 이 단계에서 제품 소스를 수정하거나 앱을 빌드·실행하지 않는다.
+- 후속 사용자가 병렬 개발을 승인했다. 제품 소스 수정과 검사 빌드는 진행하며 앱 실행·재시작은 하지 않는다.
 
 ## 고정한 화면 기준
 

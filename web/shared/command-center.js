@@ -443,7 +443,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   function renderHistory(entries, destination = content) {
     if (!entries.length) { destination.append(node('p', 'cc-empty', label('no_history', '아직 기록이 없습니다.'))); return; }
     const full = destination === content;
-    for (const entry of entries.slice(0, 100)) {
+    for (const entry of entries.slice(-100)) {
       const owner = entry.target?.workspace_id === workspaceId && entry.target?.task_id ? list(project()?.tasks).find(task => routeKey(task.target) === routeKey(entry.target)) : null;
       const row = node('div', 'cc-history-row'), body = node('div'); row.dataset.ccHistoryId = str(entry.id);
       body.append(node('p', full ? 'cc-history-title' : '', entry.text), node('small', 'cc-muted', full ? owner ? [owner.provider, owner.role, owner.device].filter(Boolean).join(' · ') : '프로젝트 기록' : entry.detail)); row.append(node('time', '', entry.time), body);

@@ -1378,6 +1378,9 @@ impl App {
         };
         for event in events {
             match event {
+                runtime::RuntimeEvent::RemoteTaskInput { target, reply } => {
+                    local_close::event(&mut host, workspace, runtime_instance, target, reply)
+                }
                 runtime::RuntimeEvent::RemoteWorkerObserved {
                     request_id,
                     capabilities,

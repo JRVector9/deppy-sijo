@@ -133,7 +133,8 @@ pub(super) fn workspace_preparing(host: &CommandCenterHost, workspace: &str) -> 
             .any(|p| p.record.workspace.0 == workspace && p.preparing())
 }
 pub(super) fn handoff_pending(host: &CommandCenterHost, target: &cc::RouteTarget) -> bool {
-    sessions::target_pending(host, target)
+    local_close::target_pending(host, target)
+        || sessions::target_pending(host, target)
         || host.inputs.values().any(|p| {
             p.target.workspace_id == target.workspace_id && p.target.task_id == target.task_id
         })
@@ -144,7 +145,8 @@ pub(super) fn handoff_pending(host: &CommandCenterHost, target: &cc::RouteTarget
         })
 }
 pub(super) fn project_pending(host: &CommandCenterHost, workspace: &str) -> bool {
-    sessions::project_pending(host, workspace)
+    local_close::project_pending(host, workspace)
+        || sessions::project_pending(host, workspace)
         || host
             .inputs
             .values()

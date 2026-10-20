@@ -35319,6 +35319,7 @@ impl eframe::App for App {
                                 event,
                                 runtime::RuntimeEvent::RemoteWorkerObserved { .. }
                                     | runtime::RuntimeEvent::RemoteWorkResolved { .. }
+                                    | runtime::RuntimeEvent::RemoteTaskInput { .. }
                                     | runtime::RuntimeEvent::SessionExited { .. }
                                     | runtime::RuntimeEvent::SessionInputAccepted { .. }
                                     | runtime::RuntimeEvent::InputAdmitted { .. }

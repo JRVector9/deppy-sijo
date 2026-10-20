@@ -399,7 +399,8 @@ fn task_detail(
     match state.detail_tab {
         DetailTab::Work => {
             title(ui, snapshot, &t.activity);
-            if t.close_worker.enabled
+            if t.attempt_id.is_some()
+                && t.target.session_id.is_some()
                 && action(ui, snapshot, "워커 실행 종료 · 용량 반환", &t.close_worker)
                 && let Some(attempt_id) = &t.attempt_id
             {

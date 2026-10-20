@@ -30,6 +30,7 @@ struct LiveRoute {
     cwd: Option<String>,
     watch: Option<String>,
 }
+#[derive(Clone)]
 struct Project {
     snapshot: stored::CommandCenterSnapshot,
     revision: Option<stored::ProjectRevision>,
@@ -46,12 +47,11 @@ struct Project {
 }
 impl Project {
     fn state(&self) -> ProjectWorkState {
-        ProjectWorkState {
-            workspace_id: self.snapshot.config.workspace_id.clone(),
-            goals: self.snapshot.goals.clone(),
-            tasks: self.snapshot.tasks.clone(),
-            attempts: self.snapshot.attempts.clone(),
-        }
+        let mut state = ProjectWorkState::new(self.snapshot.config.workspace_id.clone());
+        state.goals = self.snapshot.goals.clone();
+        state.tasks = self.snapshot.tasks.clone();
+        state.attempts = self.snapshot.attempts.clone();
+        state
     }
     fn set_state(&mut self, state: ProjectWorkState) {
         self.snapshot.goals = state.goals;
@@ -113,9 +113,11 @@ pub(super) struct CommandCenterHost {
     inputs: BTreeMap<String, Input>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
     operations: BTreeMap<String, cc::Intent>,
+    remote_permits: BTreeMap<String, web_remote::cloud::CloudControlPermit>,
     receipts: VecDeque<cc::RemoteReceipt>,
     status: String,
     published: bool,
+    publication_failed: bool,
     publication_dirty: bool,
     generations: Vec<(String, u64, bool)>,
     pending_git: Option<(cc::RouteTarget, ui::git_panel::GitPanelAction)>,
@@ -136,9 +138,11 @@ impl CommandCenterHost {
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
             operations: BTreeMap::new(),
+            remote_permits: BTreeMap::new(),
             receipts: VecDeque::new(),
             status: String::new(),
             published: false,
+            publication_failed: false,
             publication_dirty: true,
             generations: vec![],
             pending_git: None,
@@ -146,7 +150,12 @@ impl CommandCenterHost {
             aux_ready: None,
         }
     }
+    pub(super) fn retry_publication(&mut self) {
+        self.publication_failed = false;
+        self.publication_dirty = true;
+    }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
+        self.remote_permits.remove(id);
         let detail = bounded(&detail.into(), 512);
         self.publication_dirty = true;
         self.status = detail.clone();
@@ -362,7 +371,15 @@ impl App {
                                 })
                             })
                             .flatten();
-                        (agent, self.cached_session_cwd(*sid), watch)
+                        (
+                            agent,
+                            active_workspace_cwd(
+                                &session.workspace_id,
+                                &self.active.id,
+                                self.cached_session_cwd(*sid),
+                            ),
+                            watch,
+                        )
                     }
                     FleetTarget::Structured { .. } => (None, None, None),
                 };
@@ -543,6 +560,29 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
+                    attempt_id: attempt.map(|a| a.id.0.clone()),
+                    result_report: if ready && attempt.is_some() {
+                        yes()
+                    } else {
+                        no("현재 시도가 없습니다.")
+                    },
+                    verify_result: if ready && task.result.is_some() {
+                        yes()
+                    } else {
+                        no("제출된 결과가 없습니다.")
+                    },
+                    verification: task
+                        .result
+                        .as_ref()
+                        .map(|r| {
+                            match r.verification {
+                                work::VerificationState::NotRun => "검증 미실행",
+                                work::VerificationState::Passed => "사용자가 수행한 검증 통과",
+                                work::VerificationState::Failed => "검증 실패",
+                            }
+                            .into()
+                        })
+                        .unwrap_or_default(),
                     terminal_session_id: live.and_then(|l| l.watch.clone()),
                     eligible_sessions: eligible,
                     target,
@@ -598,7 +638,32 @@ impl App {
             let providers = agents.iter().map(|a| a.provider.clone()).collect();
             let models = agents.iter().filter_map(|a| a.model.clone()).collect();
             let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
-            snapshot.projects.push(cc::Project { storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary: if p.loaded { "메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.".into() } else { "저장된 작업 상태를 불러오는 중입니다.".into() }, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            let main_summary = if !p.loaded {
+                "저장된 작업 상태를 불러오는 중입니다.".into()
+            } else if let Some(goal) = p.snapshot.goals.last() {
+                let state = p.state();
+                let aggregate = wm::orchestrator::aggregate_goal(&state, &goal.id);
+                let completion = if state.goal_is_complete(&goal.id) {
+                    "모든 결과 확인 완료"
+                } else {
+                    "진행 중"
+                };
+                format!(
+                    "{completion} · 작업 {} · 결과 제출 {} · 검증 통과 {} · 사용자 확인 {}\n메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.",
+                    aggregate.total,
+                    aggregate.results_submitted,
+                    aggregate.verification_passed,
+                    aggregate.user_confirmed
+                )
+            } else {
+                "메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.".into()
+            };
+            let planner_mode =
+                wm::provider_adapter::planner_mode(wm::provider_adapter::PlannerSupport {
+                    structured_final_response: false,
+                    tool_execution_restricted: false,
+                });
+            snapshot.projects.push(cc::Project { storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),
@@ -615,6 +680,7 @@ impl App {
         &mut self,
         operation_id: String,
         value: serde_json::Value,
+        permit: web_remote::cloud::CloudControlPermit,
     ) {
         if !self.command_center_layout.available || uuid::Uuid::parse_str(&operation_id).is_err() {
             return;
@@ -635,7 +701,13 @@ impl App {
             return;
         }
         if let Some(host) = self.command_center.as_mut() {
-            host.enqueue(operation_id, intent);
+            if permit.is_current()
+                && !host.operations.contains_key(&operation_id)
+                && host.remote_permits.len() < 64
+            {
+                host.remote_permits.insert(operation_id.clone(), permit);
+                host.enqueue(operation_id, intent);
+            }
             self.egui_ctx.request_repaint();
         }
     }
@@ -645,6 +717,29 @@ impl App {
         id: &str,
         intent: cc::Intent,
     ) -> Result<(), String> {
+        // An intent is transactional in memory as well as in the sidecar: a full queue,
+        // draft capacity error, or validation failure must not expose partial edits.
+        let workspace = intent_workspace(&intent).map(str::to_owned);
+        project_transaction(host, workspace.as_deref(), |host| {
+            self.apply_command_center_intent(host, id, intent)
+        })
+    }
+
+    fn apply_command_center_intent(
+        &mut self,
+        host: &mut CommandCenterHost,
+        id: &str,
+        intent: cc::Intent,
+    ) -> Result<(), String> {
+        if host
+            .remote_permits
+            .get(id)
+            .is_some_and(|permit| !permit.is_current())
+        {
+            return Err(
+                "원격 제어 권한이 만료되었거나 취소되었습니다. 요청을 적용하지 않았습니다.".into(),
+            );
+        }
         match intent {
             cc::Intent::RetryStorage { workspace_id } => {
                 if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
@@ -757,6 +852,7 @@ impl App {
             cc::Intent::InstallPlanJson { workspace_id, json } => {
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let request = p.request.as_ref().ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
+                if request.config_revision() != p.snapshot.config.revision || request.goal().workspace_id != p.snapshot.config.workspace_id { return Err("메인 계획 요청의 설정이나 프로젝트가 바뀌었습니다.".into()); }
                 let policy = p.policy();
                 let proposal = wm::provider_adapter::accept_manual_json(request,&json,&p.snapshot.config,&policy).map_err(|e| e.to_string())?;
                 let mut state = p.state();
@@ -783,6 +879,7 @@ impl App {
                 let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
                 if live.agent.as_ref() != Some(&task.assigned_agent) { return Err("워커 공급자·모델·강도가 배정안과 일치하지 않습니다.".into()); }
                 let confirmed = p.confirmed.as_ref().ok_or("먼저 현재 배정안을 확인해 주세요.")?;
+                if confirmed.goal_id() != &task.goal_id { return Err("확인한 배정안과 다른 목표의 작업입니다.".into()); }
                 let request = wm::dispatch::DispatchRequest { task_id: task.id.clone(), operation_id: work::OperationId::from_string(id.into()).map_err(|e| e.to_string())?, folder: wm::dispatch::DispatchFolder { path: p.snapshot.config.folder.clone(), worktree_owner: None }, persistent_binding: persistent(&live), runtime_binding: binding(&live,target.session_id.as_deref().unwrap()).ok_or("실행 세대가 확인되지 않습니다.")? };
                 let prepared = wm::dispatch::prepare_dispatch(&p.state(),&p.ledger,confirmed,request,&p.snapshot.config,&p.policy()).map_err(|e| e.to_string())?;
                 let prepared = match prepared { wm::dispatch::PrepareOutcome::Ready(prepared) => prepared, wm::dispatch::PrepareOutcome::Existing { attempt_id,delivery } => return Err(format!("이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",attempt_id.0)) };
@@ -794,14 +891,35 @@ impl App {
                 return Ok(());
             }
             cc::Intent::Approval { .. } => return Err("이 실행의 정확한 승인 요청을 확인할 수 없습니다. 실제 세션의 승인 UI를 사용해 주세요.".into()),
+            cc::Intent::ReportResult { target,attempt_id,text } => {
+                if text.trim().is_empty() || text.len() > work::WORK_EVENT_MAX_BYTES { return Err("실제 작업 결과는 8KiB 이하로 기록해 주세요.".into()); }
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
+                let revision = task.result.as_ref().map(|r| r.revision.next()).unwrap_or(Some(work::ResultRevision(1))).ok_or("결과 리비전 한도입니다.")?;
+                let result = work::TaskResult { revision,summary: text.clone(),source_revision: None,artifact_revision: None,verification: work::VerificationState::NotRun };
+                result.validate().map_err(|e| e.to_string())?;
+                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::ResultSubmitted { result },format!("수동 결과 보고 · 검증 미실행\n{text}"))?;
+                host.save(&target.workspace_id,None,Some(id.into()))?;
+                return Ok(());
+            }
+            cc::Intent::VerifyResult { target,attempt_id,revision,passed,evidence } => {
+                if evidence.trim().is_empty() || evidence.len() > 4096 { return Err("직접 수행한 검증의 명령과 결과를 4KiB 이하로 기록해 주세요.".into()); }
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
+                let result = task.result.as_ref().filter(|r| r.revision.0.to_string() == revision).ok_or("검증할 결과 리비전이 바뀌었습니다.")?;
+                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::VerificationFinished { result_revision: result.revision,outcome: if passed { work::VerificationState::Passed } else { work::VerificationState::Failed } },format!("사용자 직접 검증 · {}\n{}",if passed { "통과" } else { "실패" },evidence))?;
+                host.save(&target.workspace_id,None,Some(id.into()))?;
+                return Ok(());
+            }
             cc::Intent::ConfirmResult { target, revision } => {
                 let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
                 let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("현재 시도가 없습니다.")?;
                 let result = task.result.as_ref().ok_or("검증된 결과가 없습니다.")?;
                 if result.revision.0.to_string() != revision { return Err("결과 리비전이 변경되었습니다.".into()); }
-                let event = work::WorkEvent { id: work::EventId::new(), workspace_id: WorkspaceId(target.workspace_id.clone()), task_id: task.id.clone(), attempt_id: attempt.id.clone(), runtime_binding: attempt.runtime_binding.clone().ok_or("현재 실행 바인딩이 없습니다.")?, sequence: attempt.last_event_sequence.saturating_add(1), kind: work::WorkEventKind::UserConfirmed { result_revision: result.revision } };
-                let mut state = p.state(); state.apply_event(event).map_err(|e| e.to_string())?; p.set_state(state);
+                let attempt_id = attempt.id.0.clone();
+                let result_revision = result.revision;
+                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::UserConfirmed { result_revision },format!("사용자 결과 확인 · 리비전 {revision}"))?;
                 host.save(&target.workspace_id,None,Some(id.into()))?;
                 return Ok(());
             }
@@ -826,11 +944,17 @@ impl App {
                 .values()
                 .all(|p| p.generation == p.saved_generation)
         {
-            if host.published {
+            if host.published && !host.publication_failed {
                 if let Some(core) = &self.session_core {
-                    let _ = core.publish_work_snapshot(serde_json::Value::Null);
+                    if core.publish_work_snapshot(serde_json::Value::Null).is_ok() {
+                        host.published = false;
+                    } else {
+                        host.publication_failed = true;
+                        host.status =
+                            "원격 작업 화면 지우기에 실패했습니다. 다시 열어 갱신할 수 있습니다."
+                                .into();
+                    }
                 }
-                host.published = false;
             }
             self.command_center = Some(host);
             return;
@@ -876,117 +1000,82 @@ impl App {
                         token: found,
                         result,
                     }),
-                ) if workspace_id.0 == workspace && found == token => {
-                    match result {
-                        Ok(record) => {
-                            let p = host.projects.get_mut(&workspace).unwrap();
-                            if let Some(record) = record {
-                                let preserved: Vec<_> = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .filter(|d| !d.target_key.starts_with("settings:"))
-                                    .cloned()
-                                    .collect();
-                                p.revision = Some(record.revision);
-                                p.snapshot = record.snapshot;
-                                for draft in preserved {
-                                    if let Some(existing) = p
-                                        .snapshot
-                                        .drafts
-                                        .iter_mut()
-                                        .find(|d| d.target_key == draft.target_key)
-                                    {
-                                        *existing = draft;
-                                    } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
-                                        p.snapshot.drafts.push(draft);
-                                    }
-                                }
-                                p.scopes = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .find(|d| d.target_key == "settings:scopes")
-                                    .and_then(|d| serde_json::from_str(&d.text).ok())
-                                    .unwrap_or_default();
-                                p.allowed_agents = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .find(|d| d.target_key == "settings:agents")
-                                    .and_then(|d| serde_json::from_str(&d.text).ok())
-                                    .unwrap_or_else(|| {
-                                        vec![p.snapshot.config.worker_agent.clone()]
-                                    });
-                                // Recovery never replays an operation whose writer ACK was lost.
-                                for outbox in &mut p.snapshot.outbox {
-                                    if matches!(
-                                        outbox.state,
-                                        stored::DispatchOutboxState::Pending
-                                            | stored::DispatchOutboxState::Admitted
-                                    ) {
-                                        outbox.state = stored::DispatchOutboxState::Uncertain;
-                                    }
-                                }
-                                for task in &mut p.snapshot.tasks {
-                                    if task.current_attempt_id.is_some()
-                                        && !matches!(
-                                            task.state,
-                                            work::WorkState::Completed
-                                                | work::WorkState::Failed
-                                                | work::WorkState::Cancelled
-                                        )
-                                    {
-                                        task.state = work::WorkState::ObservationUnknown;
-                                    }
-                                }
-                                for attempt in &mut p.snapshot.attempts {
-                                    if !matches!(
-                                        attempt.state,
-                                        work::WorkState::Completed
-                                            | work::WorkState::Failed
-                                            | work::WorkState::Cancelled
-                                    ) {
-                                        attempt.state = work::WorkState::ObservationUnknown;
-                                    }
-                                }
-                                p.dirty();
-                            }
-                            p.loaded = true;
-                            p.storage_blocked = false;
-                            if let Some(goal) = p
-                                .snapshot
-                                .goals
-                                .iter()
-                                .rev()
-                                .find(|g| g.state == work::WorkState::PlanReview)
-                            {
-                                p.request = wm::plan::PlannerRequest::new(
-                                    goal,
-                                    &p.snapshot.config,
-                                    &p.policy(),
-                                )
-                                .ok();
-                            }
-                            let target = host
-                                .main_target(&workspace, host.projects.get(&workspace).unwrap());
-                            if let Some(draft) = host.projects[&workspace]
+                ) if workspace_id.0 == workspace && found == token => match result {
+                    Ok(record) => {
+                        let p = host.projects.get_mut(&workspace).unwrap();
+                        if let Some(record) = record {
+                            let preserved: Vec<_> = p
                                 .snapshot
                                 .drafts
                                 .iter()
-                                .find(|d| d.target_key == "main")
-                            {
-                                host.ui.set_draft(target, draft.text.clone());
+                                .filter(|d| !d.target_key.starts_with("settings:"))
+                                .cloned()
+                                .collect();
+                            p.revision = Some(record.revision);
+                            p.snapshot = record.snapshot;
+                            for draft in preserved {
+                                if let Some(existing) = p
+                                    .snapshot
+                                    .drafts
+                                    .iter_mut()
+                                    .find(|d| d.target_key == draft.target_key)
+                                {
+                                    *existing = draft;
+                                } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
+                                    p.snapshot.drafts.push(draft);
+                                }
                             }
+                            p.scopes = p
+                                .snapshot
+                                .drafts
+                                .iter()
+                                .find(|d| d.target_key == "settings:scopes")
+                                .and_then(|d| serde_json::from_str(&d.text).ok())
+                                .unwrap_or_default();
+                            p.allowed_agents = p
+                                .snapshot
+                                .drafts
+                                .iter()
+                                .find(|d| d.target_key == "settings:agents")
+                                .and_then(|d| serde_json::from_str(&d.text).ok())
+                                .unwrap_or_else(|| vec![p.snapshot.config.worker_agent.clone()]);
+                            recover_observation(&mut p.snapshot);
+                            p.dirty();
                         }
-                        Err(_) => {
-                            if let Some(p) = host.projects.get_mut(&workspace) {
-                                p.storage_blocked = true;
-                            }
-                            host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
+                        p.loaded = true;
+                        p.storage_blocked = false;
+                        if let Some(goal) = p
+                            .snapshot
+                            .goals
+                            .iter()
+                            .rev()
+                            .find(|g| g.state == work::WorkState::PlanReview)
+                        {
+                            p.request = wm::plan::PlannerRequest::new(
+                                goal,
+                                &p.snapshot.config,
+                                &p.policy(),
+                            )
+                            .ok();
+                        }
+                        let target =
+                            host.main_target(&workspace, host.projects.get(&workspace).unwrap());
+                        if let Some(draft) = host.projects[&workspace]
+                            .snapshot
+                            .drafts
+                            .iter()
+                            .find(|d| d.target_key == "main")
+                        {
+                            host.ui.set_draft(target, draft.text.clone());
                         }
                     }
-                }
+                    Err(_) => {
+                        if let Some(p) = host.projects.get_mut(&workspace) {
+                            p.storage_blocked = true;
+                        }
+                        host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
+                    }
+                },
                 (
                     Some(Flight::Save {
                         workspace,
@@ -1005,9 +1094,14 @@ impl App {
                             p.ack_saved(revision, generation);
                         }
                         if let Some(after) = after {
+                            let authorized = host
+                                .remote_permits
+                                .get(&after.id)
+                                .is_none_or(|permit| permit.is_current());
                             let live = host.route(&after.input.target).cloned();
                             let p = host.projects.get_mut(&workspace).unwrap();
-                            let valid = p.snapshot.config.revision == after.config_revision
+                            let valid = authorized
+                                && p.snapshot.config.revision == after.config_revision
                                 && live.as_ref().is_some_and(|l| l.capture.prompt.is_some());
                             if valid {
                                 let mut allowed = true;
@@ -1023,7 +1117,14 @@ impl App {
                                     host.reject(&after.id,"실행 요청은 이미 처리되었거나 유효하지 않습니다. 다시 보내지 않았습니다.");
                                 }
                             } else {
-                                host.finish(&after.id,cc::ReceiptStatus::Uncertain,"저장 후 실행 대상 또는 설정이 바뀌었습니다. 입력을 보내지 않았습니다.");
+                                if let Some(assignment) = &after.input.dispatch {
+                                    apply_delivery_outcome(
+                                        p,
+                                        assignment,
+                                        ui::composer::PromptAdmissionOutcome::Rejected,
+                                    );
+                                }
+                                host.reject(&after.id,"저장 후 권한·실행 대상·설정이 바뀌었습니다. 입력을 보내지 않았습니다.");
                             }
                         }
                         if let Some(id) = receipt {
@@ -1133,18 +1234,31 @@ impl App {
         }
         self.command_center = Some(host);
         if let Some((target, prompt, id)) = send {
-            self.broadcast_prompt_to(
-                &target,
-                &prompt,
-                PromptDeliveryOrigin::CommandCenter {
-                    automatic: self
-                        .command_center
-                        .as_ref()
-                        .and_then(|h| h.inputs.get(&id))
-                        .is_some_and(|input| input.dispatch.is_some()),
-                    operation_id: id,
-                },
-            );
+            // Recheck at the actual runtime enqueue boundary, after any queued mutations.
+            let authorized = self.command_center.as_ref().is_some_and(|host| {
+                host.remote_permits
+                    .get(&id)
+                    .is_none_or(|permit| permit.is_current())
+            });
+            if !authorized {
+                self.command_center_input_outcome(
+                    &id,
+                    ui::composer::PromptAdmissionOutcome::Rejected,
+                );
+            } else {
+                self.broadcast_prompt_to(
+                    &target,
+                    &prompt,
+                    PromptDeliveryOrigin::CommandCenter {
+                        automatic: self
+                            .command_center
+                            .as_ref()
+                            .and_then(|h| h.inputs.get(&id))
+                            .is_some_and(|input| input.dispatch.is_some()),
+                        operation_id: id,
+                    },
+                );
+            }
         }
         let generations: Vec<_> = self
             .command_center
@@ -1154,26 +1268,39 @@ impl App {
             .iter()
             .map(|(id, p)| (id.clone(), p.generation, p.loaded))
             .collect();
-        let dirty = self
-            .command_center
-            .as_ref()
-            .is_some_and(|h| h.publication_dirty || h.generations != generations || !h.published);
+        let dirty = self.command_center.as_ref().is_some_and(|h| {
+            h.publication_dirty
+                || h.generations != generations
+                || !h.published && !h.publication_failed
+        });
         if dirty && visible {
-            if let Some(core) = &self.session_core {
-                if let Ok(value) = serde_json::to_value(self.command_center_snapshot()) {
-                    let _ = core.publish_work_snapshot(value);
-                }
-            }
+            let result = if let Some(core) = &self.session_core {
+                serde_json::to_value(self.command_center_snapshot())
+                    .map_err(|_| ())
+                    .and_then(|value| core.publish_work_snapshot(value).map_err(|_| ()))
+            } else {
+                Ok(())
+            };
             if let Some(host) = self.command_center.as_mut() {
-                host.published = true;
-                host.publication_dirty = false;
                 host.generations = generations;
+                host.publication_dirty = false;
+                match result {
+                    Ok(()) => {
+                        host.published = self.session_core.is_some();
+                        host.publication_failed = false;
+                    }
+                    Err(()) => {
+                        host.publication_failed = true;
+                        host.status = "원격 작업 화면 갱신에 실패했습니다. 로컬 작업은 보존되며 다음 변경 때 다시 게시합니다.".into();
+                    }
+                }
             }
         } else if !visible && self.command_center.as_ref().is_some_and(|h| h.published) {
             if let Some(core) = &self.session_core {
-                let _ = core.publish_work_snapshot(serde_json::Value::Null);
+                if core.publish_work_snapshot(serde_json::Value::Null).is_ok() {
+                    self.command_center.as_mut().unwrap().published = false;
+                }
             }
-            self.command_center.as_mut().unwrap().published = false;
         }
     }
     pub(super) fn command_center_input_outcome(
@@ -1191,6 +1318,15 @@ impl App {
         let accepted = outcome == ui::composer::PromptAdmissionOutcome::Accepted;
         let unknown = outcome == ui::composer::PromptAdmissionOutcome::Unknown;
         if let Some(p) = host.projects.get_mut(&input.target.workspace_id) {
+            if let Some(marker) = p
+                .snapshot
+                .drafts
+                .iter_mut()
+                .find(|d| d.target_key == format!("operation:{id}"))
+            {
+                marker.delivery_uncertain = unknown;
+                p.dirty();
+            }
             if let Some(assignment) = &input.dispatch {
                 apply_delivery_outcome(p, assignment, outcome);
             }
@@ -1445,6 +1581,128 @@ impl App {
         self.frame_stats.end();
     }
 }
+fn project_transaction<T>(
+    host: &mut CommandCenterHost,
+    workspace: Option<&str>,
+    apply: impl FnOnce(&mut CommandCenterHost) -> Result<T, String>,
+) -> Result<T, String> {
+    let previous = workspace.and_then(|ws| host.projects.get(ws).cloned());
+    let result = apply(host);
+    if result.is_err()
+        && let (Some(workspace), Some(previous)) = (workspace, previous)
+    {
+        host.projects.insert(workspace.into(), previous);
+    }
+    result
+}
+fn active_workspace_cwd(
+    workspace: &str,
+    active_workspace: &str,
+    active_cwd: Option<String>,
+) -> Option<String> {
+    (workspace == active_workspace)
+        .then_some(active_cwd)
+        .flatten()
+}
+fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
+    match intent {
+        cc::Intent::SaveProject { workspace_id, .. }
+        | cc::Intent::InstallPlanJson { workspace_id, .. }
+        | cc::Intent::ConfirmPlan { workspace_id, .. }
+        | cc::Intent::RetryStorage { workspace_id } => Some(workspace_id),
+        cc::Intent::Submit { target, .. }
+        | cc::Intent::DraftChanged { target, .. }
+        | cc::Intent::DispatchTask { target }
+        | cc::Intent::ReportResult { target, .. }
+        | cc::Intent::VerifyResult { target, .. }
+        | cc::Intent::ConfirmResult { target, .. } => Some(&target.workspace_id),
+        _ => None,
+    }
+}
+fn recover_observation(snapshot: &mut stored::CommandCenterSnapshot) {
+    fn active(state: work::WorkState) -> bool {
+        matches!(
+            state,
+            work::WorkState::Queued
+                | work::WorkState::Running
+                | work::WorkState::WaitingApproval
+                | work::WorkState::WaitingInput
+                | work::WorkState::ObservationUnknown
+        )
+    }
+    for outbox in &mut snapshot.outbox {
+        if outbox.state == stored::DispatchOutboxState::Pending {
+            outbox.state = stored::DispatchOutboxState::Uncertain;
+        }
+    }
+    for task in &mut snapshot.tasks {
+        if task.current_attempt_id.is_some() && active(task.state) {
+            task.state = work::WorkState::ObservationUnknown;
+        }
+    }
+    for attempt in &mut snapshot.attempts {
+        if active(attempt.state) {
+            attempt.state = work::WorkState::ObservationUnknown;
+        }
+    }
+}
+
+fn apply_user_work_event(
+    p: &mut Project,
+    target: &cc::RouteTarget,
+    expected_attempt: &str,
+    kind: work::WorkEventKind,
+    display: String,
+) -> Result<(), String> {
+    if p.storage_blocked || !p.loaded {
+        return Err("저장 상태를 먼저 확인해 주세요.".into());
+    }
+    let task = p
+        .snapshot
+        .tasks
+        .iter()
+        .find(|t| {
+            Some(&t.id.0) == target.task_id.as_ref() && t.workspace_id.0 == target.workspace_id
+        })
+        .ok_or("현재 프로젝트의 작업이 아닙니다.")?;
+    let attempt = task
+        .current_attempt_id
+        .as_ref()
+        .and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id))
+        .ok_or("작업의 현재 시도가 없습니다.")?;
+    if attempt.id.0 != expected_attempt {
+        return Err("보고할 작업 시도가 바뀌었습니다. 현재 결과 화면을 다시 확인해 주세요.".into());
+    }
+    let event = work::WorkEvent {
+        id: work::EventId::new(),
+        workspace_id: task.workspace_id.clone(),
+        task_id: task.id.clone(),
+        attempt_id: attempt.id.clone(),
+        runtime_binding: attempt
+            .runtime_binding
+            .clone()
+            .ok_or("현재 시도의 실행 바인딩이 없습니다.")?,
+        sequence: attempt.last_event_sequence.saturating_add(1),
+        kind,
+    };
+    let stored_event = stored::StoredEvent {
+        id: event.id.clone(),
+        task_id: Some(event.task_id.clone()),
+        attempt_id: Some(event.attempt_id.clone()),
+        display_payload: bounded(&display, work::WORK_EVENT_MAX_BYTES),
+    };
+    let mut state = p.state();
+    if state.apply_event(event).map_err(|e| e.to_string())? != wm::ApplyOutcome::Applied {
+        return Err("현재 작업 상태에서는 이 보고를 적용할 수 없습니다.".into());
+    }
+    p.set_state(state);
+    if p.snapshot.events.len() >= work::WORK_PAGE_MAX_ROWS {
+        p.snapshot.events.remove(0);
+    }
+    p.snapshot.events.push(stored_event);
+    Ok(())
+}
+
 fn same_folder(a: &str, b: &str) -> bool {
     fn normalized(path: &str) -> Option<Vec<String>> {
         let path = Path::new(path);
@@ -1730,6 +1988,13 @@ mod tests {
                 id: "workspace-a".into(),
                 main_target: target(),
                 config: config.clone(),
+                tasks: vec![cc::Task {
+                    attempt_id: Some("exact-attempt".into()),
+                    result_report: yes(),
+                    verify_result: yes(),
+                    verification: "검증 미실행".into(),
+                    ..Default::default()
+                }],
                 sessions: vec![cc::Session {
                     target: target(),
                     terminal_session_id: Some(uuid::Uuid::new_v4().to_string()),
@@ -1869,5 +2134,143 @@ mod tests {
         assert!(!same_folder("/tmp/a/../b", "/tmp/b"));
         assert!(!same_folder("relative/path", "relative/path"));
         assert!(!same_folder("/different-volume/한글", "/tmp/한글"));
+    }
+    #[test]
+    fn manual_report_is_bound_to_the_displayed_attempt_and_requires_separate_verification() {
+        let (mut p, assignment) = attempted();
+        let target = cc::RouteTarget {
+            workspace_id: p.snapshot.config.workspace_id.0.clone(),
+            task_id: Some(assignment.task.id.0.clone()),
+            session_id: None,
+        };
+        let result = work::TaskResult {
+            revision: work::ResultRevision(1),
+            summary: "actual user report".into(),
+            source_revision: None,
+            artifact_revision: None,
+            verification: work::VerificationState::NotRun,
+        };
+        assert!(
+            apply_user_work_event(
+                &mut p,
+                &target,
+                "stale-attempt",
+                work::WorkEventKind::ResultSubmitted {
+                    result: result.clone()
+                },
+                "stale".into()
+            )
+            .is_err()
+        );
+        assert!(p.snapshot.tasks[0].result.is_none());
+        apply_user_work_event(
+            &mut p,
+            &target,
+            &assignment.attempt.id.0,
+            work::WorkEventKind::ResultSubmitted { result },
+            "manual report".into(),
+        )
+        .unwrap();
+        assert_eq!(p.snapshot.tasks[0].state, work::WorkState::ResultSubmitted);
+        assert_eq!(
+            p.snapshot.tasks[0].result.as_ref().unwrap().verification,
+            work::VerificationState::NotRun
+        );
+        assert!(
+            apply_user_work_event(
+                &mut p,
+                &target,
+                &assignment.attempt.id.0,
+                work::WorkEventKind::UserConfirmed {
+                    result_revision: work::ResultRevision(1)
+                },
+                "cannot confirm unverified".into()
+            )
+            .is_err()
+        );
+        apply_user_work_event(
+            &mut p,
+            &target,
+            &assignment.attempt.id.0,
+            work::WorkEventKind::VerificationFinished {
+                result_revision: work::ResultRevision(1),
+                outcome: work::VerificationState::Passed,
+            },
+            "cargo test: passed".into(),
+        )
+        .unwrap();
+        assert_eq!(
+            p.snapshot.tasks[0].state,
+            work::WorkState::AwaitingUserConfirmation
+        );
+        assert!(!p.state().goal_is_complete(&assignment.task.goal_id));
+        apply_user_work_event(
+            &mut p,
+            &target,
+            &assignment.attempt.id.0,
+            work::WorkEventKind::UserConfirmed {
+                result_revision: work::ResultRevision(1),
+            },
+            "confirmed".into(),
+        )
+        .unwrap();
+        assert!(p.state().goal_is_complete(&assignment.task.goal_id));
+    }
+    #[test]
+    fn restore_preserves_durable_result_review_and_invalidates_only_active_observation() {
+        for state in [
+            work::WorkState::Queued,
+            work::WorkState::Running,
+            work::WorkState::ResultSubmitted,
+            work::WorkState::VerificationFailed,
+            work::WorkState::AwaitingUserConfirmation,
+            work::WorkState::Completed,
+        ] {
+            let (mut p, _) = attempted();
+            p.snapshot.tasks[0].state = state;
+            p.snapshot.attempts[0].state = state;
+            recover_observation(&mut p.snapshot);
+            let expected = if matches!(state, work::WorkState::Queued | work::WorkState::Running) {
+                work::WorkState::ObservationUnknown
+            } else {
+                state
+            };
+            assert_eq!(p.snapshot.tasks[0].state, expected);
+            assert_eq!(p.snapshot.attempts[0].state, expected);
+        }
+    }
+    #[test]
+    fn active_cwd_cannot_be_lent_to_a_warm_workspace_with_the_same_session_number() {
+        // SessionId(1) exists in both runtimes; the cache contains only active A.
+        assert_eq!(
+            active_workspace_cwd("A", "A", Some("/project-A".into())),
+            Some("/project-A".into())
+        );
+        assert_eq!(
+            active_workspace_cwd("B", "A", Some("/project-A".into())),
+            None
+        );
+    }
+    #[test]
+    fn rejected_partial_settings_edit_preserves_original_project_on_full_draft_capacity() {
+        let mut host = host();
+        let mut p = project();
+        let original = p.snapshot.config.clone();
+        p.snapshot.drafts = (0..work::WORK_DRAFT_MAX_COUNT)
+            .map(|n| stored::WorkDraft {
+                target_key: format!("draft-{n}"),
+                text: String::new(),
+                delivery_uncertain: false,
+            })
+            .collect();
+        host.projects.insert("workspace-a".into(), p);
+        let result = project_transaction(&mut host, Some("workspace-a"), |host| {
+            let p = host.projects.get_mut("workspace-a").unwrap();
+            p.snapshot.config.name = "partial rejected edit".into();
+            set_draft(p, "settings:scopes", r#"["src"]"#, false)
+        });
+        assert!(result.is_err());
+        assert_eq!(host.projects["workspace-a"].snapshot.config, original);
+        assert_eq!(host.projects["workspace-a"].generation, 0);
     }
 }

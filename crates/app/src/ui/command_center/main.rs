@@ -460,10 +460,73 @@ fn task_detail(
             }
         }
         DetailTab::Result => {
+            if !t.verification.is_empty() {
+                weak(ui, snapshot, &t.verification);
+            }
+            if t.result_report.enabled {
+                egui::CollapsingHeader::new("수동 결과 보고")
+                    .id_salt("manual-result")
+                    .show(ui, |ui| {
+                        ui.label("실제 작업 결과를 기록합니다. 제출 후 검증 상태는 미실행입니다.");
+                        let report = state.result_reports.entry(t.target.clone()).or_default();
+                        ui.add(
+                            egui::TextEdit::multiline(report)
+                                .desired_rows(4)
+                                .desired_width(f32::INFINITY)
+                                .char_limit(8192),
+                        );
+                        if ui
+                            .add_enabled(
+                                !report.trim().is_empty(),
+                                egui::Button::new("결과 제출 · 검증 미실행"),
+                            )
+                            .clicked()
+                        {
+                            intents.push(Intent::ReportResult {
+                                target: t.target.clone(),
+                                attempt_id: t.attempt_id.clone().unwrap_or_default(),
+                                text: report.clone(),
+                            });
+                        }
+                    });
+            }
             if let Some(result) = &t.result {
                 ui.add(egui::Label::new(result).wrap());
             } else {
                 weak(ui, snapshot, text(snapshot, "no_result"));
+            }
+            if t.verify_result.enabled {
+                ui.label("직접 수행한 검증 명령과 결과를 기록합니다.");
+                let evidence = state
+                    .verification_reports
+                    .entry(t.target.clone())
+                    .or_default();
+                ui.add(
+                    egui::TextEdit::multiline(evidence)
+                        .desired_rows(3)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(4096),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    for (passed, label) in [(true, "검증 통과 기록"), (false, "검증 실패 기록")]
+                    {
+                        if ui
+                            .add_enabled(
+                                !evidence.trim().is_empty() && t.result_revision.is_some(),
+                                egui::Button::new(label),
+                            )
+                            .clicked()
+                        {
+                            intents.push(Intent::VerifyResult {
+                                target: t.target.clone(),
+                                attempt_id: t.attempt_id.clone().unwrap_or_default(),
+                                revision: t.result_revision.clone().unwrap(),
+                                passed,
+                                evidence: evidence.clone(),
+                            });
+                        }
+                    }
+                });
             }
             ui.horizontal_wrapped(|ui| {
                 let available = Capability {

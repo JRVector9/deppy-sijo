@@ -438,3 +438,53 @@ fn task_native_aux_and_terminal_preserve_detail_header_and_composer() {
     assert!(state.aux_rect.is_none());
     assert!(state.terminal_rect.unwrap().top() > layout.content.top() + 100.0);
 }
+
+#[test]
+fn manual_result_and_verification_controls_capture_exact_displayed_attempt_and_revision() {
+    let mut snapshot = rich_fixture();
+    let task = &mut snapshot.projects[0].tasks[0];
+    task.attempt_id = Some("attempt-current".into());
+    task.result_report.enabled = true;
+    task.verify_result.enabled = true;
+    task.result = Some("actual report".into());
+    task.result_revision = Some("7".into());
+    let target = task.target.clone();
+    let mut initial = HarnessState::default();
+    initial.ui.open_task(target.clone());
+    initial.ui.detail_tab = DetailTab::Result;
+    initial
+        .ui
+        .result_reports
+        .insert(target.clone(), "actual manual report".into());
+    initial
+        .ui
+        .verification_reports
+        .insert(target.clone(), "cargo test: 12 passed".into());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1000.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            initial,
+        );
+    harness.run();
+    harness.get_by_label("수동 결과 보고").click();
+    harness.run();
+    harness.get_by_label("결과 제출 · 검증 미실행").click();
+    harness.run();
+    assert!(harness.state().intents.contains(&Intent::ReportResult {
+        target: target.clone(),
+        attempt_id: "attempt-current".into(),
+        text: "actual manual report".into()
+    }));
+    harness.get_by_label("검증 통과 기록").click();
+    harness.run();
+    assert!(harness.state().intents.contains(&Intent::VerifyResult {
+        target,
+        attempt_id: "attempt-current".into(),
+        revision: "7".into(),
+        passed: true,
+        evidence: "cargo test: 12 passed".into()
+    }));
+}

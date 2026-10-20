@@ -121,6 +121,14 @@ pub struct Approval {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
     #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub result_report: Capability,
+    #[serde(default)]
+    pub verify_result: Capability,
+    #[serde(default)]
+    pub verification: String,
+    #[serde(default)]
     pub eligible_sessions: Vec<Session>,
     #[serde(default)]
     pub terminal_session_id: Option<String>,
@@ -252,6 +260,18 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    ReportResult {
+        target: RouteTarget,
+        attempt_id: String,
+        text: String,
+    },
+    VerifyResult {
+        target: RouteTarget,
+        attempt_id: String,
+        revision: String,
+        passed: bool,
+        evidence: String,
+    },
     RetryStorage {
         workspace_id: String,
     },
@@ -333,6 +353,8 @@ pub struct UiState {
     pub aux_rect: Option<egui::Rect>,
     pub aux_target: Option<RouteTarget>,
     pub aux_tab: Option<DetailTab>,
+    result_reports: BTreeMap<RouteTarget, String>,
+    verification_reports: BTreeMap<RouteTarget, String>,
     task_workers: BTreeMap<String, Option<String>>,
     plan_json: BTreeMap<String, String>,
     active_workspace: Option<String>,

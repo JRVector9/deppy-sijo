@@ -28199,10 +28199,10 @@ impl App {
                 break;
             };
             let reply = request.take_navigation_reply();
-            let Some(intent) = self
+            let Some((intent, permit)) = self
                 .session_core
                 .as_ref()
-                .and_then(|core| core.authorize_cloud_control(request))
+                .and_then(|core| core.authorize_cloud_control_deferred(request))
             else {
                 if let Some(reply) = reply {
                     reply.finish(web_remote::cloud::CloudNavigationOutcome::Rejected);
@@ -28213,7 +28213,7 @@ impl App {
                 CloudControlIntent::CommandCenter {
                     operation_id,
                     intent,
-                } => self.command_center_remote_intent(operation_id, intent),
+                } => self.command_center_remote_intent(operation_id, intent, permit),
                 CloudControlIntent::RevokeConnection { connection_id } => {
                     self.cloud_agent.revoke_connection(&connection_id)
                 }
@@ -35644,6 +35644,9 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.command_center_layout.open();
+                        if let Some(host) = self.command_center.as_mut() {
+                            host.retry_publication();
+                        }
                     }
                 });
         }

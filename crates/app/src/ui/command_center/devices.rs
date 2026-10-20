@@ -146,32 +146,103 @@ pub(super) fn show(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
-    ui.heading(text(snapshot, "devices"));
+    ui.heading("연결된 기기");
+    weak(
+        ui,
+        snapshot,
+        "에이전트는 컴퓨터에서 실행하고, 휴대폰으로도 진행과 결과를 확인하세요.",
+    );
+    ui.add_space(24.0);
     if snapshot.devices.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_devices"));
     }
+    let mobile = state.last_layout.is_some_and(|l| l.mobile);
     for device in &snapshot.devices {
-        rule(ui, snapshot);
-        ui.label(egui::RichText::new(&device.name).strong());
-        weak(ui, snapshot, &device.description);
-        weak(ui, snapshot, &device.capabilities);
-        ui.label(
-            egui::RichText::new(&device.connection).color(if device.connected {
-                colors(snapshot).green
-            } else {
-                colors(snapshot).red
-            }),
+        let c = colors(snapshot);
+        let width = ui.available_width();
+        let row = egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(0, 18))
+            .show(ui, |ui| {
+                ui.set_min_width(width);
+                ui.horizontal_top(|ui| {
+                    let (icon, _) =
+                        ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::hover());
+                    ui.painter().rect_stroke(
+                        icon,
+                        4.0,
+                        egui::Stroke::new(1.0, c.line),
+                        egui::StrokeKind::Inside,
+                    );
+                    let monitor = egui::Rect::from_center_size(
+                        icon.center() - egui::vec2(0.0, 2.0),
+                        egui::vec2(17.0, 12.0),
+                    );
+                    ui.painter().rect_stroke(
+                        monitor,
+                        1.0,
+                        egui::Stroke::new(1.0, c.muted),
+                        egui::StrokeKind::Inside,
+                    );
+                    ui.painter().hline(
+                        icon.center().x - 5.0..=icon.center().x + 5.0,
+                        icon.center().y + 8.0,
+                        egui::Stroke::new(1.0, c.muted),
+                    );
+                    ui.allocate_ui_with_layout(
+                        egui::vec2((width - if mobile { 145.0 } else { 330.0 }).max(80.0), 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_min_width(
+                                (width - if mobile { 145.0 } else { 330.0 }).max(80.0),
+                            );
+                            ui.label(
+                                egui::RichText::new(&device.name)
+                                    .size((if mobile { 13.0 } else { 14.0 }) * snapshot.font_scale)
+                                    .strong(),
+                            );
+                            weak(ui, snapshot, &device.description);
+                            if mobile {
+                                weak(ui, snapshot, &device.capabilities);
+                            }
+                            if device.revoke.enabled
+                                && snapshot.execution_setup.enabled
+                                && ghost_button(ui, snapshot, "실행 허용 회수", 28.0, 11.0)
+                                    .clicked()
+                            {
+                                intents.push(Intent::RevokeExecutionDevice {
+                                    workspace_id: p.id.clone(),
+                                    device_id: device.id.clone(),
+                                });
+                            }
+                        },
+                    );
+                    if !mobile {
+                        ui.allocate_ui(egui::vec2(170.0, 0.0), |ui| {
+                            weak(ui, snapshot, &device.capabilities)
+                        });
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("● {}", device.connection))
+                            .size((if mobile { 11.0 } else { 12.0 }) * snapshot.font_scale)
+                            .color(if device.connected { c.green } else { c.red }),
+                    );
+                });
+            })
+            .response;
+        ui.painter().hline(
+            row.rect.x_range(),
+            row.rect.bottom(),
+            egui::Stroke::new(1.0, c.line),
         );
-        if device.revoke.enabled
-            && snapshot.execution_setup.enabled
-            && ui.small_button("실행 허용 회수").clicked()
-        {
-            intents.push(Intent::RevokeExecutionDevice {
-                workspace_id: p.id.clone(),
-                device_id: device.id.clone(),
-            });
-        }
     }
+    ui.add_space(28.0);
+    ui.heading("새 기기 연결");
+    weak(
+        ui,
+        snapshot,
+        "연결할 컴퓨터에서 받은 연결 정보를 확인하세요.",
+    );
+    ui.add_space(18.0);
     egui::CollapsingHeader::new("이 컴퓨터에서 프로젝트 실행 · TLS 연결 설정")
         .id_salt("cc-server-execution-settings")
         .show(ui, |ui| {

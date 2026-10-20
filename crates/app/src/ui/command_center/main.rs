@@ -33,7 +33,7 @@ pub(super) fn body(
                 }
                 return;
             };
-            let content_width = ui.available_width().min(1000.0);
+            let content_width = ui.available_width().min(960.0);
             let inset = ((ui.available_width() - content_width) * 0.5).max(0.0);
             ui.horizontal(|ui| {
                 ui.add_space(inset);
@@ -61,7 +61,13 @@ fn title(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
     ui.add(
         egui::Label::new(
             egui::RichText::new(value)
-                .size(17.0 * snapshot.font_scale)
+                .size(
+                    (if ui.ctx().viewport_rect().width() <= 760.0 {
+                        13.0
+                    } else {
+                        14.0
+                    }) * snapshot.font_scale,
+                )
                 .strong(),
         )
         .wrap(),
@@ -75,6 +81,7 @@ fn home(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
+    ui.spacing_mut().item_spacing.y = 0.0;
     if p.storage_retry.enabled {
         ui.label(&p.storage_retry.reason);
         if ui.button("저장 상태 다시 확인").clicked() {
@@ -84,29 +91,62 @@ fn home(
         }
         rule(ui, snapshot);
     }
-    weak(
-        ui,
-        snapshot,
-        format!("{} · {}", text(snapshot, "goal"), p.name),
+    ui.add(egui::Label::new(
+        egui::RichText::new(format!("{} · {}", text(snapshot, "goal"), p.name))
+            .size(11.0 * snapshot.font_scale)
+            .line_height(Some(17.0 * snapshot.font_scale))
+            .color(colors(snapshot).muted),
+    ));
+    ui.add_space(9.0);
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(if p.goal.is_empty() {
+                text(snapshot, "first_goal")
+            } else {
+                &p.goal
+            })
+            .size(
+                (if state.last_layout.is_some_and(|l| l.mobile) {
+                    16.0
+                } else {
+                    18.0
+                }) * snapshot.font_scale,
+            )
+            .strong()
+            .line_height(Some(
+                (if state.last_layout.is_some_and(|l| l.mobile) {
+                    25.6
+                } else {
+                    28.8
+                }) * snapshot.font_scale,
+            )),
+        )
+        .wrap(),
     );
-    ui.add_space(6.0);
-    title(
-        ui,
-        snapshot,
-        if p.goal.is_empty() {
-            text(snapshot, "first_goal")
-        } else {
-            &p.goal
-        },
-    );
-    ui.add_space(14.0);
+    ui.add_space(20.0);
     ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
         for (index, key) in ["goal", "plan_assign", "independent", "collect", "verify"]
             .iter()
             .enumerate()
         {
             if index > 0 {
-                weak(ui, snapshot, "—");
+                let (rect, _) = ui.allocate_exact_size(
+                    egui::vec2(
+                        if state.last_layout.is_some_and(|l| l.mobile) {
+                            10.0
+                        } else {
+                            26.0
+                        },
+                        12.0,
+                    ),
+                    egui::Sense::hover(),
+                );
+                ui.painter().hline(
+                    rect.x_range(),
+                    rect.center().y,
+                    egui::Stroke::new(1.0, colors(snapshot).line),
+                );
             }
             let label = if *key == "independent" {
                 format!(
@@ -118,11 +158,21 @@ fn home(
                         .count()
                 )
             } else {
-                text(snapshot, key).into()
+                if *key == "goal" {
+                    "목표".into()
+                } else {
+                    text(snapshot, key).into()
+                }
             };
             ui.label(
                 egui::RichText::new(label)
-                    .small()
+                    .size(
+                        (if state.last_layout.is_some_and(|l| l.mobile) {
+                            9.0
+                        } else {
+                            10.0
+                        }) * snapshot.font_scale,
+                    )
                     .color(if *key == "independent" {
                         colors(snapshot).accent
                     } else {
@@ -131,9 +181,16 @@ fn home(
             );
         }
     });
-    rule(ui, snapshot);
+    ui.add_space(24.0);
+    let (border, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        border.x_range(),
+        border.top(),
+        egui::Stroke::new(1.0, colors(snapshot).line),
+    );
     if p.manual_plan.enabled {
-        egui::CollapsingHeader::new("배정안 JSON 직접 확인")
+        egui::CollapsingHeader::new("고급 · 배정안 직접 확인")
             .id_salt("manual-plan")
             .show(ui, |ui| {
                 ui.label("메인 응답의 배정안 JSON을 붙여넣으면 프로젝트·설정·범위를 검증합니다.");
@@ -171,7 +228,7 @@ fn home(
             if p.tasks.is_empty() && p.goal.is_empty() {
                 text(snapshot, "first_title")
             } else {
-                text(snapshot, "main_collects")
+                text(snapshot, "main_plan")
             },
         );
         if p.create_main.enabled && action(ui, snapshot, "새 메인 만들기", &p.create_main) {
@@ -179,8 +236,9 @@ fn home(
                 workspace_id: p.id.clone(),
             });
         }
+        ui.add_space(8.0);
         if !p.main_summary.is_empty() {
-            ui.add(egui::Label::new(&p.main_summary).wrap());
+            description(ui, snapshot, &p.main_summary);
         } else {
             weak(
                 ui,
@@ -208,17 +266,36 @@ fn home(
             }
         });
         if !p.tasks.is_empty() {
-            rule(ui, snapshot);
-            weak(
-                ui,
-                snapshot,
-                format!(
-                    "{} {} · {}",
-                    text(snapshot, "parallel_limit"),
-                    p.config.parallel_limit,
-                    p.config.automation
-                ),
+            let (r, _) =
+                ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+            ui.painter().hline(
+                r.x_range(),
+                r.top(),
+                egui::Stroke::new(1.0, colors(snapshot).line),
             );
+            ui.add_space(12.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.label(
+                    egui::RichText::new(if p.config.use_worktrees {
+                        "작업별 독립 worktree"
+                    } else {
+                        "공유 경로 · 수정 범위 확인"
+                    })
+                    .size(10.0 * snapshot.font_scale)
+                    .color(colors(snapshot).muted),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "동시 실행 최대 {} · {}",
+                            p.config.parallel_limit, p.config.automation
+                        ))
+                        .size(10.0 * snapshot.font_scale)
+                        .color(colors(snapshot).muted),
+                    );
+                });
+            });
         }
         if let Some(goal_id) = &p.pending_goal_id {
             ui.add_space(10.0);
@@ -248,7 +325,6 @@ fn home(
         })
         .collect();
     if !attention.is_empty() || !pending_approvals.is_empty() {
-        rule(ui, snapshot);
         thread(ui, snapshot, "CHECK", |ui| {
             title(
                 ui,
@@ -259,7 +335,9 @@ fn home(
                     attention.len() + pending_approvals.len()
                 ),
             );
-            weak(ui, snapshot, text(snapshot, "check_help"));
+            ui.add_space(8.0);
+            description(ui, snapshot, text(snapshot, "check_help"));
+            ui.add_space(18.0);
             ui.horizontal_wrapped(|ui| {
                 for t in attention {
                     if ui
@@ -328,7 +406,6 @@ fn home(
         });
     }
     if !p.history.is_empty() {
-        rule(ui, snapshot);
         thread(ui, snapshot, "LIVE", |ui| {
             title(ui, snapshot, text(snapshot, "main_collects"));
             for h in p.history.iter().take(3) {
@@ -342,54 +419,170 @@ fn home(
     }
 }
 
+fn description(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new(value)
+                .size(12.0 * snapshot.font_scale)
+                .line_height(Some(22.2 * snapshot.font_scale))
+                .color(colors(snapshot).muted),
+        )
+        .wrap(),
+    );
+}
+
 fn thread(ui: &mut egui::Ui, snapshot: &Snapshot, label: &str, draw: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(8.0);
-    if ui.available_width() < 480.0 {
-        weak(ui, snapshot, label);
+    let mobile = ui.ctx().viewport_rect().width() <= 760.0;
+    ui.add_space(if mobile { 18.0 } else { 22.0 });
+    if mobile {
+        ui.add(egui::Label::new(
+            egui::RichText::new(label)
+                .monospace()
+                .size(9.0 * snapshot.font_scale)
+                .color(colors(snapshot).muted),
+        ));
         draw(ui);
     } else {
+        let width = ui.available_width();
         ui.horizontal_top(|ui| {
-            ui.allocate_ui(egui::vec2(42.0, 20.0), |ui| weak(ui, snapshot, label));
-            ui.vertical(|ui| {
-                ui.set_max_width(ui.available_width());
-                draw(ui);
+            ui.spacing_mut().item_spacing.x = 12.0;
+            ui.allocate_ui(egui::vec2(42.0, 16.0), |ui| {
+                ui.set_min_width(42.0);
+                ui.add(egui::Label::new(
+                    egui::RichText::new(label)
+                        .monospace()
+                        .size(10.0 * snapshot.font_scale)
+                        .color(colors(snapshot).muted),
+                ));
             });
+            ui.allocate_ui_with_layout(
+                egui::vec2((width - 54.0).max(1.0), 0.0),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    ui.set_min_width((width - 54.0).max(1.0));
+                    draw(ui);
+                },
+            );
         });
     }
-    ui.add_space(10.0);
+    ui.add_space(if mobile { 18.0 } else { 22.0 });
+    let (r, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+    ui.painter().hline(
+        r.x_range(),
+        r.top(),
+        egui::Stroke::new(1.0, colors(snapshot).line),
+    );
 }
 
 fn task_list(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, p: &Project) {
-    ui.heading(text(snapshot, "tasks"));
-    weak(ui, snapshot, &p.name);
-    ui.add_space(14.0);
+    ui.heading("프로젝트 작업");
+    weak(
+        ui,
+        snapshot,
+        format!(
+            "{} · {}개 독립 작업",
+            p.name,
+            p.tasks
+                .iter()
+                .filter(|t| t.target.workspace_id == p.id)
+                .count()
+        ),
+    );
+    ui.add_space(24.0);
+    let mobile = state.last_layout.is_some_and(|l| l.mobile);
     if p.tasks.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_tasks"));
     }
-    for t in p.tasks.iter().filter(|t| t.target.workspace_id == p.id) {
-        ui.push_id(&t.target.task_id, |ui| {
-            if ui
-                .add(
-                    egui::Button::new(egui::RichText::new(&t.title).strong())
-                        .frame(false)
-                        .wrap(),
-                )
-                .clicked()
-                && let Some(id) = &t.target.task_id
-            {
-                state.select_task(id.clone());
-            }
-            weak(ui, snapshot, &t.scope);
-            ui.horizontal_wrapped(|ui| {
-                weak(
-                    ui,
-                    snapshot,
-                    format!("{} · {} · {}", t.provider, t.role, t.device),
-                );
-                workers::status(ui, snapshot, t.state);
+    if !mobile {
+        ui.horizontal(|ui| {
+            weak(ui, snapshot, "나눈 작업");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                weak(ui, snapshot, "상태");
+                ui.add_space(70.0);
+                weak(ui, snapshot, text(snapshot, "owner_device"));
             });
-            rule(ui, snapshot);
         });
+        rule(ui, snapshot);
+    }
+    for t in p.tasks.iter().filter(|t| t.target.workspace_id == p.id) {
+        let width = ui.available_width();
+        let mut clicked = false;
+        let r = egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(if mobile { 0 } else { 12 }, 13))
+            .show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    let owner = if mobile {
+                        0.0
+                    } else if width < 700.0 {
+                        140.0
+                    } else {
+                        190.0
+                    };
+                    let state_w = 100.0;
+                    ui.allocate_ui_with_layout(
+                        egui::vec2((width - owner - state_w - 40.0).max(60.0), 0.0),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            clicked = ui
+                                .add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&t.title)
+                                            .size(
+                                                (if mobile { 13.0 } else { 14.0 })
+                                                    * snapshot.font_scale,
+                                            )
+                                            .strong(),
+                                    )
+                                    .wrap()
+                                    .sense(egui::Sense::click()),
+                                )
+                                .clicked();
+                            weak(ui, snapshot, &t.scope);
+                            if mobile {
+                                weak(
+                                    ui,
+                                    snapshot,
+                                    format!("{} · {} · {}", t.provider, t.role, t.device),
+                                );
+                            }
+                        },
+                    );
+                    if !mobile {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(owner, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.label(
+                                    egui::RichText::new(format!("{} · {}", t.provider, t.role))
+                                        .size(13.0 * snapshot.font_scale),
+                                );
+                                weak(ui, snapshot, &t.device);
+                            },
+                        );
+                    }
+                    workers::status(ui, snapshot, t.state);
+                });
+            })
+            .response;
+        ui.painter().hline(
+            r.rect.x_range(),
+            r.rect.bottom(),
+            egui::Stroke::new(1.0, colors(snapshot).line),
+        );
+        if (clicked
+            || ui
+                .interact(
+                    r.rect,
+                    ui.id()
+                        .with(("task-list", &t.target.workspace_id, &t.target.task_id)),
+                    egui::Sense::click(),
+                )
+                .clicked())
+            && let Some(id) = &t.target.task_id
+        {
+            state.select_task(id.clone());
+        }
     }
 }
 
@@ -404,6 +597,9 @@ fn task_detail(
         weak(ui, snapshot, text(snapshot, "unavailable_task"));
         return;
     };
+    if state.detail_tab == DetailTab::Result {
+        state.detail_tab = DetailTab::Work;
+    }
     ui.heading(&t.title);
     ui.horizontal_wrapped(|ui| {
         workers::status(ui, snapshot, t.state);
@@ -413,36 +609,64 @@ fn task_detail(
             format!("{} · {} · {}", t.provider, t.role, t.device),
         );
     });
-    weak(ui, snapshot, &t.directory);
     ui.add_space(12.0);
-    ui.horizontal_wrapped(|ui| {
-        for (tab, key) in [
-            (DetailTab::Work, "work"),
-            (DetailTab::Result, "result"),
-            (DetailTab::Git, "git"),
-            (DetailTab::History, "history"),
-            (DetailTab::Terminal, "terminal"),
-        ] {
-            if ui
-                .selectable_label(state.detail_tab == tab, text(snapshot, key))
-                .clicked()
-            {
-                state.detail_tab = tab;
-                if t.target.session_id.is_some() {
-                    match tab {
-                        DetailTab::Git => intents.push(Intent::OpenGit(t.target.clone())),
-                        DetailTab::History => intents.push(Intent::OpenHistory(t.target.clone())),
-                        DetailTab::Terminal => intents.push(Intent::OpenSession(t.target.clone())),
-                        _ => {}
+    egui::ScrollArea::horizontal()
+        .id_salt("cc-detail-tabs")
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = if ui.ctx().viewport_rect().width() <= 760.0 {
+                    16.0
+                } else {
+                    22.0
+                };
+                for (tab, key) in [
+                    (DetailTab::Work, "work_result"),
+                    (DetailTab::Terminal, "original_terminal"),
+                    (DetailTab::Git, "git"),
+                    (DetailTab::History, "history"),
+                ] {
+                    let r = ghost_button(
+                        ui,
+                        snapshot,
+                        text(snapshot, key),
+                        38.0,
+                        if ui.ctx().viewport_rect().width() <= 760.0 {
+                            11.0
+                        } else {
+                            14.0
+                        },
+                    );
+                    if state.detail_tab == tab {
+                        ui.painter().hline(
+                            r.rect.x_range(),
+                            r.rect.bottom(),
+                            egui::Stroke::new(2.0, colors(snapshot).accent),
+                        );
+                    }
+                    if r.clicked() {
+                        state.detail_tab = tab;
+                        if t.target.session_id.is_some() {
+                            match tab {
+                                DetailTab::Git => intents.push(Intent::OpenGit(t.target.clone())),
+                                DetailTab::History => {
+                                    intents.push(Intent::OpenHistory(t.target.clone()))
+                                }
+                                DetailTab::Terminal => {
+                                    intents.push(Intent::OpenSession(t.target.clone()))
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
-            }
-        }
-    });
+            });
+        });
     rule(ui, snapshot);
     match state.detail_tab {
-        DetailTab::Work => {
-            title(ui, snapshot, &t.activity);
+        DetailTab::Work | DetailTab::Result => {
+            title(ui, snapshot, "진행 내용");
+            description(ui, snapshot, &t.activity);
             if t.reconcile_remote.enabled
                 && action(ui, snapshot, "원래 요청 상태만 확인", &t.reconcile_remote)
             {
@@ -541,22 +765,40 @@ fn task_detail(
                     intents.push(Intent::DispatchTask { target });
                 }
             }
-            if action(ui, snapshot, "새 워커 생성 후 배정", &t.create_worker) {
+            if (t.create_worker.enabled || t.state == TaskState::VerificationFailed)
+                && action(ui, snapshot, "새 워커 생성 후 배정", &t.create_worker)
+            {
                 intents.push(Intent::CreateWorker {
                     target: t.target.clone(),
                 });
             }
-            for (key, value) in [
-                ("scope", &t.scope),
-                ("criteria", &t.acceptance_criteria),
-                ("directory", &t.directory),
-                ("device", &t.device),
-            ] {
-                if !value.is_empty() {
-                    weak(ui, snapshot, text(snapshot, key));
-                    ui.add(egui::Label::new(value).wrap());
-                }
-            }
+            egui::Grid::new(("cc-task-facts", &t.target.workspace_id, &t.target.task_id))
+                .num_columns(2)
+                .min_col_width(if ui.ctx().viewport_rect().width() <= 760.0 {
+                    80.0
+                } else {
+                    110.0
+                })
+                .spacing([16.0, 10.0])
+                .show(ui, |ui| {
+                    for (key, value) in [
+                        ("scope", &t.scope),
+                        ("directory", &t.directory),
+                        ("criteria", &t.acceptance_criteria),
+                        ("device", &t.device),
+                    ] {
+                        if !value.is_empty() {
+                            weak(ui, snapshot, text(snapshot, key));
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(value).size(13.0 * snapshot.font_scale),
+                                )
+                                .wrap(),
+                            );
+                            ui.end_row();
+                        }
+                    }
+                });
             if let Some(a) = &t.approval {
                 rule(ui, snapshot);
                 title(ui, snapshot, text(snapshot, "approval_title"));
@@ -579,8 +821,9 @@ fn task_detail(
                     weak(ui, snapshot, &a.action.reason);
                 }
             }
-        }
-        DetailTab::Result => {
+            ui.add_space(24.0);
+            rule(ui, snapshot);
+            title(ui, snapshot, "제출된 결과");
             if !t.verification.is_empty() {
                 weak(ui, snapshot, &t.verification);
             }
@@ -693,6 +936,11 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
     let mobile = state.last_layout.is_some_and(|l| l.mobile);
     let (number_w, owner_w, gap) = if mobile {
         (18.0, 76.0, 7.0)
+    } else if state
+        .last_layout
+        .is_some_and(|l| l.screen.width() <= 1250.0)
+    {
+        (20.0, 85.0, 12.0)
     } else {
         (24.0, 104.0, 12.0)
     };
@@ -702,6 +950,7 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
     let response = egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(0, 12))
         .show(ui, |ui| {
+            ui.set_min_width(ui.available_width());
             ui.set_min_height(38.0 * scale);
             ui.spacing_mut().item_spacing = egui::vec2(gap, 3.0);
             ui.horizontal_top(|ui| {
@@ -709,6 +958,7 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                     egui::vec2(number_w, 0.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
+                        ui.set_min_width(number_w);
                         ui.label(
                             egui::RichText::new(format!("{:02}", i + 1))
                                 .size(10.0 * scale)
@@ -805,15 +1055,50 @@ fn history(
     }
     for h in entries {
         ui.push_id(&h.id, |ui| {
-            weak(ui, snapshot, &h.time);
-            ui.add(egui::Label::new(egui::RichText::new(&h.text).strong()).wrap());
-            weak(ui, snapshot, &h.detail);
-            if let Some(target) = &h.target
-                && ui.small_button(text(snapshot, "open_history")).clicked()
-            {
-                intents.push(Intent::OpenHistory(target.clone()));
-            }
-            rule(ui, snapshot);
+            let width = ui.available_width();
+            let row = egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(0, 13))
+                .show(ui, |ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui(
+                            egui::vec2(if width < 500.0 { 35.0 } else { 50.0 }, 0.0),
+                            |ui| weak(ui, snapshot, &h.time),
+                        );
+                        ui.allocate_ui_with_layout(
+                            egui::vec2((width - 80.0).max(1.0), 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(&h.text)
+                                            .size(13.0 * snapshot.font_scale)
+                                            .strong(),
+                                    )
+                                    .wrap(),
+                                );
+                                weak(ui, snapshot, &h.detail);
+                                if let Some(target) = &h.target
+                                    && ghost_button(
+                                        ui,
+                                        snapshot,
+                                        text(snapshot, "open_history"),
+                                        28.0,
+                                        11.0,
+                                    )
+                                    .clicked()
+                                {
+                                    intents.push(Intent::OpenHistory(target.clone()));
+                                }
+                            },
+                        );
+                    });
+                })
+                .response;
+            ui.painter().hline(
+                row.rect.x_range(),
+                row.rect.bottom(),
+                egui::Stroke::new(1.0, colors(snapshot).line),
+            );
         });
     }
 }
@@ -842,4 +1127,6 @@ fn terminal(
     }
 }
 
-pub(super) use super::composer::{composer, composer_id, submit};
+#[cfg(test)]
+pub(super) use super::composer::submit;
+pub(super) use super::composer::{composer, composer_id};

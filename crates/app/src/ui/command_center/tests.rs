@@ -103,6 +103,151 @@ struct HarnessState {
     intents: Vec<Intent>,
 }
 
+#[test]
+fn task_work_tab_includes_submitted_result_and_has_four_destinations() {
+    let mut snapshot = rich_fixture();
+    let task = &mut snapshot.projects[0].tasks[0];
+    task.result = Some("실제로 제출한 작업 결과".into());
+    let mut initial = UiState {
+        active_workspace: snapshot.selected_workspace_id.clone(),
+        ..Default::default()
+    };
+    initial.open_task(task.target.clone());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    harness.get_by_label("작업과 결과");
+    harness.get_by_label("실제로 제출한 작업 결과");
+    assert!(harness.query_by_label("결과").is_none());
+    harness.get_by_label("원문 터미널");
+}
+
+#[test]
+fn monitor_actions_keep_full_click_height_and_exact_worker_target() {
+    let snapshot = rich_fixture();
+    let expected = snapshot.projects[0].tasks[0].target.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            HarnessState::default(),
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    let monitor = harness.state().ui.last_layout.unwrap().monitor.unwrap();
+    let button = harness
+        .get_all_by_label("작업 상세")
+        .find(|n| monitor.contains_rect(n.rect()))
+        .expect("monitor task action");
+    assert!(button.rect().height() >= 28.0, "{:?}", button.rect());
+    button.click();
+    harness.run();
+    assert_eq!(harness.state().ui.selected_task_id, expected.task_id);
+    assert_eq!(harness.state().ui.view, View::Task);
+}
+
+#[test]
+fn settings_default_keeps_advanced_scope_collapsed_and_agent_fields_inline() {
+    let snapshot = approved_visual_fixture();
+    let initial = UiState {
+        active_workspace: snapshot.selected_workspace_id.clone(),
+        view: View::Settings,
+        ..Default::default()
+    };
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1100.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    assert!(harness.query_by_label("수정 범위").is_none());
+    let content = harness.state().last_layout.unwrap().content;
+    let provider = harness
+        .get_all_by_label("메인 에이전트")
+        .find(|n| content.contains(n.rect().center()))
+        .unwrap();
+    let model = harness.get_by_label("모델");
+    assert!((provider.rect().top() - model.rect().top()).abs() < 1.0);
+    harness.get_by_label("취소").click();
+    harness.run();
+    assert_eq!(harness.state().view, View::Main);
+    assert!(harness.state().settings_draft.is_none());
+}
+
+#[test]
+fn project_navigation_deduplicates_bound_sessions_and_opens_exact_independent_session() {
+    let mut snapshot = rich_fixture();
+    let p = &mut snapshot.projects[0];
+    let unrelated = RouteTarget {
+        workspace_id: p.id.clone(),
+        session_id: Some("independent-exact".into()),
+        task_id: None,
+    };
+    for (title, target) in [
+        ("bound main duplicate", p.main_target.clone()),
+        ("bound worker duplicate", p.tasks[0].target.clone()),
+        ("independent Codex", unrelated.clone()),
+        (
+            "different project",
+            RouteTarget {
+                workspace_id: "another-project".into(),
+                session_id: Some("independent-exact".into()),
+                task_id: None,
+            },
+        ),
+    ] {
+        p.sessions.push(Session {
+            title: title.into(),
+            target,
+            provider: "Codex".into(),
+            device: "same computer".into(),
+            ..Default::default()
+        });
+    }
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            HarnessState::default(),
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    assert!(harness.query_by_label("bound main duplicate").is_none());
+    assert!(harness.query_by_label("bound worker duplicate").is_none());
+    assert!(harness.query_by_label("different project").is_none());
+    let item = harness
+        .get_all_by_label("independent Codex")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .unwrap();
+    item.click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .intents
+            .contains(&Intent::OpenSession(unrelated.clone()))
+    );
+    assert_eq!(
+        harness.state().ui.requested_terminal_target.as_ref(),
+        Some(&unrelated)
+    );
+}
+
 fn rich_fixture() -> Snapshot {
     let mut snapshot = fixture();
     snapshot.status = "로컬 snapshot · 실행 상태는 관측된 근거만 표시".into();
@@ -335,7 +480,8 @@ fn approved_assignment_density_and_owner_column_are_visible() {
 }
 
 #[test]
-fn mobile_primary_tabs_are_all_visible_at_both_font_sizes() {
+fn mobile_primary_tabs_keep_font_scale_and_scroll_to_each_destination() {
+    let mut first_width = 0.0;
     for scale in [1.0, 1.25] {
         let snapshot = Snapshot {
             font_scale: scale,
@@ -352,17 +498,35 @@ fn mobile_primary_tabs_are_all_visible_at_both_font_sizes() {
         use_korean_font(&mut harness);
         harness.run();
         let header = harness.state().last_layout.unwrap().header;
+        let first = harness
+            .get_all_by_label("메인 에이전트")
+            .find(|n| header.y_range().contains(n.rect().center().y))
+            .unwrap()
+            .rect();
+        if scale == 1.0 {
+            first_width = first.width();
+        } else {
+            assert!(
+                first.width() >= first_width * 1.18,
+                "font enlargement must not be shrunk to fit"
+            );
+        }
         let rollback = harness.get_by_label("기존 화면").rect();
-        for label in ["메인 에이전트", "작업 3", "터미널", "에이전트·기기", "이력"]
-        {
+        assert!(header.contains_rect(rollback));
+        for label in ["작업 3", "터미널", "에이전트·기기", "이력"] {
             let tab = harness
                 .get_all_by_label(label)
-                .find(|n| header.contains(n.rect().center()))
+                .find(|n| header.y_range().contains(n.rect().center().y))
+                .expect(label);
+            tab.scroll_to_me();
+            harness.run();
+            let tab = harness
+                .get_all_by_label(label)
+                .find(|n| header.y_range().contains(n.rect().center().y))
                 .expect(label);
             assert!(
-                header.contains_rect(tab.rect()) && tab.rect().right() < rollback.left(),
-                "visible {label} at {scale}: {:?} / {rollback:?}",
-                tab.rect()
+                tab.rect().intersects(header),
+                "scrollable {label} at {scale}"
             );
         }
     }
@@ -395,7 +559,7 @@ fn settings_fields_follow_approved_width_and_touch_height() {
             .expect("settings directory input")
             .rect();
         assert!(
-            field.width() <= 620.5,
+            field.width() <= 960.5,
             "bounded settings column at {width}: {field:?}"
         );
         assert!(
@@ -449,12 +613,12 @@ fn worker_drawer_header_and_footer_remain_visible_with_many_workers() {
                 "close shares monitor header"
             );
         }
-        let footer = harness.get_by_label("기기 관리").rect();
+        let footer = harness.get_by_label("기기 관리 ↗").rect();
         assert!(
             panel.contains_rect(footer) && panel.bottom() - footer.bottom() < 26.0,
             "persistent device footer at {width}: {footer:?} / {panel:?}"
         );
-        harness.get_by_label("기기 관리").click();
+        harness.get_by_label("기기 관리 ↗").click();
         harness.run();
         assert!(harness.state().intents.contains(&Intent::ManageDevices {
             workspace_id: Some("project-a".into())
@@ -702,10 +866,26 @@ fn command_center_render_evidence() {
         .unwrap_or_else(|| "/private/tmp/deppy-cc-native-fix-20261020/screenshots".into());
     std::fs::create_dir_all(&output).unwrap();
     let mut metrics = Vec::new();
-    for width in [1440.0, 1280.0, 1000.0, 760.0, 390.0] {
-        for scale in [1.0, 1.25] {
+    let quick = std::env::var_os("DEPPY_CC_EVIDENCE_QUICK").is_some();
+    let widths: &[f32] = if quick {
+        &[1440.0, 1200.0, 390.0]
+    } else {
+        &[1440.0, 1280.0, 1200.0, 1000.0, 760.0, 390.0]
+    };
+    let scales: &[f32] = if quick { &[1.0] } else { &[1.0, 1.25] };
+    for &width in widths {
+        for &scale in scales {
             for dark in [true, false] {
-                let mut modes = vec!["main", "settings", "empty", "no-project", "devices"];
+                let mut modes = vec![
+                    "main",
+                    "settings",
+                    "empty",
+                    "no-project",
+                    "devices",
+                    "tasks",
+                    "task",
+                    "history",
+                ];
                 if width <= 1050.0 {
                     modes.push("workers");
                 }
@@ -729,13 +909,27 @@ fn command_center_render_evidence() {
                         view: match mode {
                             "settings" => View::Settings,
                             "devices" => View::Devices,
+                            "tasks" => View::Tasks,
+                            "task" => View::Task,
+                            "history" => View::History,
                             _ => View::Main,
+                        },
+                        selected_task_id: if mode == "task" {
+                            snapshot.projects[0].tasks[1].target.task_id.clone()
+                        } else {
+                            None
                         },
                         left_drawer: mode == "projects",
                         right_drawer: mode == "workers",
                         ..Default::default()
                     };
-                    let height = if width == 390.0 { 844.0 } else { 900.0 };
+                    let height = if width == 390.0 {
+                        844.0
+                    } else if width == 1200.0 {
+                        800.0
+                    } else {
+                        900.0
+                    };
                     let mut harness = egui_kittest::Harness::builder()
                         .with_size(egui::vec2(width, height))
                         .build_ui_state(
@@ -792,8 +986,10 @@ fn approved_visual_fixture() -> Snapshot {
     p.config.directory = p.directory.clone();
     p.main_model = "GPT-6.1-Sol".into();
     p.config.model = p.main_model.clone();
+    p.config.provider = p.main_provider.clone();
+    p.config.effort = p.main_effort.clone();
     p.goal = "모바일 결제 화면을 개선하고, 리뷰와 동작 검증까지 진행해 줘.".into();
-    p.main_summary = "메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 확인할 수 있습니다.".into();
+    p.main_summary = "메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 계속 확인할 수 있습니다.".into();
     p.available_providers = vec!["Codex".into(), "Claude".into()];
     p.available_models = vec![p.main_model.clone()];
     p.available_efforts = vec!["xhigh".into()];
@@ -980,6 +1176,10 @@ fn manual_result_and_verification_controls_capture_exact_displayed_attempt_and_r
     harness.run();
     harness.get_by_label("수동 결과 보고").click();
     harness.run();
+    harness
+        .get_by_label("결과 제출 · 검증 미실행")
+        .scroll_to_me();
+    harness.run();
     harness.get_by_label("결과 제출 · 검증 미실행").click();
     harness.run();
     assert!(harness.state().intents.contains(&Intent::ReportResult {
@@ -987,6 +1187,8 @@ fn manual_result_and_verification_controls_capture_exact_displayed_attempt_and_r
         attempt_id: "attempt-current".into(),
         text: "actual manual report".into()
     }));
+    harness.get_by_label("검증 통과 기록").scroll_to_me();
+    harness.run();
     harness.get_by_label("검증 통과 기록").click();
     harness.run();
     assert!(harness.state().intents.contains(&Intent::VerifyResult {

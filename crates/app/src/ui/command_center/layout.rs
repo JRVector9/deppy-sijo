@@ -55,7 +55,7 @@ impl LayoutRects {
             if mobile {
                 (if composer_focused { 151.0 } else { 123.0 }) + extra
             } else {
-                (if composer_focused { 174.0 } else { 136.0 }) + extra
+                (if composer_focused { 170.0 } else { 132.0 }) + extra
             }
         } else {
             0.0

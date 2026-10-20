@@ -593,6 +593,7 @@ pub const LABELS: &[(&str, &str)] = &[
     ("scope", "수정 범위"),
     ("criteria", "완료 조건"),
     ("directory", "작업 폴더"),
+    ("project_directory", "이 Mac의 프로젝트 폴더"),
     ("device", "실행 기기"),
     ("unavailable_task", "선택한 작업을 찾을 수 없습니다."),
     ("no_result", "아직 제출된 결과가 없습니다."),
@@ -1362,10 +1363,11 @@ fn projectbar(
                     }
                 }
                 ui.allocate_ui_with_layout(
-                    egui::vec2(ui.available_width(), l.projectbar.height() - 24.0),
+                    egui::vec2(ui.available_width(), 48.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.set_min_width(ui.max_rect().width());
+                        ui.spacing_mut().item_spacing.y = 4.0;
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(p.map(|p| p.name.as_str()).unwrap_or("Deppy"))
@@ -1378,6 +1380,7 @@ fn projectbar(
                         );
                         if let Some(p) = p {
                             ui.horizontal(|ui| {
+                                ui.spacing_mut().interact_size.y = 0.0;
                                 let (dot, _) = ui.allocate_exact_size(
                                     egui::vec2(6.0, 12.0),
                                     egui::Sense::hover(),
@@ -1429,7 +1432,11 @@ fn worktop(
         });
         if l.mobile
             && ui
-                .button("☰")
+                .add(
+                    egui::Button::new("☰")
+                        .frame(false)
+                        .min_size(egui::vec2(28.0, 28.0)),
+                )
                 .on_hover_text(text(snapshot, "projects_open"))
                 .clicked()
         {
@@ -1479,7 +1486,15 @@ fn worktop(
                 }
             }
             if state.view != View::Main {
-                if ui.small_button(text(snapshot, "back_main")).clicked() {
+                if ghost_button(
+                    ui,
+                    snapshot,
+                    text(snapshot, "back_main"),
+                    28.0,
+                    if l.mobile { 10.0 } else { 12.0 },
+                )
+                .clicked()
+                {
                     state.view = View::Main;
                 }
             } else if !l.mobile

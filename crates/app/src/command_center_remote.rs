@@ -555,10 +555,10 @@ impl App {
         id: &str,
         target: &cc::RouteTarget,
     ) -> Result<(), String> {
-        reconcile::ensure_no_idle_worker(host, target)?;
         if host.remote_permits.contains_key(id) {
             return Err("이 컴퓨터에서 새 원격 실행을 시작해 주세요.".into());
         }
+        reconcile::ensure_no_idle_worker(host, target)?;
         if host.flight.is_some() {
             return Err("프로젝트 저장을 마친 뒤 실행해 주세요.".into());
         }

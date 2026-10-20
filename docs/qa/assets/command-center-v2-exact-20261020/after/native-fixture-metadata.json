@@ -1,0 +1,20 @@
+{
+  "approved_source": "docs/mockups/multi-agent-command-center-v2-2026-10-20.html",
+  "fixture_only": true,
+  "live_user_data": false,
+  "snapshot_files": "*.snapshot.json: exact serialized native Snapshot for each image",
+  "records": {
+    "review_result": "Approved taskScreen review result paragraph",
+    "verification": "Approved taskScreen review evidence: code review, runtime tests not run",
+    "history": "Approved initialization example-review/example-approval/example-ui records with exact text/time",
+    "history_kind": "Exact approved event IDs: example-review work / example-approval approval / example-ui work; no prose-based classification."
+  },
+  "native_dto_omissions": [
+    "No task dependency list, submitted file summaries, main-review status, user-confirmation metadata or structured review comments in current Task render DTO. Existing capability states retained; fixture does not enable unavailable actions."
+  ],
+  "fixture_only_identity": {
+    "result_revision": "fixture-review-result-1",
+    "task_targets": "Existing native rich_fixture exact task IDs; approved record IDs/text/time mapped to those targets."
+  },
+  "remaining_observed_layout_limits": []
+}

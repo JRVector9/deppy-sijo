@@ -1,0 +1,461 @@
+{
+  "integration_source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "note": "Native/PWA evidence source file hashes recorded in respective manifests; selected durable PNGs only, full matrices recorded in JSON",
+  "files": [
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-1200-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-1200-dark-main.png",
+      "sha256": "1de73ba163eb20ac83c3310aec150d2cf40a43047d1ec78d6e387d9ef3036102"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-1200-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-1200-light-main.png",
+      "sha256": "4bce8e5a8d428bc347d8f56d6c88d544804e77ddaa5b19b3b124b463d83473ab"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-1440-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-1440-dark-main.png",
+      "sha256": "d19a21b63f598cf8038103be21045b6f58c3cf5fc7ea69d62376bb3516bccb64"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-1440-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-1440-light-main.png",
+      "sha256": "6f464478e3c232ad6775efc4316a9a707286d5b2f7605eaceec4b287aa36ce83"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-390-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-390-dark-main.png",
+      "sha256": "8bdbc5ebba4c3924aebaf0caad532b90e8f58159aeeb1c975a3d8fd1174c578b"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-390-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/approved-390-light-main.png",
+      "sha256": "7fe4649e83eb04d329d768adf523a9e926fc76b3f66b034d74ca1c0499357ed9"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-1200-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-1200-dark-main.png",
+      "sha256": "20a4c3c4001c1b456946d32696cc1ec2de741673d698279b2284825c15291c14"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-1200-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-1200-light-main.png",
+      "sha256": "f0a444ffdf46093773592b937357d899aaaac9ab24fe2f1cfa2ea9c872105c24"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-1440-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-1440-dark-main.png",
+      "sha256": "7ca1ca093208b38102749c23b7f5cf2a763d3a1b99a3208300aad6d08770baaa"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-1440-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-1440-light-main.png",
+      "sha256": "23725391693400cee9ba7843a21405aa5fa5c7f6635b4e3183186ae784f50572"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-390-dark-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-390-dark-main.png",
+      "sha256": "cf9bce5090d54ac48591f65abaf7df50ac0afacd2a3eaad169e496d532faf9c2"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-390-light-main.png",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/shared-390-light-main.png",
+      "sha256": "d5eace9dee08af4124cf80896f979b404e8db36b279befd8c71e66c90c222e8c"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/browser-measurements.json",
+      "source_file": "/private/tmp/deppy-cc-exact-final-d58505a8-20261020/measurements.json",
+      "sha256": "a7687a8e80aaf64917ebe021a53bc7cb0a688aa80e22a212d439812a7ffae072"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1440-dark-font100.png",
+      "sha256": "9a777079d4b061b88f49d98b98303016d4999948e7dd138fd26c40df2f335c5c"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1440-light.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1440-light-font100.png",
+      "sha256": "5fe473f75f45eb8ec93f50c392d1cb80d602f40f090c68da0f1cabdc99d29e7e"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1440-light.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1440-light-font100.snapshot.json",
+      "sha256": "b787b85769fec461cddcf32885a8bc086e72fe849cb0d1f710dde48264f57283"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1200-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1200-dark-font100.png",
+      "sha256": "33a09a41ca99399fe8939b11c9abf3151e4bcb6d820aefe189f1a2ccbac30f10"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-1200-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-1200-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-390-dark-font100.png",
+      "sha256": "03272f15c4b01b3a8627db0c58dc4c6d40d6977eefc7526a965d27ed91f84bf8"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-390-light.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-390-light-font100.png",
+      "sha256": "171d67b4b2b96ff85bbba9db60a6a50343cef76176118a81278fe494a27d8c48"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-main-390-light.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/main-390-light-font100.snapshot.json",
+      "sha256": "b787b85769fec461cddcf32885a8bc086e72fe849cb0d1f710dde48264f57283"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-1440-dark-font100.png",
+      "sha256": "cce335ec12f78a33f86702c6a2bbcad50d235c6fc6a291811908d09f852f1c1c"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-1440-light.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-1440-light-font100.png",
+      "sha256": "37a44bd981a752001540d97e0108160d71b4303bf3813ea002c91a37a9aa3423"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-1440-light.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-1440-light-font100.snapshot.json",
+      "sha256": "b787b85769fec461cddcf32885a8bc086e72fe849cb0d1f710dde48264f57283"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-390-dark-font100.png",
+      "sha256": "1be6d88ac1b9a16ccb8b387c99205e9f20868059e3c10e12ac0b2189f009a9bc"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-390-light.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-390-light-font100.png",
+      "sha256": "3dec3752976c83d00b2f94ab4448ed0b47946a88c0b9faaa69ac211ad5a6a954"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-settings-390-light.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/settings-390-light-font100.snapshot.json",
+      "sha256": "b787b85769fec461cddcf32885a8bc086e72fe849cb0d1f710dde48264f57283"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-task-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/task-1440-dark-font100.png",
+      "sha256": "e565e632ecd577b2d14a668de464fdfeb8f8cc95cca0b1ec26133530565948e3"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-task-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/task-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-task-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/task-390-dark-font100.png",
+      "sha256": "c0de4a9ca6671c5d48789e7d7b57e13603d8725026263e55b6184b5831c38394"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-task-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/task-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-tasks-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/tasks-1440-dark-font100.png",
+      "sha256": "2c01a5db4989c16cd2b31801905b0d8c5288d12bf56a999f6c28b2d416ea3539"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-tasks-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/tasks-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-tasks-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/tasks-390-dark-font100.png",
+      "sha256": "7922e971d7d4aeadbfaee78b363c0c2ffcaa2b70b53f96e8d3e7a3488bfc9ae4"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-tasks-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/tasks-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-devices-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/devices-1440-dark-font100.png",
+      "sha256": "f6dadcf64977c425cd94606bd9a041364af60e5928ec60a332346da19700bb3c"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-devices-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/devices-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-devices-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/devices-390-dark-font100.png",
+      "sha256": "f9319ba0b3c9c8723592d80f930b454ba4d2b2ab2c9aabc778c4a5fd8cea8ed1"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-devices-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/devices-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-empty-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/empty-1440-dark-font100.png",
+      "sha256": "4f833b295ee9921ea0eb69724222869c8a9ee89f3aecace6a2ef13899e9d25fb"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-empty-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/empty-1440-dark-font100.snapshot.json",
+      "sha256": "add3c1490e548652aaa50951b15d53ee3797a360aff08932a706268a7734e59d"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-empty-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/empty-390-dark-font100.png",
+      "sha256": "fd79f40604b8cdc6fe7ac5bdf291f32addda9ca85fb8c60bca2cbdbdb4273650"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-empty-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/empty-390-dark-font100.snapshot.json",
+      "sha256": "add3c1490e548652aaa50951b15d53ee3797a360aff08932a706268a7734e59d"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-history-1440-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/history-1440-dark-font100.png",
+      "sha256": "9391120cb2c9bc10cb1cefc1336711f07bb276d002f99bab7f508051d252538b"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-history-1440-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/history-1440-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-history-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/history-390-dark-font100.png",
+      "sha256": "13a46bfa51f8a0161216bf1e502b4f70108fabaca9dd2165ef7901848b50e268"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-history-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/history-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-workers-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/workers-390-dark-font100.png",
+      "sha256": "8691a57575be21208429e9c327d26bf483f33ea60fa6c043915fccd32b6dd834"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-workers-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/workers-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-projects-390-dark.png",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/projects-390-dark-font100.png",
+      "sha256": "f9a71a7ba077b5ced0c4c3ed85eb39d8199b6490934ec5037d28563d81882abc"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-projects-390-dark.snapshot.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/projects-390-dark-font100.snapshot.json",
+      "sha256": "0c3a20bf0ab9cce10eef34d7aea28038dc768d6e5cf5d57f2e91ceb59cf596b5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-metrics.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/metrics.json",
+      "sha256": "2cace8c3cf8be85fe267eb6141dd82c9a74ff0cafe382cebf73fb43725b2e0f2"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-validation.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/validation.json",
+      "sha256": "95fd441d8ee809106e03750883a8bf20d9ea5f09c726466aac9d413a05a2aeb5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-source-manifest.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/source-manifest.json",
+      "sha256": "ba49837224abd632f5766e73666d2cb099c1c3c44507ca624f969126fa901427"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/native-fixture-metadata.json",
+      "source_file": "/private/tmp/cc-native-exact-final-20261020/fixture-metadata.json",
+      "sha256": "5cfe8e237a7fd68b53196e962d3935295a6ccb030c50e5f795696e6f0de584d4"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-settings-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-settings-1440-dark.png",
+      "sha256": "b9a5b65018ff1fbfa6921908251edef07f1532d23afa0b7c87b958da9af9d268"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-settings-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-settings-1440-dark.png",
+      "sha256": "bea9605701ece442bb10a295a73ec8da2bca20f4c43a9a14d736d3ffe54233d3"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-settings-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-settings-390-dark.png",
+      "sha256": "a97f8bfb8ba5a3abcf9150ccc5e66a523b4c58f66495794789620cba19f8f0de"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-settings-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-settings-390-dark.png",
+      "sha256": "38e2d856572f4627eb14b95f6e163b59d8281e7a1b0c67ccbdd2768639cb1cbc"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-task-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-task-1440-dark.png",
+      "sha256": "a8eae205c1e4aeec4f07893d6d84be8f013a5f109a9c1e0fb48cad0292061e6b"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-task-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-task-1440-dark.png",
+      "sha256": "f511d5d1c9145213bc5c108693a6a703cd5df7dd8058717464da5417863824cb"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-task-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-task-390-dark.png",
+      "sha256": "c2f4c0e366fa2af5f5f427f1fc8a38705b557c5380fc335823b62c089c759f74"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-task-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-task-390-dark.png",
+      "sha256": "1b15e6319fcd658e8e23da3df3aa48b91dc3bbf94a8f35f7a83b4d8a5efc6a6d"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-tasks-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-tasks-1440-dark.png",
+      "sha256": "5107cb5e3c4b01ffd872ba4ac62a202e524299f34df99e535ad3c9323f62b3d5"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-tasks-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-tasks-1440-dark.png",
+      "sha256": "38c26808b66b602ea386afe8aca95697916d3252d468066632a79142b7ffa4be"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-tasks-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-tasks-390-dark.png",
+      "sha256": "d503fc1e400df2eab8df10ffc1f30f155255edfd8b81af9b5e67f8ef6e0e64f8"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-tasks-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-tasks-390-dark.png",
+      "sha256": "d8967e1e7559da894e970544a519e07391760032e2ac020dba2a0f56a8a27814"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-devices-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-devices-1440-dark.png",
+      "sha256": "a1dc9092cb1cd813fbe8e62d80c64e3b600eebede058b18d99e426b72d2b44f4"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-devices-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-devices-1440-dark.png",
+      "sha256": "a3e396cfef22e85f4c1dd3eb8a67fced87db8a91bb0d227d38780745a950fd43"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-devices-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-devices-390-dark.png",
+      "sha256": "1257e5d2db79faa02cf472526a5a0ef58685f6d0239d7e5eb887d5caade384c9"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-devices-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-devices-390-dark.png",
+      "sha256": "69119c1b9ce5a71c71dd5c2b38e7ded2c4792ce5a5305a7fc87e1f17e89ed330"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-empty-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-empty-1440-dark.png",
+      "sha256": "9b6564267d587a2ffeb9d831e90154712901ee349ca876971ac961b166cf1fee"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-empty-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-empty-1440-dark.png",
+      "sha256": "06cf6e27254f068fc31a4ab6fb49cded21e15cdad5cbae7dc4ad3e19aa4cd4cc"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-empty-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-empty-390-dark.png",
+      "sha256": "03be50b76061d41fedf845a92753cafa6b9947030c419eaa3b165e613f91fe5e"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-empty-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-empty-390-dark.png",
+      "sha256": "6746d087361f09950d8feea7f858c38dfedde89116a070f0be5f89d2207cc5f3"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-history-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-history-1440-dark.png",
+      "sha256": "afb0105425f3a55faedb12e6dfbf3003c4738733bfebd22c758c94842ea54e91"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-history-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-history-1440-dark.png",
+      "sha256": "2480aafed08fa5e5b37a23f7718d4faa8468539edadce4a7f94d1ee93fe550c9"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-history-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-history-390-dark.png",
+      "sha256": "ac1fca4fcc398f7070c5d77c61f82f43d8b204462417191069f79657abddb074"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-history-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-history-390-dark.png",
+      "sha256": "5a2ba7308d4f3c5ce58cf83bc1dba7b3a1c4e6a229b8e691d51a6465d28b3b10"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-rules-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-rules-1440-dark.png",
+      "sha256": "f454b363ece34c98993faf9adcee3e969dfc6c1cb8b1ed172034be42a89a1ee8"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-rules-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-rules-1440-dark.png",
+      "sha256": "7686e248707f499137043e8b65e8be7af261bc60fabcc9cb158709daaf86588f"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/approved-rules-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/approved-rules-390-dark.png",
+      "sha256": "06e1447050d119bf8a1098e267628bd0014295aa9b219d7fdf495df49824db81"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-rules-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-rules-390-dark.png",
+      "sha256": "08cf77ee1475388791e22d51f19b875f6f7084ddaa601053a5f5a29dcd19b947"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-picker-1440-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-picker-1440-dark.png",
+      "sha256": "329d1405c0048dcb8d0d20bee0dbd3d6582086c1cd4f90f85562c8202c29a96b"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-picker-390-dark.png",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/shared-picker-390-dark.png",
+      "sha256": "5b2bb944f74872dad2c239f0ba3fa7a290fd24e2e95486bd9528e4e1c604a9ff"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-auxiliary-measurements.json",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/auxiliary-measurements.json",
+      "sha256": "c2a238d4fa0cab3a063cf4556d2b727c21a5cca89f0fe6f1833a782f07187e54"
+    },
+    {
+      "path": "docs/qa/assets/command-center-v2-exact-20261020/after/shared-screenshots-sha256.json",
+      "source_file": "/private/tmp/deppy-cc-exact-pwa-auxiliary-normalized-9763c7e7-20261020/screenshots-sha256.json",
+      "sha256": "ac43529455668ad4cf36c49b783f20b89f927b82973c509e426fa2a23bfb40fc"
+    }
+  ]
+}

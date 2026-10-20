@@ -1,0 +1,21 @@
+{
+  "source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "app": {
+    "passed": 3505,
+    "failed": 0,
+    "ignored": 40
+  },
+  "storage": {
+    "unit_passed": 512,
+    "integration_passed": 8,
+    "failed": 0
+  },
+  "production_chrome": 1,
+  "shared_browser_checks": 237,
+  "relay_node_tests": 17,
+  "native_focused_tests": 45,
+  "native_png": 52,
+  "all_gates_passed": true,
+  "gate_count": 11,
+  "note": "Final affected-source validation, not a claim of rerunning all workspace targets. Prior full workspace source f65bd5af is recorded separately."
+}

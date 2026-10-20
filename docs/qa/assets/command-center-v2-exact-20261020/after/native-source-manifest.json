@@ -1,0 +1,74 @@
+{
+  "native_head": "24619b6ed13868f63f7e49a393141f51c50399f1",
+  "root_head": "2a4ad20f2260dbc30083557166bda6c61310b0dc",
+  "fixture_only": true,
+  "app_started": false,
+  "files": [
+    {
+      "path": "crates/app/src/ui/command_center/mod.rs",
+      "sha256": "a9c8528749bb81cb32f3c10643e1ebbb10d95e06b7823a8d17ec0823790d9498",
+      "root_sha256": "a9c8528749bb81cb32f3c10643e1ebbb10d95e06b7823a8d17ec0823790d9498",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/main.rs",
+      "sha256": "db0dbfbd688eba62519265889fdcf425b6c2c9fad7b0271a0b427759d112a6f2",
+      "root_sha256": "db0dbfbd688eba62519265889fdcf425b6c2c9fad7b0271a0b427759d112a6f2",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/workers.rs",
+      "sha256": "36e2708daa9cbede0585212f84e3a4ed88767cf43828aa399b03f52cae1173fc",
+      "root_sha256": "36e2708daa9cbede0585212f84e3a4ed88767cf43828aa399b03f52cae1173fc",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/layout.rs",
+      "sha256": "4618fff8a71424fb37f9630d9ef8b6c251202f6bb6022b9c465319a67c9de26c",
+      "root_sha256": "4618fff8a71424fb37f9630d9ef8b6c251202f6bb6022b9c465319a67c9de26c",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/settings.rs",
+      "sha256": "e7299c3fb15750b0f4583a87298d5e71fbb9dadf11722f8429ef42537db56d20",
+      "root_sha256": "e7299c3fb15750b0f4583a87298d5e71fbb9dadf11722f8429ef42537db56d20",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/devices.rs",
+      "sha256": "9763c9d445eec4ca654876d5e7c2202830fdbc5014c9803f86d23689128d99db",
+      "root_sha256": "9763c9d445eec4ca654876d5e7c2202830fdbc5014c9803f86d23689128d99db",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/composer.rs",
+      "sha256": "b258c5a7d0463dca476980edc87143a33f58a95ab83ee8b53200d87b2278a3ba",
+      "root_sha256": "b258c5a7d0463dca476980edc87143a33f58a95ab83ee8b53200d87b2278a3ba",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/tests.rs",
+      "sha256": "710921af709250bca68f5d7b634cb409f3589e6143063d618f4d8d5b11e16680",
+      "root_sha256": "710921af709250bca68f5d7b634cb409f3589e6143063d618f4d8d5b11e16680",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/composer/picker.rs",
+      "sha256": "2fdf9ea76ef2bbd7516a61dd8adf0198130535a627abddfbc0ee91d458ed8add",
+      "root_sha256": "2fdf9ea76ef2bbd7516a61dd8adf0198130535a627abddfbc0ee91d458ed8add",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/ui/command_center/composer/tests.rs",
+      "sha256": "d568c1fe7d0b2727f9c487d7578eb789603ca29629758f0b20dd809aa0bbbaa1",
+      "root_sha256": "d568c1fe7d0b2727f9c487d7578eb789603ca29629758f0b20dd809aa0bbbaa1",
+      "matches_root": true
+    },
+    {
+      "path": "crates/app/src/fonts.rs",
+      "sha256": "87a68a93574135957bbb99da33e0d2b7627149243e35744fc9216a04953afe3b",
+      "root_sha256": "87a68a93574135957bbb99da33e0d2b7627149243e35744fc9216a04953afe3b",
+      "matches_root": true
+    }
+  ]
+}

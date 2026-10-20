@@ -1,0 +1,62 @@
+{
+  "source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "kind": "Actual approved/shared history geometry; demo-only explanatory footer text excluded",
+  "pairs": [
+    {
+      "width": 1440,
+      "light": false,
+      "compared_fields": [
+        "documentWidth",
+        "appWidth",
+        "form",
+        "fields",
+        "tabs",
+        "history",
+        "content"
+      ],
+      "differences": []
+    },
+    {
+      "width": 1440,
+      "light": true,
+      "compared_fields": [
+        "documentWidth",
+        "appWidth",
+        "form",
+        "fields",
+        "tabs",
+        "history",
+        "content"
+      ],
+      "differences": []
+    },
+    {
+      "width": 390,
+      "light": false,
+      "compared_fields": [
+        "documentWidth",
+        "appWidth",
+        "form",
+        "fields",
+        "tabs",
+        "history",
+        "content"
+      ],
+      "differences": []
+    },
+    {
+      "width": 390,
+      "light": true,
+      "compared_fields": [
+        "documentWidth",
+        "appWidth",
+        "form",
+        "fields",
+        "tabs",
+        "history",
+        "content"
+      ],
+      "differences": []
+    }
+  ]
+}

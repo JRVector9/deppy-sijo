@@ -8,6 +8,9 @@
 - Preserve mobile remote scroll positions and resume read-only observation after lost receipts while retaining mutating-operation fences.
 - Restore the approved native row, drawer, footer and settings dimensions, and the PWA monitor, MAIN/CHECK/LIVE and exact terminal navigation. Preserve focused controls and scroll positions across snapshots.
 - Keep per-goal review evidence with explicit current-policy reconfirmation after recovery, preserve productive attempts, and evict only clean completed project caches.
+- Keep the main composer editable before an agent is connected; configure real sessions and provider/model/effort choices from the composer, retain drafts across binding, and require a separate explicit send.
+- Match approved desktop/mobile reading surfaces, true semibold typography, compact controls and combined work/result tabs; preserve newer drafts and settings across late load, save and input acknowledgements.
+- Preserve actual history categories with legacy-compatible storage, exact task ownership and compact desktop/mobile rows and filters.
 - Bind supported structured command approvals to the exact live owner, turn and provider request, fence actual writes against revocation, and defer unsupported execution scopes to the original session.
 
 This branch has no distributed release artifact. See [usage and capability boundaries](docs/command-center-v2.md) and [verification evidence](docs/qa/2026-10-20-command-center-v2-implementation.md).

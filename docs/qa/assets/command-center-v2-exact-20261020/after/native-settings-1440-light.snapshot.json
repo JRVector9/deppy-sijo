@@ -1,0 +1,357 @@
+{
+  "receipts": [],
+  "projects": [
+    {
+      "available_agents": [],
+      "pending_approvals": [],
+      "create_main": {
+        "enabled": false,
+        "reason": ""
+      },
+      "loaded": false,
+      "storage_retry": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "planner_prompt": null,
+      "id": "project-a",
+      "name": "nomorevibe",
+      "directory": "~/projects/nomorevibe",
+      "goal": "모바일 결제 화면을 개선하고, 리뷰와 동작 검증까지 진행해 줘.",
+      "main_summary": "메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 계속 확인할 수 있습니다.",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "project-a",
+        "session_id": "opaque-pane-a",
+        "task_id": null
+      },
+      "main_provider": "Codex",
+      "main_model": "GPT-6.1-Sol",
+      "main_effort": "xhigh",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [],
+      "tasks": [
+        {
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": null,
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-a",
+            "task_id": "task-a"
+          },
+          "title": "결제 화면 구현",
+          "role": "구현",
+          "scope": "결제 요약·버튼·좁은 화면",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Claude",
+          "device": "이 Mac",
+          "directory": "/projects/a/.worktrees/task-a",
+          "state": "running",
+          "activity": "결제 요약과 버튼 간격을 수정하고 있습니다.",
+          "observed_at": "14:21",
+          "result": null,
+          "result_revision": null,
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        },
+        {
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": null,
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "코드 검토 의견 · 런타임 테스트 미실행",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-b",
+            "task_id": "task-b"
+          },
+          "title": "독립 코드 리뷰",
+          "role": "리뷰",
+          "scope": "변경 범위·예외 처리 검토",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Codex",
+          "device": "gpu3090",
+          "directory": "/projects/a/.worktrees/task-b",
+          "state": "awaiting_user_confirmation",
+          "activity": "중복 제출과 실패 응답 처리 검토를 마쳤습니다.",
+          "observed_at": "14:24",
+          "result": "중복 제출 방지와 실패 응답 표시를 검토했습니다. 권고 2건을 메인에게 전달했습니다.",
+          "result_revision": "fixture-review-result-1",
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        },
+        {
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": null,
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-c",
+            "task_id": "task-c"
+          },
+          "title": "모바일 동작 검증",
+          "role": "검증",
+          "scope": "구현 완료 후 시나리오 확인",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Codex",
+          "device": "gpu3090",
+          "directory": "/projects/a/.worktrees/task-c",
+          "state": "waiting_approval",
+          "activity": "모바일 mock 검증 명령의 범위 확인을 기다립니다. 구현·리뷰 결과 이후 실행합니다.",
+          "observed_at": "14:23",
+          "result": null,
+          "result_revision": null,
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        }
+      ],
+      "history": [
+        {
+          "id": "example-review",
+          "kind": "work",
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-b",
+            "task_id": "task-b"
+          },
+          "time": "14:24",
+          "text": "리뷰 결과를 제출했습니다. 런타임 테스트는 실행하지 않았습니다.",
+          "detail": ""
+        },
+        {
+          "id": "example-approval",
+          "kind": "approval",
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-c",
+            "task_id": "task-c"
+          },
+          "time": "14:23",
+          "text": "모바일 mock 검증 명령의 승인을 요청했습니다.",
+          "detail": ""
+        },
+        {
+          "id": "example-ui",
+          "kind": "work",
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-a",
+            "task_id": "task-a"
+          },
+          "time": "14:21",
+          "text": "결제 화면 구현을 시작했습니다.",
+          "detail": ""
+        }
+      ],
+      "config": {
+        "allowed_scope_roots": [],
+        "name": "nomorevibe",
+        "directory": "~/projects/nomorevibe",
+        "main_session_id": "opaque-pane-a",
+        "provider": "Codex",
+        "model": "GPT-6.1-Sol",
+        "effort": "xhigh",
+        "worker_providers": [
+          "Codex",
+          "Claude"
+        ],
+        "parallel_limit": 3,
+        "automation": "배정 전 확인",
+        "use_worktrees": true,
+        "revision": ""
+      },
+      "save_settings": {
+        "enabled": true,
+        "reason": ""
+      },
+      "available_providers": [
+        "Codex",
+        "Claude"
+      ],
+      "available_models": [
+        "GPT-6.1-Sol"
+      ],
+      "available_efforts": [
+        "xhigh"
+      ],
+      "available_automation": [
+        "배정 전 확인"
+      ]
+    }
+  ],
+  "selected_workspace_id": "project-a",
+  "devices": [
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-0",
+      "name": "이 Mac",
+      "description": "프로젝트 실행 기기",
+      "capabilities": "Codex · Claude",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    },
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-1",
+      "name": "gpu3090",
+      "description": "프로젝트 실행 기기",
+      "capabilities": "Codex · Claude",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    },
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-2",
+      "name": "휴대폰",
+      "description": "원격 관측",
+      "capabilities": "상태·승인·결과 확인",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    }
+  ],
+  "dark_mode": false,
+  "font_scale": 1.0,
+  "labels": {},
+  "add_project": {
+    "enabled": true,
+    "reason": ""
+  },
+  "manage_devices": {
+    "enabled": true,
+    "reason": ""
+  },
+  "status": "로컬 snapshot · 실행 상태는 관측된 근거만 표시"
+}

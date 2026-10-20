@@ -1,0 +1,177 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 2.469,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/fmt.log"
+  },
+  {
+    "name": "diff",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 0.015,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/diff.log"
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 4.459,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/boundary.log"
+  },
+  {
+    "name": "deps",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-deps"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 0.236,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/deps.log"
+  },
+  {
+    "name": "i18n",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "i18n-check"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 64.114,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/i18n.log"
+  },
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 19.931,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/clippy.log"
+  },
+  {
+    "name": "app",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "--bin",
+      "deppy-sijo",
+      "--",
+      "--test-threads=1"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 124.0,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/app.log"
+  },
+  {
+    "name": "storage",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "storage",
+      "--",
+      "--test-threads=1"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 28.533,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/storage.log"
+  },
+  {
+    "name": "production-chrome",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "web-remote",
+      "--test",
+      "command_center_chrome",
+      "--",
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 9.745,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/production-chrome.log"
+  },
+  {
+    "name": "shared-chrome",
+    "command": [
+      "node",
+      "web/shared/tests/command-center.browser.mjs"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 7.053,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/shared-chrome.log"
+  },
+  {
+    "name": "relay-node",
+    "command": [
+      "node",
+      "--test",
+      "web/relay-shell/tests/channel-concurrency.test.mjs",
+      "web/relay-shell/tests/reconnect.test.mjs"
+    ],
+    "source": "d58505a89cc76011118f60044810617c7bb0d236",
+    "exit_code": 0,
+    "seconds": 0.139,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates-final/relay-node.log"
+  }
+]

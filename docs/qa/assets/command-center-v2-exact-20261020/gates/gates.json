@@ -1,0 +1,157 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--check"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 2.589,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/fmt.log"
+  },
+  {
+    "name": "diff",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 0.016,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/diff.log"
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 4.539,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/boundary.log"
+  },
+  {
+    "name": "deps",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-deps"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 0.226,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/deps.log"
+  },
+  {
+    "name": "i18n",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "i18n-check"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 42.198,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/i18n.log"
+  },
+  {
+    "name": "clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--all-targets",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 16.369,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/clippy.log"
+  },
+  {
+    "name": "workspace",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "--workspace",
+      "--",
+      "--test-threads=1"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 419.936,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/workspace.log"
+  },
+  {
+    "name": "production-chrome",
+    "command": [
+      "cargo",
+      "test",
+      "--offline",
+      "--locked",
+      "-p",
+      "web-remote",
+      "--test",
+      "command_center_chrome",
+      "--",
+      "--ignored",
+      "--nocapture",
+      "--test-threads=1"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 6.837,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/production-chrome.log"
+  },
+  {
+    "name": "shared-chrome",
+    "command": [
+      "node",
+      "web/shared/tests/command-center.browser.mjs"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 7.039,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/shared-chrome.log"
+  },
+  {
+    "name": "relay-node",
+    "command": [
+      "node",
+      "--test",
+      "web/relay-shell/tests/channel-concurrency.test.mjs",
+      "web/relay-shell/tests/reconnect.test.mjs"
+    ],
+    "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+    "exit_code": 0,
+    "seconds": 0.163,
+    "log": "docs/qa/assets/command-center-v2-exact-20261020/gates/relay-node.log"
+  }
+]

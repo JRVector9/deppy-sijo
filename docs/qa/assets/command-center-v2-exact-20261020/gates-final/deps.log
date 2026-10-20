@@ -1,0 +1,3 @@
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.06s
+     Running `target/debug/xtask check-deps`
+check-deps OK — crate 27개, 금지 edge/순환 없음

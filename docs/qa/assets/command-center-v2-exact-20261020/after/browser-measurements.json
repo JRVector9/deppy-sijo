@@ -1,0 +1,5011 @@
+{
+  "source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "source_files": {
+    "web/shared/command-center.js": "8da81af51b390afe75071cc0784df9b76999359804f30acf36365ad186a38d2b",
+    "web/shared/command-center.css": "399e8abab3d4e3346f1232672a19230512082ed7056ae30e376011255f5e57f2"
+  },
+  "reference_sha256": "17025c009526c4926b5cabdc4e62ab071cf314bcda921b23a0edb38070dd1d54",
+  "kind": "Actual approved HTML and shared renderer, matching snapshot; exact-main missing Session.input filled from supplied Project.main_input; isolated Chrome, not native app or physical phone",
+  "cases": [
+    {
+      "kind": "approved",
+      "width": 1440,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 743,
+          "w": 908,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 756,
+          "w": 860,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 757,
+          "w": 858,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 705,
+          "w": 908,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 718,
+          "w": 860,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 719,
+          "w": 858,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1440,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 743,
+          "w": 908,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 756,
+          "w": 860,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 757,
+          "w": 858,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 705,
+          "w": 908,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 718,
+          "w": 860,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 719,
+          "w": 858,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 1440,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 743,
+          "w": 908,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 756,
+          "w": 860,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 757,
+          "w": 858,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 705,
+          "w": 908,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 718,
+          "w": 860,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 719,
+          "w": 858,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1440,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 743,
+          "w": 908,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 756,
+          "w": 860,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 757,
+          "w": 858,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "appWidth": 1440,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1440,
+          "h": 48
+        },
+        "project": {
+          "x": 220,
+          "y": 48,
+          "w": 1220,
+          "h": 84
+        },
+        "context": {
+          "x": 220,
+          "y": 132,
+          "w": 908,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 220,
+          "y": 705,
+          "w": 908,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 244,
+          "y": 718,
+          "w": 860,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 245,
+          "y": 819,
+          "w": 858,
+          "h": 42
+        },
+        "input": {
+          "x": 245,
+          "y": 719,
+          "w": 858,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1282.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1388.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 220,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 315.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 373.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 430.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 526.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 1200,
+      "height": 800,
+      "light": false,
+      "blur": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 643,
+          "w": 730,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 656,
+          "w": 690,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 657,
+          "w": 688,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 605,
+          "w": 730,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 618,
+          "w": 690,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 619,
+          "w": 688,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1200,
+      "height": 800,
+      "light": false,
+      "blur": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 643,
+          "w": 730,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 656,
+          "w": 690,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 657,
+          "w": 688,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 605,
+          "w": 730,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 618,
+          "w": 690,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 619,
+          "w": 688,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 1200,
+      "height": 800,
+      "light": true,
+      "blur": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 643,
+          "w": 730,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 656,
+          "w": 690,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 657,
+          "w": 688,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 605,
+          "w": 730,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 618,
+          "w": 690,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 619,
+          "w": 688,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1200,
+      "height": 800,
+      "light": true,
+      "blur": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 643,
+          "w": 730,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 656,
+          "w": 690,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 657,
+          "w": 688,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1200,
+        "documentWidth": 1200,
+        "appWidth": 1200,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1200,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 1004,
+          "h": 84
+        },
+        "context": {
+          "x": 196,
+          "y": 132,
+          "w": 730,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 605,
+          "w": 730,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 618,
+          "w": 690,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 719,
+          "w": 688,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 619,
+          "w": 688,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 1046.5625,
+              "y": 73.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "rect": {
+              "x": 1152.765625,
+              "y": 73.5,
+              "w": 27.234375,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 196,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 287.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 341.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 394.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 486.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 1000,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 743,
+          "w": 804,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 756,
+          "w": 764,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 757,
+          "w": 762,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 705,
+          "w": 804,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 718,
+          "w": 764,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 719,
+          "w": 762,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1000,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 743,
+          "w": 804,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 756,
+          "w": 764,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 757,
+          "w": 762,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 705,
+          "w": 804,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 718,
+          "w": 764,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 719,
+          "w": 762,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 1000,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 743,
+          "w": 804,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 756,
+          "w": 764,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 757,
+          "w": 762,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 705,
+          "w": 804,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 718,
+          "w": 764,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 719,
+          "w": 762,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1000,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 743,
+          "w": 804,
+          "h": 133
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 756,
+          "w": 764,
+          "h": 106
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 757,
+          "w": 762,
+          "h": 62
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 1000,
+        "documentWidth": 1000,
+        "appWidth": 1000,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 1000,
+          "h": 48
+        },
+        "project": {
+          "x": 196,
+          "y": 48,
+          "w": 804,
+          "h": 78
+        },
+        "context": {
+          "x": 196,
+          "y": 126,
+          "w": 804,
+          "h": 48
+        },
+        "composerWrap": {
+          "x": 196,
+          "y": 705,
+          "w": 804,
+          "h": 171
+        },
+        "composerFrame": {
+          "x": 216,
+          "y": 718,
+          "w": 764,
+          "h": 144
+        },
+        "composerFooter": {
+          "x": 217,
+          "y": 819,
+          "w": 762,
+          "h": 42
+        },
+        "input": {
+          "x": 217,
+          "y": 719,
+          "w": 762,
+          "h": 100
+        },
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 881.796875,
+              "y": 70.5,
+              "w": 98.203125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "13px",
+            "rect": {
+              "x": 188,
+              "y": 0,
+              "w": 75.0625,
+              "h": 47
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "13px",
+            "rect": {
+              "x": 277.0625,
+              "y": 0,
+              "w": 38.15625,
+              "h": 47
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "13px",
+            "rect": {
+              "x": 329.21875,
+              "y": 0,
+              "w": 37.75,
+              "h": 47
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "13px",
+            "rect": {
+              "x": 380.96875,
+              "y": 0,
+              "w": 75.265625,
+              "h": 47
+            }
+          },
+          {
+            "text": "이력",
+            "font": "13px",
+            "rect": {
+              "x": 470.234375,
+              "y": 0,
+              "w": 26.5,
+              "h": 47
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 760,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 754,
+          "w": 760,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 764,
+          "w": 736,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 765,
+          "w": 734,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 726,
+          "w": 760,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 736,
+          "w": 736,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 737,
+          "w": 734,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 760,
+      "height": 900,
+      "light": false,
+      "blur": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 754,
+          "w": 760,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 764,
+          "w": 736,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 765,
+          "w": 734,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 726,
+          "w": 760,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 736,
+          "w": 736,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 737,
+          "w": 734,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 760,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 754,
+          "w": 760,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 764,
+          "w": 736,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 765,
+          "w": 734,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 726,
+          "w": 760,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 736,
+          "w": 736,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 737,
+          "w": 734,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 760,
+      "height": 900,
+      "light": true,
+      "blur": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 754,
+          "w": 760,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 764,
+          "w": 736,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 765,
+          "w": 734,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 760,
+        "documentWidth": 760,
+        "appWidth": 760,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 760,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 760,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 760,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 726,
+          "w": 760,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 736,
+          "w": 736,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 825,
+          "w": 734,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 737,
+          "w": 734,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 668.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 390,
+      "height": 844,
+      "light": false,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 698,
+          "w": 390,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 708,
+          "w": 366,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 709,
+          "w": 364,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 670,
+          "w": 390,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 680,
+          "w": 366,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 681,
+          "w": 364,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 390,
+      "height": 844,
+      "light": false,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 698,
+          "w": 390,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 708,
+          "w": 366,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 709,
+          "w": 364,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(25, 28, 33)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 670,
+          "w": 390,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 680,
+          "w": 366,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 681,
+          "w": 364,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 390,
+      "height": 844,
+      "light": true,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 698,
+          "w": 390,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 708,
+          "w": 366,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 709,
+          "w": 364,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 670,
+          "w": 390,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 680,
+          "w": 366,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 681,
+          "w": 364,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 390,
+      "height": 844,
+      "light": true,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 698,
+          "w": 390,
+          "h": 124
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 708,
+          "w": 366,
+          "h": 104
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 709,
+          "w": 364,
+          "h": 60
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "appWidth": 390,
+        "background": "rgb(243, 245, 247)",
+        "header": {
+          "x": 0,
+          "y": 0,
+          "w": 390,
+          "h": 46
+        },
+        "project": {
+          "x": 0,
+          "y": 46,
+          "w": 390,
+          "h": 72
+        },
+        "context": {
+          "x": 0,
+          "y": 118,
+          "w": 390,
+          "h": 44
+        },
+        "composerWrap": {
+          "x": 0,
+          "y": 670,
+          "w": 390,
+          "h": 152
+        },
+        "composerFrame": {
+          "x": 12,
+          "y": 680,
+          "w": 366,
+          "h": 132
+        },
+        "composerFooter": {
+          "x": 13,
+          "y": 769,
+          "w": 364,
+          "h": 42
+        },
+        "input": {
+          "x": 13,
+          "y": 681,
+          "w": 364,
+          "h": 88
+        },
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": "프로젝트 설정",
+            "rect": {
+              "x": 298.46875,
+              "y": 65.5,
+              "w": 75.53125,
+              "h": 32
+            }
+          }
+        ],
+        "nav": [
+          {
+            "text": "메인 에이전트",
+            "font": "11px",
+            "rect": {
+              "x": 49,
+              "y": 0,
+              "w": 64.25,
+              "h": 45
+            }
+          },
+          {
+            "text": "작업 3",
+            "font": "11px",
+            "rect": {
+              "x": 127.25,
+              "y": 0,
+              "w": 33.15625,
+              "h": 45
+            }
+          },
+          {
+            "text": "터미널",
+            "font": "11px",
+            "rect": {
+              "x": 174.40625,
+              "y": 0,
+              "w": 32.546875,
+              "h": 45
+            }
+          },
+          {
+            "text": "에이전트·기기",
+            "font": "11px",
+            "rect": {
+              "x": 220.953125,
+              "y": 0,
+              "w": 64.421875,
+              "h": 45
+            }
+          },
+          {
+            "text": "이력",
+            "font": "11px",
+            "rect": {
+              "x": 299.375,
+              "y": 0,
+              "w": 23.03125,
+              "h": 45
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

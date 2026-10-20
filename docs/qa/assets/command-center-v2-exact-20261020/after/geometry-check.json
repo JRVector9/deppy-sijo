@@ -1,0 +1,26 @@
+{
+  "source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "kind": "Actual same-viewport approved HTML vs shared render, measured primary surface fields only",
+  "pairs": 10,
+  "states": [
+    "blur",
+    "focus"
+  ],
+  "fields": [
+    "background",
+    "header",
+    "project",
+    "context",
+    "input",
+    "inputResize",
+    "inputFont",
+    "selectDisplay",
+    "ownerAlign",
+    "ownerLeftBorder",
+    "composerWrap",
+    "composerFrame",
+    "composerFooter"
+  ],
+  "tolerance_css_px": 0.02,
+  "differences": []
+}

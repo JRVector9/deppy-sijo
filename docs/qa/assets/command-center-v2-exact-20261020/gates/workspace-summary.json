@@ -1,0 +1,563 @@
+{
+  "source": "f65bd5afb44d091701af3416db6e91366deb89f8",
+  "note": "Last result per Cargo target; nested subprocess test results excluded",
+  "targets": 79,
+  "passed": 6095,
+  "failed": 0,
+  "ignored": 67,
+  "results": [
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/agent_mcp-d7fd92dd7de677a2)",
+      "status": "ok",
+      "passed": 92,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/audit-fccd9d2f5beceeb8)",
+      "status": "ok",
+      "passed": 65,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/auth-2ca8f7fc954c4a50)",
+      "status": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/connector_contract-f571d84c2ea7730f)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/connector_service-9ff8b5c809700914)",
+      "status": "ok",
+      "passed": 83,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/connector_ui-f33e0fba8e9e92cb)",
+      "status": "ok",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/deppy_core-8f611ccdd6416807)",
+      "status": "ok",
+      "passed": 20,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/main.rs (target/debug/deps/deppy_sijo-8502ff477ece624f)",
+      "status": "ok",
+      "passed": 3500,
+      "failed": 0,
+      "ignored": 40
+    },
+    {
+      "target": "     Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-70676eb9671c8353)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-ccfb7d11cc2b0e29)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-9a39075e96b7ae3e)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-1815b2fa480b53df)",
+      "status": "ok",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/logging_policy.rs (target/debug/deps/logging_policy-e29479325be5b3ad)",
+      "status": "ok",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-188bc0121785130b)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/http_client-1cac2f9e715644c4)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/i18n-a5a4e210f98a94da)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/mcp-52c54eeeddd6eec3)",
+      "status": "ok",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/main.rs (target/debug/deps/deppy_mcp_proxy-fd156b9a0abca4ad)",
+      "status": "ok",
+      "passed": 109,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/hook_task_prompt.rs (target/debug/deps/hook_task_prompt-8ad8a9f1515d5243)",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/mcp_store-27c99acec9fa96b7)",
+      "status": "ok",
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/mux-d79edb242b62a2be)",
+      "status": "ok",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/persist-2b7db64bb10fd8cf)",
+      "status": "ok",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/platform-db5e51cbc10b1fe2)",
+      "status": "ok",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/pty-215543120c620b89)",
+      "status": "ok",
+      "passed": 70,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/relay_protocol-ff4c57bcc5a4079c)",
+      "status": "ok",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/relay_wire_vectors.rs (target/debug/deps/relay_wire_vectors-f7ea4d0758ccb73a)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/relay_server-4000c834ec732585)",
+      "status": "ok",
+      "passed": 36,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/main.rs (target/debug/deps/relay_server-846c6ffaa5774d0e)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/deploy_manifests.rs (target/debug/deps/deploy_manifests-f1eadc2be9e4a7a6)",
+      "status": "ok",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/shutdown.rs (target/debug/deps/shutdown-927dcd6e1ccd4eaa)",
+      "status": "ok",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/transport_contract.rs (target/debug/deps/transport_contract-173fe65f581bab83)",
+      "status": "ok",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/runtime-c0f66c725f40135d)",
+      "status": "ok",
+      "passed": 420,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/secret-3f3b5bc1c7242e7a)",
+      "status": "ok",
+      "passed": 80,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/session-707108cf9386b59d)",
+      "status": "ok",
+      "passed": 81,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/storage-fc26dc5804158f3b)",
+      "status": "ok",
+      "passed": 511,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/background_agent_lifecycle.rs (target/debug/deps/background_agent_lifecycle-95404dcfce55d5a6)",
+      "status": "ok",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/storage_core-fc911b96df042766)",
+      "status": "ok",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/terminal-bdeb872130ef752c)",
+      "status": "ok",
+      "passed": 138,
+      "failed": 0,
+      "ignored": 4
+    },
+    {
+      "target": "     Running unittests src/lib.rs (target/debug/deps/web_remote-b91fbe2280426548)",
+      "status": "ok",
+      "passed": 406,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-6801d7e85d5cc0c5)",
+      "status": "ok",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-6e167dde623d1005)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/command_center_chrome.rs (target/debug/deps/command_center_chrome-02444cdac3aa0181)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-f845c940358b2c96)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-84829e7397ccedd6)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-02be0fb50893c526)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    {
+      "target": "     Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-e4c638c2df51f0b2)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-403fbb450acd96a8)",
+      "status": "ok",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-11187e7443fcc422)",
+      "status": "ok",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/transport_independence.rs (target/debug/deps/transport_independence-ec2eb0fe564878df)",
+      "status": "ok",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "     Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-2874669ce787bbad)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-c814bf8b79b540c0)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-e27c44346b7c0934)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-04357a5f6aa3f90f)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-b9e57bda725701ae)",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    {
+      "target": "     Running unittests src/main.rs (target/debug/deps/xtask-8fb400638c15502e)",
+      "status": "ok",
+      "passed": 16,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests agent_mcp",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests audit",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests auth",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests connector_contract",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests connector_service",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests connector_ui",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests deppy_core",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests http_client",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests i18n",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests mcp",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests mcp_store",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests mux",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests persist",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests platform",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests pty",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests relay_protocol",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests relay_server",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests runtime",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests secret",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests session",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests storage",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests storage_core",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests terminal",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    {
+      "target": "   Doc-tests web_remote",
+      "status": "ok",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  ]
+}

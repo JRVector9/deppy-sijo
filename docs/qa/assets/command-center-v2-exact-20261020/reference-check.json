@@ -1,0 +1,32 @@
+[
+  {
+    "path": "docs/mockups/multi-agent-command-center-v2-2026-10-20.html",
+    "sha256": "17025c009526c4926b5cabdc4e62ab071cf314bcda921b23a0edb38070dd1d54",
+    "matches": true
+  },
+  {
+    "path": "docs/mockups/multi-agent-command-center-2026-10-20.html",
+    "sha256": "692c9d193c36d7a2d84c58ea2a746579b79fc9bbd77e09525aa3b9a684302ab7",
+    "matches": true
+  },
+  {
+    "path": "docs/superpowers/specs/2026-10-20-command-center-v2-design.md",
+    "sha256": "b0115a81a1ddedf15465dd7fc398dfc2d84f1593bc211e327d8f4fd44ad36681",
+    "matches": true
+  },
+  {
+    "path": "docs/design/command-center-v2/desktop-final.png",
+    "sha256": "28c6335e9c4335eabee375da950251c46344ea4b316ad70fe4d1ee1a9150973a",
+    "matches": true
+  },
+  {
+    "path": "docs/design/command-center-v2/desktop-light-final.png",
+    "sha256": "9798f6673424ff20d72e06ea0d84b01fb93eada08de33f19b3061bcb80059b1e",
+    "matches": true
+  },
+  {
+    "path": "docs/design/command-center-v2/mobile-main.png",
+    "sha256": "0014e5f7939283270f78ceb7b33ecbc56f69bea89d56c29c042bd1ac453bf782",
+    "matches": true
+  }
+]

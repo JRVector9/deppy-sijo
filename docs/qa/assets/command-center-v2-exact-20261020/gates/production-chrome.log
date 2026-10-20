@@ -1,0 +1,16 @@
+   Compiling ring v0.17.14
+   Compiling rustls-webpki v0.103.15
+   Compiling rustls v0.23.46
+   Compiling rcgen v0.14.10
+   Compiling ureq v3.4.0
+   Compiling tungstenite v0.30.0
+   Compiling runtime v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/runtime)
+   Compiling web-remote v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.59s
+     Running tests/command_center_chrome.rs (target/debug/deps/command_center_chrome-45a3d47c92c766d6)
+
+running 1 test
+test command_center_production_shell_preserves_drafts_and_terminal_roundtrip ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s
+

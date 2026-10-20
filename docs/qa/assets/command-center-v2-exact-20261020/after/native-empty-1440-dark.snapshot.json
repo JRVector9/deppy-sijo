@@ -1,0 +1,136 @@
+{
+  "receipts": [],
+  "projects": [
+    {
+      "available_agents": [],
+      "pending_approvals": [],
+      "create_main": {
+        "enabled": false,
+        "reason": ""
+      },
+      "loaded": false,
+      "storage_retry": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "planner_prompt": null,
+      "id": "project-a",
+      "name": "nomorevibe",
+      "directory": "~/projects/nomorevibe",
+      "goal": "",
+      "main_summary": "",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "project-a",
+        "session_id": "opaque-pane-a",
+        "task_id": null
+      },
+      "main_provider": "Codex",
+      "main_model": "GPT-6.1-Sol",
+      "main_effort": "xhigh",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [],
+      "tasks": [],
+      "history": [],
+      "config": {
+        "allowed_scope_roots": [],
+        "name": "nomorevibe",
+        "directory": "~/projects/nomorevibe",
+        "main_session_id": "opaque-pane-a",
+        "provider": "Codex",
+        "model": "GPT-6.1-Sol",
+        "effort": "xhigh",
+        "worker_providers": [
+          "Codex",
+          "Claude"
+        ],
+        "parallel_limit": 3,
+        "automation": "배정 전 확인",
+        "use_worktrees": true,
+        "revision": ""
+      },
+      "save_settings": {
+        "enabled": true,
+        "reason": ""
+      },
+      "available_providers": [
+        "Codex",
+        "Claude"
+      ],
+      "available_models": [
+        "GPT-6.1-Sol"
+      ],
+      "available_efforts": [
+        "xhigh"
+      ],
+      "available_automation": [
+        "배정 전 확인"
+      ]
+    }
+  ],
+  "selected_workspace_id": "project-a",
+  "devices": [
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-0",
+      "name": "이 Mac",
+      "description": "프로젝트 실행 기기",
+      "capabilities": "Codex · Claude",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    },
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-1",
+      "name": "gpu3090",
+      "description": "프로젝트 실행 기기",
+      "capabilities": "Codex · Claude",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    },
+    {
+      "revoke": {
+        "enabled": false,
+        "reason": ""
+      },
+      "id": "visual-device-2",
+      "name": "휴대폰",
+      "description": "원격 관측",
+      "capabilities": "상태·승인·결과 확인",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    }
+  ],
+  "dark_mode": true,
+  "font_scale": 1.0,
+  "labels": {},
+  "add_project": {
+    "enabled": true,
+    "reason": ""
+  },
+  "manage_devices": {
+    "enabled": true,
+    "reason": ""
+  },
+  "status": "로컬 snapshot · 실행 상태는 관측된 근거만 표시"
+}

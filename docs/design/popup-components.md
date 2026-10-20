@@ -29,6 +29,7 @@
 | 31–33 | 프롬프트 라이브러리·변경사항·세션 관리 | 공용 중앙 이동·크기 조절 셸과 본문 여백 | `ui/prompt_palette.rs` · `ui/diff_panel.rs` · `ui/agent_sessions.rs` |
 | 34–36 | 이벤트 적체·워크스페이스 한도·셀 열기 실패 | 공용 Info 팝업 · 순차 안내 | `crates/app/src/ui/popup/information.rs` · 호출자 `app.rs` |
 | 38 포트 | 포트 관리 목록 | 공용 앵커 팝오버 · 목록 행·스크롤·고정 푸터 | `crates/app/src/ui/ports.rs` · 호출자 `ui/agent_terminal.rs` |
+| 39 | 입력창 모델·MCP / Command Center 메인 선택 | 공용 앵커 팝오버 · 연결 전 작성·명시적 저장/새 실행 | `crates/app/src/ui/composer.rs` · `ui/command_center/composer.rs` |
 | 44 | 프로젝트 키 추가·수정 | 480pt 공용 셸·숨김 새 값·빈 입력 유지·원본·사용처 | `crates/app/src/ui/project_keys.rs` |
 | 45 | 원본 파일 연결·가져오기 | 480pt 공용 셸·파일 종류/경로·자동 보관·환경 분리 | `crates/app/src/ui/project_keys.rs` |
 | 46 | GitHub 목적지 연결 | 480pt 공용 셸·인증·정확한 범위·자동 전송 opt-in | `crates/app/src/ui/project_keys.rs` |
@@ -152,6 +153,14 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 37의 포트 부분은 상태바 앵커 팝오버다. 배경 모달을 만들지 않고 공용 머리글·표면·닫기·본문·고정 푸터를 재사용한다. 폭은560pt 이하로 제한한다. 본문은 viewport와560pt 상한을 함께 적용한 한 개 ScrollArea이고 현재/다른/외부 섹션과 `list_row`를 그린다. 행 동작은 `list_actions`가 실제34pt 높이로 배치하며, 스크롤 영역의 남은 높이를 버튼 행 높이로 사용하지 않는다. 새로고침은 푸터에서 기존 의도만 보내며 새 폴링을 추가하지 않는다. 주소 복사는 IPv4/IPv6/와일드카드 소켓 문자열을 그대로 유지한다. 외부·보호·소유권 불명 프로세스는 읽기 전용이다. 행의 종료는 기존12번 확인창을 열 뿐이고 확인창은 원래 팝오버 외부에서 원래 소유권/프로세스 시작 식별자를 유지한다. 승인·리소스 팝오버의 기존 표시 구조는 이번 변경에 포함하지 않는다.
 
 HTML의37번은 상세 포트 목록을 보여준다. 기존42개 번호를 유지하고43번 재연결 확인을 추가했으며 `#terminal_status`, `#env_project_close`, `#env_delete`, `#overflow`, `#warm_limit`, `#cross_pane_failure`, `#workspace_rebind`로 해당 화면을 직접 열 수 있다. 시안의 포트 종료를 누르면 선택한 소켓/워크스페이스로12번을 보여주고 취소 시 목록으로 돌아간다.
+
+## 입력창 앵커 선택 39 — Command Center 확장
+
+Command Center의 작성 대상 버튼에서 메인 세션·에이전트·모델·추론 강도를 고른다. `ui/command_center/composer.rs`가 상태와 기존 `SaveProject`/`CreateMain` 의도를 소유하고 `popup::popover`, `popover_frame`, `field`, `choice_input`, `body`, `footer`, `notice`를 재사용한다. 중앙 모달이나 새 실행 프로세스를 여는 동작은 메뉴 열기와 분리한다. 폭은360pt 이하, 본문은 화면 높이에 맞춘 내부 스크롤을 사용한다.
+
+메인이 연결되지 않아도 초안을 쓸 수 있다. 연결 전 Enter/전송은 이 메뉴를 열고 초안을 유지한다. 저장·기존 세션 연결·새 메인 만들기는 각각 명시적으로 선택하며 연결 성공만으로 작성 내용을 보내지 않는다. 사용자는 연결을 확인한 후 다시 전송한다. 실제 공급자 카탈로그의 모델·강도 조합만 선택하며, 비어 있는 작업 범위와 작업 에이전트 허용 목록은 사용자가 직접 지정한다. 실패·취소·Esc는 작성 초안을 버리지 않는다. 전송 권한과 대상 소유권 검증은 기존 host가 유지한다.
+
+[49개 사례 HTML의39번](../mockups/shared-popup-components-2026-09-30.html#composer_picker)에 같은 입력 흐름을 기록한다. 이 문서는 물리 기기나 실행 중인 앱의 검증 결과를 대신하지 않는다.
 
 ## 다음 팝업을 적용할 때
 

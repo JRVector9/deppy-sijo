@@ -1,0 +1,20 @@
+{
+  "source": "d58505a89cc76011118f60044810617c7bb0d236",
+  "kind": "Static report opened in isolated Chrome; not Deppy app",
+  "cases": [
+    {
+      "width": 1440,
+      "documentWidth": 1440,
+      "images": 34,
+      "broken": [],
+      "checklistRows": 26
+    },
+    {
+      "width": 390,
+      "documentWidth": 390,
+      "images": 34,
+      "broken": [],
+      "checklistRows": 26
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+   Compiling ring v0.17.14
+    Checking storage v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/storage)
+   Compiling rustls v0.23.46
+    Checking rustls-webpki v0.103.15
+    Checking rcgen v0.14.10
+    Checking ureq v3.4.0
+    Checking tungstenite v0.30.0
+    Checking runtime v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/runtime)
+    Checking http-client v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/http-client)
+    Checking mcp v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/mcp)
+    Checking web-remote v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/web-remote)
+    Checking auth v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/auth)
+    Checking connector-service v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/connector-service)
+    Checking agent-mcp v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/agent-mcp)
+    Checking relay-server v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/relay-server)
+    Checking deppy-sijo v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/app)
+    Checking mcp-proxy v0.14.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/mcp-proxy)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 19.85s

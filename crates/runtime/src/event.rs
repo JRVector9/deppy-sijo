@@ -301,6 +301,10 @@ pub enum RuntimeEvent {
         identity: crate::remote_worker::RemoteWorkIdentity,
         result: crate::remote_worker::RemoteWorkResult,
     },
+    RemoteTaskInput {
+        target: crate::remote_input::RemoteTaskTarget,
+        reply: crate::remote_input::RemoteTaskInputReply,
+    },
 }
 
 impl RuntimeEvent {
@@ -600,6 +604,7 @@ mod tests {
                 "SessionInputAccepted",
                 "RemoteWorkerObserved",
                 "RemoteWorkResolved",
+                "RemoteTaskInput",
             ]
         );
     }

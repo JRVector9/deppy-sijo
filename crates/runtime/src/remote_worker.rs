@@ -274,6 +274,7 @@ pub struct RemoteWorkerHost {
     pub(crate) lease_counter: u64,
     pub(crate) execution_counter: u64,
     pub(crate) active: Vec<(OperationId, SessionId)>,
+    pub(crate) executions: Vec<crate::remote_input::ExecutionRecord>,
     pub(crate) pending: Vec<PendingWork>,
     pub(crate) attempt_folders: Vec<(AttemptFolderGrant, Arc<RemoteDirectory>)>,
 }
@@ -315,6 +316,7 @@ impl RemoteWorkerHost {
             lease_counter: 0,
             execution_counter: 0,
             active: vec![],
+            executions: vec![],
             pending: vec![],
             attempt_folders: vec![],
         })
@@ -1296,6 +1298,303 @@ mod tests {
         assert!(!root.join("launches").exists());
         drop(client);
         server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct PromptLauncher;
+    impl RemoteWorkLauncher for PromptLauncher {
+        fn prepare(
+            &self,
+            _: &RemoteWorkerProfile,
+            prompt: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            anyhow::ensure!(prompt.is_none(), "idle only");
+            let mut command = Launcher.prepare(&profile(), None)?;
+            if let RuntimeCommand::SpawnAgent { args, .. } = &mut command {
+                *args=vec!["-c".into(),"\"$@\"; exec /bin/sleep 2".into(),crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME.into(),"/bin/sh".into(),"-c".into(),"stty raw -echo; printf '\\033[?2004h❯ '; dd bs=1 count=25 of=accepted 2>/dev/null; sleep 2".into()];
+            }
+            Ok(command)
+        }
+    }
+    #[test]
+    fn remote_compute_guarded_input_requires_server_execution_proof_and_deduplicates() {
+        use crate::remote_input::*;
+        let root =
+            std::env::temp_dir().join(format!("deppy-remote-input-{}", uuid::Uuid::new_v4()));
+        let (a, pin, control) = worker_with_launcher(
+            &root.join("a"),
+            "a",
+            Arc::new(Journal::default()),
+            Arc::new(PromptLauncher),
+        );
+        control
+            .slot
+            .lock()
+            .unwrap()
+            .host
+            .as_mut()
+            .unwrap()
+            .config
+            .profiles[0]
+            .agent
+            .provider = "claude".into();
+        let client = RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &pin).unwrap();
+        let events = client.subscribe();
+        let caps = inspect(&client, &events);
+        let mut work = request(&caps, "input-launch");
+        work.initial_prompt = None;
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: work.clone(),
+            })
+            .unwrap();
+        let RuntimeEvent::RemoteWorkResolved {
+            result:
+                RemoteWorkResult::Launched {
+                    session,
+                    execution_generation,
+                },
+            ..
+        } = wait_event(&events, |e| {
+            matches!(e, RuntimeEvent::RemoteWorkResolved { .. })
+        })
+        else {
+            panic!("launch failed")
+        };
+        let target = RemoteTaskTarget {
+            identity: work.identity,
+            session,
+            execution_generation,
+        };
+        let (b, b_pin, b_control) = worker_with_launcher(
+            &root.join("b"),
+            "b",
+            Arc::new(Journal::default()),
+            Arc::new(PromptLauncher),
+        );
+        b_control
+            .slot
+            .lock()
+            .unwrap()
+            .host
+            .as_mut()
+            .unwrap()
+            .config
+            .profiles[0]
+            .agent
+            .provider = "claude".into();
+        let b_client =
+            RemoteRuntimeClient::attach_tls(b.local_addr(), b.auth_token(), &b_pin).unwrap();
+        let b_events = b_client.subscribe();
+        let b_caps = inspect(&b_client, &b_events);
+        let mut b_work = request(&b_caps, "other-input-launch");
+        b_work.initial_prompt = None;
+        b_client
+            .send_command(RuntimeCommand::SpawnRemoteWork { request: b_work })
+            .unwrap();
+        let RuntimeEvent::RemoteWorkResolved {
+            result:
+                RemoteWorkResult::Launched {
+                    session: b_session, ..
+                },
+            ..
+        } = wait_event(&b_events, |e| {
+            matches!(e, RuntimeEvent::RemoteWorkResolved { .. })
+        })
+        else {
+            panic!("second launch failed")
+        };
+        assert_eq!(
+            b_session, session,
+            "two real workers intentionally alias numeric session IDs"
+        );
+        b_client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: RemoteTaskInputRequest::Observe {
+                    target: target.clone(),
+                    request_id: 8,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&b_events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::Observed {
+                    execution: None,
+                    ..
+                },
+                ..
+            }
+        ));
+        let until = Instant::now() + Duration::from_secs(4);
+        let proof = loop {
+            client
+                .send_command(RuntimeCommand::RemoteTaskInput {
+                    request: RemoteTaskInputRequest::Observe {
+                        target: target.clone(),
+                        request_id: 7,
+                    },
+                })
+                .unwrap();
+            if let RuntimeEvent::RemoteTaskInput {
+                reply:
+                    RemoteTaskInputReply::Observed {
+                        execution: Some(proof),
+                        ..
+                    },
+                ..
+            } = wait_event(&events, |e| {
+                matches!(e, RuntimeEvent::RemoteTaskInput { .. })
+            }) {
+                break proof;
+            }
+            assert!(
+                Instant::now() < until,
+                "server did not capture a ready native execution"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(proof.foreground.is_current());
+        assert_ne!(proof.execution,proof.foreground,"a known launcher wrapper must pin the inner CLI process, not its persistent shell");
+        let operation = OperationId::new();
+        let input = RemoteTaskInputRequest::Deliver {
+            target: target.clone(),
+            execution_handle: proof.execution_handle.clone(),
+            operation_id: operation.clone(),
+            prompt: "bounded task".into(),
+            deadline_unix_ms: unix_millis().unwrap() + 10_000,
+        };
+        b_client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: input.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&b_events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::Delivered {
+                    result: RemoteTaskInputResult::ObservationUnknown,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            std::fs::read(root.join("b/accepted"))
+                .unwrap_or_default()
+                .is_empty()
+        );
+        let mut expired = input.clone();
+        if let RemoteTaskInputRequest::Deliver {
+            deadline_unix_ms, ..
+        } = &mut expired
+        {
+            *deadline_unix_ms = unix_millis().unwrap() - 1;
+        }
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput { request: expired })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::Delivered {
+                    result: RemoteTaskInputResult::Rejected { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut forged = input.clone();
+        if let RemoteTaskInputRequest::Deliver {
+            execution_handle, ..
+        } = &mut forged
+        {
+            *execution_handle = uuid::Uuid::new_v4().to_string();
+        }
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput { request: forged })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::Delivered {
+                    result: RemoteTaskInputResult::Rejected { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        // A forged handle must not consume this valid operation's idempotency key.
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: input.clone(),
+            })
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(4);
+        let mut admitted = false;
+        let mut accepted = 0;
+        while !admitted || accepted == 0 {
+            for event in events.drain() {
+                match event {
+                    RuntimeEvent::RemoteTaskInput {
+                        reply:
+                            RemoteTaskInputReply::Delivered {
+                                operation_id,
+                                result: RemoteTaskInputResult::Admitted,
+                            },
+                        ..
+                    } if operation_id == operation => admitted = true,
+                    RuntimeEvent::SessionInputAccepted {
+                        operation_id: Some(id),
+                        sequence,
+                        at_micros,
+                        ..
+                    } if id == operation.0 => {
+                        assert!(at_micros > 0);
+                        assert_eq!(sequence, 1);
+                        accepted += 1;
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < until,
+                "input did not reach guarded PTY queue"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput { request: input })
+            .unwrap();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            for event in events.drain() {
+                if matches!(event, RuntimeEvent::SessionInputAccepted { .. }) {
+                    accepted += 1;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(accepted, 1, "duplicate task input must not enter PTY twice");
+        assert_eq!(
+            std::fs::read(root.join("a/accepted")).unwrap(),
+            b"\x1b[200~bounded task\x1b[201~\r"
+        );
+        drop(b_client);
+        b.shutdown();
+        drop(client);
+        a.shutdown();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

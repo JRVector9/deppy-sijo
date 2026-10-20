@@ -3171,6 +3171,9 @@ impl Worker {
             Err(code) => reject(code),
             Ok(command) => {
                 let session = SessionId(self.next_id);
+                let wrapped=matches!(&command,RuntimeCommand::SpawnAgent{command,args,..}
+                    if command=="/bin/sh" && args.first().is_some_and(|a|a=="-c")
+                    && args.get(2).is_some_and(|a|a==crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME));
                 self.handle_command_inner_with_cwd(
                     command,
                     Some((directory, request.folder.clone())),
@@ -3180,6 +3183,30 @@ impl Worker {
                         Some(generation) => {
                             host.execution_counter = generation;
                             host.active.push((id.operation_id.clone(), session));
+                            let owner = self
+                                .sessions
+                                .get(&session)
+                                .and_then(|s| s.process_identity().pid)
+                                .and_then(deppy_core::process_identity::ProcessIdentity::capture);
+                            if let Some(profile) = host
+                                .config
+                                .profiles
+                                .iter()
+                                .find(|p| p.id == request.profile_id)
+                            {
+                                host.executions.push(crate::remote_input::ExecutionRecord {
+                                    target: crate::remote_input::RemoteTaskTarget {
+                                        identity: id.clone(),
+                                        session,
+                                        execution_generation: generation,
+                                    },
+                                    owner,
+                                    wrapped,
+                                    profile: profile.agent.clone(),
+                                    proof: None,
+                                    inputs: vec![],
+                                });
+                            }
                             R::Launched {
                                 session,
                                 execution_generation: generation,
@@ -3197,6 +3224,194 @@ impl Worker {
             Ok(false) => P::Pending(PendingPhase::Resolve(result)),
             Err(_) => P::Complete(R::ObservationUnknown),
         }
+    }
+
+    fn remote_task_input(&mut self, request: crate::remote_input::RemoteTaskInputRequest) {
+        use crate::remote_input::{
+            RemoteExecutionProof, RemoteTaskInputReply as R, RemoteTaskInputRequest as Q,
+            RemoteTaskInputResult as I,
+        };
+        use deppy_core::process_identity::ProcessIdentity;
+        let target = request.target().clone();
+        let denied = || I::Rejected {
+            reason: pty::PtyInputRejectReason::AdmissionDenied,
+        };
+        let shared = Arc::clone(&self.remote_worker);
+        let reply = (|| {
+            let mut slot = shared.lock().ok()?;
+            let host = slot.host.as_mut()?;
+            if target.identity.incarnation.as_str() != self.instance_token
+                || target.identity.device_id != host.config.device_id
+                || target.identity.workspace_id != host.config.workspace_id
+                || target.identity.grant_epoch != host.config.grant_epoch
+            {
+                return None;
+            }
+            let index = host.executions.iter().position(|r| r.target == target)?;
+            let record = &mut host.executions[index];
+            let kind = match record.profile.provider.to_ascii_lowercase().as_str() {
+                "claude" => crate::AgentPromptKind::Claude,
+                "codex" => crate::AgentPromptKind::Codex,
+                _ => crate::AgentPromptKind::Other,
+            };
+            match &request {
+                Q::Observe { request_id, .. } => {
+                    let effects = self.collect_session_pump_effects(&[target.session], false, true);
+                    self.finish_session_pump_effects(effects);
+                    let active = self.sessions.get(&target.session)?;
+                    if !active.lifecycle().is_running()
+                        || active.pending_output_bytes() > 0
+                        || !active.bracketed_paste()
+                    {
+                        return None;
+                    }
+                    let foreground = ProcessIdentity::capture(active.foreground_process_group()?)?;
+                    let owner = record.owner?;
+                    if !crate::remote_input::owns_foreground(owner, foreground) {
+                        return None;
+                    }
+                    let execution=crate::remote_input::inner_execution(owner,foreground,record.wrapped)?;
+                    let guard = crate::AgentInputGuard {
+                        foreground_process_group: foreground.pid,
+                        provider: kind,
+                        intent: crate::AgentInputIntent::AutomaticPrompt,
+                    };
+                    if !guard.allows(active, self.detectors.get(&target.session)) {
+                        return None;
+                    }
+                    if let Some(proof) = &record.proof {
+                        if proof.foreground != foreground || proof.execution!=execution {
+                            return None;
+                        }
+                    } else {
+                        record.proof = Some(RemoteExecutionProof {
+                            target: target.clone(),
+                            execution_handle: uuid::Uuid::new_v4().to_string(),
+                            foreground,
+                            execution,
+                            profile: record.profile.clone(),
+                        });
+                    }
+                    Some(R::Observed {
+                        request_id: *request_id,
+                        execution: record.proof.clone().map(Box::new),
+                    })
+                }
+                Q::Deliver {
+                    execution_handle,
+                    operation_id,
+                    prompt,
+                    deadline_unix_ms,
+                    ..
+                } => {
+                    let proof = record.proof.as_ref()?;
+                    if proof.execution_handle != *execution_handle {
+                        return Some(R::Delivered {
+                            operation_id: operation_id.clone(),
+                            result: denied(),
+                        });
+                    }
+                    let digest = request.digest().ok()?;
+                    if let Some((_, previous, result)) =
+                        record.inputs.iter().find(|(op, _, _)| op == operation_id)
+                    {
+                        return Some(R::Delivered {
+                            operation_id: operation_id.clone(),
+                            result: if *previous == digest {
+                                result.clone()
+                            } else {
+                                denied()
+                            },
+                        });
+                    }
+                    let now = crate::remote_input::unix_millis()?;
+                    let remaining = deadline_unix_ms
+                        .checked_sub(now)
+                        .filter(|ms| *ms > 0 && *ms <= 30_000);
+                    let Some(remaining) = remaining else {
+                        return Some(R::Delivered {
+                            operation_id: operation_id.clone(),
+                            result: denied(),
+                        });
+                    };
+                    let owner = record.owner?;
+                    let foreground = proof.foreground;
+                    let execution=proof.execution;
+                    // Release the record borrow before consulting the bounded per-host ledger.
+                    if host
+                        .executions
+                        .iter()
+                        .map(|r| r.inputs.len())
+                        .sum::<usize>()
+                        >= 256
+                        || host
+                            .executions
+                            .iter()
+                            .any(|r| r.inputs.iter().any(|(op, _, _)| op == operation_id))
+                    {
+                        return Some(R::Delivered {
+                            operation_id: operation_id.clone(),
+                            result: denied(),
+                        });
+                    }
+                    // Retain unknown before the effect. Same-operation retries can never re-enter.
+                    host.executions[index].inputs.push((
+                        operation_id.clone(),
+                        digest,
+                        I::ObservationUnknown,
+                    ));
+                    let admission = crate::InputAdmission::new(
+                        crate::InputPermit::new(),
+                        Instant::now() + Duration::from_millis(remaining.min(1000)),
+                        move |action| {
+                            if crate::remote_input::execution_is_current(owner, foreground,execution) {
+                                action();
+                            }
+                        },
+                    )
+                    .with_agent_guard(crate::AgentInputGuard {
+                        foreground_process_group: foreground.pid,
+                        provider: kind,
+                        intent: crate::AgentInputIntent::AutomaticPrompt,
+                    })
+                    .with_bracketed_paste_required();
+                    let paste = format!("\x1b[200~{prompt}\x1b[201~");
+                    let result = self.admit_input_batch_for_operation(
+                        target.session,
+                        &[paste.as_bytes(), b"\r"],
+                        Some(&admission),
+                        Some(operation_id.as_str()),
+                    );
+                    self.emit(RuntimeEvent::InputAdmitted {
+                        session: target.session,
+                        operation_id: operation_id.0.clone(),
+                        result,
+                    });
+                    let result = match result {
+                        Ok(()) => I::Admitted,
+                        Err(reason) => I::Rejected { reason },
+                    };
+                    if let Some((_, _, stored)) = host.executions[index].inputs.last_mut() {
+                        *stored = result.clone();
+                    }
+                    Some(R::Delivered {
+                        operation_id: operation_id.clone(),
+                        result,
+                    })
+                }
+            }
+        })()
+        .unwrap_or(match request {
+            Q::Observe { request_id, .. } => R::Observed {
+                request_id,
+                execution: None,
+            },
+            Q::Deliver { operation_id, .. } => R::Delivered {
+                operation_id,
+                result: I::ObservationUnknown,
+            },
+        });
+        self.emit(RuntimeEvent::RemoteTaskInput { target, reply });
     }
 
     fn handle_command_inner(&mut self, command: RuntimeCommand) {
@@ -3220,6 +3435,7 @@ impl Worker {
                 self.inspect_remote_worker(request_id)
             }
             RuntimeCommand::SpawnRemoteWork { request } => self.spawn_remote_work(request),
+            RuntimeCommand::RemoteTaskInput { request } => self.remote_task_input(request),
             RuntimeCommand::SpawnAgentBeside { .. } => {
                 unreachable!("split launch normalized above")
             }

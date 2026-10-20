@@ -3075,9 +3075,9 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        assert_eq!(PROTO_VERSION, 32);
+        assert_eq!(PROTO_VERSION, 33);
         for version in [
-            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31,
+            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
         ] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
@@ -4000,6 +4000,7 @@ mod tests {
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
             RuntimeEvent::SessionTitleChanged { .. } => "SessionTitleChanged",
             RuntimeEvent::SessionInputAccepted { .. } => "SessionInputAccepted",
+            RuntimeEvent::RemoteTaskInput { .. } => "RemoteTaskInput",
         }
     }
 

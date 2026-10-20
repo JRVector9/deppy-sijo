@@ -414,6 +414,9 @@ pub(crate) fn runtime_command_retained_bytes(
         retained_strings(&mut total, transient_args)?;
     }
     match command {
+        RuntimeCommand::RemoteTaskInput { request } => {
+            retained_add(&mut total, request.retained_bytes())?
+        }
         RuntimeCommand::InspectRemoteWorker { .. } => {}
         RuntimeCommand::SpawnRemoteWork { request } => {
             retained_add(&mut total, request.retained_bytes())?
@@ -622,6 +625,7 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         canonicalize_mux_pane_id(pane);
     }
     match command {
+        RuntimeCommand::RemoteTaskInput { request } => request.canonicalize(),
         RuntimeCommand::InspectRemoteWorker { .. } => {}
         RuntimeCommand::SpawnRemoteWork { request } => request.canonicalize(),
         RuntimeCommand::SpawnAgent {
@@ -834,6 +838,11 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         validate_args(&argv)?;
     }
     match command {
+        RuntimeCommand::RemoteTaskInput { request } => {
+            if !request.is_valid() {
+                return Err(admission_error("remote_task_input_invalid"));
+            }
+        }
         RuntimeCommand::InspectRemoteWorker { request_id } => {
             if *request_id == 0 {
                 return Err(admission_error("remote_worker_request_invalid"));
@@ -1446,11 +1455,18 @@ pub enum RuntimeCommand {
     SpawnRemoteWork {
         request: crate::remote_worker::RemoteWorkRequest,
     },
+    RemoteTaskInput {
+        request: crate::remote_input::RemoteTaskInputRequest,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::RemoteTaskInput { request } => f
+                .debug_struct("RemoteTaskInput")
+                .field("target", request.target())
+                .finish(),
             RuntimeCommand::InspectRemoteWorker { request_id } => f
                 .debug_struct("InspectRemoteWorker")
                 .field("request_id", request_id)
@@ -2935,6 +2951,7 @@ mod tests {
                 "QueryTerminalHistory",
                 "InspectRemoteWorker",
                 "SpawnRemoteWork",
+                "RemoteTaskInput",
             ]
         );
     }

@@ -10386,7 +10386,18 @@ mod tests {
             queue_preparation
                 .contains("prepare_runtime_command_for_retention_internal(&mut command)")
         );
-        let worker_handler = production.split("fn handle_command_inner").nth(1).unwrap();
+        let wrapper = production.split_once("fn handle_command_inner(").unwrap().1;
+        assert!(
+            wrapper
+                .split("fn handle_command_inner_with_cwd(")
+                .next()
+                .unwrap()
+                .contains("self.handle_command_inner_with_cwd(command, None)")
+        );
+        let worker_handler = production
+            .split("fn handle_command_inner_with_cwd(")
+            .nth(1)
+            .unwrap();
         let worker_handler_prefix = worker_handler.split("match command").next().unwrap();
         assert!(
             worker_handler_prefix

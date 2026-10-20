@@ -2933,6 +2933,8 @@ mod tests {
                 "RequestMuxSnapshot",
                 "TerminalControl",
                 "QueryTerminalHistory",
+                "InspectRemoteWorker",
+                "SpawnRemoteWork",
             ]
         );
     }

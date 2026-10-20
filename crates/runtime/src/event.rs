@@ -598,6 +598,8 @@ mod tests {
                 "TerminalHistoryResult",
                 "SessionTitleChanged",
                 "SessionInputAccepted",
+                "RemoteWorkerObserved",
+                "RemoteWorkResolved",
             ]
         );
     }

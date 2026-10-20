@@ -280,7 +280,7 @@ mod tests {
                 .conn
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            2
+            super::super::SCHEMA_VERSION
         );
         drop(store);
         assert_eq!(std::fs::read(&main).unwrap(), b"legacy fixture bytes");

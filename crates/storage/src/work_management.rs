@@ -20,11 +20,23 @@ use std::collections::{HashMap, HashSet};
 #[path = "work_management_remote.rs"]
 mod remote_operations;
 pub use remote_operations::{RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationResult};
+#[path = "work_devices.rs"]
+mod devices;
+pub use devices::{RegisteredExecutionDevice, StoredExecutionDevice};
 
 pub const COMMAND_CENTER_FILE_NAME: &str = "command-center-v2.sqlite3";
 
 const APPLICATION_ID: i64 = 0x4443_4332;
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
+const DEVICE_SCHEMA: &str = r#"
+CREATE TABLE work_execution_devices (
+ workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
+ device_id TEXT NOT NULL CHECK(length(CAST(device_id AS BLOB)) BETWEEN 1 AND 128),
+ revision INTEGER NOT NULL CHECK(revision>0),
+ body BLOB NOT NULL CHECK(typeof(body)='blob' AND length(body)<=32768),
+ PRIMARY KEY(workspace_id,device_id)
+);
+"#;
 const REMOTE_SCHEMA: &str = r#"
 CREATE TABLE work_remote_operations (
  workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
@@ -40,6 +52,9 @@ fn source_digest(version: i64) -> String {
     hash.update(SCHEMA.as_bytes());
     if version >= 2 {
         hash.update(REMOTE_SCHEMA.as_bytes());
+    }
+    if version >= 3 {
+        hash.update(DEVICE_SCHEMA.as_bytes());
     }
     digest_hex(&hash.finalize())
 }
@@ -452,6 +467,7 @@ impl CommandCenterStore {
         if application_id == 0 && version == 0 && tables == 0 {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(REMOTE_SCHEMA)?;
+            tx.execute_batch(DEVICE_SCHEMA)?;
             tx.execute(
                 "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
                 rusqlite::params![schema_digest(&tx)?, source_digest(SCHEMA_VERSION)],
@@ -464,7 +480,7 @@ impl CommandCenterStore {
                 "unrecognized Command Center sidecar"
             );
             anyhow::ensure!(
-                version == 1 || version == SCHEMA_VERSION,
+                (1..=SCHEMA_VERSION).contains(&version),
                 "unsupported Command Center sidecar version"
             );
             let format: Option<(String, String, String)> = tx
@@ -483,8 +499,13 @@ impl CommandCenterStore {
                     && digest == schema_digest(&tx)?,
                 "invalid Command Center sidecar schema"
             );
-            if version == 1 {
-                tx.execute_batch(REMOTE_SCHEMA)?;
+            if version < SCHEMA_VERSION {
+                if version < 2 {
+                    tx.execute_batch(REMOTE_SCHEMA)?;
+                }
+                if version < 3 {
+                    tx.execute_batch(DEVICE_SCHEMA)?;
+                }
                 tx.execute(
                     "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
                     rusqlite::params![schema_digest(&tx)?, source_digest(SCHEMA_VERSION)],

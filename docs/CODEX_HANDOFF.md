@@ -1,5 +1,16 @@
 # Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
 
+## Latest checkpoint — read-only remote terminal / local exact close
+
+- Root HEAD `26a03021`: exact owned local close `5fb89b54`→`26a03021` 통합. UI owner actual command_center75 PASS/0 FAIL/1 ignored, check --tests PASS; 실제 원operation/런타임/attempt/소유권 불일치 거부와 unknown 종료 재요청 차단을 포함한다. 기존 수동 연결 세션은 원안 종료 기능으로 안내한다.
+- PWA 원격 읽기 DTO/watch `7e041af5`→`23e62bd0`, style `77f5298c`→`155cbcf3`. Root 공유 DOM/와이어는 View-only ObserveRemoteSession + opaque remote target을 사용하며 local UUID watch로 대체하지 않는다. native 원격 입력은 실제 scoped controller를 사용하지만 cross-TLS cloud remote submit은 revoke fence 미지원으로 계속 disabled다.
+- Root actual Chrome **106 assertions PASS**, `/private/tmp/deppy-cc-readonly-lifecycle-green-20261020.log`. 실제 RED lost receipt 재연결 시 갱신이 막힘(`/private/tmp/deppy-cc-readonly-lifecycle-red-20261020.log`,101checks) → 관측 전용2s 만료/재연결 정리로 GREEN. 변경·입력 operation fence는 유지한다. 숨김 snapshot의0크기 DOM이 읽던 위치를 덮는 문제도 독립 Chrome probe에서120/70→0/0 재현 후 exactroute별 bounded64 위치 보존으로 수정/회귀 통과했다.
+- Root actual work focused **11 PASS/0 FAIL**, `/private/tmp/deppy-cc-web-remote-readonly-suite-green-20261020.log`. 4projects×64tasks×16choices +128KiB viewport stress는 최초480KiB publication 실패를 실제 재현 후 압박 시 화면표시만 최신512B+truncated 안내로 줄여 GREEN. 실행 ID/원문/설정은 변형하지 않는다.
+- native actual offscreen **1 PASS/0 FAIL**, 10 PNG `/private/tmp/deppy-command-center-native-final-evidence-20261020`; `/private/tmp/deppy-cc-native-final-offscreen-20261020.log`. Devices1440/390 포함하며 실제 실행 앱 화면 증거는 아니다.
+- 독립 리뷰에서 Relay shell `send:()=>false`로 원격 관측을 버리는 결함도 확인했다. cc_contracts가 Relay paired View-only bridge/실제 회귀를 별도 파일 범위로 수정 중. Root가 shared JS/와이어를 소유하여 충돌을 피한다.
+- cc_storage 원operation SELECT-only 복구 최신 actual storage26 PASS, runtime420 PASS/0 FAIL/1 ignored, strict runtime/storage Clippy PASS. 실제 scopedTLS lostlaunch/inputACK fixture1 PASS 후 최종 App31tests 진행 중. cc_ui는 명시 조회 후 observed-idle만 저장하고 initialprompt/새assignment/새입력 자동 재진입 없이 native reconcile 버튼을 마무리한다.
+- 다음: root PWA 커밋 → storage/UI/Relay 마지막 narrow commit 리뷰·통합 → feature freeze → fmt/boundary/deps/i18n/strictworkspaceClippy/fullworkspace 최종 gate. root target 독점/jobs2. 앱 실행·제품 배포·push·main merge는 하지 않는다. 아래 과거 checkpoint의 미통합·미커밋·미실행 표시는 이 최신 기록보다 우선하지 않는다.
+
 ## Latest checkpoint — native server / scoped remote input integration
 
 - 업데이트: scoped TLS credential `bf56d3c1`→`704b0e25`, 실제 Observe/Close `0c74bc7b`→`abdc4968`, native viewport/composer/Close `86001039`→`f17b567e`, obsolete restore 제거 `f1cd9bec`→`95c37f4e`, queue style `4a8637c9` 통합 완료. 아래 HIGH admin-token export 경로는 Root에서 제거했고 exact scoped API로만 복사한다. pending/error/old grant/copy operation/runtime 응답을 대조한다. 독립 cc_contracts 재리뷰에서 차단할 결함 없음. 실제 scopedTLS2 PASS + guarded 입력/터미널/종료1 PASS를 storage가 실행했다.

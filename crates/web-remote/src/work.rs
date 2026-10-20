@@ -67,6 +67,12 @@ pub fn validate_intent(v: &Value) -> bool {
     }
     match v["type"].as_str() {
         Some("load_project") => keys(v, &["type", "workspace_id"]) && identity(&v["workspace_id"]),
+        Some("observe_remote_session") => {
+            keys(v, &["type", "target"])
+                && target(&v["target"])
+                && identity(&v["target"]["session_id"])
+                && identity(&v["target"]["task_id"])
+        }
         Some("submit") => {
             keys(v, &["type", "target", "text"])
                 && target(&v["target"])
@@ -150,7 +156,10 @@ pub fn validate_intent(v: &Value) -> bool {
 }
 
 pub fn required_action(v: &Value) -> RelayAction {
-    if v["type"] == "load_project" {
+    if matches!(
+        v["type"].as_str(),
+        Some("load_project" | "observe_remote_session")
+    ) {
         RelayAction::View
     } else if v["type"] == "approval" {
         RelayAction::Approval
@@ -249,6 +258,20 @@ fn compact_projection(projection: &mut Value) -> Result<(), WorkError> {
                     if let Some(value) = task.get_mut(key) {
                         short(value, limit);
                     }
+                }
+                if let Some(remote) = task.get_mut("remote_terminal")
+                    && let Some(text) = remote.get("text").and_then(Value::as_str)
+                    && text.len() > 512
+                {
+                    // Under publication pressure, retain the newest visible terminal text.
+                    // This is a read-only preview; no executable payload or identity is changed.
+                    let mut start = text.len() - (512 - "…\n".len());
+                    while !text.is_char_boundary(start) {
+                        start += 1;
+                    }
+                    let preview = format!("…\n{}", &text[start..]);
+                    remote["text"] = Value::String(preview);
+                    remote["truncated"] = Value::Bool(true);
                 }
                 if let Some(choices) = task
                     .as_object_mut()
@@ -394,6 +417,23 @@ mod tests {
         ));
     }
     #[test]
+    fn work_remote_observation_is_view_only_and_exact_target_bound() {
+        let mut intent = json!({"type":"observe_remote_session","target":{"workspace_id":"w","session_id":"remote:original-launch","task_id":"t"}});
+        assert!(validate_intent(&intent));
+        assert_eq!(required_action(&intent), RelayAction::View);
+        intent["target"]["task_id"] = Value::Null;
+        assert!(!validate_intent(&intent));
+        intent["target"]["task_id"] = json!("t");
+        intent["target"]["session_id"] = Value::Null;
+        assert!(!validate_intent(&intent));
+        intent["target"]["session_id"] = json!("remote:original-launch");
+        intent["token"] = json!("not-a-view-authority");
+        assert!(!validate_intent(&intent));
+        assert!(!validate_intent(
+            &json!({"type":"close_worker","target":{"workspace_id":"w","session_id":"remote:original-launch","task_id":"t"},"attempt_id":"a"})
+        ));
+    }
+    #[test]
     fn work_result_forms_require_exact_attempt_and_bounded_user_evidence() {
         let target = json!({"workspace_id":"w","session_id":null,"task_id":"t"});
         let mut report = json!({"type":"report_result","target":target,"attempt_id":"attempt-a","text":"사용자가 확인한 결과"});
@@ -460,7 +500,13 @@ mod tests {
             let tasks:Vec<_>=(0..64).map(|t| { let mut task=task.clone();task["target"]["workspace_id"]=json!(format!("workspace-{p}"));task["target"]["task_id"]=json!(format!("task-{p}-{t}"));for worker in task["eligible_sessions"].as_array_mut().unwrap(){worker["target"]["workspace_id"]=json!(format!("workspace-{p}"));}task }).collect();
             json!({"id":format!("workspace-{p}"),"tasks":tasks,"history":(0..100).map(|i|json!({"id":format!("e-{i}"),"text":"이력 응답 ".repeat(150)})).collect::<Vec<_>>()})
         }).collect();
-        let source = json!({"projects":projects,"devices":[],"status":"Observed"});
+        let mut source = json!({"projects":projects,"devices":[],"status":"Observed"});
+        // The host bounds actual cached remote terminal text at 128 KiB total.
+        for p in 0..4 {
+            let latest = "최신 화면";
+            let terminal = format!("{}{}", "x".repeat(32 * 1024 - latest.len()), latest);
+            source["projects"][p]["tasks"][0]["remote_terminal"] = json!({"text":terminal,"cols":160,"rows":80,"connected":true,"closed":false,"status":"관측됨"});
+        }
         let encoded = encode_frame(&source, true, true)
             .expect("valid bounded projects should keep publishing");
         assert!(encoded.len() <= MAX_WORK_SNAPSHOT_BYTES);
@@ -470,6 +516,16 @@ mod tests {
                 .as_array()
                 .unwrap();
             assert_eq!(tasks.len(), 64);
+            let remote_text = tasks[0]["remote_terminal"]["text"].as_str().unwrap();
+            assert!(remote_text.len() <= 512 && remote_text.ends_with("최신 화면"));
+            assert_eq!(tasks[0]["remote_terminal"]["truncated"], true);
+            assert_eq!(
+                source["projects"][p]["tasks"][0]["remote_terminal"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                32 * 1024
+            );
             assert_eq!(
                 frame["snapshot"]["projects"][p]["worker_sessions"]
                     .as_array()
@@ -583,8 +639,18 @@ mod tests {
             .authorize_cloud_control_deferred(rx.try_recv().unwrap())
             .expect("view-only project read is authorized");
         assert!(permit.is_current());
+        let observe = CloudControlIntent::CommandCenter {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            intent: json!({"type":"observe_remote_session","target":{"workspace_id":"workspace-b","session_id":"remote:original-launch","task_id":"task-b"}}),
+        };
+        assert!(core.dashboard().request_cloud_control(&origin, observe));
+        let (_, view_permit) = core
+            .authorize_cloud_control_deferred(rx.try_recv().unwrap())
+            .expect("a scoped remote observation needs view authority only");
+        assert!(view_permit.is_current());
         origin.revoke();
         assert!(!permit.is_current());
+        assert!(!view_permit.is_current());
     }
     #[test]
     fn work_relay_outbound_rejects_unfiltered_approval_or_input_capability() {

@@ -44,7 +44,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   let connected = false, opened = false, initialized = false, destroyed = false, composing = false;
   let currentKey = '', currentTarget = null, currentCapability = null, draftTotal = 0, draftSerial = 0, compositionEndedAt = -Infinity;
   let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null;
-  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map();
+  let remoteWatchTimer = null;
+  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map();
   const element = node('section', 'cc-shell'); element.hidden = true;
   const reopen = button('지휘 터미널 열기', () => setOpen(true), 'cc-button cc-reopen'); reopen.dataset.ccOpen = '';
   const app = node('section', 'cc-app'); app.setAttribute('aria-label', '에이전트 지휘 터미널');
@@ -87,8 +88,9 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function setOpen(value) {
     if (!snapshot || destroyed) return;
+    rememberRemotePosition();
     opened = value; app.hidden = !value; reopen.hidden = value;
-    if (!value) closeDrawers(); notifyVisibility(value);
+    if (!value) closeDrawers(); notifyVisibility(value); restoreRemotePosition(); syncRemoteWatch();
   }
   function rememberDraft() {
     if (!currentKey) return true;
@@ -103,11 +105,14 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     return true;
   }
   function emit(intent, scope, metadata = {}) {
+    // Observation is a repeatable read, unlike input/launch operations. A lost read receipt
+    // must not permanently fence the watch, nor retire any mutating operation's fence.
+    for (const [id, item] of pending) if (item.observation && performance.now() - item.started >= 2000) pending.delete(id);
     if (!connected || destroyed || isPending(scope)) return false;
     if (pending.size >= 16) { say('접수 확인 대기 항목이 많습니다. 기존 요청을 확인한 뒤 다시 시도해 주세요.'); return false; }
     if (nextRequest > 0xffffffff) { say('요청 번호를 모두 사용했습니다. 연결을 새로 열어 주세요.'); return false; }
     if (!globalThis.crypto?.randomUUID) { say('보안 연결에서만 요청을 전송할 수 있습니다.'); return false; }
-    const operation = crypto.randomUUID(), item = {scope, request: nextRequest++, status: 'pending', ...metadata};
+    const operation = crypto.randomUUID(), item = {scope, request: nextRequest++, status: 'pending', started: performance.now(), observation: intent.type === 'observe_remote_session', ...metadata};
     pending.set(operation, item);
     try {
       const result = send?.({type: 'cloud_control', request: item.request, intent: {action: 'command_center', operation_id: operation, intent: copy(intent)}});
@@ -198,10 +203,36 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function terminalButton(task) {
     const id = str(task?.terminal_session_id);
-    const control = button(label('terminal', '터미널'), () => { if (id && typeof watchSession === 'function') { setOpen(false); watchSession(id); } }, 'cc-button cc-ghost');
+    const remote = isRemoteTask(task);
+    const control = button(label('terminal', '터미널'), () => {
+      if (remote) { if (!rememberDraft()) return; screen = 'task'; taskId = task.target.task_id; detailTab = 'terminal'; closeDrawers(); requestRemoteView(task); render(); }
+      else if (id && typeof watchSession === 'function') { setOpen(false); watchSession(id); }
+    }, 'cc-button cc-ghost');
     control.dataset.ccTerminal = task?.target?.task_id || 'main';
-    control.disabled = !id || typeof watchSession !== 'function' || (task?.terminal && !enabled(task.terminal));
+    control.disabled = !connected || (!remote && (!id || typeof watchSession !== 'function')) || task?.terminal?.enabled === false;
     control.title = control.disabled ? str(task?.terminal?.reason) || '이 세션의 터미널 연결을 제공하지 않습니다' : '이 세션의 실제 터미널 열기'; return control;
+  }
+  function isRemoteTask(task) { return !!task?.target?.task_id && str(task?.target?.session_id).startsWith('remote:'); }
+  function remoteViewTask() { const task = selectedTask(); return screen === 'task' && detailTab === 'terminal' && isRemoteTask(task) && task.terminal?.enabled !== false ? task : null; }
+  function requestRemoteView(task) { return emit({type: 'observe_remote_session', target: task.target}, 'observe:' + routeKey(task.target)); }
+  function syncRemoteWatch() {
+    if (!opened || !connected || destroyed || document.visibilityState === 'hidden' || !remoteViewTask()) { clearTimeout(remoteWatchTimer); remoteWatchTimer = null; return; }
+    if (remoteWatchTimer !== null) return;
+    remoteWatchTimer = setTimeout(() => {
+      remoteWatchTimer = null;
+      const task = remoteViewTask();
+      if (opened && connected && !destroyed && document.visibilityState !== 'hidden' && task) requestRemoteView(task);
+      syncRemoteWatch();
+    }, 1000);
+  }
+  function renderRemoteTerminal(task) {
+    const observed = task.remote_terminal, bar = node('div', 'cc-actions');
+    bar.append(node('span', 'cc-muted', [observed?.status || '화면 관측을 기다립니다.', '읽기 전용'].join(' · ')));
+    const refresh = button('화면 새로 고침', () => requestRemoteView(task), 'cc-button cc-ghost');
+    refresh.disabled = !connected || isPending('observe:' + routeKey(task.target)); bar.append(refresh); content.append(bar);
+    const surface = node('pre', 'cc-remote-terminal', str(observed?.text) || '원격 워커의 실제 화면을 조회합니다.');
+    surface.dataset.ccRoute = routeKey(task.target); surface.tabIndex = 0; surface.setAttribute('aria-label', '원격 워커 터미널 · 읽기 전용'); content.append(surface);
+    if (observed?.truncated) content.append(node('p', 'cc-muted', '전송 크기 제한으로 화면의 마지막 일부를 표시합니다.'));
   }
   function renderLeft() {
     left.replaceChildren(node('div', 'cc-side-label', label('workspaces', '워크스페이스')), button('닫기', closeDrawers, 'cc-button cc-ghost cc-drawer-close'));
@@ -266,6 +297,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       const tab = button(label(key, caption), () => { detailTab = key; render(); }, 'cc-tab' + (detailTab === key ? ' cc-active' : '')); tab.setAttribute('aria-current', detailTab === key ? 'page' : 'false'); tabs.append(tab);
     }
     tabs.append(terminalButton(task)); content.append(tabs);
+    if (detailTab === 'terminal' && isRemoteTask(task)) { renderRemoteTerminal(task); return; }
     if (detailTab === 'history') { renderHistory(list(p.history).filter(h => h.target?.task_id === task.target?.task_id)); return; }
     if (detailTab === 'git') { content.append(node('p', 'cc-empty', str(task.git?.reason) || '이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다.')); return; }
     if (detailTab === 'result') {
@@ -392,8 +424,25 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       if (replacement && selection && replacement.type !== 'number') replacement.setSelectionRange?.(...selection);
     }
   }
+  function rememberRemotePosition() {
+    const surface = content.querySelector('.cc-remote-terminal');
+    if (!opened || document.visibilityState === 'hidden' || !surface?.clientHeight || !surface.clientWidth) return;
+    const key = surface.dataset.ccRoute;
+    remotePositions.delete(key);
+    remotePositions.set(key, {left: surface.scrollLeft, top: surface.scrollTop, following: surface.scrollTop + surface.clientHeight >= surface.scrollHeight - 2});
+    if (remotePositions.size > 64) remotePositions.delete(remotePositions.keys().next().value);
+  }
+  function restoreRemotePosition() {
+    const surface = content.querySelector('.cc-remote-terminal');
+    if (!opened || !surface?.clientHeight || !surface.clientWidth) return;
+    const position = remotePositions.get(surface.dataset.ccRoute);
+    surface.scrollLeft = position?.left || 0;
+    surface.scrollTop = position && !position.following ? position.top : surface.scrollHeight;
+  }
+  content.addEventListener('scroll', rememberRemotePosition, true);
   function render() {
     if (!snapshot || destroyed) return; applyTheme(); nav.replaceChildren();
+    rememberRemotePosition();
     for (const [key, fallback] of [['main', '메인'], ['tasks', '작업'], ['devices', '기기'], ['history', '기록'], ['settings', '설정']]) {
       const tab = button(label(key, fallback), () => navigate(key), 'cc-nav-button' + ((screen === key || (screen === 'task' && key === 'tasks')) ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', screen === key ? 'page' : 'false'); nav.append(tab);
     }
@@ -406,6 +455,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const openRight = button('작업자 ' + list(p?.tasks).length, () => openDrawer('right', openRight), 'cc-button cc-ghost cc-open-right'); openRight.dataset.ccOpenRight = ''; openRight.setAttribute('aria-label', '작업자 패널 열기');
     context.append(openLeft, caption); if (screen === 'task') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight);
     renderContent(p); updateComposer(); status.textContent = connected ? str(snapshot.status) || '관측된 상태' : '연결 끊김 · 초안 보존 · 자동 재전송 없음';
+    restoreRemotePosition();
+    syncRemoteWatch();
   }
   function onKey(event) {
     if (event.key === 'Escape') { closeDrawers(); return; }
@@ -416,6 +467,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     else if (!event.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) { event.preventDefault(); first?.focus(); }
   }
   element.addEventListener('keydown', onKey);
+  document.addEventListener('visibilitychange', syncRemoteWatch);
   const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (drawer) closeDrawers(); }) : null; observer?.observe(element);
   return {
     element,
@@ -429,17 +481,17 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
         pending.delete(entry[0]); say('호스트가 요청을 접수하지 않았습니다. 초안은 보존됩니다.'); render(); return true;
       }
       if (message?.type !== 'work_snapshot') return false;
-      if (message.snapshot === null) { rememberDraft(); snapshot = null; connected = false; element.hidden = true; opened = false; notifyVisibility(false); return true; }
+      if (message.snapshot === null) { rememberDraft(); rememberRemotePosition(); snapshot = null; connected = false; for (const [id, item] of pending) if (item.observation) pending.delete(id); element.hidden = true; opened = false; notifyVisibility(false); syncRemoteWatch(); return true; }
       if (!message.snapshot || !Array.isArray(message.snapshot.projects)) return false;
       rememberDraft(); snapshot = message.snapshot; connected = true; receipts(snapshot.receipts);
       if (!list(snapshot.projects).some(p => p.id === workspaceId)) { workspaceId = snapshot.selected_workspace_id || list(snapshot.projects)[0]?.id || null; screen = 'main'; taskId = null; }
       element.hidden = false; if (!initialized) { initialized = true; opened = true; } app.hidden = !opened; reopen.hidden = opened; render(); notifyVisibility(opened); return true;
     },
     resetConnection() {
-      if (destroyed) return; rememberDraft(); connected = false; for (const item of pending.values()) item.status = 'uncertain'; say('연결이 끊겼습니다. 초안은 보존되며 요청을 자동으로 다시 보내지 않습니다.'); render();
+      if (destroyed) return; rememberDraft(); connected = false; for (const [id, item] of pending) { if (item.observation) pending.delete(id); else item.status = 'uncertain'; } say('연결이 끊겼습니다. 초안은 보존되며 요청을 자동으로 다시 보내지 않습니다.'); render();
     },
     destroy() {
-      if (destroyed) return; destroyed = true; observer?.disconnect(); element.removeEventListener('keydown', onKey); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); element.remove(); notifyVisibility(false);
+      if (destroyed) return; destroyed = true; syncRemoteWatch(); observer?.disconnect(); element.removeEventListener('keydown', onKey); content.removeEventListener('scroll', rememberRemotePosition, true); document.removeEventListener('visibilitychange', syncRemoteWatch); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); remotePositions.clear(); element.remove(); notifyVisibility(false);
     },
   };
 }

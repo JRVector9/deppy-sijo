@@ -139,6 +139,12 @@ impl RemoteWorkerControl {
             .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
         if let Some(host) = &host {
             anyhow::ensure!(
+                slot.host.as_ref().is_none_or(|current| {
+                    current.active.is_empty() && current.pending.is_empty()
+                }),
+                "remote_worker_grant_in_use"
+            );
+            anyhow::ensure!(
                 host.config.grant_epoch > slot.grant_floor,
                 "remote_worker_grant_epoch_stale"
             );
@@ -164,6 +170,79 @@ impl RemoteWorkerControl {
         }
         Ok(())
     }
+    /// Trusted host setup only; never callable by a runtime wire command.
+    pub fn grant_attempt_folder(
+        &self,
+        attempt_id: &AttemptId,
+        path: impl AsRef<std::path::Path>,
+    ) -> anyhow::Result<AttemptFolderGrant> {
+        anyhow::ensure!(
+            id_valid(attempt_id.as_str()),
+            "remote_worker_attempt_invalid"
+        );
+        let (device_id, workspace_id, grant_epoch) = {
+            let slot = self
+                .slot
+                .lock()
+                .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+            let host = slot
+                .host
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("remote_worker_disabled"))?;
+            (
+                host.config.device_id.clone(),
+                host.config.workspace_id.clone(),
+                host.config.grant_epoch,
+            )
+        };
+        // Canonicalization and descriptor acquisition are deliberately outside the runtime lock.
+        let (folder, folder_anchor, directory) = open_directory(path.as_ref())?;
+        let grant = AttemptFolderGrant {
+            device_id,
+            workspace_id,
+            attempt_id: attempt_id.clone(),
+            folder,
+            folder_anchor,
+            grant_epoch,
+        };
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+        let host = slot
+            .host
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("remote_worker_disabled"))?;
+        anyhow::ensure!(
+            host.config.device_id == grant.device_id
+                && host.config.workspace_id == grant.workspace_id
+                && host.config.grant_epoch == grant.grant_epoch,
+            "remote_worker_grant_changed"
+        );
+        if let Some((previous, _)) = host
+            .attempt_folders
+            .iter()
+            .find(|(g, _)| g.attempt_id == grant.attempt_id)
+        {
+            anyhow::ensure!(previous == &grant, "remote_worker_attempt_folder_immutable");
+            return Ok(previous.clone());
+        }
+        anyhow::ensure!(
+            host.attempt_folders.len() < 32,
+            "remote_worker_attempt_folders_full"
+        );
+        host.attempt_folders.push((grant.clone(), directory));
+        Ok(grant)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptFolderGrant {
+    pub device_id: String,
+    pub workspace_id: WorkspaceId,
+    pub attempt_id: AttemptId,
+    pub folder: String,
+    pub folder_anchor: String,
+    pub grant_epoch: u64,
 }
 #[derive(Default)]
 pub(crate) struct RemoteWorkerSlot {
@@ -196,6 +275,7 @@ pub struct RemoteWorkerHost {
     pub(crate) execution_counter: u64,
     pub(crate) active: Vec<(OperationId, SessionId)>,
     pub(crate) pending: Vec<PendingWork>,
+    pub(crate) attempt_folders: Vec<(AttemptFolderGrant, Arc<RemoteDirectory>)>,
 }
 impl RemoteWorkerHost {
     /// Filesystem validation belongs on a host setup worker, outside rendering.
@@ -223,47 +303,71 @@ impl RemoteWorkerHost {
                 "remote_worker_profile_invalid"
             );
         }
-        let folder = std::fs::canonicalize(&config.folder)?;
-        let folder = folder
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("remote_worker_folder_invalid"))?
-            .to_owned();
-        anyhow::ensure!(
-            folder.len() <= 4096 && !folder.chars().any(char::is_control),
-            "remote_worker_folder_invalid"
-        );
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
-        }
-        let directory = options.open(&folder)?;
-        let anchor = folder_anchor(&folder)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let metadata = directory.metadata()?;
-            anyhow::ensure!(
-                anchor == format!("{}:{}", metadata.dev(), metadata.ino()),
-                "remote_worker_folder_changed"
-            );
-        }
+        let (folder, anchor, directory) = open_directory(&config.folder)?;
         Ok(Self {
             config,
             folder,
             anchor,
             launcher,
             journal,
-            directory: Arc::new(directory.into()),
+            directory,
             leases: vec![],
             lease_counter: 0,
             execution_counter: 0,
             active: vec![],
             pending: vec![],
+            attempt_folders: vec![],
         })
     }
+    pub(crate) fn directory_for(
+        &self,
+        request: &RemoteWorkRequest,
+    ) -> Option<Arc<RemoteDirectory>> {
+        if let Some((grant, directory)) = self
+            .attempt_folders
+            .iter()
+            .find(|(grant, _)| grant.attempt_id == request.identity.attempt_id)
+        {
+            return (grant.folder == request.folder
+                && grant.folder_anchor == request.folder_anchor)
+                .then(|| Arc::clone(directory));
+        }
+        (request.folder == self.folder && request.folder_anchor == self.anchor)
+            .then(|| Arc::clone(&self.directory))
+    }
+}
+/// Host setup worker boundary: never run canonicalization or filesystem opens on the runtime loop.
+fn open_directory(
+    path: &std::path::Path,
+) -> anyhow::Result<(String, String, Arc<RemoteDirectory>)> {
+    let folder = std::fs::canonicalize(path)?;
+    let folder = folder
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("remote_worker_folder_invalid"))?
+        .to_owned();
+    anyhow::ensure!(
+        folder.len() <= 4096 && !folder.chars().any(char::is_control),
+        "remote_worker_folder_invalid"
+    );
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+    }
+    let directory = options.open(&folder)?;
+    let anchor = folder_anchor(&folder)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = directory.metadata()?;
+        anyhow::ensure!(
+            anchor == format!("{}:{}", metadata.dev(), metadata.ino()),
+            "remote_worker_folder_changed"
+        );
+    }
+    Ok((folder, anchor, Arc::new(directory.into())))
 }
 fn id_valid(value: &str) -> bool {
     !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
@@ -938,6 +1042,230 @@ mod tests {
         ));
         assert!(!root.join("launches").exists());
         drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn remote_compute_configuration_cannot_replace_active_or_pending_grant() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-active-grant-{}", uuid::Uuid::new_v4()));
+        let make_host = |epoch| {
+            std::fs::create_dir_all(&root).unwrap();
+            RemoteWorkerHost::new(
+                RemoteWorkerConfig {
+                    device_id: "active".into(),
+                    workspace_id: WorkspaceId("workspace-active".into()),
+                    folder: root.clone(),
+                    grant_epoch: epoch,
+                    max_workers: 2,
+                    profiles: vec![profile()],
+                },
+                Arc::new(Launcher),
+                Arc::new(Journal::default()),
+            )
+            .unwrap()
+        };
+        let control = RemoteWorkerControl {
+            slot: Arc::default(),
+            wake: None,
+        };
+        control.configure(Some(make_host(1))).unwrap();
+        control
+            .slot
+            .lock()
+            .unwrap()
+            .host
+            .as_mut()
+            .unwrap()
+            .active
+            .push((OperationId("existing-op".into()), SessionId(1)));
+        assert!(control.configure(Some(make_host(2))).is_err());
+        assert_eq!(control.slot.lock().unwrap().grant_floor, 1);
+        control.configure(None).unwrap();
+        control.configure(Some(make_host(2))).unwrap();
+        {
+            let mut slot = control.slot.lock().unwrap();
+            let host = slot.host.as_mut().unwrap();
+            let caps = RemoteWorkerCapabilities {
+                device_id: "active".into(),
+                workspace_id: WorkspaceId("workspace-active".into()),
+                incarnation: RuntimeIncarnationId("runtime-active".into()),
+                folder: host.folder.clone(),
+                folder_anchor: host.anchor.clone(),
+                grant_epoch: 2,
+                lease_epoch: 1,
+                profiles: vec![profile()],
+                max_workers: 2,
+                active_workers: 0,
+                active_operation_ids: vec![],
+            };
+            host.pending.push(PendingWork {
+                request: request(&caps, "pending-op"),
+                phase: PendingPhase::Claim,
+            });
+        }
+        assert!(control.configure(Some(make_host(3))).is_err());
+        drop(control);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn remote_compute_attempt_folders_are_exact_pinned_and_preserve_other_workers() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-attempt-folders-{}", uuid::Uuid::new_v4()));
+        let project = root.join("project");
+        let a = root.join("worktree-a");
+        let b = root.join("worktree-b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (server, pin, control) =
+            worker_with_control(&project, "folders", Arc::new(Journal::default()));
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+                .unwrap();
+        let rx = client.subscribe();
+        let caps = inspect(&client, &rx);
+        let mut first = request(&caps, "folder-a");
+        let mut second = request(&caps, "folder-b");
+        let grant_a = control
+            .grant_attempt_folder(&first.identity.attempt_id, &a)
+            .unwrap();
+        let grant_b = control
+            .grant_attempt_folder(&second.identity.attempt_id, &b)
+            .unwrap();
+        assert_eq!(
+            control
+                .grant_attempt_folder(&first.identity.attempt_id, &a)
+                .unwrap(),
+            grant_a
+        );
+        assert!(
+            control
+                .grant_attempt_folder(&first.identity.attempt_id, &b)
+                .is_err()
+        );
+        first.folder = grant_a.folder.clone();
+        first.folder_anchor = grant_a.folder_anchor.clone();
+        second.folder = grant_b.folder.clone();
+        second.folder_anchor = grant_b.folder_anchor.clone();
+        // The path may be replaced after setup; execution still enters the opened directory.
+        let moved = root.join("worktree-a-moved");
+        std::fs::rename(&a, &moved).unwrap();
+        std::fs::create_dir(&a).unwrap();
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: first.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(
+                &rx,
+                |e| matches!(e, RuntimeEvent::RemoteWorkResolved {identity,..} if identity.operation_id == first.identity.operation_id)
+            ),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched {
+                    session: SessionId(1),
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut wrong = second.clone();
+        wrong.folder = grant_a.folder;
+        wrong.folder_anchor = grant_a.folder_anchor;
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork { request: wrong })
+            .unwrap();
+        assert!(matches!(
+            wait_event(
+                &rx,
+                |e| matches!(e, RuntimeEvent::RemoteWorkResolved {identity,..} if identity.operation_id == second.identity.operation_id)
+            ),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Rejected {
+                    code: RemoteWorkError::FolderChanged
+                },
+                ..
+            }
+        ));
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: second.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(
+                &rx,
+                |e| matches!(e, RuntimeEvent::RemoteWorkResolved {identity,..} if identity.operation_id == second.identity.operation_id)
+            ),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched {
+                    session: SessionId(2),
+                    ..
+                },
+                ..
+            }
+        ));
+        let until = Instant::now() + Duration::from_secs(5);
+        while !moved.join("actual-cwd").exists() || !b.join("actual-cwd").exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(moved.join("actual-cwd"))
+                .unwrap()
+                .trim(),
+            std::fs::canonicalize(&moved).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(b.join("actual-cwd"))
+                .unwrap()
+                .trim(),
+            std::fs::canonicalize(&b).unwrap().to_str().unwrap()
+        );
+        assert!(!a.join("launches").exists());
+        assert!(!project.join("launches").exists());
+        let live = inspect(&client, &rx);
+        assert_eq!(live.active_workers, 2);
+        assert_eq!(live.active_operation_ids.len(), 2);
+        drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn remote_compute_attempt_folder_grants_are_bounded_and_revoked_with_parent() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-grant-bounds-{}", uuid::Uuid::new_v4()));
+        let (server, _, control) =
+            worker_with_control(&root, "bounds", Arc::new(Journal::default()));
+        assert!(
+            control
+                .grant_attempt_folder(&AttemptId("".into()), &root)
+                .is_err()
+        );
+        assert!(
+            control
+                .grant_attempt_folder(&AttemptId("missing".into()), root.join("missing"))
+                .is_err()
+        );
+        for index in 0..32 {
+            control
+                .grant_attempt_folder(&AttemptId(format!("attempt-{index}")), &root)
+                .unwrap();
+        }
+        assert!(
+            control
+                .grant_attempt_folder(&AttemptId("overflow".into()), &root)
+                .is_err()
+        );
+        control
+            .grant_attempt_folder(&AttemptId("attempt-0".into()), &root)
+            .unwrap();
+        control.configure(None).unwrap();
+        assert!(
+            control
+                .grant_attempt_folder(&AttemptId("attempt-0".into()), &root)
+                .is_err()
+        );
         server.shutdown();
         std::fs::remove_dir_all(root).unwrap();
     }

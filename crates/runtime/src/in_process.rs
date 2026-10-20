@@ -3121,9 +3121,9 @@ impl Worker {
         if id.grant_epoch != host.config.grant_epoch {
             return P::Complete(R::ObservationUnknown);
         }
-        if request.folder != host.folder || request.folder_anchor != host.anchor {
+        let Some(directory) = host.directory_for(request) else {
             return P::Complete(reject(E::FolderChanged));
-        }
+        };
         // This claim commits before process creation. An unresolved claim is never reclaimed.
         match host.journal.claim(request) {
             Ok(C::New) => {}
@@ -3173,7 +3173,7 @@ impl Worker {
                 let session = SessionId(self.next_id);
                 self.handle_command_inner_with_cwd(
                     command,
-                    Some((Arc::clone(&host.directory), host.folder.clone())),
+                    Some((directory, request.folder.clone())),
                 );
                 if self.sessions.contains_key(&session) {
                     match host.execution_counter.checked_add(1) {

@@ -26,6 +26,13 @@ function button(caption, action, className = 'cc-button') {
   const control = node('button', className, caption);
   control.type = 'button'; control.addEventListener('click', action); return control;
 }
+function icon(name) {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24'); svg.setAttribute('aria-hidden', 'true'); svg.classList.add('cc-icon');
+  const path = document.createElementNS(svg.namespaceURI, 'path');
+  path.setAttribute('d', {send: 'M12 19V5m-6 6 6-6 6 6', terminal: 'm5 7 5 5-5 5m8 0h6', monitor: 'M4 4h16v16H4zM14 4v16', menu: 'M4 6h16M4 12h16M4 18h16', device: 'M4 4h16v12H4zM8 20h8m-4-4v4'}[name] || 'M4 4h16v16H4z');
+  svg.append(path); return svg;
+}
 function stateTag(state, translate = (_, fallback) => fallback) {
   const [caption, tone] = states[state] || ['관측 불확실', 'amber'];
   const keys = {waiting_approval: 'approval', waiting_input: 'input', result_submitted: 'result', verification_failed: 'verification', awaiting_user_confirmation: 'confirmation', observation_unknown: 'unknown'};
@@ -48,8 +55,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   let connected = false, opened = false, initialized = false, destroyed = false, composing = false;
   let currentKey = '', currentTarget = null, currentCapability = null, draftTotal = 0, draftSerial = 0, compositionEndedAt = -Infinity;
   let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null, monitorFilter = 'all', monitorCollapsed = false;
-  let remoteWatchTimer = null;
-  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map();
+  let remoteWatchTimer = null, agentPicker = null, contentIdentity = '';
+  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map(), agentDrafts = new Map();
   const element = node('section', 'cc-shell'); element.hidden = true;
   const reopen = button('지휘 터미널 열기', () => setOpen(true), 'cc-button cc-reopen'); reopen.dataset.ccOpen = '';
   const app = node('section', 'cc-app'); app.setAttribute('aria-label', '에이전트 지휘 터미널');
@@ -58,9 +65,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   const nav = node('nav', 'cc-nav'); nav.setAttribute('aria-label', '주요 화면');
   const headActions = node('div', 'cc-head-actions');
   const theme = button('라이트', () => { themeOverride = !app.classList.contains('cc-light'); applyTheme(); }, 'cc-button cc-ghost');
-  const currentTerminal = button('터미널로', openCurrentTerminal, 'cc-button cc-ghost'); currentTerminal.dataset.ccCurrentTerminal = '';
   const close = button('×', () => setOpen(false), 'cc-button cc-ghost'); close.dataset.ccClose = ''; close.setAttribute('aria-label', '지휘 화면 접기');
-  headActions.append(theme, currentTerminal, close);
+  const deviceCount = node('span', 'cc-device-count'); headActions.append(deviceCount, theme, close);
   header.append(brand, nav, headActions);
   const layout = node('div', 'cc-layout');
   const backdrop = button('', closeDrawers, 'cc-backdrop'); backdrop.tabIndex = -1; backdrop.setAttribute('aria-label', '패널 닫기');
@@ -70,13 +76,13 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   const context = node('div', 'cc-context'), content = node('div', 'cc-content'); content.tabIndex = -1;
   const form = node('form', 'cc-composer-wrap'), composer = node('div', 'cc-composer');
   const input = node('textarea', 'cc-input'); input.rows = 2; input.dataset.ccComposer = '';
-  const composerFoot = node('div', 'cc-composer-foot'), targetCaption = node('span', 'cc-target'), inputHint = node('span', 'cc-input-hint');
-  const submit = node('button', 'cc-button cc-primary', '보내기 ↑'); submit.type = 'submit'; submit.dataset.ccSend = '';
+  const composerFoot = node('div', 'cc-composer-foot'), targetCaption = button('', () => openAgentPicker(), 'cc-target'), inputHint = node('span', 'cc-input-hint'); targetCaption.dataset.ccTarget = '';
+  const submit = node('button', 'cc-button cc-primary cc-send'); submit.append(icon('send')); submit.type = 'submit'; submit.dataset.ccSend = '';
   composerFoot.append(targetCaption, inputHint, submit); composer.append(input, composerFoot); form.append(composer);
   main.append(context, content, form);
   const right = node('aside', 'cc-monitor'); right.setAttribute('aria-label', '현재 프로젝트 작업자 모니터');
   workbody.append(main, right); workspace.append(projectbar, workbody); layout.append(backdrop, left, workspace);
-  const footer = node('footer', 'cc-status'), status = node('span', 'cc-status-text'); footer.append(status);
+  const footer = node('footer', 'cc-status'), status = node('span', 'cc-status-text'); footer.append(node('span', 'cc-grow cc-accent', '메인 → 독립 작업자 → 결과 취합 → 검증'), status);
   const notice = node('div', 'cc-notice'); notice.hidden = true; notice.setAttribute('role', 'status'); notice.setAttribute('aria-live', 'polite');
   app.append(header, layout, footer, notice); element.append(reopen, app); host.append(element);
   const label = (key, fallback) => str(snapshot?.labels?.['command_center.' + key]) || fallback;
@@ -148,6 +154,10 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
           if (currentKey === item.draftKey && input.value === item.raw) input.value = '';
         }
         if (item.settingsVersion !== undefined && settings.get(item.workspace)?.version === item.settingsVersion) settings.delete(item.workspace);
+        if (item.agentVersion !== undefined) {
+          const draft = agentDrafts.get(item.workspace), saved = list(snapshot.projects).find(p => p.id === item.workspace)?.config;
+          if (draft && saved) { if (draft.version === item.agentVersion) draft.config = copy(saved); else draft.config.revision = saved.revision; }
+        }
         if (item.planVersion !== undefined && plans.get(item.workspace)?.version === item.planVersion) plans.delete(item.workspace);
         if (item.resultKey && resultDrafts.get(item.resultKey)?.version === item.resultVersion) resultDrafts.delete(item.resultKey);
       }
@@ -156,20 +166,27 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function updateComposer() {
     const p = project(), task = selectedTask();
-    const target = screen === 'task' ? task?.target : screen === 'main' ? p?.main_target : null;
+    const candidate = screen === 'task' ? task?.target : screen === 'main' ? p?.main_target : null;
+    const target = candidate?.workspace_id === p?.id && (screen !== 'main' || !candidate?.task_id) ? candidate : null;
     const capability = screen === 'task' ? task?.input : p?.main_input;
-    const nextKey = routeKey(target), caption = screen === 'task' ? str(task?.title) : label('main', '메인');
+    // A project's main draft belongs to its main role even before a session is bound.
+    // Task drafts retain the exact opaque session/task owner key.
+    const nextKey = screen === 'main' && p ? routeKey({workspace_id: p.id, session_id: null, task_id: null}) : routeKey(target);
+    const bound = !!target?.session_id && (screen !== 'main' || p?.config?.main_session_id === target.session_id);
+    const caption = screen === 'task' ? [task?.provider, task?.role, task?.device].filter(Boolean).join(' · ') : p?.name + ' / ' + (bound ? '메인 ' + p.main_provider : '메인 에이전트 선택');
     if (currentKey !== nextKey) { currentKey = nextKey; input.value = drafts.get(nextKey)?.text || ''; }
     currentTarget = target ? copy(target) : null; currentCapability = capability;
-    form.hidden = !target; input.disabled = !target || !connected || !enabled(capability);
-    input.placeholder = input.disabled ? str(capability?.reason) || '현재 입력할 수 없습니다' : caption + '에게 목표나 변경할 내용을 알려 주세요';
+    form.hidden = !(screen === 'main' && p || screen === 'task' && task);
+    input.disabled = readOnly || !nextKey || isRemoteTask(task);
+    input.placeholder = input.disabled ? str(capability?.reason) || '읽기 전용 화면입니다' : screen === 'task' ? '이 에이전트에게 추가 내용을 알려 주세요' : '메인에게 목표를 알려 주세요 · 구현·리뷰·검증으로 나눕니다';
     input.setAttribute('aria-label', caption + '에게 보낼 내용');
-    targetCaption.textContent = caption + ' · ' + str(screen === 'task' ? task?.provider : p?.main_provider);
+    targetCaption.textContent = caption; targetCaption.disabled = readOnly || screen !== 'main'; targetCaption.setAttribute('aria-expanded', String(agentPicker === p?.id));
+    targetCaption.title = screen === 'main' ? '메인 에이전트와 실행 설정 선택' : '선택한 작업의 정확한 담당 세션';
     const blocked = isPending('submit:' + nextKey), oversized = bytes(input.value.normalize('NFC')) > INPUT_LIMIT;
-    submit.disabled = input.disabled || blocked || !input.value.trim() || oversized;
-    submit.title = blocked ? '접수 여부를 확인할 때까지 다시 보낼 수 없습니다' : str(capability?.reason);
-    submit.textContent = label('send', '보내기') + ' ↑';
+    submit.disabled = input.disabled || !connected || blocked || !input.value.trim() || oversized || bound && !enabled(capability);
+    submit.title = blocked ? '접수 여부를 확인할 때까지 다시 보낼 수 없습니다' : str(capability?.reason); submit.setAttribute('aria-label', caption + '에게 전송');
     inputHint.textContent = blocked ? '접수 확인 대기 · 초안 보존' : oversized ? label('input_limit', '입력은 UTF-8 16 KiB까지 전송할 수 있습니다') : label('send_hint', 'Enter 전송 · Shift+Enter 줄바꿈');
+    renderAgentPicker();
   }
   input.addEventListener('input', () => { if (!rememberDraft()) input.value = drafts.get(currentKey)?.text || ''; updateComposer(); });
   input.addEventListener('compositionstart', () => { composing = true; });
@@ -182,15 +199,93 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   });
   form.addEventListener('submit', event => {
     event.preventDefault();
-    if (composing || input.disabled || submit.disabled || !currentTarget || !enabled(currentCapability) || !rememberDraft()) return;
+    if (composing || input.disabled || !rememberDraft() || !input.value.trim()) return;
+    if (screen === 'main' && (!currentTarget?.session_id || project()?.config?.main_session_id !== currentTarget.session_id)) { openAgentPicker(); return; }
+    if (submit.disabled || !connected || !currentTarget || !enabled(currentCapability)) return;
     const raw = input.value, normalized = raw.normalize('NFC'); if (!normalized.trim() || bytes(normalized) > INPUT_LIMIT) return;
     emit({type: 'submit', target: currentTarget, text: normalized}, 'submit:' + currentKey, {draftKey: currentKey, raw, version: drafts.get(currentKey)?.version});
   });
+  function openAgentPicker() {
+    const p = project(); if (readOnly || screen !== 'main' || !p || !rememberDraft()) return;
+    if (!agentDrafts.has(p.id)) {
+      if (agentDrafts.size >= 64) { say('설정 초안 한도를 넘었습니다.'); return; }
+      agentDrafts.set(p.id, {config: copy(p.config), version: 0});
+    }
+    agentPicker = p.id; renderAgentPicker(); targetCaption.setAttribute('aria-expanded', 'true');
+    form.querySelector('[data-cc-agent-session]')?.focus({preventScroll: true});
+  }
+  function closeAgentPicker(discard = false) {
+    if (discard) agentDrafts.delete(agentPicker); agentPicker = null; renderAgentPicker(); targetCaption.setAttribute('aria-expanded', 'false');
+  }
+  function agentChoices(p) {
+    const sessions = list(p.eligible_sessions ?? p.sessions).filter(s => s.target?.workspace_id === p.id && s.target?.session_id && !s.target?.task_id);
+    const agents = list(p.available_agents).filter(a => str(a.provider)).map(a => ({...a, model: str(a.model), effort: str(a.effort)}));
+    // Older snapshots still expose observed tuples. Never manufacture provider/model pairs.
+    const observed = [...sessions]; if (!agents.length && p.config?.main_session_id) observed.push(p.config);
+    for (const a of observed) if (str(a.provider) && a.provider !== 'unbound' && !agents.some(v => v.provider === a.provider && v.model === str(a.model) && str(v.effort) === str(a.effort))) agents.push({provider: a.provider, model: str(a.model), effort: str(a.effort)});
+    return {sessions, agents};
+  }
+  function renderAgentPicker() {
+    const old = form.querySelector('[data-cc-agent-picker]'), focus = old?.contains(document.activeElement) ? document.activeElement : null;
+    const focusKey = focus?.dataset.ccFocus, selection = textSelection(focus), scroll = old?.scrollTop || 0;
+    old?.remove(); const p = project(), draft = agentDrafts.get(agentPicker);
+    if (readOnly || screen !== 'main' || agentPicker !== p?.id || !draft) return;
+    const panel = node('section', 'cc-agent-picker'); panel.dataset.ccAgentPicker = ''; panel.setAttribute('role', 'dialog'); panel.setAttribute('aria-label', '메인 에이전트 선택');
+    const heading = node('div', 'cc-picker-heading'); heading.append(node('h2', '', '메인 에이전트 선택'), button('×', () => { closeAgentPicker(); targetCaption.focus({preventScroll: true}); }, 'cc-button cc-ghost')); panel.append(heading);
+    panel.append(node('p', 'cc-muted', '연결과 설정을 확인한 뒤 작성한 내용을 다시 전송해 주세요.'));
+    const {sessions, agents} = agentChoices(p);
+    const config = draft.config;
+    const selectField = (caption, key, values, placeholder, change) => {
+      const row = node('label', 'cc-field'), select = node('select'); row.append(node('span', '', caption));
+      const empty = node('option', '', placeholder); empty.value = ''; select.append(empty);
+      for (const [value, caption] of values) { const option = node('option', '', caption); option.value = value; select.append(option); }
+      select.value = config[key] || ''; select.dataset['ccAgent' + ({main_session_id: 'Session', provider: 'Provider', model: 'Model', effort: 'Effort'}[key])] = ''; select.dataset.ccFocus = 'agent-' + key;
+      select.addEventListener('change', () => { change(select.value); draft.version++; renderAgentPicker(); }); row.append(select); return row;
+    };
+    panel.append(selectField('기존 메인 세션', 'main_session_id', sessions.map(s => [s.target.session_id, [s.title, s.provider, s.model, s.effort, s.device].filter(Boolean).join(' · ')]), '연결할 세션 선택', value => {
+      const selected = sessions.find(s => s.target.session_id === value); config.main_session_id = value || null;
+      if (selected) for (const key of ['provider', 'model', 'effort']) config[key] = str(selected[key]);
+    }));
+    const inline = node('div', 'cc-inline-fields');
+    inline.append(selectField('에이전트', 'provider', [...new Set(agents.map(a => a.provider))].map(v => [v, v]), '에이전트 선택', value => { config.provider = value; config.model = ''; config.effort = ''; config.main_session_id = null; }));
+    const models = [...new Set(agents.filter(a => a.provider === config.provider).map(a => a.model))];
+    inline.append(selectField('모델', 'model', models.filter(Boolean).map(v => [v, v]), models.includes('') ? '기본 모델' : '모델 선택', value => { config.model = value; config.effort = ''; config.main_session_id = null; })); panel.append(inline);
+    const efforts = [...new Set(agents.filter(a => a.provider === config.provider && a.model === config.model).map(a => str(a.effort)))];
+    panel.append(selectField('추론 강도', 'effort', efforts.filter(Boolean).map(v => [v, v]), efforts.includes('') ? '기본 설정 유지' : '추론 강도 선택', value => { config.effort = value; config.main_session_id = null; }));
+    const workers = node('fieldset', 'cc-picker-workers'); workers.append(node('legend', '', '작업 에이전트 · 하나 이상 선택'));
+    for (const provider of [...new Set([...agents.map(a => a.provider), ...list(config.worker_providers)])]) {
+      const row = node('label'), control = node('input'); control.type = 'checkbox'; control.checked = list(config.worker_providers).includes(provider); control.dataset.ccAgentWorker = provider; control.dataset.ccFocus = 'agent-worker-' + provider;
+      control.addEventListener('change', () => { const chosen = new Set(config.worker_providers); control.checked ? chosen.add(provider) : chosen.delete(provider); config.worker_providers = [...chosen]; draft.version++; renderAgentPicker(); }); row.append(control, node('span', '', provider)); workers.append(row);
+    }
+    panel.append(workers);
+    if (!list(config.allowed_scope_roots).length || draft.scopesEdited) {
+      const row = node('label', 'cc-field'), area = node('textarea'); row.append(node('span', '', '작업 범위 · 줄마다 상대 폴더')); area.rows = 2; area.value = list(config.allowed_scope_roots).join('\n'); area.dataset.ccFocus = 'agent-scopes'; area.dataset.ccAgentScopes = '';
+      area.addEventListener('input', () => { config.allowed_scope_roots = area.value.split('\n').map(v => v.trim()).filter(Boolean); draft.scopesEdited = true; draft.version++; renderAgentPicker(); }); row.append(area); panel.append(row);
+    }
+    const selectedSession = sessions.find(s => s.target.session_id === config.main_session_id);
+    const tupleValid = config.main_session_id ? !!selectedSession && ['provider', 'model', 'effort'].every(key => str(selectedSession[key]) === str(config[key])) : agents.some(a => a.provider === config.provider && a.model === config.model && str(a.effort) === str(config.effort));
+    const valid = tupleValid && list(config.worker_providers).length > 0 && list(config.allowed_scope_roots).length > 0;
+    const comparable = value => JSON.stringify(Object.fromEntries(Object.entries(value).filter(([key]) => key !== 'revision').sort(([a], [b]) => a.localeCompare(b))));
+    const saved = comparable(config) === comparable(p.config), actions = node('div', 'cc-actions');
+    const save = button('설정 저장', () => {
+      if (!valid || !enabled(p.save_settings) || !connected || isPending('save:' + p.id)) return;
+      emit({type: 'save_project', workspace_id: p.id, config: copy(config)}, 'save:' + p.id, {workspace: p.id, agentVersion: draft.version});
+    }, 'cc-button cc-primary'); save.dataset.ccAgentSave = ''; save.disabled = !valid || !connected || !enabled(p.save_settings) || isPending('save:' + p.id); save.title = str(p.save_settings?.reason);
+    const create = button('새 메인 만들기', () => {
+      if (!saved || config.main_session_id || !valid || !connected || !enabled(p.create_main)) return;
+      emit({type: 'create_main', workspace_id: p.id}, 'create-main:' + p.id);
+    }); create.dataset.ccAgentCreate = ''; create.disabled = !saved || !!config.main_session_id || !valid || !connected || !enabled(p.create_main) || isPending('save:' + p.id) || isPending('create-main:' + p.id); create.title = !saved ? '설정 저장이 확인된 뒤 새 메인을 만들 수 있습니다.' : str(p.create_main?.reason);
+    const cancel = button('취소', () => { closeAgentPicker(true); input.focus({preventScroll: true}); }, 'cc-button cc-ghost'); cancel.dataset.ccAgentCancel = ''; actions.append(save, create, cancel); panel.append(actions);
+    if (!enabled(p.create_main) && p.create_main?.reason) panel.append(node('p', 'cc-picker-note cc-muted', p.create_main.reason));
+    panel.addEventListener('keydown', event => { if (event.key === 'Enter' && ['INPUT', 'SELECT'].includes(event.target.tagName)) { event.preventDefault(); event.stopPropagation(); } });
+    form.append(panel); panel.scrollTop = scroll;
+    if (focusKey) { const replacement = [...panel.querySelectorAll('[data-cc-focus]')].find(control => control.dataset.ccFocus === focusKey); replacement?.focus({preventScroll: true}); if (selection && textSelection(replacement)) replacement.setSelectionRange(...selection); }
+  }
   function navigate(next, selected = null) {
-    if (!rememberDraft()) return; screen = next; taskId = selected; detailTab = 'work'; closeDrawers(); render(); content.scrollTop = 0;
+    if (!rememberDraft()) return; agentPicker = null; screen = next; taskId = selected; detailTab = 'work'; closeDrawers(); render(); content.scrollTop = 0;
   }
   function chooseProject(id) {
-    if (!rememberDraft()) return; workspaceId = id; screen = 'main'; taskId = null; monitorFilter = 'all'; closeDrawers(); render(); content.scrollTop = 0;
+    if (!rememberDraft()) return; agentPicker = null; workspaceId = id; screen = 'main'; taskId = null; monitorFilter = 'all'; closeDrawers(); render(); content.scrollTop = 0;
     if (project()?.loaded === false) {
       if (readOnly) say('Mac에서 이 프로젝트를 열면 저장된 작업 화면이 표시됩니다.');
       else emit({type: 'load_project', workspace_id: id}, 'load:' + id);
@@ -231,7 +326,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function openTaskDetail(task, tab = 'work') {
     if (!rememberDraft()) return;
-    screen = 'task'; taskId = task.target?.task_id; detailTab = tab; closeDrawers(); render(); content.scrollTop = 0;
+    agentPicker = null; screen = 'task'; taskId = task.target?.task_id; detailTab = tab === 'result' ? 'work' : tab; closeDrawers(); render(); content.scrollTop = 0;
   }
   const needsAttention = task => ['waiting_approval', 'waiting_input', 'result_submitted', 'verification_failed', 'awaiting_user_confirmation', 'failed', 'observation_unknown'].includes(task.state);
   const hasResult = task => ['result_submitted', 'verification_failed', 'awaiting_user_confirmation', 'completed'].includes(task.state);
@@ -264,24 +359,39 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     if (observed?.truncated) content.append(node('p', 'cc-muted', '전송 크기 제한으로 화면의 마지막 일부를 표시합니다.'));
   }
   function renderLeft() {
-    left.replaceChildren(node('div', 'cc-side-label', label('workspaces', '워크스페이스')), button('닫기', closeDrawers, 'cc-button cc-ghost cc-drawer-close'));
+    const heading = node('div', 'cc-side-label'), add = button('＋', () => {}, 'cc-button cc-ghost'); add.disabled = true; add.setAttribute('aria-label', '프로젝트 추가'); add.title = str(snapshot.add_project?.reason) || '이 Mac의 프로젝트 관리에서 프로젝트를 등록해 주세요.'; heading.append(node('span', '', label('workspaces', '워크스페이스')), add);
+    left.replaceChildren(heading, button('닫기', closeDrawers, 'cc-button cc-ghost cc-drawer-close'));
     left.querySelector('.cc-drawer-close').dataset.ccDrawerFocus = 'close';
     for (const p of list(snapshot.projects).slice(0, 64)) {
+      const group = node('div', 'cc-project-group');
       const row = button('', () => chooseProject(p.id), 'cc-project-row' + (p.id === workspaceId ? ' cc-active' : '')); row.dataset.ccProject = p.id; row.dataset.ccDrawerFocus = 'project:' + p.id;
-      row.append(node('span', 'cc-project-glyph', '▱'), node('span', 'cc-grow', p.name), node('span', 'cc-muted', list(p.tasks).length));
-      row.setAttribute('aria-current', p.id === workspaceId ? 'true' : 'false'); left.append(row);
-      if (p.id === workspaceId) for (const session of list(p.sessions).slice(0, 64)) {
-        const entry = button('', () => { closeDrawers(); if (session.terminal_session_id && typeof watchSession === 'function') { setOpen(false); watchSession(session.terminal_session_id); } else say('이 세션의 터미널 연결을 제공하지 않습니다.'); }, 'cc-session');
-        entry.dataset.ccDrawerFocus = 'session:' + routeKey(session.target);
-        entry.append(node('strong', '', session.title), node('small', '', [session.provider, session.model, session.effort, session.device].filter(Boolean).join(' · ')), stateTag(session.state, label)); left.append(entry);
+      row.append(node('span', 'cc-project-glyph', str(p.name).slice(0, 1).toUpperCase()), node('strong', 'cc-grow', p.name), node('span', 'cc-muted', list(p.tasks).length));
+      row.setAttribute('aria-current', p.id === workspaceId ? 'true' : 'false'); group.append(row);
+      for (const task of list(p.tasks).slice(0, 64)) {
+        const entry = button('', () => { if (!rememberDraft()) return; workspaceId = p.id; openTaskDetail(task); }, 'cc-session' + (p.id === workspaceId && screen === 'task' && task.target?.task_id === taskId ? ' cc-selected' : ''));
+        entry.dataset.ccSidebarTask = task.target?.task_id || ''; entry.dataset.ccDrawerFocus = 'task:' + routeKey(task.target);
+        const meta = node('small'); meta.append(stateTag(task.state, label), document.createTextNode(' · ' + [task.provider, task.device].filter(Boolean).join(' · ')));
+        entry.append(node('strong', '', task.title), meta); group.append(entry);
       }
+      const sameSession = (a, b) => !!a?.session_id && a.workspace_id === b?.workspace_id && a.session_id === b?.session_id;
+      const independent = list(p.sessions).filter(session => session.target?.workspace_id === p.id && session.target?.session_id && !sameSession(session.target, p.main_target) && !list(p.tasks).some(task => sameSession(session.target, task.target)));
+      for (const session of independent.slice(0, 64)) {
+        const entry = button('', () => {
+          if (!rememberDraft()) return;
+          if (!session.terminal_session_id || typeof watchSession !== 'function') { say('이 세션의 터미널 연결을 제공하지 않습니다.'); return; }
+          workspaceId = p.id; screen = 'main'; taskId = null; agentPicker = null; render(); setOpen(false); watchSession(session.terminal_session_id);
+        }, 'cc-session'); entry.dataset.ccSidebarSession = session.target.session_id; entry.dataset.ccDrawerFocus = 'session:' + routeKey(session.target);
+        const meta = node('small'); meta.append(stateTag(session.state, label), document.createTextNode(' · ' + [session.provider, session.device].filter(Boolean).join(' · '))); entry.append(node('strong', '', session.title), meta); group.append(entry);
+      }
+      if (!list(p.tasks).length && !independent.length) group.append(node('p', 'cc-project-empty', '배정된 작업이 없습니다.')); left.append(group);
     }
-    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); foot.querySelector('button').dataset.ccDrawerFocus = 'settings'; foot.querySelector('button').dataset.ccSettings = ''; left.append(foot);
+    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), button('메인에게 작업 맡기기', () => navigate('main'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); foot.querySelector('button').dataset.ccDrawerFocus = 'settings'; foot.querySelector('button').dataset.ccSettings = ''; left.append(foot);
   }
   function taskRow(task) {
     const row = button('', () => navigate('task', task.target?.task_id), 'cc-task-row'); row.dataset.ccTask = task.target?.task_id || '';
     const title = node('div', 'cc-task-title'); title.append(node('strong', '', task.title), node('small', '', task.scope));
-    row.append(title, node('span', 'cc-owner', [task.provider, task.device].filter(Boolean).join(' · ')), stateTag(task.state, label));
+    const owner = node('span', 'cc-owner'); owner.append(node('span', '', [task.provider, task.role].filter(Boolean).join(' · ')), node('small', 'cc-muted', task.device));
+    row.append(title, owner, stateTag(task.state, label), node('span', 'cc-task-arrow cc-muted', '›'));
     return row;
   }
   function renderRight(p) {
@@ -290,7 +400,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const heading = node('header', 'cc-monitor-title'); heading.append(node('h2', '', label('workers', '작업자')), node('small', 'cc-muted', '실행 ' + running + (p?.config ? ' / 최대 ' + p.config.parallel_limit : '')), button(label('close', '닫기'), closeDrawers, 'cc-button cc-ghost cc-drawer-close')); right.replaceChildren(heading); heading.querySelector('button').dataset.ccDrawerFocus = 'close';
     const scroll = node('div', 'cc-monitor-scroll'), filters = node('div', 'cc-monitor-filter'); filters.setAttribute('aria-label', '작업자 필터');
     for (const [key, caption] of [['all', '전체'], ['attention', '확인 필요'], ['running', '실행 중']]) {
-      const control = button(caption, () => { monitorFilter = key; render(); }, 'cc-button cc-ghost');
+      const control = button(caption, () => { monitorFilter = key; render(); }, 'cc-button');
       control.dataset.ccMonitorFilter = key; control.dataset.ccDrawerFocus = 'filter:' + key; control.setAttribute('aria-pressed', String(monitorFilter === key)); filters.append(control);
     }
     scroll.append(filters);
@@ -316,7 +426,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     foot.append(node('small', 'cc-muted', '기기 ' + list(snapshot.devices).filter(device => device.connected).length + '대 연결'), devices); right.append(scroll, foot); scroll.scrollTop = previousScroll;
   }
   function title(caption, description) {
-    const intro = node('div', 'cc-intro'); intro.append(node('h1', '', caption)); if (description) intro.append(node('p', 'cc-muted', description)); content.append(intro);
+    const intro = node('div', 'cc-intro'); intro.append(node('h1', '', caption)); if (description) intro.append(node('p', 'cc-muted', description)); content.append(intro); return intro;
   }
   function renderHistory(entries, destination = content) {
     if (!entries.length) { destination.append(node('p', 'cc-empty', label('no_history', '아직 기록이 없습니다.'))); return; }
@@ -329,7 +439,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const tasks = list(p.tasks), goal = node('section', 'cc-goal');
     goal.append(node('p', 'cc-section-label', '프로젝트 목표 · ' + p.name), node('p', 'cc-instruction', p.goal || '이 프로젝트에서 어떤 작업을 진행할까요?'));
     const flow = node('div', 'cc-main-flow');
-    for (const caption of ['목표', '계획·배정', '독립 실행 ' + tasks.filter(t => t.state === 'running').length, '결과 취합', '검증']) flow.append(node('span', '', caption));
+    ['목표', '계획·배정', '독립 실행 ' + tasks.filter(t => t.state === 'running').length, '결과 취합', '검증'].forEach((caption, index) => { if (index) flow.append(node('i')); flow.append(node('span', index === 2 ? 'cc-current' : '', caption)); });
     goal.append(flow); content.append(goal);
     const thread = (key, caption) => {
       const section = node('section', 'cc-thread-entry'), body = node('div', 'cc-thread-body'); section.dataset.ccThread = key;
@@ -391,22 +501,17 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function renderTask(p, task) {
     if (!task) { title(label('unavailable_task', '작업을 찾을 수 없습니다')); return; }
-    title(task.title, [task.role, task.provider, task.device].filter(Boolean).join(' · '));
+    const intro = title(task.title, [task.provider, task.role, task.device].filter(Boolean).join(' · ')), heading = node('div', 'cc-detail-heading'); intro.querySelector('p')?.classList.add('cc-detail-meta'); heading.append(intro.querySelector('h1'), stateTag(task.state, label)); intro.prepend(heading);
     const tabs = node('nav', 'cc-tabs'); tabs.setAttribute('aria-label', '작업 상세');
-    for (const [key, caption] of [['work', '작업'], ['result', '결과'], ['git', 'Git'], ['history', '기록']]) {
-      const tab = button(label(key, caption), () => { detailTab = key; render(); }, 'cc-tab' + (detailTab === key ? ' cc-active' : '')); tab.setAttribute('aria-current', detailTab === key ? 'page' : 'false'); tabs.append(tab);
+    for (const [key, caption] of [['work', '작업과 결과'], ['terminal', '원문 터미널'], ['git', 'Git 변경'], ['history', '기록']]) {
+      const tab = key === 'terminal' ? terminalButton(task) : button(caption, () => { detailTab = key; render(); });
+      tab.textContent = caption; tab.className = 'cc-tab' + (detailTab === key ? ' cc-active' : ''); tab.setAttribute('aria-current', detailTab === key ? 'page' : 'false'); tabs.append(tab);
     }
-    tabs.append(terminalButton(task)); content.append(tabs);
+    content.append(tabs);
     if (detailTab === 'terminal' && isRemoteTask(task)) { renderRemoteTerminal(task); return; }
     if (detailTab === 'history') { renderHistory(list(p.history).filter(h => h.target?.task_id === task.target?.task_id)); return; }
     if (detailTab === 'git') { content.append(node('p', 'cc-empty', str(task.git?.reason) || '이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다.')); return; }
-    if (detailTab === 'result') {
-      content.append(node('pre', 'cc-log', task.result || label('no_result', '아직 제출된 결과가 없습니다.')));
-      content.append(node('p', 'cc-muted', task.verification || '검증 미실행'));
-      renderResultForms(task);
-      if (task.result_revision) content.append(actionButton(label('confirm_result', '결과 확인'), task.confirm_result, {type: 'confirm_result', target: task.target, revision: task.result_revision}, 'result:' + routeKey(task.target))); return;
-    }
-    content.append(stateTag(task.state, label), facts([[label('scope', '범위'), task.scope], [label('criteria', '완료 기준'), task.acceptance_criteria], [label('directory', '실행 폴더'), task.directory], ['최근 관측', task.observed_at]]), node('p', 'cc-activity', task.activity));
+    content.append(node('h2', '', '진행 내용'), node('p', 'cc-activity', task.activity), facts([[label('scope', '배정 범위'), task.scope], [label('directory', '작업 폴더'), task.directory], [label('criteria', '완료 조건'), task.acceptance_criteria], ['최근 관측', task.observed_at]]));
     if (task.approval && !readOnly) {
       const approval = task.approval, box = node('section', 'cc-approval'); box.dataset.ccApproval = ''; box.append(node('h2', '', label('approval_title', '실행 승인 요청')), node('pre', 'cc-log', approval.command), facts([[label('directory', '폴더'), approval.directory], [label('scope', '범위'), approval.scope]]));
       const actions = node('div', 'cc-actions'); for (const allow of [false, true]) actions.append(actionButton(allow ? label('allow_once', '허용') : label('deny', '거절'), approval.action, {type: 'approval', target: task.target, approval_id: approval.id, allow}, 'approval:' + routeKey(task.target) + ':' + approval.id, allow ? 'cc-button cc-primary' : 'cc-button')); box.append(actions); content.append(box);
@@ -429,7 +534,11 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     });
     const updateDispatch = () => { dispatch.disabled = !select.value || !connected || !enabled(task.dispatch) || isPending('dispatch:' + selectionKey); };
     select.addEventListener('change', () => { workerSelections.set(selectionKey, select.value); updateDispatch(); });
-    dispatch.title = str(task.dispatch?.reason); updateDispatch(); actions.append(select, dispatch, terminalButton(task)); content.append(actions);
+    dispatch.title = str(task.dispatch?.reason); updateDispatch(); actions.append(select, dispatch, terminalButton(task)); if (choices.length || enabled(task.dispatch) || isPending('dispatch:' + selectionKey)) content.append(actions);
+    const result = node('section', 'cc-result-section'); result.append(node('h2', '', '제출된 결과'));
+    result.append(node('p', 'cc-result-text', task.result || label('no_result', '아직 제출된 결과가 없습니다.')), facts([['검증 근거', task.verification || '검증 미실행'], ['사용자 확인', task.state === 'completed' ? '확인 완료' : '미확인']]));
+    if (task.result_revision) { const actions = node('div', 'cc-actions'); actions.append(actionButton(label('confirm_result', '결과 확인'), task.confirm_result, {type: 'confirm_result', target: task.target, revision: task.result_revision}, 'result:' + routeKey(task.target))); result.append(actions); }
+    content.append(result); renderResultForms(task);
   }
   function renderResultForms(task) {
     if (!task.attempt_id || readOnly) return;
@@ -459,10 +568,10 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     if (task.result_revision) addForm('verify', task.verify_result, '직접 수행한 검증 기록', 4096);
   }
   function renderSettings(p) {
-    title('프로젝트 설정', '변경한 값은 저장 요청의 접수가 확인될 때까지 보존됩니다.');
+    const intro = title('프로젝트 설정', '메인과 작업 폴더를 정하고, 필요할 때 실행 규칙을 조정하세요.'), heading = node('div', 'cc-detail-heading'), add = button('프로젝트 추가', () => {}); add.disabled = true; add.title = str(snapshot.add_project?.reason) || '이 Mac의 프로젝트 관리에서 프로젝트를 등록해 주세요.'; heading.append(intro.querySelector('h1'), add); intro.prepend(heading);
     let draft = settings.get(p.id); if (!draft) { if (settings.size >= 64) { content.append(node('p', 'cc-empty', '설정 초안 한도를 넘었습니다.')); return; } draft = {config: copy(p.config), version: 0}; settings.set(p.id, draft); }
     else if (draft.version === 0) draft.config = copy(p.config);
-    const fields = node('div', 'cc-form');
+    const fields = node('div', 'cc-form'); let fieldParent = fields;
     function field(caption, key, choices = null, type = 'text') {
       const row = node('label', 'cc-field'); row.append(node('span', '', caption));
       const control = node(choices ? 'select' : type === 'paths' ? 'textarea' : 'input');
@@ -473,43 +582,64 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       if (key === 'parallel_limit') { control.min = '1'; control.max = '8'; }
       control.disabled = !enabled(p.save_settings) || !connected;
       control.dataset.ccFocus = 'setting-' + key;
-      control.addEventListener(choices || type === 'checkbox' ? 'change' : 'input', () => { draft.config[key] = type === 'checkbox' ? control.checked : type === 'paths' ? control.value.split('\n').map(v => v.trim()).filter(Boolean) : key === 'parallel_limit' ? Number(control.value) : key === 'main_session_id' ? control.value || null : control.value; draft.version++; });
-      row.append(control); fields.append(row);
+      control.addEventListener(choices || type === 'checkbox' ? 'change' : 'input', () => {
+        draft.config[key] = type === 'checkbox' ? control.checked : type === 'paths' ? control.value.split('\n').map(v => v.trim()).filter(Boolean) : key === 'parallel_limit' ? Number(control.value) : key === 'main_session_id' ? control.value || null : control.value;
+        if (key === 'main_session_id' && control.value) {
+          const selected = list(p.eligible_sessions ?? p.sessions).find(s => s.target?.workspace_id === p.id && s.target?.session_id === control.value);
+          if (selected) for (const key of ['provider', 'model', 'effort']) draft.config[key] = str(selected[key]);
+        }
+        if (['provider', 'model', 'effort'].includes(key)) { draft.config.main_session_id = null; if (key === 'provider') draft.config.model = ''; if (key !== 'effort') draft.config.effort = ''; }
+        draft.version++; if (['main_session_id', 'provider', 'model', 'effort'].includes(key)) render();
+      });
+      row.append(control); if (key === 'directory') row.append(node('small', 'cc-muted', '다른 컴퓨터의 폴더는 기기 연결 시 확인합니다.')); fieldParent.append(row);
     }
-    field(label('name', '프로젝트 이름'), 'name'); field(label('directory', '프로젝트 폴더'), 'directory');
-    const sessions = list(p.eligible_sessions ?? p.sessions);
+    field(label('name', '프로젝트 이름'), 'name'); field('이 Mac의 프로젝트 폴더', 'directory');
+    const {sessions, agents} = agentChoices(p), providers = [...new Set(agents.map(a => a.provider))];
+    const inline = node('div', 'cc-inline-fields'); fields.append(inline); fieldParent = inline;
+    field(label('provider', '메인 에이전트'), 'provider', [['', '에이전트 선택'], ...providers.map(v => [v, v])]);
+    const models = [...new Set(agents.filter(a => a.provider === draft.config.provider).map(a => a.model))];
+    field(label('model', '모델'), 'model', [['', models.includes('') ? '기본 모델' : '모델 선택'], ...models.filter(Boolean).map(v => [v, v])]);
+    const rules = node('details', 'cc-rules'), summary = node('summary', '', '실행 규칙 '); summary.append(node('span', 'cc-rule-summary cc-muted', '· 작업자·병렬 실행·자동화')); rules.dataset.ccDetails = 'settings-rules'; rules.append(summary, node('p', 'cc-rule-note cc-muted', '이 프로젝트의 다음 배정부터 적용합니다.')); fields.append(rules); fieldParent = rules;
     field(label('main_binding', '메인 세션'), 'main_session_id', [['', label('unbound', '연결하지 않음')], ...sessions.map(s => [s.target?.session_id || '', s.title])]);
-    field(label('provider', '기본 제공자'), 'provider', list(p.available_providers).map(v => [v, v])); field(label('model', '모델'), 'model', list(p.available_models).map(v => [v, v])); field(label('effort', '추론 강도'), 'effort', list(p.available_efforts).map(v => [v, v]));
+    const efforts = [...new Set(agents.filter(a => a.provider === draft.config.provider && a.model === draft.config.model).map(a => a.effort))];
+    field(label('effort', '추론 강도'), 'effort', [['', efforts.includes('') ? '기본 설정 유지' : '추론 강도 선택'], ...efforts.filter(Boolean).map(v => [v, v])]);
     field('허용 범위 (줄마다 상대 폴더)', 'allowed_scope_roots', null, 'paths');
     field(label('parallel_limit', '동시 작업 수'), 'parallel_limit', null, 'number'); field(label('automation', '자동화'), 'automation', list(p.available_automation).map(v => [v, v])); field(label('worktrees', '작업별 worktree 사용'), 'use_worktrees', null, 'checkbox');
-    const providers = node('fieldset', 'cc-providers'); providers.append(node('legend', '', label('worker_providers', '작업자 제공자')));
+    const workerProviders = node('fieldset', 'cc-providers'); workerProviders.append(node('legend', '', label('worker_providers', '작업자 제공자')));
     for (const provider of list(p.available_providers)) {
       const row = node('label'), control = node('input'); control.type = 'checkbox'; control.checked = list(draft.config.worker_providers).includes(provider); control.disabled = !enabled(p.save_settings) || !connected;
-      control.addEventListener('change', () => { const chosen = new Set(draft.config.worker_providers); control.checked ? chosen.add(provider) : chosen.delete(provider); draft.config.worker_providers = [...chosen]; draft.version++; }); row.append(control, node('span', '', provider)); providers.append(row);
+      control.addEventListener('change', () => { const chosen = new Set(draft.config.worker_providers); control.checked ? chosen.add(provider) : chosen.delete(provider); draft.config.worker_providers = [...chosen]; draft.version++; }); row.append(control, node('span', '', provider)); workerProviders.append(row);
     }
-    fields.append(providers);
-    const save = button(label('save', '프로젝트 설정 저장'), () => {
+    rules.append(workerProviders); fields.append(node('p', 'cc-form-notice', '변경한 설정은 진행 중인 작업의 담당·모델·폴더를 바꾸지 않습니다.'));
+    const save = button(label('save', '저장'), () => {
       if (!enabled(p.save_settings)) return;
       if (!Number.isInteger(draft.config.parallel_limit) || draft.config.parallel_limit < 1 || draft.config.parallel_limit > 8 || !draft.config.name.trim() || !draft.config.directory.trim()) { say('이름·폴더와 동시 작업 수 1–8을 확인해 주세요.'); return; }
       emit({type: 'save_project', workspace_id: p.id, config: copy(draft.config)}, 'save:' + p.id, {workspace: p.id, settingsVersion: draft.version});
-    }, 'cc-button cc-primary'); save.disabled = !enabled(p.save_settings) || !connected || isPending('save:' + p.id); save.title = str(p.save_settings?.reason); fields.append(save); content.append(fields);
+    }, 'cc-button cc-primary'); save.disabled = !enabled(p.save_settings) || !connected || isPending('save:' + p.id); save.title = str(p.save_settings?.reason);
+    const cancel = button('취소', () => { settings.delete(p.id); navigate('main'); }, 'cc-button cc-ghost'); cancel.dataset.ccSettingsCancel = '';
+    const actions = node('div', 'cc-actions'); actions.append(save, cancel); fields.append(actions); content.append(fields);
   }
   function renderContent(p) {
     const scroll = content.scrollTop, active = content.contains(document.activeElement) ? document.activeElement : null;
     const focusKey = active?.dataset.ccFocus, selection = textSelection(active);
-    const expanded = [...content.querySelectorAll('details')].map(detail => detail.open);
-    content.replaceChildren();
+    const identity = JSON.stringify([workspaceId, screen, taskId, detailTab]);
+    const expanded = contentIdentity === identity ? [...content.querySelectorAll('details')].map(detail => detail.open) : []; contentIdentity = identity;
+    content.replaceChildren(); content.classList.toggle('cc-settings-screen', screen === 'settings');
     if (screen === 'devices') {
       title('연결된 기기', '열람·입력 권한과 작업 실행 권한은 각각 표시됩니다.');
       if (!list(snapshot.devices).length) content.append(node('p', 'cc-empty', '등록된 기기가 없습니다.'));
       for (const device of list(snapshot.devices).slice(0, 64)) {
-        const row = node('div', 'cc-device-row'), body = node('div'); body.append(node('h2', '', device.name), node('small', 'cc-muted', device.description), node('p', 'cc-muted', str(device.capabilities))); row.append(body, node('span', device.connected ? 'cc-green' : 'cc-amber', device.connection), node('small', 'cc-muted', device.can_execute ? '작업 실행 가능' : label('viewer_only', '작업 실행 없음'))); content.append(row);
+        const row = node('div', 'cc-device-row'), body = node('div'), glyph = node('span', 'cc-device-icon'), capability = node('div', 'cc-device-capability cc-muted'); glyph.append(icon('device')); body.append(node('h2', '', device.name), node('small', 'cc-muted', device.description)); capability.append(node('p', '', str(device.capabilities)), node('small', '', device.can_execute ? '작업 실행 가능' : label('viewer_only', '작업 실행 없음'))); row.append(glyph, body, capability, node('span', 'cc-device-state ' + (device.connected ? 'cc-green' : 'cc-amber'), device.connection)); content.append(row);
       }
     } else if (!p) title('프로젝트를 선택해 주세요', '호스트에서 등록한 프로젝트가 이곳에 표시됩니다.');
     else if (screen === 'task') renderTask(p, selectedTask());
     else if (screen === 'settings') renderSettings(p);
     else if (screen === 'history') { title('프로젝트 기록'); renderHistory(list(p.history)); }
-    else if (screen === 'tasks') { title('작업', '현재 프로젝트에 배정된 독립 작업입니다.'); if (!list(p.tasks).length) content.append(node('p', 'cc-empty', '아직 배정된 작업이 없습니다.')); for (const task of list(p.tasks).slice(0, 64)) content.append(taskRow(task)); }
+    else if (screen === 'tasks') {
+      title('프로젝트 작업', p.name + ' · ' + list(p.tasks).length + '개 독립 작업');
+      if (!list(p.tasks).length) content.append(node('p', 'cc-empty', '메인에게 목표를 보내 작업을 배정하세요.'));
+      else { const table = node('div', 'cc-task-table'), labels = node('div', 'cc-task-labels'); for (const caption of ['나눈 작업', '담당 · 실행 기기', '상태', '']) labels.append(node('span', '', caption)); table.append(labels); for (const task of list(p.tasks).slice(0, 64)) table.append(taskRow(task)); content.append(table); }
+    }
     else renderMain(p);
     content.scrollTop = scroll;
     [...content.querySelectorAll('details')].forEach((detail, index) => { detail.open = expanded[index] || false; });
@@ -543,19 +673,23 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     app.classList.toggle('cc-monitor-collapsed', monitorCollapsed);
     for (const [key, fallback] of [['main', '메인 에이전트'], ['tasks', '작업'], ['terminal', '터미널'], ['devices', '에이전트·기기'], ['history', '이력']]) {
       const active = screen === key || screen === 'task' && key === (detailTab === 'terminal' ? 'terminal' : 'tasks');
-      const tab = button(label('nav_' + key, fallback), () => key === 'terminal' ? openCurrentTerminal() : navigate(key), 'cc-nav-button' + (active ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', active ? 'page' : 'false'); nav.append(tab);
+      const caption = key === 'tasks' ? fallback + ' ' + list(project()?.tasks).length : fallback;
+      const tab = button(label('nav_' + key, caption), () => key === 'terminal' ? openCurrentTerminal() : navigate(key), 'cc-nav-button' + (active ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', active ? 'page' : 'false'); nav.append(tab);
     }
     const p = project(); renderLeft(); renderRight(p); projectbar.replaceChildren();
-    const heading = node('div', 'cc-grow'); heading.append(node('h2', '', p?.name || '프로젝트 없음'), node('small', 'cc-path', p?.directory || ''));
+    const heading = node('div', 'cc-grow'), scope = node('span', 'cc-path'); scope.append(node('span', 'cc-accent', '●'), document.createTextNode(' '), node('code', '', p?.directory || ''), document.createTextNode(' · 프로젝트 범위')); heading.append(node('h2', '', p?.name || '프로젝트 없음'), scope);
     const select = node('select', 'cc-project-select'); select.setAttribute('aria-label', '작업할 프로젝트'); for (const available of list(snapshot.projects).slice(0, 64)) { const option = node('option', '', available.name); option.value = available.id; select.append(option); } select.value = p?.id || ''; select.addEventListener('change', () => chooseProject(select.value));
-    const settings = button('⚙', () => navigate('settings'), 'cc-button cc-ghost'); settings.dataset.ccSettings = ''; settings.setAttribute('aria-label', '프로젝트 설정'); projectbar.append(heading, select, settings);
+    const settings = button('프로젝트 설정 ↗', () => navigate('settings'), 'cc-button cc-ghost'); settings.dataset.ccSettings = ''; settings.setAttribute('aria-label', '프로젝트 설정');
+    const toggle = button('◫', () => { monitorCollapsed = !monitorCollapsed; render(); }, 'cc-button cc-ghost cc-monitor-toggle'); toggle.dataset.ccMonitorToggle = ''; toggle.setAttribute('aria-label', monitorCollapsed ? '작업자 패널 펼치기' : '작업자 패널 접기'); toggle.setAttribute('aria-expanded', String(!monitorCollapsed));
+    const controls = node('div', 'cc-project-controls'); controls.append(node('label', 'cc-muted', '작업할 프로젝트'), select, settings, toggle); projectbar.append(heading, controls);
     context.replaceChildren();
-    const openLeft = button('☰', () => openDrawer('left', openLeft), 'cc-button cc-ghost cc-open-left'); openLeft.dataset.ccOpenLeft = ''; openLeft.setAttribute('aria-label', '프로젝트 목록 열기');
-    const caption = node('div', 'cc-grow', screen === 'task' ? selectedTask()?.title || '작업' : screen === 'main' ? '메인 에이전트' : label(screen, {tasks: '프로젝트 작업', devices: '기기', history: '기록', settings: '설정'}[screen]));
-    if (screen === 'main') caption.append(node('small', 'cc-context-model', [p?.main_provider, p?.main_model, p?.main_effort].filter(Boolean).join(' · ')));
+    const openLeft = button('', () => openDrawer('left', openLeft), 'cc-button cc-ghost cc-open-left'); openLeft.append(icon('menu')); openLeft.dataset.ccOpenLeft = ''; openLeft.setAttribute('aria-label', '프로젝트 목록 열기');
+    const caption = node('div', 'cc-grow'), captionTitle = node('h2', '', screen === 'task' ? [selectedTask()?.provider, selectedTask()?.role].filter(Boolean).join(' · ') || '작업' : screen === 'main' ? '메인 에이전트' : label(screen, {tasks: '프로젝트 작업', devices: '기기', history: '프로젝트 기록', settings: '프로젝트 설정'}[screen])); caption.append(captionTitle);
+    if (screen === 'main') captionTitle.append(node('small', 'cc-context-model', p?.main_target?.session_id ? [p?.main_provider, [p?.main_model, p?.main_effort].filter(Boolean).join(' ')].filter(Boolean).join(' · ') : '메인 에이전트 선택'));
     const openRight = button('작업자 ' + list(p?.tasks).length, () => openDrawer('right', openRight), 'cc-button cc-ghost cc-open-right'); openRight.dataset.ccOpenRight = ''; openRight.setAttribute('aria-label', '작업자 패널 열기');
-    const toggle = button(monitorCollapsed ? '작업자 펼치기' : '작업자 접기', () => { monitorCollapsed = !monitorCollapsed; render(); }, 'cc-button cc-ghost cc-monitor-toggle'); toggle.dataset.ccMonitorToggle = ''; toggle.setAttribute('aria-label', monitorCollapsed ? '작업자 패널 펼치기' : '작업자 패널 접기'); toggle.setAttribute('aria-expanded', String(!monitorCollapsed));
-    context.append(openLeft, caption); if (screen === 'task') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight, toggle);
+    const history = button('전체 기록', () => navigate('history'), 'cc-button cc-ghost cc-all-history'); history.dataset.ccContextHistory = ''; history.hidden = screen === 'history';
+    context.append(openLeft, caption, history); if (screen !== 'main') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight);
+    deviceCount.textContent = '기기 ' + list(snapshot.devices).filter(device => device.connected).length + '대 연결';
     renderContent(p); updateComposer(); status.textContent = connected ? str(snapshot.status) || '관측된 상태' : '연결 끊김 · 초안 보존 · 자동 재전송 없음';
     if (drawer) {
       drawerReturn = drawer === 'left' ? openLeft : openRight;
@@ -569,7 +703,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     syncRemoteWatch();
   }
   function onKey(event) {
-    if (event.key === 'Escape') { closeDrawers(); return; }
+    if (event.key === 'Escape') { if (agentPicker) { event.preventDefault(); event.stopPropagation(); closeAgentPicker(); targetCaption.focus({preventScroll: true}); } else closeDrawers(); return; }
     if (event.key !== 'Tab' || !drawer) return;
     const panel = drawer === 'left' ? left : right; if (!panel.hasAttribute('aria-modal')) return;
     const controls = [...panel.querySelectorAll('button:not(:disabled),select:not(:disabled),input:not(:disabled),[tabindex="0"]')].filter(control => control.getClientRects().length), first = controls[0], last = controls.at(-1);
@@ -577,6 +711,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     else if (!event.shiftKey && (document.activeElement === last || !panel.contains(document.activeElement))) { event.preventDefault(); first?.focus(); }
   }
   element.addEventListener('keydown', onKey);
+  const onPickerOutside = event => { if (agentPicker && !form.querySelector('[data-cc-agent-picker]')?.contains(event.target) && !targetCaption.contains(event.target)) closeAgentPicker(); };
+  element.addEventListener('pointerdown', onPickerOutside);
   document.addEventListener('visibilitychange', syncRemoteWatch);
   const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (drawer) closeDrawers(); }) : null; observer?.observe(element);
   return {
@@ -601,7 +737,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       if (destroyed) return; rememberDraft(); connected = false; for (const [id, item] of pending) { if (item.observation) pending.delete(id); else item.status = 'uncertain'; } say('연결이 끊겼습니다. 초안은 보존되며 요청을 자동으로 다시 보내지 않습니다.'); render();
     },
     destroy() {
-      if (destroyed) return; destroyed = true; syncRemoteWatch(); observer?.disconnect(); element.removeEventListener('keydown', onKey); content.removeEventListener('scroll', rememberRemotePosition, true); document.removeEventListener('visibilitychange', syncRemoteWatch); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); remotePositions.clear(); element.remove(); notifyVisibility(false);
+      if (destroyed) return; destroyed = true; syncRemoteWatch(); observer?.disconnect(); element.removeEventListener('keydown', onKey); element.removeEventListener('pointerdown', onPickerOutside); content.removeEventListener('scroll', rememberRemotePosition, true); document.removeEventListener('visibilitychange', syncRemoteWatch); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); remotePositions.clear(); agentDrafts.clear(); element.remove(); notifyVisibility(false);
     },
   };
 }

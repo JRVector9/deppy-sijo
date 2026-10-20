@@ -6,6 +6,13 @@ use runtime::remote_worker::{
 };
 
 pub(crate) enum SettingsRequest {
+    NativeIdentity {
+        operation_id: String,
+        workspace: String,
+        session: runtime::SessionId,
+        runtime_instance: u64,
+        runtime_token: String,
+    },
     Catalog {
         workspace: String,
         folder: String,
@@ -40,6 +47,14 @@ pub(crate) struct InstallRequest {
     pub hooks: bool,
 }
 pub(crate) enum SettingsResult {
+    NativeIdentity {
+        operation_id: String,
+        workspace: String,
+        session: runtime::SessionId,
+        runtime_instance: u64,
+        runtime_token: String,
+        native: Option<String>,
+    },
     Catalog {
         workspace: String,
         folder: String,
@@ -75,6 +90,20 @@ pub(crate) struct Catalog {
 impl SettingsRequest {
     pub(crate) fn failed(self) -> SettingsResult {
         match self {
+            Self::NativeIdentity {
+                operation_id,
+                workspace,
+                session,
+                runtime_instance,
+                runtime_token,
+            } => SettingsResult::NativeIdentity {
+                operation_id,
+                workspace,
+                session,
+                runtime_instance,
+                runtime_token,
+                native: None,
+            },
             Self::Catalog {
                 workspace,
                 folder,
@@ -121,6 +150,29 @@ impl SettingsRequest {
 
 pub(crate) fn execute(db: &Db, request: SettingsRequest) -> SettingsResult {
     match request {
+        SettingsRequest::NativeIdentity {
+            operation_id,
+            workspace,
+            session,
+            runtime_instance,
+            runtime_token,
+        } => {
+            let native = db
+                .agent_attention_native_for_runtime(
+                    &format!("{workspace}:{}", session.0),
+                    &runtime_token,
+                )
+                .ok()
+                .flatten();
+            SettingsResult::NativeIdentity {
+                operation_id,
+                workspace,
+                session,
+                runtime_instance,
+                runtime_token,
+                native,
+            }
+        }
         SettingsRequest::Catalog {
             workspace,
             folder,
@@ -678,6 +730,25 @@ impl App {
             return;
         };
         match result {
+            SettingsResult::NativeIdentity {
+                operation_id,
+                workspace,
+                session,
+                runtime_instance,
+                runtime_token,
+                native,
+            } => {
+                self.command_center = Some(host);
+                self.command_center_native_identity_result(
+                    operation_id,
+                    workspace,
+                    session,
+                    runtime_instance,
+                    runtime_token,
+                    native,
+                );
+                return;
+            }
             SettingsResult::Catalog {
                 workspace,
                 folder,
@@ -1165,6 +1236,7 @@ impl App {
         runtime_instance: u64,
         events: &[runtime::RuntimeEvent],
     ) {
+        self.observe_command_center_turn_events(runtime_instance, events);
         let Some(mut host) = self.command_center.take() else {
             return;
         };

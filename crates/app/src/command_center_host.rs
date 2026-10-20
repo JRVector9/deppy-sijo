@@ -14,6 +14,8 @@ use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
 pub(super) mod launch;
 #[path = "command_center_switch.rs"]
 pub(super) mod layout;
+#[path = "command_center_observe.rs"]
+mod observe;
 #[path = "command_center_routes.rs"]
 mod routes;
 
@@ -127,11 +129,12 @@ pub(super) struct CommandCenterHost {
     installed: BTreeMap<u64, launch::Installed>,
     execution_bindings: Vec<(Capture, work::RuntimeBinding, work::AgentSelection)>,
     next_grant_epoch: u64,
+    observations: observe::Observations,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
     operations: BTreeMap<String, cc::Intent>,
-    remote_permits: BTreeMap<String, web_remote::cloud::CloudControlPermit>,
+    remote_permits: BTreeMap<String, Arc<web_remote::cloud::CloudControlPermit>>,
     receipts: VecDeque<cc::RemoteReceipt>,
     status: String,
     published: bool,
@@ -163,6 +166,7 @@ impl CommandCenterHost {
             installed: BTreeMap::new(),
             execution_bindings: vec![],
             next_grant_epoch: 0,
+            observations: observe::Observations::new(ctx),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -799,7 +803,8 @@ impl App {
                 && !host.operations.contains_key(&operation_id)
                 && host.remote_permits.len() < 64
             {
-                host.remote_permits.insert(operation_id.clone(), permit);
+                host.remote_permits
+                    .insert(operation_id.clone(), Arc::new(permit));
                 host.enqueue(operation_id, intent);
             }
             self.egui_ctx.request_repaint();
@@ -1347,6 +1352,7 @@ impl App {
                 }
             }
         }
+        self.pump_command_center_observations(&mut host);
         self.pump_command_center_launches(&mut host);
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
@@ -1410,31 +1416,7 @@ impl App {
         }
         self.command_center = Some(host);
         if let Some((target, prompt, id)) = send {
-            // Recheck at the actual runtime enqueue boundary, after any queued mutations.
-            let authorized = self.command_center.as_ref().is_some_and(|host| {
-                host.remote_permits
-                    .get(&id)
-                    .is_none_or(|permit| permit.is_current())
-            });
-            if !authorized {
-                self.command_center_input_outcome(
-                    &id,
-                    ui::composer::PromptAdmissionOutcome::Rejected,
-                );
-            } else {
-                self.broadcast_prompt_to(
-                    &target,
-                    &prompt,
-                    PromptDeliveryOrigin::CommandCenter {
-                        automatic: self
-                            .command_center
-                            .as_ref()
-                            .and_then(|h| h.inputs.get(&id))
-                            .is_some_and(|input| input.dispatch.is_some()),
-                        operation_id: id,
-                    },
-                );
-            }
+            self.stage_command_center_observed_prompt(target, prompt, id);
         }
         let generations: Vec<_> = self
             .command_center
@@ -2102,7 +2084,7 @@ fn work_state(state: work::WorkState) -> cc::TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn host() -> CommandCenterHost {
+    pub(super) fn host() -> CommandCenterHost {
         CommandCenterHost::new(
             std::env::temp_dir().join(format!("cc-inert-{}", uuid::Uuid::new_v4())),
             &egui::Context::default(),
@@ -2287,7 +2269,7 @@ mod tests {
         }
         assert_eq!(bounded("한글문자", 7), "한글");
     }
-    fn attempted() -> (Project, wm::dispatch::DispatchAssignment) {
+    pub(super) fn attempted() -> (Project, wm::dispatch::DispatchAssignment) {
         let mut p = project();
         let mut state = p.state();
         let goal = state

@@ -19347,6 +19347,7 @@ impl App {
             crate::agent_state_worker::AgentStateSection::Attention => {
                 self.cloud_agent
                     .install_native_turns(snapshot.native_turns.clone());
+                self.command_center_native_turns(&snapshot.native_turns);
                 // 턴 경계 판정용 직전 스냅샷 — "대기/완료였다가 작업 중"만 새 턴으로 본다
                 // (note_turn_starts 주석 참조). 아래에서 덮어쓰기 전에 떠 둔다.
                 let was_blocked: std::collections::HashSet<(String, runtime::SessionId)> = self
@@ -19879,8 +19880,12 @@ impl App {
                 self.stage_agent_state_projection(
                     crate::agent_state_worker::AgentStateSection::Attention,
                     AppAgentStateProjectionKind::Attention {
-                        native_turn_keys: self.cloud_agent.native_turn_keys(),
-                        completion_keys: self.cloud_agent.completion_watch_keys(),
+                        native_turn_keys: self
+                            .command_center_native_keys(self.cloud_agent.native_turn_keys(), false),
+                        completion_keys: self.command_center_native_keys(
+                            self.cloud_agent.completion_watch_keys(),
+                            true,
+                        ),
                     },
                 );
                 self.stage_agent_state_projection(
@@ -20181,8 +20186,10 @@ impl App {
             self.stage_agent_state_projection(
                 crate::agent_state_worker::AgentStateSection::Attention,
                 AppAgentStateProjectionKind::Attention {
-                    native_turn_keys: self.cloud_agent.native_turn_keys(),
-                    completion_keys: self.cloud_agent.completion_watch_keys(),
+                    native_turn_keys: self
+                        .command_center_native_keys(self.cloud_agent.native_turn_keys(), false),
+                    completion_keys: self
+                        .command_center_native_keys(self.cloud_agent.completion_watch_keys(), true),
                 },
             );
         }
@@ -28473,8 +28480,10 @@ impl App {
             self.stage_agent_state_projection(
                 crate::agent_state_worker::AgentStateSection::Attention,
                 AppAgentStateProjectionKind::Attention {
-                    native_turn_keys: self.cloud_agent.native_turn_keys(),
-                    completion_keys: self.cloud_agent.completion_watch_keys(),
+                    native_turn_keys: self
+                        .command_center_native_keys(self.cloud_agent.native_turn_keys(), false),
+                    completion_keys: self
+                        .command_center_native_keys(self.cloud_agent.completion_watch_keys(), true),
                 },
             );
             ctx.request_repaint_after(std::time::Duration::from_millis(250));
@@ -35253,6 +35262,7 @@ impl eframe::App for App {
         );
         let command_center_observe_runtime =
             self.command_center_layout.available && self.command_center.is_some();
+        let mut command_center_lost_runtimes = Vec::new();
         let mut command_center_runtime_events = Vec::new();
         let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
@@ -35267,6 +35277,8 @@ impl eframe::App for App {
                                 runtime::RuntimeEvent::RemoteWorkerObserved { .. }
                                     | runtime::RuntimeEvent::RemoteWorkResolved { .. }
                                     | runtime::RuntimeEvent::SessionExited { .. }
+                                    | runtime::RuntimeEvent::SessionInputAccepted { .. }
+                                    | runtime::RuntimeEvent::InputAdmitted { .. }
                             )
                         })
                         .cloned()
@@ -35274,6 +35286,9 @@ impl eframe::App for App {
                 );
             }
             let completion_events_overflowed = rt.events.take_overflowed();
+            if completion_events_overflowed {
+                command_center_lost_runtimes.push(rt.runtime_instance);
+            }
             self.cloud_agent.observe_input_with_integrity(
                 rt.runtime_instance,
                 &events,
@@ -35402,6 +35417,9 @@ impl eframe::App for App {
         for (runtime_instance, event) in prompt_admission_events {
             self.observe_prompt_admissions(runtime_instance, std::slice::from_ref(&event));
         }
+        for runtime in command_center_lost_runtimes {
+            self.command_center_observation_lost(runtime);
+        }
         for (workspace_id, runtime_instance, event) in command_center_runtime_events {
             self.observe_command_center_runtime(
                 &workspace_id,
@@ -35436,6 +35454,9 @@ impl eframe::App for App {
             &new_events,
         );
         let completion_events_overflowed = self.active.events.take_overflowed();
+        if completion_events_overflowed {
+            self.command_center_observation_lost(self.active.runtime_instance);
+        }
         self.cloud_agent.observe_input_with_integrity(
             self.active.runtime_instance,
             &new_events,

@@ -100,6 +100,7 @@ impl Devices {
             enabled: true,
             reason: String::new(),
             connecting: self.has_pending(),
+            assignments: vec![],
             candidates: self
                 .candidates
                 .iter()

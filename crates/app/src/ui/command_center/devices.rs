@@ -6,10 +6,22 @@ use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionSetup {
+    pub assignments: Vec<AssignmentChoice>,
     pub enabled: bool,
     pub reason: String,
     pub connecting: bool,
     pub candidates: Vec<ExecutionCandidate>,
+}
+#[derive(Clone, Debug, Default)]
+pub struct AssignmentChoice {
+    pub workspace_id: String,
+    pub device_id: Option<String>,
+    pub profile_id: String,
+    pub label: String,
+    pub provider: String,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub capability: Capability,
 }
 #[derive(Clone, Debug, Default)]
 pub struct ExecutionCandidate {

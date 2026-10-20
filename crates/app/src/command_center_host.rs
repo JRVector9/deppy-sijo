@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 use storage::work_management as stored;
 use unicode_normalization::UnicodeNormalization as _;
 use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
+#[path = "command_center_assignment.rs"]
+mod assignment;
 #[path = "command_center_devices.rs"]
 mod devices;
 #[path = "command_center_launch.rs"]
@@ -49,7 +51,7 @@ struct Project {
     allowed_agents: Vec<work::AgentSelection>,
     request: Option<wm::plan::PlannerRequest>,
     proposal: Option<wm::plan::ValidatedPlan>,
-    confirmed: Option<wm::dispatch::ConfirmedPlan>,
+    confirmed: Option<assignment::Confirmed>,
     ledger: wm::dispatch::DeliveryLedger,
     catalog: Option<launch::Catalog>,
     catalog_requested: bool,
@@ -589,6 +591,7 @@ impl App {
             } else {
                 yes()
             };
+            let assignment_choices = assignment::choices(p, &host.devices.policies);
             let mut tasks = vec![];
             for task in &p.snapshot.tasks {
                 let attempt = task
@@ -615,7 +618,8 @@ impl App {
                     .live
                     .iter()
                     .filter(|l| {
-                        l.capture.workspace == ws.id
+                        task.execution_device.is_none()
+                            && l.capture.workspace == ws.id
                             && l.capture.prompt.is_some()
                             && l.agent.as_ref() == Some(&task.assigned_agent)
                             && l.state == cc::TaskState::Queued
@@ -638,7 +642,10 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
-                    create_worker: if ready
+                    selected_assignment: assignment::selected(task, &assignment_choices),
+                    create_worker: if task.execution_device.is_some() {
+                        no("원격 입력 승인 경로를 연결하는 중입니다.")
+                    } else if ready
                         && p.confirmed.is_some()
                         && p.state().can_dispatch(&task.id)
                         && (!config.use_worktrees || p.worktree_root.is_some())
@@ -683,7 +690,10 @@ impl App {
                     scope: bounded(&task.scope, 1024),
                     acceptance_criteria: bounded(&task.acceptance_criteria, 1024),
                     provider: task.assigned_agent.provider.clone(),
-                    device: "로컬".into(),
+                    device: task
+                        .execution_device
+                        .clone()
+                        .unwrap_or_else(|| "이 컴퓨터".into()),
                     directory: attempt
                         .map(|a| a.folder.clone())
                         .unwrap_or_else(|| config.folder.clone()),
@@ -734,6 +744,17 @@ impl App {
                     }
                 }
             }
+            for device in
+                host.devices.policies.iter().filter(|d| {
+                    d.registration().workspace_id.0 == ws.id && d.validate_fresh().is_ok()
+                })
+            {
+                for profile in device.profiles() {
+                    if !agents.contains(&profile.agent) {
+                        agents.push(profile.agent.clone());
+                    }
+                }
+            }
             let providers = agents.iter().map(|a| a.provider.clone()).collect();
             let models = agents.iter().filter_map(|a| a.model.clone()).collect();
             let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
@@ -775,6 +796,9 @@ impl App {
             revoke: no("로컬 실행 환경은 기기 권한 회수 대상이 아닙니다."),
         });
         host.devices.project(&mut snapshot, &self.active.id);
+        if let Some(p) = host.projects.get(&self.active.id) {
+            snapshot.execution_setup.assignments = assignment::choices(p, &host.devices.policies);
+        }
         snapshot
     }
     pub(super) fn command_center_input_permit(
@@ -856,8 +880,9 @@ impl App {
             );
         }
         match intent {
+            cc::Intent::SetTaskAssignment {target,config_revision,device_id,profile_id}=>return self.amend_command_center_assignment(host,id,target,config_revision,device_id,profile_id),
             cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
-            cc::Intent::CreateWorker {target} => return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref()),
+            cc::Intent::CreateWorker {target} => {if host.projects.get(&target.workspace_id).and_then(|p|p.snapshot.tasks.iter().find(|t|Some(&t.id.0)==target.task_id.as_ref())).is_some_and(|t|t.execution_device.is_some()) {return Err("원격 입력 승인 경로를 연결하는 중입니다.".into());} return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref());},
             cc::Intent::ConnectExecutionDevice {workspace_id,request_id}=>return self.connect_command_center_device(host,id,&workspace_id,request_id),
             cc::Intent::GrantExecutionDevice {workspace_id,candidate_id,profile_ids,max_workers}=>return self.grant_command_center_device(host,id,&workspace_id,&candidate_id,profile_ids,max_workers),
             cc::Intent::RevokeExecutionDevice {workspace_id,device_id}=>return self.revoke_command_center_device(host,id,&workspace_id,&device_id),
@@ -938,7 +963,10 @@ impl App {
                     for agent in &catalog.defaults {if config.worker_providers.contains(&agent.provider) && !allowed_agents.contains(agent) {allowed_agents.push(agent.clone());}}
                     if !catalog.choices.contains(&selection) && live.is_none() {return Err("설치된 공급자의 실제 모델·강도 설정을 선택해 주세요.".into());}
                 }
+                for device in host.devices.policies.iter().filter(|d|d.registration().workspace_id.0==workspace_id && d.validate_fresh().is_ok()) {for profile in device.profiles() {if config.worker_providers.contains(&profile.agent.provider) && !allowed_agents.contains(&profile.agent) {allowed_agents.push(profile.agent.clone());}}}
+                allowed_agents.sort_by_key(|a|(a.provider.clone(),a.model.clone(),a.effort.clone()));
                 allowed_agents.dedup();
+                if allowed_agents.len()>32 {return Err("허용 실행 프로필은 32개까지 저장할 수 있습니다.".into());}
                 if config.worker_providers.iter().any(|provider| !allowed_agents.iter().any(|a| &a.provider == provider)) { return Err("선택한 워커 공급자의 실제 모델·강도 설정을 확인할 수 없습니다.".into()); }
                 let worker = allowed_agents.first().cloned().ok_or("현재 실행 중인 워커 공급자를 선택해 주세요.")?;
                 let p = host.projects.get_mut(&workspace_id).unwrap();
@@ -1006,7 +1034,8 @@ impl App {
                 let proposal = p.proposal.as_ref().ok_or("검증된 배정안이 없습니다.")?;
                 if proposal.plan().goal_id.0 != goal_id { return Err("배정안이 바뀌었습니다. 현재 배정안을 확인해 주세요.".into()); }
                 let mut state = p.state();
-                let confirmed = wm::orchestrator::confirm_proposal(&mut state,proposal,&p.snapshot.config,&p.policy()).map_err(|e| e.to_string())?;
+                let goal=proposal.plan().goal_id.clone();
+                let confirmed=if state.tasks.iter().any(|t|t.goal_id==goal && t.execution_device.is_some()) {assignment::Confirmed::Mixed(wm::remote_dispatch::RemoteConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy(),&host.devices.policies).map_err(|e|e.to_string())?)} else {assignment::Confirmed::Local(wm::dispatch::ConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy()).map_err(|e|e.to_string())?)};
                 p.confirmed = Some(confirmed); p.proposal = None; p.set_state(state);
                 host.save(&workspace_id,None,Some(id.into()))?;
                 return Ok(());
@@ -1021,7 +1050,7 @@ impl App {
                 let confirmed = p.confirmed.as_ref().ok_or("먼저 현재 배정안을 확인해 주세요.")?;
                 if confirmed.goal_id() != &task.goal_id { return Err("확인한 배정안과 다른 목표의 작업입니다.".into()); }
                 let request = wm::dispatch::DispatchRequest { task_id: task.id.clone(), operation_id: work::OperationId::from_string(id.into()).map_err(|e| e.to_string())?, folder: wm::dispatch::DispatchFolder { path: p.snapshot.config.folder.clone(), worktree_owner: None }, persistent_binding: persistent(&live), runtime_binding: binding(&live,target.session_id.as_deref().unwrap()).ok_or("실행 세대가 확인되지 않습니다.")? };
-                let prepared = wm::dispatch::prepare_dispatch(&p.state(),&p.ledger,confirmed,request,&p.snapshot.config,&p.policy()).map_err(|e| e.to_string())?;
+                let prepared=p.prepare_local(request,work::AttemptId::new())?;
                 let prepared = match prepared { wm::dispatch::PrepareOutcome::Ready(prepared) => prepared, wm::dispatch::PrepareOutcome::Existing { attempt_id,delivery } => return Err(format!("이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",attempt_id.0)) };
                 let assignment = prepared.assignment;
                 p.set_state(prepared.next_state);
@@ -1853,7 +1882,8 @@ fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
         | cc::Intent::InstallPlanJson { workspace_id, .. }
         | cc::Intent::ConfirmPlan { workspace_id, .. }
         | cc::Intent::RetryStorage { workspace_id } => Some(workspace_id),
-        cc::Intent::CreateWorker { target }
+        cc::Intent::SetTaskAssignment { target, .. }
+        | cc::Intent::CreateWorker { target }
         | cc::Intent::Submit { target, .. }
         | cc::Intent::DraftChanged { target, .. }
         | cc::Intent::DispatchTask { target }

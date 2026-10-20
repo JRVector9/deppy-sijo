@@ -488,3 +488,51 @@ fn manual_result_and_verification_controls_capture_exact_displayed_attempt_and_r
         evidence: "cargo test: 12 passed".into()
     }));
 }
+
+#[test]
+fn plan_review_assignment_picker_emits_exact_native_profile_and_revision() {
+    let mut snapshot = rich_fixture();
+    snapshot.projects[0].config.revision = "12".into();
+    let task = &mut snapshot.projects[0].tasks[0];
+    task.state = TaskState::PlanReview;
+    task.selected_assignment = None;
+    let target = task.target.clone();
+    snapshot.execution_setup.assignments.push(AssignmentChoice {
+        workspace_id: target.workspace_id.clone(),
+        device_id: Some("tls-device-b".into()),
+        profile_id: "immutable-profile-7".into(),
+        label: "실제 기기 B · Claude · 실제 모델".into(),
+        capability: Capability {
+            enabled: true,
+            reason: String::new(),
+        },
+        ..Default::default()
+    });
+    let mut initial = HarnessState::default();
+    initial.ui.open_task(target.clone());
+    initial.ui.detail_tab = DetailTab::Work;
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1000.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| state.intents.extend(show(ui, &mut state.ui, &snapshot)),
+            initial,
+        );
+    harness.run();
+    harness.get_by_value("실행 기기 · 프로필 선택").click();
+    harness.run();
+    harness
+        .get_by_label("실제 기기 B · Claude · 실제 모델")
+        .click();
+    harness.run();
+    let intent = Intent::SetTaskAssignment {
+        target,
+        config_revision: "12".into(),
+        device_id: Some("tls-device-b".into()),
+        profile_id: "immutable-profile-7".into(),
+    };
+    assert!(harness.state().intents.contains(&intent));
+    assert!(
+        serde_json::to_value(intent).is_err(),
+        "native trust assignment cannot arrive as unauthenticated JSON"
+    );
+}

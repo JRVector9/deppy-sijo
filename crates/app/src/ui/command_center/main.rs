@@ -399,6 +399,56 @@ fn task_detail(
     match state.detail_tab {
         DetailTab::Work => {
             title(ui, snapshot, &t.activity);
+            if t.state == TaskState::PlanReview {
+                let choices: Vec<_> = snapshot
+                    .execution_setup
+                    .assignments
+                    .iter()
+                    .filter(|c| c.workspace_id == p.id)
+                    .collect();
+                if !choices.is_empty() {
+                    let key = |c: &AssignmentChoice| {
+                        serde_json::to_string(&(c.device_id.as_deref(), c.profile_id.as_str()))
+                            .unwrap_or_default()
+                    };
+                    egui::ComboBox::from_id_salt(("task-assignment", &p.id, &t.target.task_id))
+                        .selected_text(
+                            choices
+                                .iter()
+                                .find(|c| Some(key(c)) == t.selected_assignment)
+                                .map(|c| c.label.as_str())
+                                .unwrap_or("실행 기기 · 프로필 선택"),
+                        )
+                        .width(ui.available_width().min(420.0))
+                        .show_ui(ui, |ui| {
+                            for c in choices {
+                                if ui
+                                    .add_enabled(
+                                        c.capability.enabled,
+                                        egui::Button::selectable(
+                                            Some(key(c)) == t.selected_assignment,
+                                            &c.label,
+                                        ),
+                                    )
+                                    .on_hover_text(&c.capability.reason)
+                                    .clicked()
+                                {
+                                    intents.push(Intent::SetTaskAssignment {
+                                        target: t.target.clone(),
+                                        config_revision: p.config.revision.clone(),
+                                        device_id: c.device_id.clone(),
+                                        profile_id: c.profile_id.clone(),
+                                    });
+                                }
+                            }
+                        });
+                    weak(
+                        ui,
+                        snapshot,
+                        "기기·프로필 변경을 저장한 뒤 전체 배정안을 확인하면 실행할 수 있습니다.",
+                    );
+                }
+            }
             if t.dispatch.enabled {
                 let selected = state
                     .task_workers

@@ -656,18 +656,7 @@ impl App {
             })
             .transpose()?;
         let selection = if let Some(task) = &task {
-            let confirmed = p
-                .confirmed
-                .as_ref()
-                .ok_or("현재 배정안을 먼저 확인해 주세요.")?;
-            let ready = wm::queue::ready_tasks(
-                &p.state(),
-                confirmed,
-                &p.snapshot.config,
-                &policy,
-                &p.ledger,
-            )
-            .map_err(|e| e.to_string())?;
+            let ready = p.ready_tasks()?;
             if !ready.contains(&task.id) {
                 return Err("의존 작업·실행 용량·수정 범위를 먼저 확인해 주세요.".into());
             }
@@ -1123,6 +1112,8 @@ impl App {
                                 binding.clone(),
                                 pending.record.selection.clone(),
                             ));
+                            host.observations
+                                .register_first_input(live.capture.clone(), binding.clone());
                             live.runtime_binding = Some(binding.clone());
                             live.agent = Some(pending.record.selection.clone());
                             let live = live.clone();
@@ -1132,32 +1123,24 @@ impl App {
                             let result = (|| -> Result<(), String> {
                                 let p = host.projects.get_mut(&workspace).unwrap();
                                 if let Some(task_id) = &pending.record.task_id {
-                                    let confirmed = p
-                                        .confirmed
-                                        .as_ref()
-                                        .ok_or("배정안 확인이 바뀌었습니다.")?;
-                                    let dispatch = wm::dispatch::prepare_dispatch_with_attempt_id(
-                                        &p.state(),
-                                        &p.ledger,
-                                        confirmed,
-                                        wm::dispatch::DispatchRequest {
-                                            task_id: task_id.clone(),
-                                            operation_id: pending.record.operation_id.clone(),
-                                            folder: wm::dispatch::DispatchFolder {
-                                                path: pending.record.folder.clone(),
-                                                worktree_owner: pending
-                                                    .owned
-                                                    .as_ref()
-                                                    .map(|owned| owned.owner.clone()),
+                                    let dispatch = p
+                                        .prepare_local(
+                                            wm::dispatch::DispatchRequest {
+                                                task_id: task_id.clone(),
+                                                operation_id: pending.record.operation_id.clone(),
+                                                folder: wm::dispatch::DispatchFolder {
+                                                    path: pending.record.folder.clone(),
+                                                    worktree_owner: pending
+                                                        .owned
+                                                        .as_ref()
+                                                        .map(|owned| owned.owner.clone()),
+                                                },
+                                                persistent_binding: persistent(&live),
+                                                runtime_binding: binding,
                                             },
-                                            persistent_binding: persistent(&live),
-                                            runtime_binding: binding,
-                                        },
-                                        pending.record.attempt_id.clone(),
-                                        &p.snapshot.config,
-                                        &p.policy(),
-                                    )
-                                    .map_err(|e| e.to_string())?;
+                                            pending.record.attempt_id.clone(),
+                                        )
+                                        .map_err(|e| e.to_string())?;
                                     let wm::dispatch::PrepareOutcome::Ready(prepared) = dispatch
                                     else {
                                         return Err("이미 처리된 실행 요청입니다. 다시 입력하지 않았습니다.".into());

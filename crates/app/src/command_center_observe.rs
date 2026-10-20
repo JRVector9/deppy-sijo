@@ -26,6 +26,7 @@ pub(super) struct Observations {
     watches: BTreeMap<String, Watch>,
     delayed: BTreeMap<String, Delayed>,
     reads_inflight: std::collections::BTreeSet<String>,
+    first_inputs: Vec<(Capture, work::RuntimeBinding)>,
 }
 impl Observations {
     pub fn new(ctx: &egui::Context) -> Self {
@@ -38,10 +39,25 @@ impl Observations {
             watches: BTreeMap::new(),
             delayed: BTreeMap::new(),
             reads_inflight: std::collections::BTreeSet::new(),
+            first_inputs: vec![],
         }
     }
     pub(super) fn has_pending(&self) -> bool {
         !self.watches.is_empty() || !self.delayed.is_empty() || !self.reads_inflight.is_empty()
+    }
+    pub(super) fn register_first_input(&mut self, capture: Capture, binding: work::RuntimeBinding) {
+        if self.first_inputs.len() < 256 {
+            self.first_inputs.push((capture, binding));
+        }
+    }
+    fn take_first_input(&mut self, live: &LiveRoute) -> bool {
+        let Some(index) = self.first_inputs.iter().position(|(capture, binding)| {
+            capture == &live.capture && live.runtime_binding.as_ref() == Some(binding)
+        }) else {
+            return false;
+        };
+        self.first_inputs.remove(index);
+        true
     }
     fn begin(
         &mut self,
@@ -97,6 +113,7 @@ impl Observations {
             .get(&(source.runtime_instance, source.session))
             .copied();
         let digest = storage::native_prompt_digest(prompt);
+        let first_input = self.take_first_input(live);
         if let (Some(baseline), Some(sequence)) = (self.native.get(&key), sequence) {
             self.tracker.begin(
                 identity.clone(),
@@ -106,7 +123,7 @@ impl Observations {
                 digest,
                 micros(),
             )?;
-        } else if live.runtime_binding.is_some() {
+        } else if first_input && sequence.is_none_or(|sequence| sequence == 0) {
             // Only an exact idle-launch result grants the initial sequence-zero watermark.
             self.tracker.begin_fresh(
                 identity.clone(),
@@ -357,6 +374,12 @@ impl App {
                     operation_id,
                     at_micros,
                 } => {
+                    host.observations.first_inputs.retain(|(capture, _)| {
+                        !capture
+                            .prompt
+                            .as_ref()
+                            .is_some_and(|p| p.runtime_instance == runtime && p.session == *session)
+                    });
                     if host.observations.sequences.len() < 256
                         || host
                             .observations
@@ -755,6 +778,25 @@ mod tests {
         };
         host.projects.insert("workspace-a".into(), p);
         (host, watch, assignment)
+    }
+    #[test]
+    fn owned_launch_fresh_observation_is_one_shot_and_exact_capture_bound() {
+        let (mut host, _, _) = fixture();
+        let live = host.live[0].clone();
+        host.observations
+            .register_first_input(live.capture.clone(), live.runtime_binding.clone().unwrap());
+        let mut replacement = live.clone();
+        replacement
+            .runtime_binding
+            .as_mut()
+            .unwrap()
+            .execution_generation += 1;
+        assert!(!host.observations.take_first_input(&replacement));
+        assert!(host.observations.take_first_input(&live));
+        assert!(
+            !host.observations.take_first_input(&live),
+            "owned CLI lifetime does not grant later missing-baseline fresh turns"
+        );
     }
     #[test]
     fn final_response_current_binding_is_derived_from_host_not_the_job_copy() {

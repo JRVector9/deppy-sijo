@@ -12,7 +12,10 @@ mod workers;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub use devices::{ExecutionCandidate, ExecutionProfile, ExecutionSetup, NativeDeviceSetupRequest};
+pub use devices::{
+    AssignmentChoice, ExecutionCandidate, ExecutionProfile, ExecutionSetup,
+    NativeDeviceSetupRequest,
+};
 pub use layout::LayoutRects;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -122,6 +125,8 @@ pub struct Approval {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(skip)]
+    pub selected_assignment: Option<String>,
     #[serde(default)]
     pub create_worker: Capability,
     #[serde(default)]
@@ -274,6 +279,13 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    #[serde(skip)]
+    SetTaskAssignment {
+        target: RouteTarget,
+        config_revision: String,
+        device_id: Option<String>,
+        profile_id: String,
+    },
     #[serde(skip)]
     ConnectExecutionDevice {
         workspace_id: String,

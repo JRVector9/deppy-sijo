@@ -178,18 +178,23 @@ pub(super) fn projects(
                         let selected = active
                             && state.view == View::Task
                             && state.selected_task_id == t.target.task_id;
-                        if session_row(
-                            ui,
-                            snapshot,
-                            ui.id()
-                                .with(("task", &p.id, &t.target.task_id, &t.target.session_id)),
-                            &t.title,
-                            &t.provider,
-                            &t.device,
-                            t.state,
-                            selected,
-                        )
-                        .clicked()
+                        if ui
+                            .push_id(
+                                ("task", &p.id, &t.target.task_id, &t.target.session_id),
+                                |ui| {
+                                    session_row(
+                                        ui,
+                                        snapshot,
+                                        &t.title,
+                                        &t.provider,
+                                        &t.device,
+                                        t.state,
+                                        selected,
+                                    )
+                                },
+                            )
+                            .inner
+                            .clicked()
                         {
                             if !active {
                                 intents.push(Intent::SelectProject {
@@ -200,17 +205,20 @@ pub(super) fn projects(
                         }
                     }
                     for session in independent_sessions(p) {
-                        if session_row(
-                            ui,
-                            snapshot,
-                            ui.id().with(("session", &p.id, &session.target.session_id)),
-                            &session.title,
-                            &session.provider,
-                            &session.device,
-                            session.state,
-                            false,
-                        )
-                        .clicked()
+                        if ui
+                            .push_id(("session", &p.id, &session.target.session_id), |ui| {
+                                session_row(
+                                    ui,
+                                    snapshot,
+                                    &session.title,
+                                    &session.provider,
+                                    &session.device,
+                                    session.state,
+                                    false,
+                                )
+                            })
+                            .inner
+                            .clicked()
                         {
                             if !active {
                                 intents.push(Intent::SelectProject {
@@ -272,7 +280,6 @@ pub(super) fn projects(
 fn session_row(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
-    id: egui::Id,
     title: &str,
     provider: &str,
     device: &str,
@@ -282,7 +289,7 @@ fn session_row(
     let c = colors(snapshot);
     let scale = snapshot.font_scale;
     let (_, r) = ui.allocate_space(egui::vec2(ui.available_width(), 58.0 * scale.max(1.0)));
-    let response = ui.interact(r, id, egui::Sense::click());
+    let response = ui.interact(r, ui.id().with("session-row"), egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), title)
     });

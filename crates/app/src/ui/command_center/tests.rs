@@ -1132,7 +1132,7 @@ fn command_center_render_evidence() {
                     let title = harness
                         .query_by_label("구현 · 결제 화면 구현")
                         .map(|n| rect(n.rect()));
-                    let inputs: Vec<_> = harness.get_all_by_role(egui::accesskit::Role::TextInput).map(|node| serde_json::json!({"rect":rect(node.rect()),"value":node.value()})).collect();
+                    let inputs: Vec<_> = harness.query_all_by_role(egui::accesskit::Role::TextInput).map(|node| serde_json::json!({"rect":rect(node.rect()),"value":node.value()})).collect();
                     metrics.push(serde_json::json!({"name": name, "width": width, "height": height, "scale": scale, "dark": dark, "screen": rect(l.screen), "header": rect(l.header), "content":rect(l.content), "composer":rect(l.composer), "drawer": rect(l.right_drawer()), "assignment_title": title,"text_inputs":inputs}));
                     harness
                         .render()

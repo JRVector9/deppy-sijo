@@ -196,6 +196,13 @@ pub struct Task {
     pub goal_id: GoalId,
     pub parent_task_id: Option<TaskId>,
     #[serde(deserialize_with = "deserialize_title")]
+    pub role: String,
+    #[serde(deserialize_with = "deserialize_event_payload")]
+    pub scope: String,
+    pub assigned_agent: AgentSelection,
+    #[serde(deserialize_with = "deserialize_optional_title")]
+    pub execution_device: Option<String>,
+    #[serde(deserialize_with = "deserialize_title")]
     pub title: String,
     #[serde(deserialize_with = "deserialize_input")]
     pub instructions: String,
@@ -407,6 +414,12 @@ impl Task {
         validate_id(&self.workspace_id.0)?;
         validate_id(&self.id.0)?;
         validate_id(&self.goal_id.0)?;
+        bounded("role", &self.role, WORK_TITLE_MAX_BYTES, false)?;
+        bounded("scope", &self.scope, WORK_EVENT_MAX_BYTES, true)?;
+        self.assigned_agent.validate()?;
+        if let Some(device) = &self.execution_device {
+            validate_id(device)?;
+        }
         if let Some(id) = &self.parent_task_id {
             validate_id(&id.0)?;
         }

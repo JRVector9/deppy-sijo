@@ -664,8 +664,14 @@ impl App {
             );
         }
         for suffix in ["main", "tasks", "terminal", "devices", "history"] {
-            if let Some(label) = snapshot.labels.get(&format!("command_center.{suffix}")).cloned() {
-                snapshot.labels.insert(format!("command_center.nav_{suffix}"),label);
+            if let Some(label) = snapshot
+                .labels
+                .get(&format!("command_center.{suffix}"))
+                .cloned()
+            {
+                snapshot
+                    .labels
+                    .insert(format!("command_center.nav_{suffix}"), label);
             }
         }
         let mut remote_terminal_budget = 128 * 1024;
@@ -1027,235 +1033,802 @@ impl App {
             );
         }
         match intent {
-            cc::Intent::AllowThisComputer { workspace_id, config_revision, exported_workspace_id } => return self.allow_command_center_server(host, id, &workspace_id, &config_revision, &exported_workspace_id),
+            cc::Intent::AllowThisComputer {
+                workspace_id,
+                config_revision,
+                exported_workspace_id,
+            } => {
+                return self.allow_command_center_server(
+                    host,
+                    id,
+                    &workspace_id,
+                    &config_revision,
+                    &exported_workspace_id,
+                );
+            }
             cc::Intent::RevokeThisComputer => return self.revoke_command_center_server(host, id),
-            cc::Intent::CopyThisComputerConnection => return self.copy_command_center_server_connection(host, id),
-            cc::Intent::OpenThisComputerSettings => { self.settings_category=ui::settings::Category::RemoteTls; self.request_settings_open(); },
-            cc::Intent::SetTaskAssignment {target,config_revision,device_id,profile_id}=>return self.amend_command_center_assignment(host,id,target,config_revision,device_id,profile_id),
-            cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
-            cc::Intent::CreateWorker {target} => {if host.projects.get(&target.workspace_id).and_then(|p|p.snapshot.tasks.iter().find(|t|Some(&t.id.0)==target.task_id.as_ref())).is_some_and(|t|t.execution_device.is_some()) {return self.begin_command_center_remote(host,id,&target);} return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref());},
-            cc::Intent::ConnectExecutionDevice {workspace_id,request_id}=>return self.connect_command_center_device(host,id,&workspace_id,request_id),
-            cc::Intent::GrantExecutionDevice {workspace_id,candidate_id,profile_ids,max_workers}=>return self.grant_command_center_device(host,id,&workspace_id,&candidate_id,profile_ids,max_workers),
-            cc::Intent::RevokeExecutionDevice {workspace_id,device_id}=>return self.revoke_command_center_device(host,id,&workspace_id,&device_id),
+            cc::Intent::CopyThisComputerConnection => {
+                return self.copy_command_center_server_connection(host, id);
+            }
+            cc::Intent::OpenThisComputerSettings => {
+                self.settings_category = ui::settings::Category::RemoteTls;
+                self.request_settings_open();
+            }
+            cc::Intent::SetTaskAssignment {
+                target,
+                config_revision,
+                device_id,
+                profile_id,
+            } => {
+                return self.amend_command_center_assignment(
+                    host,
+                    id,
+                    target,
+                    config_revision,
+                    device_id,
+                    profile_id,
+                );
+            }
+            cc::Intent::CreateMain { workspace_id } => {
+                return self.begin_command_center_launch(host, id, &workspace_id, None);
+            }
+            cc::Intent::CreateWorker { target } => {
+                if host
+                    .projects
+                    .get(&target.workspace_id)
+                    .and_then(|p| {
+                        p.snapshot
+                            .tasks
+                            .iter()
+                            .find(|t| Some(&t.id.0) == target.task_id.as_ref())
+                    })
+                    .is_some_and(|t| t.execution_device.is_some())
+                {
+                    return self.begin_command_center_remote(host, id, &target);
+                }
+                return self.begin_command_center_launch(
+                    host,
+                    id,
+                    &target.workspace_id,
+                    target.task_id.as_deref(),
+                );
+            }
+            cc::Intent::ConnectExecutionDevice {
+                workspace_id,
+                request_id,
+            } => return self.connect_command_center_device(host, id, &workspace_id, request_id),
+            cc::Intent::GrantExecutionDevice {
+                workspace_id,
+                candidate_id,
+                profile_ids,
+                max_workers,
+            } => {
+                return self.grant_command_center_device(
+                    host,
+                    id,
+                    &workspace_id,
+                    &candidate_id,
+                    profile_ids,
+                    max_workers,
+                );
+            }
+            cc::Intent::RevokeExecutionDevice {
+                workspace_id,
+                device_id,
+            } => return self.revoke_command_center_device(host, id, &workspace_id, &device_id),
             cc::Intent::LoadProject { workspace_id } => {
-                let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                let p = host
+                    .projects
+                    .get(&workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded {
-                    host.request_project_load(id,&workspace_id)?;
+                    host.request_project_load(id, &workspace_id)?;
                     return Ok(());
                 }
             }
             cc::Intent::RetryStorage { workspace_id } => {
-                if remote::project_pending(host,&workspace_id) {return Err("원격 실행·입력의 실제 응답을 확인한 뒤 복구해 주세요.".into());}
-                if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
-                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                p.effect_fence.revoke();p.effect_fence=remote::EffectFence::new();p.storage_blocked = false; p.loaded = false; p.catalog_requested=false;
-                host.request_project_load(id,&workspace_id)?;
+                if remote::project_pending(host, &workspace_id) {
+                    return Err("원격 실행·입력의 실제 응답을 확인한 뒤 복구해 주세요.".into());
+                }
+                if host.flight.is_some() {
+                    return Err("저장 작업이 진행 중입니다.".into());
+                }
+                let p = host
+                    .projects
+                    .get_mut(&workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                p.effect_fence.revoke();
+                p.effect_fence = remote::EffectFence::new();
+                p.storage_blocked = false;
+                p.loaded = false;
+                p.catalog_requested = false;
+                host.request_project_load(id, &workspace_id)?;
                 host.publication_dirty = true;
                 return Ok(());
             }
             cc::Intent::UseOriginalLayout => self.command_center_layout.use_original(),
-            cc::Intent::ObserveRemoteSession {target}=>return remote::sessions::request_view(host,id,&target),
+            cc::Intent::ObserveRemoteSession { target } => {
+                return remote::sessions::request_view(host, id, &target);
+            }
             cc::Intent::SetTheme { dark_mode } => {
-                self.config.ui.theme = if dark_mode { crate::config::Theme::Dark } else { crate::config::Theme::Light };
+                self.config.ui.theme = if dark_mode {
+                    crate::config::Theme::Dark
+                } else {
+                    crate::config::Theme::Light
+                };
                 self.pending_settings_config_apply = true;
             }
-            cc::Intent::AddProject => { self.command_center_layout.use_original(); self.open_workspace_add_dialog(WorkspaceAddPurpose::SwitchRuntime); }
-            cc::Intent::ManageDevices { .. } => {host.ui.view=cc::View::Devices;}
-            cc::Intent::SelectProject { workspace_id } => {
-                if !host.projects.contains_key(&workspace_id) { return Err("프로젝트가 더 이상 존재하지 않습니다.".into()); }
-                self.stage_workspace_controller_action(WorkspaceControllerAction::SwitchWorkspace(workspace_id));
+            cc::Intent::AddProject => {
+                self.command_center_layout.use_original();
+                self.open_workspace_add_dialog(WorkspaceAddPurpose::SwitchRuntime);
             }
-            navigation @ (cc::Intent::OpenSession(_) | cc::Intent::OpenGit(_) | cc::Intent::OpenHistory(_)) => {
-                let (target, tab_kind) = match navigation { cc::Intent::OpenGit(t) => (t, cc::DetailTab::Git), cc::Intent::OpenHistory(t) => (t, cc::DetailTab::History), cc::Intent::OpenSession(t) => (t, cc::DetailTab::Terminal), _ => unreachable!() };
-                if remote::sessions::is_target(host,&target){
-                    if tab_kind!=cc::DetailTab::Terminal {return Err("원격 Git·이력 조회는 아직 제공되지 않습니다. 실제 터미널 화면을 사용해 주세요.".into());}
-                    if target.task_id.is_some(){host.ui.open_task(target);host.ui.detail_tab=cc::DetailTab::Terminal;}else{host.ui.open_terminal(target);}
+            cc::Intent::ManageDevices { .. } => {
+                host.ui.view = cc::View::Devices;
+            }
+            cc::Intent::SelectProject { workspace_id } => {
+                if !host.projects.contains_key(&workspace_id) {
+                    return Err("프로젝트가 더 이상 존재하지 않습니다.".into());
+                }
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SwitchWorkspace(
+                    workspace_id,
+                ));
+            }
+            navigation @ (cc::Intent::OpenSession(_)
+            | cc::Intent::OpenGit(_)
+            | cc::Intent::OpenHistory(_)) => {
+                let (target, tab_kind) = match navigation {
+                    cc::Intent::OpenGit(t) => (t, cc::DetailTab::Git),
+                    cc::Intent::OpenHistory(t) => (t, cc::DetailTab::History),
+                    cc::Intent::OpenSession(t) => (t, cc::DetailTab::Terminal),
+                    _ => unreachable!(),
+                };
+                if remote::sessions::is_target(host, &target) {
+                    if tab_kind != cc::DetailTab::Terminal {
+                        return Err("원격 Git·이력 조회는 아직 제공되지 않습니다. 실제 터미널 화면을 사용해 주세요.".into());
+                    }
+                    if target.task_id.is_some() {
+                        host.ui.open_task(target);
+                        host.ui.detail_tab = cc::DetailTab::Terminal;
+                    } else {
+                        host.ui.open_terminal(target);
+                    }
                     return Ok(());
                 }
-                let route = host.route(&target).ok_or("실행 대상이 바뀌었습니다. 현재 세션을 다시 선택해 주세요.")?.clone();
+                let route = host
+                    .route(&target)
+                    .ok_or("실행 대상이 바뀌었습니다. 현재 세션을 다시 선택해 주세요.")?
+                    .clone();
                 match &route.capture.target {
                     FleetTarget::Pty { tab, pane, .. } => {
                         self.reveal_terminal_session();
-                        self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession { workspace_id: target.workspace_id.clone(), tab: tab.clone(), pane: pane.clone() });
-                        if target.task_id.is_some() { host.ui.open_task(target.clone()); host.ui.detail_tab = tab_kind; }
-                        else { host.ui.open_terminal(target.clone()); }
-                        if matches!(tab_kind,cc::DetailTab::Git | cc::DetailTab::History) { host.aux_loading = Some((target,tab_kind)); host.aux_ready = None; }
+                        self.stage_workspace_controller_action(
+                            WorkspaceControllerAction::FocusSession {
+                                workspace_id: target.workspace_id.clone(),
+                                tab: tab.clone(),
+                                pane: pane.clone(),
+                            },
+                        );
+                        if target.task_id.is_some() {
+                            host.ui.open_task(target.clone());
+                            host.ui.detail_tab = tab_kind;
+                        } else {
+                            host.ui.open_terminal(target.clone());
+                        }
+                        if matches!(tab_kind, cc::DetailTab::Git | cc::DetailTab::History) {
+                            host.aux_loading = Some((target, tab_kind));
+                            host.aux_ready = None;
+                        }
                     }
                     FleetTarget::Structured { session_id } => {
-                        if self.agent_sessions_ui.open_session(session_id) { self.agent_sessions_ui.open(); self.command_center_layout.use_original(); }
+                        if self.agent_sessions_ui.open_session(session_id) {
+                            self.agent_sessions_ui.open();
+                            self.command_center_layout.use_original();
+                        }
                     }
                 }
             }
             cc::Intent::DraftChanged { target, text } => {
-                work::validate_input(&text).or_else(|e| if text.is_empty() { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())?;
+                work::validate_input(&text)
+                    .or_else(|e| if text.is_empty() { Ok(()) } else { Err(e) })
+                    .map_err(|e| e.to_string())?;
                 let key = draft_key(host, &target)?;
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                if !p.loaded { return Err("상태를 불러오는 중입니다.".into()); }
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded {
+                    return Err("상태를 불러오는 중입니다.".into());
+                }
                 set_draft(p, &key, &text, false)?;
                 host.ui.set_draft(target, text);
                 return Ok(());
             }
-            cc::Intent::SaveProject { workspace_id, config } => {
-                if remote::project_pending(host,&workspace_id) {return Err("원격 실행·입력 승인 대기 중에는 실행 설정을 바꿀 수 없습니다.".into());}
-                if config.allowed_scope_roots.len() > 64 || config.allowed_scope_roots.iter().map(String::len).sum::<usize>() > 8192 { return Err("허용 범위는 합계 8KiB, 64개 이하로 지정해 주세요.".into()); }
-                let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                if !p.loaded || host.flight.is_some() { return Err("저장 중에는 설정을 변경할 수 없습니다.".into()); }
+            cc::Intent::SaveProject {
+                workspace_id,
+                config,
+            } => {
+                if remote::project_pending(host, &workspace_id) {
+                    return Err(
+                        "원격 실행·입력 승인 대기 중에는 실행 설정을 바꿀 수 없습니다.".into(),
+                    );
+                }
+                if config.allowed_scope_roots.len() > 64
+                    || config
+                        .allowed_scope_roots
+                        .iter()
+                        .map(String::len)
+                        .sum::<usize>()
+                        > 8192
+                {
+                    return Err("허용 범위는 합계 8KiB, 64개 이하로 지정해 주세요.".into());
+                }
+                let p = host
+                    .projects
+                    .get(&workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded || host.flight.is_some() {
+                    return Err("저장 중에는 설정을 변경할 수 없습니다.".into());
+                }
                 if config.use_worktrees && p.worktree_root.is_none() {
-                    if host.pending_configs.contains_key(&workspace_id) {return Err("전용 워크트리 폴더를 이미 준비 중입니다.".into());}
-                    if !self.queue_global_settings_action(&workspace_id,SettingsJobAction::CommandCenter(launch::SettingsRequest::PrepareRoot {operation_id:id.into(),workspace:workspace_id.clone(),folder:p.snapshot.config.folder.clone(),revision:p.snapshot.config.revision})) {return Err("설정 워커가 사용 중입니다. 잠시 뒤 저장해 주세요.".into());}
-                    host.pending_configs.insert(workspace_id,(id.into(),config));
-                    host.status="소유가 검증되는 전용 워크트리 루트를 준비하고 있습니다.".into();
+                    if host.pending_configs.contains_key(&workspace_id) {
+                        return Err("전용 워크트리 폴더를 이미 준비 중입니다.".into());
+                    }
+                    if !self.queue_global_settings_action(
+                        &workspace_id,
+                        SettingsJobAction::CommandCenter(launch::SettingsRequest::PrepareRoot {
+                            operation_id: id.into(),
+                            workspace: workspace_id.clone(),
+                            folder: p.snapshot.config.folder.clone(),
+                            revision: p.snapshot.config.revision,
+                        }),
+                    ) {
+                        return Err("설정 워커가 사용 중입니다. 잠시 뒤 저장해 주세요.".into());
+                    }
+                    host.pending_configs
+                        .insert(workspace_id, (id.into(), config));
+                    host.status = "소유가 검증되는 전용 워크트리 루트를 준비하고 있습니다.".into();
                     return Ok(());
                 }
-                if config.revision != p.snapshot.config.revision.0.to_string() { return Err("설정이 변경되었습니다. 최신 설정을 다시 열어 주세요.".into()); }
-                // Folder resolution belongs to the existing workspace registration worker.
-                let actual_folder = self.workspaces.iter().find(|ws| ws.id == workspace_id).map(|ws| ws.path.as_str()).ok_or("프로젝트가 없습니다.")?;
-                if !same_folder(&config.directory,actual_folder) { return Err("폴더 변경은 기존 프로젝트 관리에서 검증 후 적용해 주세요.".into()); }
-                let target = cc::RouteTarget { workspace_id: workspace_id.clone(), session_id: config.main_session_id.clone(), task_id: None };
-                let live = host.route(&target);
-                let selection = work::AgentSelection { provider: config.provider.clone(), model: (!config.model.is_empty()).then_some(config.model.clone()), effort: (!config.effort.is_empty()).then_some(config.effort.clone()) };
-                if config.main_session_id.is_some() && live.is_none_or(|l| l.agent.as_ref() != Some(&selection) || persistent(l).is_none()) { return Err("메인 공급자·모델·강도가 현재 선택한 실행과 일치하지 않습니다.".into()); }
-                let main_binding = live.and_then(persistent);
-                if config.worker_providers.is_empty() { return Err("실제 워커 공급자를 하나 이상 선택해 주세요.".into()); }
-                let mut allowed_agents: Vec<_> = host.live.iter().filter(|l| l.capture.workspace == workspace_id).filter_map(|l| l.agent.as_ref()).filter(|a| config.worker_providers.contains(&a.provider)).cloned().collect();
-                if let Some(catalog)=&p.catalog {
-                    for agent in &catalog.defaults {if config.worker_providers.contains(&agent.provider) && !allowed_agents.contains(agent) {allowed_agents.push(agent.clone());}}
-                    if !catalog.choices.contains(&selection) && live.is_none() {return Err("설치된 공급자의 실제 모델·강도 설정을 선택해 주세요.".into());}
+                if config.revision != p.snapshot.config.revision.0.to_string() {
+                    return Err("설정이 변경되었습니다. 최신 설정을 다시 열어 주세요.".into());
                 }
-                for device in host.devices.policies.iter().filter(|d|d.registration().workspace_id.0==workspace_id && d.validate_fresh().is_ok()) {for profile in device.profiles() {if config.worker_providers.contains(&profile.agent.provider) && !allowed_agents.contains(&profile.agent) {allowed_agents.push(profile.agent.clone());}}}
-                allowed_agents.sort_by_key(|a|(a.provider.clone(),a.model.clone(),a.effort.clone()));
+                // Folder resolution belongs to the existing workspace registration worker.
+                let actual_folder = self
+                    .workspaces
+                    .iter()
+                    .find(|ws| ws.id == workspace_id)
+                    .map(|ws| ws.path.as_str())
+                    .ok_or("프로젝트가 없습니다.")?;
+                if !same_folder(&config.directory, actual_folder) {
+                    return Err("폴더 변경은 기존 프로젝트 관리에서 검증 후 적용해 주세요.".into());
+                }
+                let target = cc::RouteTarget {
+                    workspace_id: workspace_id.clone(),
+                    session_id: config.main_session_id.clone(),
+                    task_id: None,
+                };
+                let live = host.route(&target);
+                let selection = work::AgentSelection {
+                    provider: config.provider.clone(),
+                    model: (!config.model.is_empty()).then_some(config.model.clone()),
+                    effort: (!config.effort.is_empty()).then_some(config.effort.clone()),
+                };
+                if config.main_session_id.is_some()
+                    && live.is_none_or(|l| {
+                        l.agent.as_ref() != Some(&selection) || persistent(l).is_none()
+                    })
+                {
+                    return Err(
+                        "메인 공급자·모델·강도가 현재 선택한 실행과 일치하지 않습니다.".into(),
+                    );
+                }
+                let main_binding = live.and_then(persistent);
+                if config.worker_providers.is_empty() {
+                    return Err("실제 워커 공급자를 하나 이상 선택해 주세요.".into());
+                }
+                let mut allowed_agents: Vec<_> = host
+                    .live
+                    .iter()
+                    .filter(|l| l.capture.workspace == workspace_id)
+                    .filter_map(|l| l.agent.as_ref())
+                    .filter(|a| config.worker_providers.contains(&a.provider))
+                    .cloned()
+                    .collect();
+                if let Some(catalog) = &p.catalog {
+                    for agent in &catalog.defaults {
+                        if config.worker_providers.contains(&agent.provider)
+                            && !allowed_agents.contains(agent)
+                        {
+                            allowed_agents.push(agent.clone());
+                        }
+                    }
+                    if !catalog.choices.contains(&selection) && live.is_none() {
+                        return Err("설치된 공급자의 실제 모델·강도 설정을 선택해 주세요.".into());
+                    }
+                }
+                for device in host.devices.policies.iter().filter(|d| {
+                    d.registration().workspace_id.0 == workspace_id && d.validate_fresh().is_ok()
+                }) {
+                    for profile in device.profiles() {
+                        if config.worker_providers.contains(&profile.agent.provider)
+                            && !allowed_agents.contains(&profile.agent)
+                        {
+                            allowed_agents.push(profile.agent.clone());
+                        }
+                    }
+                }
+                allowed_agents
+                    .sort_by_key(|a| (a.provider.clone(), a.model.clone(), a.effort.clone()));
                 allowed_agents.dedup();
-                if allowed_agents.len()>32 {return Err("허용 실행 프로필은 32개까지 저장할 수 있습니다.".into());}
-                if config.worker_providers.iter().any(|provider| !allowed_agents.iter().any(|a| &a.provider == provider)) { return Err("선택한 워커 공급자의 실제 모델·강도 설정을 확인할 수 없습니다.".into()); }
-                let worker = allowed_agents.first().cloned().ok_or("현재 실행 중인 워커 공급자를 선택해 주세요.")?;
+                if allowed_agents.len() > 32 {
+                    return Err("허용 실행 프로필은 32개까지 저장할 수 있습니다.".into());
+                }
+                if config
+                    .worker_providers
+                    .iter()
+                    .any(|provider| !allowed_agents.iter().any(|a| &a.provider == provider))
+                {
+                    return Err(
+                        "선택한 워커 공급자의 실제 모델·강도 설정을 확인할 수 없습니다.".into(),
+                    );
+                }
+                let worker = allowed_agents
+                    .first()
+                    .cloned()
+                    .ok_or("현재 실행 중인 워커 공급자를 선택해 주세요.")?;
                 let p = host.projects.get_mut(&workspace_id).unwrap();
-                let next = work::ProjectConfig { workspace_id: WorkspaceId(workspace_id.clone()), revision: p.snapshot.config.revision.next().ok_or("설정 리비전 한도입니다.")?, name: config.name.trim().into(), folder: actual_folder.to_owned(), main_agent: selection, worker_agent: worker, max_workers: config.parallel_limit, confirm_plan: true, use_worktrees: config.use_worktrees };
+                let next = work::ProjectConfig {
+                    workspace_id: WorkspaceId(workspace_id.clone()),
+                    revision: p
+                        .snapshot
+                        .config
+                        .revision
+                        .next()
+                        .ok_or("설정 리비전 한도입니다.")?,
+                    name: config.name.trim().into(),
+                    folder: actual_folder.to_owned(),
+                    main_agent: selection,
+                    worker_agent: worker,
+                    max_workers: config.parallel_limit,
+                    confirm_plan: true,
+                    use_worktrees: config.use_worktrees,
+                };
                 next.validate().map_err(|e| e.to_string())?;
-                let mut policy = p.policy(); policy.config_revision = next.revision; policy.project_folder = next.folder.clone(); policy.allowed_agents = allowed_agents.clone(); policy.allowed_scope_roots = config.allowed_scope_roots.clone(); policy.max_workers = next.max_workers;
+                let mut policy = p.policy();
+                policy.config_revision = next.revision;
+                policy.project_folder = next.folder.clone();
+                policy.allowed_agents = allowed_agents.clone();
+                policy.allowed_scope_roots = config.allowed_scope_roots.clone();
+                policy.max_workers = next.max_workers;
                 policy.validate_config(&next).map_err(|e| e.to_string())?;
-                p.snapshot.config = next; p.snapshot.main_binding = main_binding; p.scopes = config.allowed_scope_roots; p.allowed_agents = allowed_agents;
+                p.snapshot.config = next;
+                p.snapshot.main_binding = main_binding;
+                p.scopes = config.allowed_scope_roots;
+                p.allowed_agents = allowed_agents;
                 let scopes = serde_json::to_string(&p.scopes).map_err(|e| e.to_string())?;
                 set_draft(p, "settings:scopes", &scopes, false)?;
-                set_draft(p, "settings:agents", &serde_json::to_string(&p.allowed_agents).map_err(|e| e.to_string())?, false)?;
-                p.request = None; p.proposal = None; p.confirmed.clear(); p.dirty();
+                set_draft(
+                    p,
+                    "settings:agents",
+                    &serde_json::to_string(&p.allowed_agents).map_err(|e| e.to_string())?,
+                    false,
+                )?;
+                p.request = None;
+                p.proposal = None;
+                p.confirmed.clear();
+                p.dirty();
                 host.save(&workspace_id, None, Some(id.into()))?;
-                let p=host.projects.get_mut(&workspace_id).unwrap();p.effect_fence.revoke();p.effect_fence=remote::EffectFence::new();
+                let p = host.projects.get_mut(&workspace_id).unwrap();
+                p.effect_fence.revoke();
+                p.effect_fence = remote::EffectFence::new();
                 return Ok(());
             }
             cc::Intent::Submit { target, text } => {
                 work::validate_input(&text).map_err(|e| e.to_string())?;
-                if local_close::target_pending(host,&target){return Err("이 워커의 실제 종료 응답을 확인한 뒤 입력해 주세요.".into());}
-                if remote::sessions::is_target(host,&target){return remote::sessions::begin(host,id,&target,Some(text),None);}
-                if host.inputs.values().any(|pending| pending.target == target) { return Err("이 대상의 입력 승인 응답을 기다리고 있습니다. 자동 재전송하지 않습니다.".into()); }
-                let live = host.route(&target).ok_or("입력 대상의 현재 실행을 확인할 수 없습니다.")?.clone();
-                if live.capture.prompt.is_none() { return Err("현재 세션은 상관관계가 확인된 입력 승인 경로를 지원하지 않습니다.".into()); }
+                if local_close::target_pending(host, &target) {
+                    return Err("이 워커의 실제 종료 응답을 확인한 뒤 입력해 주세요.".into());
+                }
+                if remote::sessions::is_target(host, &target) {
+                    return remote::sessions::begin(host, id, &target, Some(text), None);
+                }
+                if host.inputs.values().any(|pending| pending.target == target) {
+                    return Err(
+                        "이 대상의 입력 승인 응답을 기다리고 있습니다. 자동 재전송하지 않습니다."
+                            .into(),
+                    );
+                }
+                let live = host
+                    .route(&target)
+                    .ok_or("입력 대상의 현재 실행을 확인할 수 없습니다.")?
+                    .clone();
+                if live.capture.prompt.is_none() {
+                    return Err(
+                        "현재 세션은 상관관계가 확인된 입력 승인 경로를 지원하지 않습니다.".into(),
+                    );
+                }
                 let key = draft_key(host, &target)?;
-                let is_main = host.projects.get(&target.workspace_id).is_some_and(|p| host.main_target(&target.workspace_id,p) == target);
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                if !p.loaded || host.flight.is_some() { return Err("저장 또는 불러오기가 완료된 뒤 입력해 주세요.".into()); }
-                if p.snapshot.drafts.iter().any(|d| d.target_key == format!("operation:{id}")) || p.snapshot.goals.iter().any(|g| g.submission_id.0 == id) {
+                let is_main = host
+                    .projects
+                    .get(&target.workspace_id)
+                    .is_some_and(|p| host.main_target(&target.workspace_id, p) == target);
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded || host.flight.is_some() {
+                    return Err("저장 또는 불러오기가 완료된 뒤 입력해 주세요.".into());
+                }
+                if p.snapshot
+                    .drafts
+                    .iter()
+                    .any(|d| d.target_key == format!("operation:{id}"))
+                    || p.snapshot.goals.iter().any(|g| g.submission_id.0 == id)
+                {
                     return Err("이미 저장된 입력 ID입니다. 승인 상태가 불명확한 입력을 다시 보내지 않았습니다.".into());
                 }
                 let mut prompt = text.clone();
                 if is_main {
-                    let policy = p.policy(); policy.validate_config(&p.snapshot.config).map_err(|e| e.to_string())?;
-                    if live.agent.as_ref() != Some(&p.snapshot.config.main_agent) { return Err("메인 실행의 공급자 설정이 바뀌었습니다.".into()); }
+                    let policy = p.policy();
+                    policy
+                        .validate_config(&p.snapshot.config)
+                        .map_err(|e| e.to_string())?;
+                    if live.agent.as_ref() != Some(&p.snapshot.config.main_agent) {
+                        return Err("메인 실행의 공급자 설정이 바뀌었습니다.".into());
+                    }
                     let mut state = p.state();
-                    let goal_id = state.submit_goal(work::SubmissionId::from_string(id.into()).map_err(|e| e.to_string())?, bounded(&text,256), text.clone()).map_err(|e| e.to_string())?;
+                    let goal_id = state
+                        .submit_goal(
+                            work::SubmissionId::from_string(id.into())
+                                .map_err(|e| e.to_string())?,
+                            bounded(&text, 256),
+                            text.clone(),
+                        )
+                        .map_err(|e| e.to_string())?;
                     let goal = state.goals.iter().find(|g| g.id == goal_id).unwrap();
-                    let request = wm::plan::PlannerRequest::new(goal,&p.snapshot.config,&policy).map_err(|e| e.to_string())?.with_runtime_binding(binding(&live,target.session_id.as_deref().unwrap()).ok_or("현재 메인 실행 바인딩이 없습니다.")?).map_err(|e| e.to_string())?;
+                    let request = wm::plan::PlannerRequest::new(goal, &p.snapshot.config, &policy)
+                        .map_err(|e| e.to_string())?
+                        .with_runtime_binding(
+                            binding(&live, target.session_id.as_deref().unwrap())
+                                .ok_or("현재 메인 실행 바인딩이 없습니다.")?,
+                        )
+                        .map_err(|e| e.to_string())?;
                     prompt = request.to_prompt().map_err(|e| e.to_string())?;
-                    p.request = Some(request); p.proposal = None; p.set_state(state);
+                    p.request = Some(request);
+                    p.proposal = None;
+                    p.set_state(state);
                 } else if let Some(task_id) = &target.task_id {
-                    let task = p.snapshot.tasks.iter().find(|t| &t.id.0 == task_id).ok_or("작업이 없습니다.")?;
-                    let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("작업의 현재 시도가 없습니다.")?;
-                    if attempt.runtime_binding.as_ref() != binding(&live,target.session_id.as_deref().unwrap()).as_ref() { return Err("작업의 현재 실행 대상이 바뀌었습니다.".into()); }
+                    let task = p
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .find(|t| &t.id.0 == task_id)
+                        .ok_or("작업이 없습니다.")?;
+                    let attempt = task
+                        .current_attempt_id
+                        .as_ref()
+                        .and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id))
+                        .ok_or("작업의 현재 시도가 없습니다.")?;
+                    if attempt.runtime_binding.as_ref()
+                        != binding(&live, target.session_id.as_deref().unwrap()).as_ref()
+                    {
+                        return Err("작업의 현재 실행 대상이 바뀌었습니다.".into());
+                    }
                 }
-                set_draft(p,&format!("operation:{id}"),&serde_json::to_string(&target).map_err(|e| e.to_string())?,true)?;
-                set_draft(p,&key,&text,true)?;
+                set_draft(
+                    p,
+                    &format!("operation:{id}"),
+                    &serde_json::to_string(&target).map_err(|e| e.to_string())?,
+                    true,
+                )?;
+                set_draft(p, &key, &text, true)?;
                 let revision = p.snapshot.config.revision;
-                let after = AfterSave { id: id.into(), input: Input { target: target.clone(), draft: text.clone(), dispatch: None }, prompt, config_revision: revision };
-                host.save(&target.workspace_id,Some(after),None)?;
+                let after = AfterSave {
+                    id: id.into(),
+                    input: Input {
+                        target: target.clone(),
+                        draft: text.clone(),
+                        dispatch: None,
+                    },
+                    prompt,
+                    config_revision: revision,
+                };
+                host.save(&target.workspace_id, Some(after), None)?;
                 return Ok(());
             }
-            cc::Intent::CloseWorker {target,attempt_id}=>return if remote::sessions::is_target(host,&target){remote::sessions::begin(host,id,&target,None,Some(&attempt_id))}else{local_close::begin(host,id,&target,&attempt_id)},
-            cc::Intent::ReconcileRemote {target}=>return remote::reconcile::begin(host,id,&target),
+            cc::Intent::CloseWorker { target, attempt_id } => {
+                return if remote::sessions::is_target(host, &target) {
+                    remote::sessions::begin(host, id, &target, None, Some(&attempt_id))
+                } else {
+                    local_close::begin(host, id, &target, &attempt_id)
+                };
+            }
+            cc::Intent::ReconcileRemote { target } => {
+                return remote::reconcile::begin(host, id, &target);
+            }
             cc::Intent::InstallPlanJson { workspace_id, json } => {
-                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                let request = p.request.as_ref().ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
-                if request.config_revision() != p.snapshot.config.revision || request.goal().workspace_id != p.snapshot.config.workspace_id { return Err("메인 계획 요청의 설정이나 프로젝트가 바뀌었습니다.".into()); }
+                let p = host
+                    .projects
+                    .get_mut(&workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                let request = p
+                    .request
+                    .as_ref()
+                    .ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
+                if request.config_revision() != p.snapshot.config.revision
+                    || request.goal().workspace_id != p.snapshot.config.workspace_id
+                {
+                    return Err("메인 계획 요청의 설정이나 프로젝트가 바뀌었습니다.".into());
+                }
                 let policy = p.policy();
-                let proposal = wm::provider_adapter::accept_manual_json(request,&json,&p.snapshot.config,&policy).map_err(|e| e.to_string())?;
+                let proposal = wm::provider_adapter::accept_manual_json(
+                    request,
+                    &json,
+                    &p.snapshot.config,
+                    &policy,
+                )
+                .map_err(|e| e.to_string())?;
                 let mut state = p.state();
-                wm::orchestrator::install_proposal(&mut state,&proposal,&p.snapshot.config,&policy).map_err(|e| e.to_string())?;
+                wm::orchestrator::install_proposal(
+                    &mut state,
+                    &proposal,
+                    &p.snapshot.config,
+                    &policy,
+                )
+                .map_err(|e| e.to_string())?;
                 p.confirmed.remove(&proposal.plan().goal_id.0);
-                p.snapshot.plan_confirmations.retain(|review| review.plan.goal_id != proposal.plan().goal_id);
-                p.proposal = Some(proposal); p.set_state(state);
-                host.save(&workspace_id,None,Some(id.into()))?;
+                p.snapshot
+                    .plan_confirmations
+                    .retain(|review| review.plan.goal_id != proposal.plan().goal_id);
+                p.proposal = Some(proposal);
+                p.set_state(state);
+                host.save(&workspace_id, None, Some(id.into()))?;
                 return Ok(());
             }
-            cc::Intent::ConfirmPlan { workspace_id, goal_id } => {
-                if remote::project_pending(host,&workspace_id) {return Err("원격 입력 승인 후 다음 배정안을 확인해 주세요.".into());}
-                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                if host.flight.is_some() || p.generation != p.saved_generation { return Err("배정안 저장이 완료된 뒤 확인해 주세요.".into()); }
+            cc::Intent::ConfirmPlan {
+                workspace_id,
+                goal_id,
+            } => {
+                if remote::project_pending(host, &workspace_id) {
+                    return Err("원격 입력 승인 후 다음 배정안을 확인해 주세요.".into());
+                }
+                let p = host
+                    .projects
+                    .get_mut(&workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                if host.flight.is_some() || p.generation != p.saved_generation {
+                    return Err("배정안 저장이 완료된 뒤 확인해 주세요.".into());
+                }
                 let goal = work::GoalId::from_string(goal_id).map_err(|error| error.to_string())?;
                 p.confirm_goal(&goal, &host.devices.policies)?;
-                host.save(&workspace_id,None,Some(id.into()))?;
+                host.save(&workspace_id, None, Some(id.into()))?;
                 return Ok(());
             }
             cc::Intent::DispatchTask { target } => {
-                if launch::workspace_uncertain(&host.launches,&target.workspace_id) {return Err("확인되지 않은 이전 실행이 있습니다. 실행 상태를 먼저 복구해 주세요.".into());}
-                let live = host.route(&target).ok_or("실행 세션을 명시적으로 선택해 주세요.")?.clone();
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                if live.state != cc::TaskState::Queued || !live.cwd.as_deref().is_some_and(|cwd| same_folder(cwd,&p.snapshot.config.folder)) || persistent(&live) == p.snapshot.main_binding { return Err("선택한 세션은 현재 프로젝트 폴더의 유휴 워커가 아닙니다.".into()); }
-                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
-                if live.agent.as_ref() != Some(&task.assigned_agent) { return Err("워커 공급자·모델·강도가 배정안과 일치하지 않습니다.".into()); }
-                let confirmed = p.confirmed_for_task(&task.id).ok_or("먼저 현재 배정안을 확인해 주세요.")?;
-                if confirmed.goal_id() != &task.goal_id { return Err("확인한 배정안과 다른 목표의 작업입니다.".into()); }
-                let request = wm::dispatch::DispatchRequest { task_id: task.id.clone(), operation_id: work::OperationId::from_string(id.into()).map_err(|e| e.to_string())?, folder: wm::dispatch::DispatchFolder { path: p.snapshot.config.folder.clone(), worktree_owner: None }, persistent_binding: persistent(&live), runtime_binding: binding(&live,target.session_id.as_deref().unwrap()).ok_or("실행 세대가 확인되지 않습니다.")? };
-                let prepared=p.prepare_existing(request)?;
-                let prepared = match prepared { wm::dispatch::PrepareOutcome::Ready(prepared) => prepared, wm::dispatch::PrepareOutcome::Existing { attempt_id,delivery } => return Err(format!("이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",attempt_id.0)) };
+                if launch::workspace_uncertain(&host.launches, &target.workspace_id) {
+                    return Err(
+                        "확인되지 않은 이전 실행이 있습니다. 실행 상태를 먼저 복구해 주세요."
+                            .into(),
+                    );
+                }
+                let live = host
+                    .route(&target)
+                    .ok_or("실행 세션을 명시적으로 선택해 주세요.")?
+                    .clone();
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                if live.state != cc::TaskState::Queued
+                    || !live
+                        .cwd
+                        .as_deref()
+                        .is_some_and(|cwd| same_folder(cwd, &p.snapshot.config.folder))
+                    || persistent(&live) == p.snapshot.main_binding
+                {
+                    return Err("선택한 세션은 현재 프로젝트 폴더의 유휴 워커가 아닙니다.".into());
+                }
+                let task = p
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .find(|t| Some(&t.id.0) == target.task_id.as_ref())
+                    .ok_or("작업이 없습니다.")?;
+                if live.agent.as_ref() != Some(&task.assigned_agent) {
+                    return Err("워커 공급자·모델·강도가 배정안과 일치하지 않습니다.".into());
+                }
+                let confirmed = p
+                    .confirmed_for_task(&task.id)
+                    .ok_or("먼저 현재 배정안을 확인해 주세요.")?;
+                if confirmed.goal_id() != &task.goal_id {
+                    return Err("확인한 배정안과 다른 목표의 작업입니다.".into());
+                }
+                let request = wm::dispatch::DispatchRequest {
+                    task_id: task.id.clone(),
+                    operation_id: work::OperationId::from_string(id.into())
+                        .map_err(|e| e.to_string())?,
+                    folder: wm::dispatch::DispatchFolder {
+                        path: p.snapshot.config.folder.clone(),
+                        worktree_owner: None,
+                    },
+                    persistent_binding: persistent(&live),
+                    runtime_binding: binding(&live, target.session_id.as_deref().unwrap())
+                        .ok_or("실행 세대가 확인되지 않습니다.")?,
+                };
+                let prepared = p.prepare_existing(request)?;
+                let prepared = match prepared {
+                    wm::dispatch::PrepareOutcome::Ready(prepared) => prepared,
+                    wm::dispatch::PrepareOutcome::Existing {
+                        attempt_id,
+                        delivery,
+                    } => {
+                        return Err(format!(
+                            "이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",
+                            attempt_id.0
+                        ));
+                    }
+                };
                 let assignment = prepared.assignment;
                 p.set_state(prepared.next_state);
-                p.snapshot.outbox.push(stored::DispatchOutbox { attempt_id: assignment.attempt.id.clone(), operation_id: assignment.attempt.operation_id.clone(), state: stored::DispatchOutboxState::Pending });
-                let after = AfterSave { id: id.into(), prompt: assignment.prompt.clone(), input: Input { target: target.clone(), draft: String::new(), dispatch: Some(assignment) }, config_revision: p.snapshot.config.revision };
-                host.save(&target.workspace_id,Some(after),None)?;
+                p.snapshot.outbox.push(stored::DispatchOutbox {
+                    attempt_id: assignment.attempt.id.clone(),
+                    operation_id: assignment.attempt.operation_id.clone(),
+                    state: stored::DispatchOutboxState::Pending,
+                });
+                let after = AfterSave {
+                    id: id.into(),
+                    prompt: assignment.prompt.clone(),
+                    input: Input {
+                        target: target.clone(),
+                        draft: String::new(),
+                        dispatch: Some(assignment),
+                    },
+                    config_revision: p.snapshot.config.revision,
+                };
+                host.save(&target.workspace_id, Some(after), None)?;
                 return Ok(());
             }
-            cc::Intent::Approval { target,approval_id,allow } => return self.respond_command_center_project_approval(host,id,&target,&approval_id,allow),
-            cc::Intent::ReportResult { target,attempt_id,text } => {
-                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 결과를 보고해 주세요.".into());}
-                if text.trim().is_empty() || text.len() > work::WORK_EVENT_MAX_BYTES { return Err("실제 작업 결과는 8KiB 이하로 기록해 주세요.".into()); }
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
-                let revision = task.result.as_ref().map(|r| r.revision.next()).unwrap_or(Some(work::ResultRevision(1))).ok_or("결과 리비전 한도입니다.")?;
-                let result = work::TaskResult { revision,summary: text.clone(),source_revision: None,artifact_revision: None,verification: work::VerificationState::NotRun };
+            cc::Intent::Approval {
+                target,
+                approval_id,
+                allow,
+            } => {
+                return self.respond_command_center_project_approval(
+                    host,
+                    id,
+                    &target,
+                    &approval_id,
+                    allow,
+                );
+            }
+            cc::Intent::ReportResult {
+                target,
+                attempt_id,
+                text,
+            } => {
+                if remote::handoff_pending(host, &target) {
+                    return Err("실제 입력 승인 응답을 확인한 뒤 결과를 보고해 주세요.".into());
+                }
+                if text.trim().is_empty() || text.len() > work::WORK_EVENT_MAX_BYTES {
+                    return Err("실제 작업 결과는 8KiB 이하로 기록해 주세요.".into());
+                }
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                let task = p
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .find(|t| Some(&t.id.0) == target.task_id.as_ref())
+                    .ok_or("현재 작업이 없습니다.")?;
+                let revision = task
+                    .result
+                    .as_ref()
+                    .map(|r| r.revision.next())
+                    .unwrap_or(Some(work::ResultRevision(1)))
+                    .ok_or("결과 리비전 한도입니다.")?;
+                let result = work::TaskResult {
+                    revision,
+                    summary: text.clone(),
+                    source_revision: None,
+                    artifact_revision: None,
+                    verification: work::VerificationState::NotRun,
+                };
                 result.validate().map_err(|e| e.to_string())?;
-                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::ResultSubmitted { result },format!("수동 결과 보고 · 검증 미실행\n{text}"))?;
-                host.save(&target.workspace_id,None,Some(id.into()))?;
+                apply_user_work_event(
+                    p,
+                    &target,
+                    &attempt_id,
+                    work::WorkEventKind::ResultSubmitted { result },
+                    format!("수동 결과 보고 · 검증 미실행\n{text}"),
+                )?;
+                host.save(&target.workspace_id, None, Some(id.into()))?;
                 return Ok(());
             }
-            cc::Intent::VerifyResult { target,attempt_id,revision,passed,evidence } => {
-                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 검증해 주세요.".into());}
-                if evidence.trim().is_empty() || evidence.len() > 4096 { return Err("직접 수행한 검증의 명령과 결과를 4KiB 이하로 기록해 주세요.".into()); }
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
-                let result = task.result.as_ref().filter(|r| r.revision.0.to_string() == revision).ok_or("검증할 결과 리비전이 바뀌었습니다.")?;
-                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::VerificationFinished { result_revision: result.revision,outcome: if passed { work::VerificationState::Passed } else { work::VerificationState::Failed } },format!("사용자 직접 검증 · {}\n{}",if passed { "통과" } else { "실패" },evidence))?;
-                host.save(&target.workspace_id,None,Some(id.into()))?;
+            cc::Intent::VerifyResult {
+                target,
+                attempt_id,
+                revision,
+                passed,
+                evidence,
+            } => {
+                if remote::handoff_pending(host, &target) {
+                    return Err("실제 입력 승인 응답을 확인한 뒤 검증해 주세요.".into());
+                }
+                if evidence.trim().is_empty() || evidence.len() > 4096 {
+                    return Err(
+                        "직접 수행한 검증의 명령과 결과를 4KiB 이하로 기록해 주세요.".into(),
+                    );
+                }
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                let task = p
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .find(|t| Some(&t.id.0) == target.task_id.as_ref())
+                    .ok_or("현재 작업이 없습니다.")?;
+                let result = task
+                    .result
+                    .as_ref()
+                    .filter(|r| r.revision.0.to_string() == revision)
+                    .ok_or("검증할 결과 리비전이 바뀌었습니다.")?;
+                apply_user_work_event(
+                    p,
+                    &target,
+                    &attempt_id,
+                    work::WorkEventKind::VerificationFinished {
+                        result_revision: result.revision,
+                        outcome: if passed {
+                            work::VerificationState::Passed
+                        } else {
+                            work::VerificationState::Failed
+                        },
+                    },
+                    format!(
+                        "사용자 직접 검증 · {}\n{}",
+                        if passed { "통과" } else { "실패" },
+                        evidence
+                    ),
+                )?;
+                host.save(&target.workspace_id, None, Some(id.into()))?;
                 return Ok(());
             }
             cc::Intent::ConfirmResult { target, revision } => {
-                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 완료를 확인해 주세요.".into());}
-                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
-                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
-                let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("현재 시도가 없습니다.")?;
+                if remote::handoff_pending(host, &target) {
+                    return Err("실제 입력 승인 응답을 확인한 뒤 완료를 확인해 주세요.".into());
+                }
+                let p = host
+                    .projects
+                    .get_mut(&target.workspace_id)
+                    .ok_or("프로젝트가 없습니다.")?;
+                let task = p
+                    .snapshot
+                    .tasks
+                    .iter()
+                    .find(|t| Some(&t.id.0) == target.task_id.as_ref())
+                    .ok_or("작업이 없습니다.")?;
+                let attempt = task
+                    .current_attempt_id
+                    .as_ref()
+                    .and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id))
+                    .ok_or("현재 시도가 없습니다.")?;
                 let result = task.result.as_ref().ok_or("검증된 결과가 없습니다.")?;
-                if result.revision.0.to_string() != revision { return Err("결과 리비전이 변경되었습니다.".into()); }
+                if result.revision.0.to_string() != revision {
+                    return Err("결과 리비전이 변경되었습니다.".into());
+                }
                 let attempt_id = attempt.id.0.clone();
                 let result_revision = result.revision;
-                apply_user_work_event(p,&target,&attempt_id,work::WorkEventKind::UserConfirmed { result_revision },format!("사용자 결과 확인 · 리비전 {revision}"))?;
-                host.save(&target.workspace_id,None,Some(id.into()))?;
+                apply_user_work_event(
+                    p,
+                    &target,
+                    &attempt_id,
+                    work::WorkEventKind::UserConfirmed { result_revision },
+                    format!("사용자 결과 확인 · 리비전 {revision}"),
+                )?;
+                host.save(&target.workspace_id, None, Some(id.into()))?;
                 return Ok(());
             }
         }

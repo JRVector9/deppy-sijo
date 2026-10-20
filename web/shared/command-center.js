@@ -183,7 +183,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     targetCaption.textContent = caption; targetCaption.disabled = readOnly || screen !== 'main'; targetCaption.setAttribute('aria-expanded', String(agentPicker === p?.id));
     targetCaption.title = screen === 'main' ? '메인 에이전트와 실행 설정 선택' : '선택한 작업의 정확한 담당 세션';
     const blocked = isPending('submit:' + nextKey), oversized = bytes(input.value.normalize('NFC')) > INPUT_LIMIT;
-    submit.disabled = input.disabled || !connected || blocked || !input.value.trim() || oversized || bound && !enabled(capability);
+    submit.disabled = input.disabled || !connected || blocked || !input.value.trim() || oversized || (screen !== 'main' || bound) && !enabled(capability);
     submit.title = blocked ? '접수 여부를 확인할 때까지 다시 보낼 수 없습니다' : str(capability?.reason); submit.setAttribute('aria-label', caption + '에게 전송');
     inputHint.textContent = blocked ? '접수 확인 대기 · 초안 보존' : oversized ? label('input_limit', '입력은 UTF-8 16 KiB까지 전송할 수 있습니다') : label('send_hint', 'Enter 전송 · Shift+Enter 줄바꿈');
     renderAgentPicker();

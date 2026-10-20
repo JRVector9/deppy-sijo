@@ -4,7 +4,7 @@
   const route = {workspace_id: 'project-a', session_id: 'opaque-main', task_id: null};
   globalThis.ccErrors = []; globalThis.ccSent = [];
   window.addEventListener('error', event => ccErrors.push(event.message));
-  globalThis.ccSnapshot = {projects: [{id: 'project-a', name: '독립 프로젝트', directory: '/fixture/한글', goal: '실제 목표', main_summary: '관측된 상태', main_target: route, main_provider: 'Codex', main_input: cap, sessions: [{target: route, title: '현재 메인', provider: 'Codex', state: 'queued', input: cap, terminal_session_id: '11111111-1111-4111-8111-111111111111'}], tasks: [], history: [], config: {}, save_settings: cap, available_providers: [], available_models: [], available_efforts: []}], selected_workspace_id: 'project-a', devices: [], dark_mode: true, labels: {}, status: '', receipts: []};
+  globalThis.ccSnapshot = {projects: [{id: 'project-a', name: '독립 프로젝트', directory: '/fixture/한글', goal: '실제 목표', main_summary: '관측된 상태', main_target: route, main_provider: 'Codex', main_input: cap, sessions: [{target: route, title: '현재 메인', provider: 'Codex', state: 'queued', input: cap, terminal_session_id: '11111111-1111-4111-8111-111111111111'}], tasks: [], history: [], config: {name: '독립 프로젝트', directory: '/fixture/한글', main_session_id: 'opaque-main', provider: 'Codex', model: '', effort: '', worker_providers: ['Codex'], allowed_scope_roots: ['src'], parallel_limit: 2, automation: '배정 전 확인', use_worktrees: true, revision: '1'}, save_settings: cap, available_providers: [], available_models: [], available_efforts: []}], selected_workspace_id: 'project-a', devices: [], dark_mode: true, labels: {}, status: '', receipts: []};
   class FakeSocket {
     static OPEN = 1; static CONNECTING = 0;
     readyState = 0; listeners = new Map();
@@ -36,6 +36,9 @@
     check(host().getBoundingClientRect().height === innerHeight, 'production host fills viewport height');
     check([...host().querySelectorAll('[data-cc-nav]')].map(button => button.dataset.ccNav).join(',') === 'main,tasks,terminal,devices,history', 'approved semantic navigation crosses production bundle');
     host().querySelector('[data-cc-settings]').click();
+    check(!host().querySelector('.cc-rules').open, 'production execution rules start collapsed');
+    host().querySelector('.cc-rules summary').click();
+    check(host().querySelector('.cc-rules').open, 'production execution rules expand through summary');
     host().querySelector('[data-cc-focus="setting-use_worktrees"]').focus(); ccSocket.publish();
     check(document.activeElement?.dataset.ccFocus === 'setting-use_worktrees', 'focused checkbox survives production snapshot');
     host().querySelector('[data-cc-nav="main"]').click();
@@ -53,11 +56,11 @@
     document.getElementById('viewer-back').click();
     await wait(() => !host().hidden && !host().querySelector('.cc-app').hidden, 'return to command center');
     check(input().value === '저장 중 새 초안', 'terminal roundtrip preserves target draft');
-    [...host().querySelectorAll('.cc-head-actions button')].find(button => button.textContent === '터미널로').click();
-    await wait(() => !document.getElementById('viewer').hidden, 'header opens exact terminal');
-    check(host().hidden && !document.getElementById('viewer').hidden && ccSent.filter(frame => frame.type === 'watch').at(-1).session === '11111111-1111-4111-8111-111111111111', 'terminal header opens exact terminal instead of dashboard');
+    host().querySelector('[data-cc-nav="terminal"]').click();
+    await wait(() => !document.getElementById('viewer').hidden, 'terminal navigation reopens exact terminal');
+    check(host().hidden && !document.getElementById('viewer').hidden && ccSent.filter(frame => frame.type === 'watch').at(-1).session === '11111111-1111-4111-8111-111111111111', 'terminal navigation preserves exact terminal instead of dashboard');
     document.getElementById('viewer-back').click();
-    await wait(() => !host().hidden && !host().querySelector('.cc-app').hidden, 'return from header terminal');
+    await wait(() => !host().hidden && !host().querySelector('.cc-app').hidden, 'return from repeated terminal navigation');
     host().querySelector('[data-cc-close]').click();
     check(!document.getElementById('dashboard-shell').hidden && !host().hidden, 'original shell and reopen control remain reachable');
     host().querySelector('[data-cc-open]').click();

@@ -218,12 +218,20 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     if (discard) agentDrafts.delete(agentPicker); agentPicker = null; renderAgentPicker(); targetCaption.setAttribute('aria-expanded', 'false');
   }
   function agentChoices(p) {
-    const sessions = list(p.eligible_sessions ?? p.sessions).filter(s => s.target?.workspace_id === p.id && s.target?.session_id && !s.target?.task_id);
+    const sessions = list(p.eligible_sessions ?? p.sessions).filter(s => s.target?.workspace_id === p.id && s.target?.session_id && !s.target?.task_id && s.input?.enabled === true);
     const agents = list(p.available_agents).filter(a => str(a.provider)).map(a => ({...a, model: str(a.model), effort: str(a.effort)}));
     // Older snapshots still expose observed tuples. Never manufacture provider/model pairs.
-    const observed = [...sessions]; if (!agents.length && p.config?.main_session_id) observed.push(p.config);
+    const observed = [...sessions]; if (!agents.length && sessions.some(s => s.target.session_id === p.config?.main_session_id)) observed.push(p.config);
     for (const a of observed) if (str(a.provider) && a.provider !== 'unbound' && !agents.some(v => v.provider === a.provider && v.model === str(a.model) && str(v.effort) === str(a.effort))) agents.push({provider: a.provider, model: str(a.model), effort: str(a.effort)});
     return {sessions, agents};
+  }
+  function mainBindingChoices(p, sessions, config, describe) {
+    const choices = sessions.map(s => [s.target.session_id, describe(s)]);
+    if (config.main_session_id && !sessions.some(s => s.target.session_id === config.main_session_id)) {
+      const current = [...list(p.eligible_sessions), ...list(p.sessions)].find(s => s.target?.workspace_id === p.id && s.target?.session_id === config.main_session_id);
+      choices.unshift([config.main_session_id, '현재 연결 · ' + (str(current?.title) || '사용할 수 없는 세션') + ' · 입력 불가', true]);
+    }
+    return choices;
   }
   function renderAgentPicker() {
     const old = form.querySelector('[data-cc-agent-picker]'), focus = old?.contains(document.activeElement) ? document.activeElement : null;
@@ -238,11 +246,11 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const selectField = (caption, key, values, placeholder, change) => {
       const row = node('label', 'cc-field'), select = node('select'); row.append(node('span', '', caption));
       const empty = node('option', '', placeholder); empty.value = ''; select.append(empty);
-      for (const [value, caption] of values) { const option = node('option', '', caption); option.value = value; select.append(option); }
+      for (const [value, caption, disabled = false] of values) { const option = node('option', '', caption); option.value = value; option.disabled = disabled; select.append(option); }
       select.value = config[key] || ''; select.dataset['ccAgent' + ({main_session_id: 'Session', provider: 'Provider', model: 'Model', effort: 'Effort'}[key])] = ''; select.dataset.ccFocus = 'agent-' + key;
       select.addEventListener('change', () => { change(select.value); draft.version++; renderAgentPicker(); }); row.append(select); return row;
     };
-    panel.append(selectField('기존 메인 세션', 'main_session_id', sessions.map(s => [s.target.session_id, [s.title, s.provider, s.model, s.effort, s.device].filter(Boolean).join(' · ')]), '연결할 세션 선택', value => {
+    panel.append(selectField('기존 메인 세션', 'main_session_id', mainBindingChoices(p, sessions, config, s => [s.title, s.provider, s.model, s.effort, s.device].filter(Boolean).join(' · ')), '연결할 세션 선택', value => {
       const selected = sessions.find(s => s.target.session_id === value); config.main_session_id = value || null;
       if (selected) for (const key of ['provider', 'model', 'effort']) config[key] = str(selected[key]);
     }));
@@ -575,7 +583,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     function field(caption, key, choices = null, type = 'text') {
       const row = node('label', 'cc-field'); row.append(node('span', '', caption));
       const control = node(choices ? 'select' : type === 'paths' ? 'textarea' : 'input');
-      if (choices) for (const [value, name] of choices) { const option = node('option', '', name); option.value = value; control.append(option); }
+      if (choices) for (const [value, name, disabled = false] of choices) { const option = node('option', '', name); option.value = value; option.disabled = disabled; control.append(option); }
       else if (type !== 'paths') { control.type = type; if (type === 'text') control.maxLength = key === 'directory' ? 4096 : 1024; }
       if (type === 'paths') control.maxLength = 16384;
       if (type === 'checkbox') control.checked = !!draft.config[key]; else control.value = type === 'paths' ? list(draft.config[key]).join('\n') : draft.config[key] ?? '';
@@ -600,7 +608,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const models = [...new Set(agents.filter(a => a.provider === draft.config.provider).map(a => a.model))];
     field(label('model', '모델'), 'model', [['', models.includes('') ? '기본 모델' : '모델 선택'], ...models.filter(Boolean).map(v => [v, v])]);
     const rules = node('details', 'cc-rules'), summary = node('summary', '', '실행 규칙 '); summary.append(node('span', 'cc-rule-summary cc-muted', '· 작업자·병렬 실행·자동화')); rules.dataset.ccDetails = 'settings-rules'; rules.append(summary, node('p', 'cc-rule-note cc-muted', '이 프로젝트의 다음 배정부터 적용합니다.')); fields.append(rules); fieldParent = rules;
-    field(label('main_binding', '메인 세션'), 'main_session_id', [['', label('unbound', '연결하지 않음')], ...sessions.map(s => [s.target?.session_id || '', s.title])]);
+    field(label('main_binding', '메인 세션'), 'main_session_id', [['', label('unbound', '연결하지 않음')], ...mainBindingChoices(p, sessions, draft.config, s => s.title)]);
     const efforts = [...new Set(agents.filter(a => a.provider === draft.config.provider && a.model === draft.config.model).map(a => a.effort))];
     field(label('effort', '추론 강도'), 'effort', [['', efforts.includes('') ? '기본 설정 유지' : '추론 강도 선택'], ...efforts.filter(Boolean).map(v => [v, v])]);
     field('허용 범위 (줄마다 상대 폴더)', 'allowed_scope_roots', null, 'paths');
@@ -611,11 +619,12 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       control.addEventListener('change', () => { const chosen = new Set(draft.config.worker_providers); control.checked ? chosen.add(provider) : chosen.delete(provider); draft.config.worker_providers = [...chosen]; draft.version++; }); row.append(control, node('span', '', provider)); workerProviders.append(row);
     }
     rules.append(workerProviders); fields.append(node('p', 'cc-form-notice', '변경한 설정은 진행 중인 작업의 담당·모델·폴더를 바꾸지 않습니다.'));
+    const bindingValid = !draft.config.main_session_id || sessions.some(s => s.target.session_id === draft.config.main_session_id);
     const save = button(label('save', '저장'), () => {
-      if (!enabled(p.save_settings)) return;
+      if (!enabled(p.save_settings) || !bindingValid) return;
       if (!Number.isInteger(draft.config.parallel_limit) || draft.config.parallel_limit < 1 || draft.config.parallel_limit > 8 || !draft.config.name.trim() || !draft.config.directory.trim()) { say('이름·폴더와 동시 작업 수 1–8을 확인해 주세요.'); return; }
       emit({type: 'save_project', workspace_id: p.id, config: copy(draft.config)}, 'save:' + p.id, {workspace: p.id, settingsVersion: draft.version});
-    }, 'cc-button cc-primary'); save.disabled = !enabled(p.save_settings) || !connected || isPending('save:' + p.id); save.title = str(p.save_settings?.reason);
+    }, 'cc-button cc-primary'); save.disabled = !enabled(p.save_settings) || !connected || !bindingValid || isPending('save:' + p.id); save.title = !bindingValid ? '입력 가능한 메인 세션을 선택하거나 연결을 해제해 주세요.' : str(p.save_settings?.reason);
     const cancel = button('취소', () => { settings.delete(p.id); navigate('main'); }, 'cc-button cc-ghost'); cancel.dataset.ccSettingsCancel = '';
     const actions = node('div', 'cc-actions'); actions.append(save, cancel); fields.append(actions); content.append(fields);
   }

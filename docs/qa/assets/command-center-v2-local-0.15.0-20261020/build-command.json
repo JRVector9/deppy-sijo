@@ -1,0 +1,18 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "-p",
+    "mcp-proxy"
+  ],
+  "env": {
+    "CARGO_BUILD_JOBS": "2"
+  },
+  "source_commit": "cb6f15d0e573feb160deca86ab0743b04c3a2191",
+  "exit_code": 0,
+  "seconds": 38.824
+}

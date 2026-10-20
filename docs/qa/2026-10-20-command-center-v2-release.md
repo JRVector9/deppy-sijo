@@ -1,3 +1,19 @@
+# Command Center v2 — 로컬 0.15.0 빌드·실행 완료
+
+사용자의 재빌드·재실행 요청에 따라0.14.0에서0.15.0으로 갱신했다. 별도 기능 브랜치 `feat/agent-command-center-v2-20261020`, source `cb6f15d0e573feb160deca86ab0743b04c3a2191`을 빌드했다. 승인 시안 보정, 연결 전 메인 입력과 입력창 내 에이전트 설정, 초안·설정 보호 및 이력 분류 변경을 포함한다.
+
+- 실제 빌드: `CARGO_BUILD_JOBS=2 cargo build --offline --locked -p deppy-sijo -p mcp-proxy`, exit0,38.824초, dev profile. workspace27개 패키지의 상속과 lock 버전을 검증했다.
+- SHA 검증한 pinned cloudflared2026.9.1과 앱·helper를 기존 Developer ID로 서명했다. 공증된 production 배포는 아니다.
+- CLI `Deppy Sijo 0.15.0`, macOS `CFBundleShortVersionString`·`CFBundleVersion` 모두0.15.0. 명시적 로컬 개발 모드의 `scripts/verify-macos-package.sh` exit0.
+- bundle: `target/bundle-0.15.0/Deppy Sijo.app`. 기존0.14.0 bundle 보존. 기존PID45806을 정상 종료하고 새PID87668의 정확한 executable 경로를 확인했다. `DEPPY_COMMAND_CENTER_V2=1`로 실행했으며 실제 CUA AX에서 새 화면과 편집 가능한 입력창을 확인했다. 사용자 설정 저장이나 에이전트 작업 전송은 하지 않았다.
+- 실제 명령·binary digest·버전·서명·실행 결과: [build-result.json](assets/command-center-v2-local-0.15.0-20261020/build-result.json)과 같은 폴더의 로그. 앞선 제품 회귀 검사 결과는 해당 소스별 QA 기록에 있고, 이번 버전 변경 뒤 전체 검사를 다시 돌렸다고 주장하지 않는다.
+
+이후 사용자가 발견한 메인 에이전트 선택 목록 중복은 별도 소스 수정 단계다. 이 문서의 서명된0.15.0 실행본에 그 후속 수정이 포함됐다고 간주하지 않는다. 이번에 완료한1회 재실행은 이후 자동 재실행 허가가 아니다.
+
+---
+
+아래는 이전0.14.0 전달 당시 기록이다. 현재 실행본은 위0.15.0 기록을 따른다.
+
 # Command Center v2 — 로컬 0.14.0 빌드·실행 완료
 
 2026-10-20 사용자가 현재 작업에서 해당 브랜치 빌드와 실행을 명시 요청했다. 아래는 실제 사용자용 로컬 개발 빌드의 전달 기록이며, 이전의 실행 금지 상태를 이번 1회 실행 요청이 대체한다.

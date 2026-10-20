@@ -19,6 +19,15 @@ fn target(v: &Value) -> bool {
             .iter()
             .all(|k| v[*k].is_null() || identity(&v[*k]))
 }
+fn text(v: &Value, max: usize) -> bool {
+    v.as_str().is_some_and(|s| {
+        !s.trim().is_empty()
+            && s.len() <= max
+            && !s
+                .chars()
+                .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    })
+}
 fn bounded(v: &Value, depth: usize, nodes: &mut usize) -> bool {
     *nodes += 1;
     if depth > 10 || *nodes > 32768 {
@@ -71,6 +80,31 @@ pub fn validate_intent(v: &Value) -> bool {
             keys(v, &["type", "target", "revision"])
                 && target(&v["target"])
                 && identity(&v["revision"])
+        }
+        Some("report_result") => {
+            keys(v, &["type", "target", "attempt_id", "text"])
+                && target(&v["target"])
+                && identity(&v["target"]["task_id"])
+                && identity(&v["attempt_id"])
+                && text(&v["text"], 8 * 1024)
+        }
+        Some("verify_result") => {
+            keys(
+                v,
+                &[
+                    "type",
+                    "target",
+                    "attempt_id",
+                    "revision",
+                    "passed",
+                    "evidence",
+                ],
+            ) && target(&v["target"])
+                && identity(&v["target"]["task_id"])
+                && identity(&v["attempt_id"])
+                && identity(&v["revision"])
+                && v["passed"].is_boolean()
+                && text(&v["evidence"], 4 * 1024)
         }
         Some("dispatch_task") => {
             keys(v, &["type", "target"])
@@ -177,6 +211,11 @@ fn filter(value: &mut Value, input: bool, approval: bool) {
                         "dispatch",
                         "confirm_result",
                         "plan_confirmation",
+                        "manual_plan",
+                        "storage_retry",
+                        "result_report",
+                        "verify_result",
+                        "launch",
                         "save_settings",
                         "add_project",
                         "manage_devices",
@@ -235,8 +274,26 @@ mod tests {
         assert!(!validate_intent(&json!({"type":"use_original_layout"})));
     }
     #[test]
+    fn work_result_forms_require_exact_attempt_and_bounded_user_evidence() {
+        let target = json!({"workspace_id":"w","session_id":null,"task_id":"t"});
+        let mut report = json!({"type":"report_result","target":target,"attempt_id":"attempt-a","text":"사용자가 확인한 결과"});
+        assert!(validate_intent(&report));
+        report["attempt_id"] = Value::Null;
+        assert!(!validate_intent(&report));
+        report["attempt_id"] = json!("attempt-a");
+        report["text"] = json!("x".repeat(8193));
+        assert!(!validate_intent(&report));
+        let mut verify = json!({"type":"verify_result","target":target,"attempt_id":"attempt-a","revision":"2","passed":true,"evidence":"사용자 검증 기록"});
+        assert!(validate_intent(&verify));
+        verify["revision"] = json!("");
+        assert!(!validate_intent(&verify));
+        verify["revision"] = json!("2");
+        verify["evidence"] = json!("x".repeat(4097));
+        assert!(!validate_intent(&verify));
+    }
+    #[test]
     fn work_read_only_projection_strips_controls_and_approval_command() {
-        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"tasks":[{"approval":{"command":"private command"},"dispatch":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[]});
+        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"manual_plan":{"enabled":true},"storage_retry":{"enabled":true},"tasks":[{"approval":{"command":"private command"},"dispatch":{"enabled":true},"result_report":{"enabled":true},"verify_result":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[]});
         let frame: Value =
             serde_json::from_str(&encode_frame(&value, false, false).unwrap()).unwrap();
         assert_eq!(frame["type"], "work_snapshot");
@@ -244,6 +301,15 @@ mod tests {
             frame["snapshot"]["projects"][0]["main_input"]["enabled"],
             false
         );
+        for key in ["manual_plan", "storage_retry"] {
+            assert_eq!(frame["snapshot"]["projects"][0][key]["enabled"], false);
+        }
+        for key in ["result_report", "verify_result"] {
+            assert_eq!(
+                frame["snapshot"]["projects"][0]["tasks"][0][key]["enabled"],
+                false
+            );
+        }
         assert!(frame["snapshot"]["projects"][0]["tasks"][0]["approval"].is_null());
         assert_eq!(value["projects"][0]["main_input"]["enabled"], true);
     }

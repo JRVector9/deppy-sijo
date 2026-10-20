@@ -24,6 +24,8 @@ fn mobile_cloud_results_keep_source_identity_and_owner_controls() {
                 "\n",
                 include_str!("../../../web/shared/cloud-results.js"),
                 "\n",
+                include_str!("../../../web/shared/command-center.js"),
+                "\n",
                 include_str!("../assets/app.js")
             )
             .as_bytes()
@@ -40,6 +42,8 @@ fn mobile_cloud_results_keep_source_identity_and_owner_controls() {
                 include_str!("../../../web/shared/mobile-theme.css"),
                 "\n",
                 include_str!("../../../web/shared/cloud-results.css"),
+                "\n",
+                include_str!("../../../web/shared/command-center.css"),
                 "\n",
                 include_str!("../assets/app.css")
             )

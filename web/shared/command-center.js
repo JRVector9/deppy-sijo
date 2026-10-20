@@ -7,7 +7,6 @@ const encoder = new TextEncoder();
 const bytes = value => encoder.encode(value).length;
 const str = value => typeof value === 'string' ? value : '';
 const list = value => Array.isArray(value) ? value : [];
-const enabled = capability => capability?.enabled === true;
 const copy = value => JSON.parse(JSON.stringify(value));
 const routeKey = target => target ? JSON.stringify([target.workspace_id, target.session_id ?? null, target.task_id ?? null]) : '';
 const states = {
@@ -38,13 +37,14 @@ function facts(entries) {
   return result;
 }
 
-export function createCommandCenterView({host, send, watchSession, onVisibility} = {}) {
+export function createCommandCenterView({host, send, watchSession, onVisibility, readOnly = false} = {}) {
   if (!host?.append) throw new TypeError('Command Center host element required');
+  const enabled = capability => !readOnly && capability?.enabled === true;
   let snapshot = null, workspaceId = null, screen = 'main', taskId = null, detailTab = 'work';
   let connected = false, opened = false, initialized = false, destroyed = false, composing = false;
   let currentKey = '', currentTarget = null, currentCapability = null, draftTotal = 0, draftSerial = 0, compositionEndedAt = -Infinity;
   let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null;
-  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), workerSelections = new Map();
+  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map();
   const element = node('section', 'cc-shell'); element.hidden = true;
   const reopen = button('지휘 터미널 열기', () => setOpen(true), 'cc-button cc-reopen'); reopen.dataset.ccOpen = '';
   const app = node('section', 'cc-app'); app.setAttribute('aria-label', '에이전트 지휘 터미널');
@@ -79,6 +79,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
   const notifyVisibility = value => { if (value !== lastVisibility) { lastVisibility = value; onVisibility?.(value); } };
   const isPending = scope => [...pending.values()].some(item => item.scope === scope);
   function applyTheme() {
+    const fontScale = Number(snapshot?.font_scale);
+    app.style.setProperty('--cc-font-scale', Number.isFinite(fontScale) ? Math.max(.75, Math.min(1.5, fontScale)) : 1);
     app.classList.toggle('cc-light', themeOverride ?? snapshot?.dark_mode === false);
     theme.textContent = app.classList.contains('cc-light') ? label('dark', '다크') : label('light', '라이트');
     theme.setAttribute('aria-label', '이 브라우저에서 ' + theme.textContent + ' 테마 사용');
@@ -136,6 +138,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
         }
         if (item.settingsVersion !== undefined && settings.get(item.workspace)?.version === item.settingsVersion) settings.delete(item.workspace);
         if (item.planVersion !== undefined && plans.get(item.workspace)?.version === item.planVersion) plans.delete(item.workspace);
+        if (item.resultKey && resultDrafts.get(item.resultKey)?.version === item.resultVersion) resultDrafts.delete(item.resultKey);
       }
       say(str(receipt.detail) || (receipt.status === 'acknowledged' ? '접수를 확인했습니다.' : '요청이 거절되었습니다. 초안은 보존됩니다.'));
     }
@@ -263,10 +266,12 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
     if (detailTab === 'git') { content.append(node('p', 'cc-empty', str(task.git?.reason) || '이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다.')); return; }
     if (detailTab === 'result') {
       content.append(node('pre', 'cc-log', task.result || label('no_result', '아직 제출된 결과가 없습니다.')));
+      content.append(node('p', 'cc-muted', task.verification || '검증 미실행'));
+      renderResultForms(task);
       if (task.result_revision) content.append(actionButton(label('confirm_result', '결과 확인'), task.confirm_result, {type: 'confirm_result', target: task.target, revision: task.result_revision}, 'result:' + routeKey(task.target))); return;
     }
     content.append(stateTag(task.state, label), facts([[label('scope', '범위'), task.scope], [label('criteria', '완료 기준'), task.acceptance_criteria], [label('directory', '실행 폴더'), task.directory], ['최근 관측', task.observed_at]]), node('p', 'cc-activity', task.activity));
-    if (task.approval) {
+    if (task.approval && !readOnly) {
       const approval = task.approval, box = node('section', 'cc-approval'); box.dataset.ccApproval = ''; box.append(node('h2', '', label('approval_title', '실행 승인 요청')), node('pre', 'cc-log', approval.command), facts([[label('directory', '폴더'), approval.directory], [label('scope', '범위'), approval.scope]]));
       const actions = node('div', 'cc-actions'); for (const allow of [false, true]) actions.append(actionButton(allow ? label('allow_once', '허용') : label('deny', '거절'), approval.action, {type: 'approval', target: task.target, approval_id: approval.id, allow}, 'approval:' + routeKey(task.target) + ':' + approval.id, allow ? 'cc-button cc-primary' : 'cc-button')); box.append(actions); content.append(box);
     }
@@ -286,6 +291,33 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
     const updateDispatch = () => { dispatch.disabled = !select.value || !connected || !enabled(task.dispatch) || isPending('dispatch:' + selectionKey); };
     select.addEventListener('change', () => { workerSelections.set(selectionKey, select.value); updateDispatch(); });
     dispatch.title = str(task.dispatch?.reason); updateDispatch(); actions.append(select, dispatch, terminalButton(task)); content.append(actions);
+  }
+  function renderResultForms(task) {
+    if (!task.attempt_id || readOnly) return;
+    const addForm = (kind, capability, caption, limit) => {
+      if (!enabled(capability)) return;
+      const key = JSON.stringify([routeKey(task.target), task.attempt_id, kind, kind === 'verify' ? task.result_revision : null]);
+      let draft = resultDrafts.get(key);
+      if (!draft) { if (resultDrafts.size >= 256) { content.append(node('p', 'cc-muted', '결과 초안 한도에 도달했습니다.')); return; } draft = {text: '', version: 0}; resultDrafts.set(key, draft); }
+      const details = node('details', 'cc-manual-plan'); details.append(node('summary', '', caption));
+      const area = node('textarea', 'cc-plan-input'); area.value = draft.text; area.dataset.ccFocus = kind + '-' + task.attempt_id; area.dataset.ccResult = kind; area.setAttribute('aria-label', caption); area.maxLength = limit;
+      const scope = kind + ':' + key;
+      const sendReport = passed => {
+        if (!draft.text.trim() || bytes(draft.text.normalize('NFC')) > limit) { say(caption + '의 입력 크기를 확인해 주세요.'); return; }
+        const intent = kind === 'report'
+          ? {type: 'report_result', target: task.target, attempt_id: task.attempt_id, text: draft.text.normalize('NFC')}
+          : {type: 'verify_result', target: task.target, attempt_id: task.attempt_id, revision: task.result_revision, passed, evidence: draft.text.normalize('NFC')};
+        emit(intent, scope, {resultKey: key, resultVersion: draft.version});
+      };
+      area.addEventListener('input', () => { draft.text = area.value; draft.version++; });
+      details.append(node('p', 'cc-muted', kind === 'report' ? '직접 확인한 결과를 기록합니다. 등록한 결과는 검증 대기 상태로 저장됩니다.' : '직접 수행한 검증의 명령과 결과를 기록해 주세요.'), area);
+      for (const [text, passed] of kind === 'report' ? [['결과 등록', true]] : [['검증 실패 기록', false], ['검증 통과 기록', true]]) {
+        const control = button(text, () => sendReport(passed)); control.disabled = !connected || isPending(scope); details.append(control);
+      }
+      content.append(details);
+    };
+    addForm('report', task.result_report, '수동 결과 보고', 8192);
+    if (task.result_revision) addForm('verify', task.verify_result, '직접 수행한 검증 기록', 4096);
   }
   function renderSettings(p) {
     title('프로젝트 설정', '변경한 값은 저장 요청의 접수가 확인될 때까지 보존됩니다.');
@@ -380,6 +412,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
   const observer = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (drawer) closeDrawers(); }) : null; observer?.observe(element);
   return {
     element,
+    open() { setOpen(true); },
     accept(message) {
       if (destroyed) return false;
       if (message?.type === 'cloud_control_result') {
@@ -399,7 +432,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility}
       if (destroyed) return; rememberDraft(); connected = false; for (const item of pending.values()) item.status = 'uncertain'; say('연결이 끊겼습니다. 초안은 보존되며 요청을 자동으로 다시 보내지 않습니다.'); render();
     },
     destroy() {
-      if (destroyed) return; destroyed = true; observer?.disconnect(); element.removeEventListener('keydown', onKey); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); workerSelections.clear(); element.remove(); notifyVisibility(false);
+      if (destroyed) return; destroyed = true; observer?.disconnect(); element.removeEventListener('keydown', onKey); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); element.remove(); notifyVisibility(false);
     },
   };
 }

@@ -7,10 +7,14 @@ const INDEX: &str = include_str!("../assets/index.html");
 const APP_JS: &str = concat!(
     include_str!("../../../web/shared/cloud-results.js"),
     "\n",
+    include_str!("../../../web/shared/command-center.js"),
+    "\n",
     include_str!("../assets/app.js")
 );
 const APP_CSS: &str = concat!(
     include_str!("../../../web/shared/cloud-results.css"),
+    "\n",
+    include_str!("../../../web/shared/command-center.css"),
     "\n",
     include_str!("../assets/app.css")
 );

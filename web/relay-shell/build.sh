@@ -21,7 +21,7 @@ DIST=${RELAY_SHELL_DIST:-"$SRC/dist"}
 MANIFEST_NAME=relay-shell.manifest.json
 FILES="index.html relay-shell.js relay-terminal.js relay-crypto.js relay-shell.css sw.js manifest.webmanifest"
 # web/shared에서 가져오는 자산. 셸 문서가 직접 참조하므로 **필수**이며, 빠지면 빌드가 멈춘다.
-SHARED_FILES="mobile-theme.css cloud-results.js cloud-results.css"
+SHARED_FILES="mobile-theme.css cloud-results.js cloud-results.css command-center.js command-center.css"
 CRYPTO_MODULE=relay-crypto.js
 SHARED_DIR=$SRC/../shared
 
@@ -157,6 +157,7 @@ build() {
         [ -f "$SRC/$name" ] || die "missing source asset: $name"
         sed -e "s|__SHELL_ORIGIN__|$SHELL_ORIGIN|g" -e "s|__RELAY_ORIGIN__|$RELAY_ORIGIN|g" \
             -e 's|../shared/cloud-results.js|./cloud-results.js|g' \
+            -e 's|../shared/command-center.js|./command-center.js|g' \
             "$SRC/$name" >"$stage/$name"
     done
 

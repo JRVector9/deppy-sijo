@@ -56,6 +56,7 @@ import {
   createTerminalView,
 } from "./relay-terminal.js";
 import { createCloudResultsView } from "../shared/cloud-results.js";
+import { createCommandCenterView } from "../shared/command-center.js";
 
 /// 이 셸이 받아들이는 가장 낮은 프로토콜 버전. 낡은 셸이 새 계약을 흉내 내지 못하게 하고,
 /// 낡은 Mac이 이 셸을 끌어내리지도 못하게 한다.
@@ -65,7 +66,7 @@ export const MIN_PROTOCOL_VERSION = 1;
 export const OUTBOUND_MESSAGE_TYPES = Object.freeze(["watch", "unwatch", "request_keyframe"]);
 
 /// 이 셸이 해석하는 수신 메시지의 전부.
-export const INBOUND_MESSAGE_TYPES = Object.freeze(["dashboard", "viewport", "cloud_snapshot"]);
+export const INBOUND_MESSAGE_TYPES = Object.freeze(["dashboard", "viewport", "cloud_snapshot", "work_snapshot"]);
 
 export const SCREEN = Object.freeze({
   BOOT: "boot",
@@ -196,6 +197,9 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     /// DOM 행 터미널 렌더러(relay-terminal.js). 세션 화면이 만들어진 뒤에만 있다.
     terminal: null,
     cloudResults: null,
+    commandCenter: null,
+    commandCenterVisible: false,
+    commandCenterReturn: false,
     /// 마지막 대시보드. 터미널 화면의 세션 전환과 종료 감지가 이걸 본다.
     workspaces: [],
     workspaceQuery: "",
@@ -400,6 +404,27 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     home.insertBefore(state.cloudResults.toggle, search);
     home.insertBefore(state.cloudResults.panel, search);
     session.append(home);
+    const commandCenterHost = element("section", "relay-command-center");
+    commandCenterHost.id = "relay-command-center";
+    commandCenterHost.hidden = true;
+    session.append(commandCenterHost);
+    state.commandCenter = createCommandCenterView({
+      host: commandCenterHost, send: () => false, readOnly: true,
+      watchSession(id) {
+        if (!state.workspaces.some(workspace => watchable(workspace).some(view => view.id === id))) {
+          state.commandCenter.open(); return false;
+        }
+        state.commandCenterReturn = true;
+        void startWatching(id, "세션"); return true;
+      },
+      onVisibility(open) {
+        state.commandCenterVisible = open;
+        commandCenterHost.hidden = state.commandCenter.element.hidden || Boolean(state.watching);
+        commandCenterHost.dataset.open = String(open);
+        home.hidden = open || Boolean(state.watching);
+      },
+    });
+
 
     // 터미널 화면 — 활성화 뒤에도 카드를 눌러야 열린다.
     const terminal = element("section", "m-term-shell");
@@ -649,6 +674,10 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     closeMenu(); closeSessionSheet();
     state.cloudResults?.resetConnection();
     state.cloudResults = null;
+    state.commandCenter?.destroy();
+    state.commandCenter = null;
+    state.commandCenterVisible = false;
+    state.commandCenterReturn = false;
     state.terminal?.destroy?.();
     state.terminal = null;
     state.watching = null;
@@ -902,6 +931,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     closeMenu(); closeSessionSheet();
     state.selectedWorkspace = workspace;
     home.hidden = true;
+    const center = byId("relay-command-center"); if (center) center.hidden = true;
     terminal.hidden = false;
     document.body.dataset.stage = "open";
     try {
@@ -940,7 +970,9 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     const terminal = byId("relay-terminal");
     const home = byId("relay-home");
     if (terminal) terminal.hidden = true;
-    if (home) home.hidden = false;
+    if (state.commandCenterReturn) { state.commandCenterReturn = false; state.commandCenter?.open(); }
+    if (home) home.hidden = state.commandCenterVisible;
+    const center = byId("relay-command-center"); if (center) center.hidden = state.commandCenter?.element.hidden ?? true;
     document.body.dataset.stage = "closed";
     if (!fromHistory) {
       try {
@@ -962,6 +994,13 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
       return;
     }
     if (!INBOUND_MESSAGE_TYPES.includes(message?.type)) return;
+    if (message.type === "work_snapshot") {
+      state.commandCenter?.accept(message);
+      const center = byId("relay-command-center"), home = byId("relay-home");
+      if (center) center.hidden = (state.commandCenter?.element.hidden ?? true) || Boolean(state.watching);
+      if (home) home.hidden = state.commandCenterVisible || Boolean(state.watching);
+      return;
+    }
     if (message.type === "cloud_snapshot") {
       // This shell's existing paired-device contract remains view-only.
       state.cloudResults?.accept({ ...message, can_control: false, can_approve: false });

@@ -26,6 +26,8 @@ const STATIC = [
   "./mobile-theme.css",
   "./cloud-results.js",
   "./cloud-results.css",
+  "./command-center.js",
+  "./command-center.css",
   "./manifest.webmanifest",
 ];
 

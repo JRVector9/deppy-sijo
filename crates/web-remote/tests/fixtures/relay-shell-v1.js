@@ -453,6 +453,19 @@ async function flow() {
   document.documentElement.style.width = previousWidth;
   document.getElementById("relay-cloud-results-toggle").click();
 
+  // Command Center remains view-only on this paired-device shell even if a sender
+  // incorrectly offers controls. A null projection restores the existing dashboard.
+  const workProjection = {projects: [{id: "ws-1", name: "독립 작업 프로젝트", directory: "/fixture", goal: "실제 목표", main_summary: "관측 상태", main_target: {workspace_id: "ws-1", session_id: "opaque-main", task_id: null}, main_input: {enabled: true}, sessions: [], tasks: [], history: [], config: {}}], selected_workspace_id: "ws-1", devices: [], receipts: []};
+  const workFrame = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "work_snapshot", snapshot: workProjection})));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, workFrame.ciphertext, workFrame.sequence);
+  const workHost = document.getElementById("relay-command-center");
+  await waitFor(() => !workHost.hidden, "encrypted Command Center projection");
+  ok(workHost.querySelector("[data-cc-composer]").disabled, "paired viewer never gains Command Center input from offered capabilities");
+  ok(workHost.getBoundingClientRect().height === innerHeight, "Relay Command Center fills actual viewport");
+  const clearWorkFrame = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "work_snapshot", snapshot: null})));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, clearWorkFrame.ciphertext, clearWorkFrame.sequence);
+  await waitFor(() => workHost.hidden && !home.hidden, "rollback to Relay home");
+
   // 카드 → 터미널 화면 + watch.
   const openFromMac = async (index) =>
     new TextDecoder().decode(

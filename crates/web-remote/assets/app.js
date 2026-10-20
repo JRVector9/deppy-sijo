@@ -263,6 +263,7 @@
       if (!wasCurrent || intentionallyClosedSockets.has(socket)) return;
       cancelPendingWatch();
       cloudResults.resetConnection();
+      commandCenter.resetConnection();
       setStatus('bad', '연결 끊김 — 재연결 중…');
       setViewerConnection('reconnecting');
       scheduleReconnect();
@@ -285,6 +286,7 @@
   function disconnect() {
     cancelPendingWatch();
     cloudResults.resetConnection();
+    commandCenter.resetConnection();
     retireResizeControl();
     retireHistory();
     manualClose = true;
@@ -325,10 +327,15 @@
       case 'approvals':
         renderApprovals(msg.pending || []);
         break;
+      case 'work_snapshot':
+        commandCenter.accept(msg);
+        syncCommandCenterVisibility();
+        break;
       case 'cloud_snapshot':
       case 'cloud_control_result':
       case 'cloud_navigation_result':
         cloudResults.accept(msg);
+        if (msg.type === 'cloud_control_result') commandCenter.accept(msg);
         break;
       case 'viewport':
         historyCompleting = historyPending && historyTargetCurrent(historyPending)
@@ -464,6 +471,7 @@
       readingChanged: handleReadingChanged,
       resumeHistory: () => sendHistoryRequest('reset', 0),
       beforeOpen: () => {
+        commandCenterHost.hidden = true;
         closeViewerMenu(false);
         closeSessionSheet(false);
         retireResizeControl();
@@ -516,6 +524,8 @@
         setComposerNote('');
       },
       afterHide: ({ rerender = true, notice = '' } = {}) => {
+        if (commandCenterReturn) { commandCenterReturn = false; commandCenter.open(); }
+        syncCommandCenterVisibility();
         if (rerender) renderWorkspaces(lastWorkspaces, lastResource);
         const closeNotices = [notice, draftCacheNotice].filter(Boolean);
         draftCacheNotice = '';
@@ -1912,6 +1922,32 @@
   });
   dashboardShell.insertBefore(cloudResults.toggle, workspaceSearch.closest('label'));
   dashboardShell.insertBefore(cloudResults.panel, workspaceSearch.closest('label'));
+  const commandCenterHost = document.createElement('section');
+  commandCenterHost.id = 'command-center-host';
+  commandCenterHost.hidden = true;
+  document.body.insertBefore(commandCenterHost, dashboardShell);
+  let commandCenterVisible = false;
+  let commandCenterReturn = false;
+  function syncCommandCenterVisibility() {
+    const viewing = !viewer.el.hidden;
+    commandCenterHost.hidden = commandCenter.element.hidden || viewing;
+    commandCenterHost.dataset.open = String(commandCenterVisible);
+    dashboardShell.hidden = commandCenterVisible || viewing;
+  }
+  const commandCenter = createCommandCenterView({
+    host: commandCenterHost, send,
+    watchSession(id) {
+      const session = lastSessions.find(row => row.id === id && !row.exited);
+      if (!session) { showNotice('현재 터미널 연결을 확인할 수 없습니다.'); commandCenter.open(); return false; }
+      commandCenterReturn = true;
+      openViewer(session.id, session.title || '세션');
+      return true;
+    },
+    onVisibility(open) {
+      commandCenterVisible = open;
+      syncCommandCenterVisibility();
+    },
+  });
   const searchable = value => String(value || '').normalize('NFC').toLocaleLowerCase();
   function sessionStatusLabel(session, workspace) {
     if (session.exited) return '종료';

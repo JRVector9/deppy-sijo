@@ -22,6 +22,8 @@ const APP_JS_BUNDLE: &str = concat!(
     "\n",
     include_str!("../../../web/shared/cloud-results.js"),
     "\n",
+    include_str!("../../../web/shared/command-center.js"),
+    "\n",
     include_str!("../assets/app.js"),
 );
 const APP_CSS_BUNDLE: &str = concat!(
@@ -33,6 +35,8 @@ const APP_CSS_BUNDLE: &str = concat!(
     include_str!("../../../web/shared/mobile-theme.css"),
     "\n",
     include_str!("../../../web/shared/cloud-results.css"),
+    "\n",
+    include_str!("../../../web/shared/command-center.css"),
     "\n",
     include_str!("../assets/app.css"),
 );

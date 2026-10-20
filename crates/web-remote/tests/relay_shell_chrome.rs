@@ -67,6 +67,8 @@ fn shell_files(fixture: &serde_json::Value) -> StaticFiles {
     for (name, mime) in [
         ("cloud-results.js", "text/javascript"),
         ("cloud-results.css", "text/css"),
+        ("command-center.js", "text/javascript"),
+        ("command-center.css", "text/css"),
     ] {
         files.insert(format!("/{name}"), (mime, read(&shared.join(name))));
         files.insert(format!("/shared/{name}"), (mime, read(&shared.join(name))));

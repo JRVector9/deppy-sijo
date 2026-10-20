@@ -326,8 +326,32 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
         model: Some("codex-model".into()),
         effort: Some("xhigh".into()),
         device: "이 Mac".into(),
+        input: Capability {
+            enabled: true,
+            reason: String::new(),
+        },
         ..Default::default()
     });
+    for (title, task_id) in [
+        ("task-owned session", Some("task-a".into())),
+        ("no-agent session", None),
+    ] {
+        p.sessions.push(Session {
+            title: title.into(),
+            provider: "Codex".into(),
+            device: "이 Mac".into(),
+            target: RouteTarget {
+                workspace_id: p.id.clone(),
+                session_id: Some(title.into()),
+                task_id: task_id.clone(),
+            },
+            input: Capability {
+                enabled: task_id.is_some(),
+                reason: String::new(),
+            },
+            ..Default::default()
+        });
+    }
     p.available_providers = vec!["Codex".into(), "Claude".into()];
     p.available_agents = vec![
         AgentOption {
@@ -390,6 +414,16 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
         .unwrap()
         .click();
     harness.run();
+    assert!(
+        harness
+            .query_by_label("task-owned session · Codex · 이 Mac")
+            .is_none()
+    );
+    assert!(
+        harness
+            .query_by_label("no-agent session · Codex · 이 Mac")
+            .is_none()
+    );
     harness
         .get_by_label("existing Codex main · Codex · 이 Mac")
         .click();
@@ -1098,7 +1132,8 @@ fn command_center_render_evidence() {
                     let title = harness
                         .query_by_label("구현 · 결제 화면 구현")
                         .map(|n| rect(n.rect()));
-                    metrics.push(serde_json::json!({"name": name, "width": width, "height": height, "scale": scale, "dark": dark, "screen": rect(l.screen), "header": rect(l.header), "drawer": rect(l.right_drawer()), "assignment_title": title}));
+                    let inputs: Vec<_> = harness.get_all_by_role(egui::accesskit::Role::TextInput).map(|node| serde_json::json!({"rect":rect(node.rect()),"value":node.value()})).collect();
+                    metrics.push(serde_json::json!({"name": name, "width": width, "height": height, "scale": scale, "dark": dark, "screen": rect(l.screen), "header": rect(l.header), "content":rect(l.content), "composer":rect(l.composer), "drawer": rect(l.right_drawer()), "assignment_title": title,"text_inputs":inputs}));
                     harness
                         .render()
                         .expect("offscreen native egui rendering")

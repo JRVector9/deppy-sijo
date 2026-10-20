@@ -68,6 +68,13 @@ fn title(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
                         14.0
                     }) * snapshot.font_scale,
                 )
+                .line_height(Some(
+                    (if ui.ctx().viewport_rect().width() <= 760.0 {
+                        20.15
+                    } else {
+                        21.7
+                    }) * snapshot.font_scale,
+                ))
                 .strong()
                 .family(crate::fonts::command_center_semibold_family(ui.ctx())),
         )
@@ -83,6 +90,7 @@ fn home(
     intents: &mut Vec<Intent>,
 ) {
     ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().interact_size.y = 0.0;
     if p.storage_retry.enabled {
         ui.label(&p.storage_retry.reason);
         if ui.button("저장 상태 다시 확인").clicked() {
@@ -95,7 +103,7 @@ fn home(
     ui.add(egui::Label::new(
         egui::RichText::new(format!("{} · {}", text(snapshot, "goal"), p.name))
             .size(11.0 * snapshot.font_scale)
-            .line_height(Some(17.0 * snapshot.font_scale))
+            .line_height(Some(17.05 * snapshot.font_scale))
             .color(colors(snapshot).muted),
     ));
     ui.add_space(9.0);
@@ -175,6 +183,13 @@ fn home(
                             10.0
                         }) * snapshot.font_scale,
                     )
+                    .line_height(Some(
+                        (if state.last_layout.is_some_and(|l| l.mobile) {
+                            13.95
+                        } else {
+                            15.5
+                        }) * snapshot.font_scale,
+                    ))
                     .color(if *key == "independent" {
                         colors(snapshot).accent
                     } else {
@@ -431,7 +446,12 @@ fn home(
 }
 
 fn description(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
-    ui.add(
+    ui.add_sized(
+        [
+            ui.available_width()
+                .min(72.0 * 7.5586 * snapshot.font_scale),
+            0.0,
+        ],
         egui::Label::new(
             egui::RichText::new(value)
                 .size(12.0 * snapshot.font_scale)
@@ -452,6 +472,7 @@ fn thread(ui: &mut egui::Ui, snapshot: &Snapshot, label: &str, draw: impl FnOnce
                 .size(9.0 * snapshot.font_scale)
                 .color(colors(snapshot).muted),
         ));
+        ui.add_space(7.0);
         draw(ui);
     } else {
         let width = ui.available_width();
@@ -961,11 +982,11 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
     let title_w = (ui.available_width() - number_w - owner_w - 2.0 * gap).max(1.0);
     let line = egui::Stroke::new(1.0, colors(snapshot).line);
     let mut owner_left = 0.0;
+    ui.add_space(1.0);
     let response = egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(0, 12))
         .show(ui, |ui| {
             ui.set_min_width(ui.available_width());
-            ui.set_min_height(38.0 * scale);
             ui.spacing_mut().item_spacing = egui::vec2(gap, 3.0);
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
@@ -990,6 +1011,7 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                             egui::Label::new(
                                 egui::RichText::new(&label)
                                     .size(12.0 * scale)
+                                    .line_height(Some(18.6 * scale))
                                     .strong()
                                     .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                             )
@@ -1012,6 +1034,7 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                             egui::Label::new(
                                 egui::RichText::new(&t.scope)
                                     .size((if mobile { 9.0 } else { 10.0 }) * scale)
+                                    .line_height(Some((if mobile { 13.95 } else { 15.5 }) * scale))
                                     .color(colors(snapshot).muted),
                             )
                             .wrap(),
@@ -1029,7 +1052,11 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                             ui.vertical(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(&t.provider).size(11.0 * scale),
+                                        egui::RichText::new(&t.provider)
+                                            .size((if mobile { 10.0 } else { 11.0 }) * scale)
+                                            .line_height(Some(
+                                                (if mobile { 15.5 } else { 17.05 }) * scale,
+                                            )),
                                     )
                                     .wrap(),
                                 );
@@ -1037,6 +1064,7 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                                     egui::Label::new(
                                         egui::RichText::new(&t.device)
                                             .size(10.0 * scale)
+                                            .line_height(Some(15.5 * scale))
                                             .color(colors(snapshot).muted),
                                     )
                                     .wrap(),

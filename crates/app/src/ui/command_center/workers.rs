@@ -422,22 +422,25 @@ pub(super) fn monitor(
         header.bottom(),
         egui::Stroke::new(1.0, c.line),
     );
+    let scroll_padding = if ui.ctx().viewport_rect().width() <= 1250.0 {
+        14.0
+    } else {
+        18.0
+    };
     region(
         ui,
-        list,
+        list.shrink2(egui::vec2(scroll_padding, 0.0)),
         c.bg,
         "cc-monitor-list",
-        if ui.ctx().viewport_rect().width() <= 1250.0 {
-            14.0
-        } else {
-            18.0
-        },
+        0.0,
         |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("cc-workers", p.map(|p| &p.id)))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 6.0;
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    ui.add_space(12.0);
                     ui.horizontal_wrapped(|ui| {
                         ui.spacing_mut().item_spacing.x = 5.0;
                         ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
@@ -473,6 +476,7 @@ pub(super) fn monitor(
                             }
                         }
                     });
+                    ui.add_space(12.0);
                     let Some(p) = p else {
                         weak(ui, snapshot, text(snapshot, "no_projects"));
                         return;
@@ -507,14 +511,15 @@ pub(super) fn monitor(
                                     egui::Frame::NONE
                                         .stroke(egui::Stroke::new(1.0, c.line))
                                         .corner_radius(3)
-                                        .inner_margin(egui::Margin::symmetric(4, 2))
+                                        .inner_margin(egui::Margin::symmetric(5, 1))
                                         .show(ui, |ui| {
                                             ui.label(
                                                 egui::RichText::new(format!(
                                                     "{} · {}",
                                                     t.provider, t.role
                                                 ))
-                                                .size(10.0 * scale),
+                                                .size(10.0 * scale)
+                                                .line_height(Some(15.5 * scale)),
                                             );
                                         });
                                     ui.with_layout(
@@ -536,6 +541,7 @@ pub(super) fn monitor(
                                     egui::Label::new(
                                         egui::RichText::new(&t.title)
                                             .size(12.0 * scale)
+                                            .line_height(Some(19.2 * scale))
                                             .strong()
                                             .family(crate::fonts::command_center_semibold_family(
                                                 ui.ctx(),
@@ -543,28 +549,37 @@ pub(super) fn monitor(
                                     )
                                     .wrap(),
                                 );
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&t.scope)
-                                            .size(10.0 * scale)
-                                            .color(c.muted),
-                                    )
-                                    .wrap(),
-                                );
                                 ui.add_space(6.0);
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(&t.activity)
-                                            .size(11.0 * scale)
+                                        egui::RichText::new(&t.scope)
+                                            .monospace()
+                                            .size(10.0 * scale)
+                                            .line_height(Some(16.0 * scale))
                                             .color(c.muted),
                                     )
                                     .wrap(),
                                 );
-                                ui.add_space(3.0);
+                                ui.add_space(10.0);
+                                let mut activity = egui::text::LayoutJob::simple(
+                                    t.activity.clone(),
+                                    egui::FontId::proportional(11.0 * scale),
+                                    if snapshot.dark_mode {
+                                        egui::Color32::from_rgb(186, 196, 208)
+                                    } else {
+                                        egui::Color32::from_rgb(70, 86, 103)
+                                    },
+                                    ui.available_width(),
+                                );
+                                activity.wrap.max_rows = 2;
+                                activity.sections[0].format.line_height = Some(18.15 * scale);
+                                ui.add(egui::Label::new(activity));
+                                ui.add_space(12.0);
                                 ui.horizontal(|ui| {
                                     ui.label(
                                         egui::RichText::new(&t.device)
                                             .size(10.0 * scale)
+                                            .line_height(Some(15.5 * scale))
                                             .color(c.muted),
                                     );
                                     ui.with_layout(
@@ -578,6 +593,7 @@ pub(super) fn monitor(
                                         },
                                     );
                                 });
+                                ui.add_space(12.0);
                                 ui.horizontal(|ui| {
                                     ui.spacing_mut().interact_size.y = 28.0 * scale;
                                     ui.spacing_mut().button_padding = egui::vec2(7.0, 4.0);
@@ -643,7 +659,16 @@ pub(super) fn monitor(
                                 ),
                             );
                         }
-                        rule(ui, snapshot);
+                        ui.add_space(17.0);
+                        let (line, _) = ui.allocate_exact_size(
+                            egui::vec2(ui.available_width(), 1.0),
+                            egui::Sense::hover(),
+                        );
+                        ui.painter().hline(
+                            line.x_range(),
+                            line.top(),
+                            egui::Stroke::new(1.0, c.line),
+                        );
                     }
                     ui.add_space(8.0);
                     ui.label(

@@ -29,8 +29,15 @@ fn form(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
+    ui.spacing_mut().item_spacing.y = 0.0;
+    ui.spacing_mut().interact_size.y = 0.0;
     ui.horizontal(|ui| {
-        ui.heading(text(snapshot, "settings"));
+        ui.label(
+            egui::RichText::new(text(snapshot, "settings"))
+                .size(20.0 * snapshot.font_scale)
+                .line_height(Some(28.0 * snapshot.font_scale))
+                .family(crate::fonts::command_center_semibold_family(ui.ctx())),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if snapshot.add_project.enabled
                 && ghost_button(ui, snapshot, text(snapshot, "add_project"), 28.0, 12.0).clicked()
@@ -39,6 +46,7 @@ fn form(
             }
         });
     });
+    ui.add_space(5.0);
     ui.add(
         egui::Label::new(
             egui::RichText::new("메인과 작업 폴더를 정하고, 필요할 때 실행 규칙을 조정하세요.")
@@ -48,6 +56,11 @@ fn form(
         )
         .wrap(),
     );
+    ui.add_space(if ui.ctx().viewport_rect().width() <= 760.0 {
+        3.0
+    } else {
+        5.0
+    });
     if state
         .settings_draft
         .as_ref()
@@ -63,10 +76,12 @@ fn form(
     field(ui, snapshot, "project_directory", |ui| {
         input(ui, snapshot, &mut draft.directory);
     });
-    weak(
-        ui,
-        snapshot,
-        "다른 컴퓨터의 폴더는 기기 연결 시 확인합니다.",
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("다른 컴퓨터의 폴더는 기기 연결 시 확인합니다.")
+            .size(12.0 * snapshot.font_scale)
+            .line_height(Some(18.6 * snapshot.font_scale))
+            .color(colors(snapshot).muted),
     );
     inline(ui, |ui, index| {
         if index == 0 {
@@ -185,7 +200,10 @@ fn form(
                             text(snapshot, "unbound"),
                         );
                         for session in p.sessions.iter().filter(|s| {
-                            s.target.workspace_id == p.id && s.target.session_id.is_some()
+                            s.target.workspace_id == p.id
+                                && s.target.session_id.is_some()
+                                && s.target.task_id.is_none()
+                                && s.input.enabled
                         }) {
                             ui.selectable_value(
                                 &mut draft.main_session_id,
@@ -268,7 +286,8 @@ fn form(
                         egui::Color32::WHITE
                     },
                 ))
-                .fill(colors(snapshot).accent),
+                .fill(colors(snapshot).accent)
+                .min_size(egui::vec2(50.0, 34.0 * snapshot.font_scale)),
             )
             .on_disabled_hover_text(&p.save_settings.reason)
             .clicked()
@@ -304,7 +323,7 @@ fn input(ui: &mut egui::Ui, snapshot: &Snapshot, value: &mut String) {
     );
 }
 fn field(ui: &mut egui::Ui, snapshot: &Snapshot, key: &str, control: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(14.0);
+    ui.add_space(19.0);
     ui.vertical(|ui| {
         ui.spacing_mut().item_spacing.y = 0.0;
         ui.label(
@@ -353,6 +372,7 @@ fn choices(
 ) {
     field(ui, snapshot, key, |ui| {
         ui.add_enabled_ui(!choices.is_empty(), |ui| {
+            ui.spacing_mut().interact_size.y = 36.0 * snapshot.font_scale.max(1.0);
             egui::ComboBox::from_id_salt(key)
                 .selected_text(
                     egui::RichText::new(if value.is_empty() {

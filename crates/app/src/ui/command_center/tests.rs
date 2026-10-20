@@ -375,3 +375,26 @@ fn command_center_render_evidence() {
         );
     }
 }
+
+#[test]
+fn snapshot_and_exact_target_intents_roundtrip_without_ui_state() {
+    let snapshot = fixture();
+    let value = serde_json::to_value(&snapshot).unwrap();
+    let restored: Snapshot = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        restored.projects[0].main_target,
+        snapshot.projects[0].main_target
+    );
+    let intent = Intent::Submit {
+        target: snapshot.projects[0].main_target.clone(),
+        text: "동일한 입력".into(),
+    };
+    let value = serde_json::to_value(&intent).unwrap();
+    assert_eq!(value["type"], "submit");
+    assert_eq!(value["target"]["session_id"], "opaque-pane-a");
+    assert_eq!(serde_json::from_value::<Intent>(value).unwrap(), intent);
+    assert!(
+        serde_json::from_str::<Intent>(r#"{"type":"submit","target":{"workspace_id":"a"}}"#)
+            .is_err()
+    );
+}

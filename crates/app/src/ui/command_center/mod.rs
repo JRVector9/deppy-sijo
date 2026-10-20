@@ -8,18 +8,20 @@ mod main;
 mod settings;
 mod workers;
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use layout::LayoutRects;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RouteTarget {
     pub workspace_id: String,
     pub session_id: Option<String>,
     pub task_id: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum View {
     #[default]
     Main,
@@ -31,7 +33,8 @@ pub enum View {
     Settings,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DetailTab {
     #[default]
     Work,
@@ -41,7 +44,8 @@ pub enum DetailTab {
     Terminal,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MonitorFilter {
     #[default]
     All,
@@ -49,7 +53,8 @@ pub enum MonitorFilter {
     Running,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TaskState {
     PlanReview,
     #[default]
@@ -82,14 +87,16 @@ impl TaskState {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Capability {
     pub enabled: bool,
     pub reason: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
+    #[serde(default)]
+    pub terminal_session_id: Option<String>,
     pub target: RouteTarget,
     pub title: String,
     pub provider: String,
@@ -98,7 +105,7 @@ pub struct Session {
     pub input: Capability,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Approval {
     pub id: String,
     pub command: String,
@@ -107,8 +114,12 @@ pub struct Approval {
     pub action: Capability,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub eligible_sessions: Vec<Session>,
+    #[serde(default)]
+    pub terminal_session_id: Option<String>,
     pub target: RouteTarget,
     pub title: String,
     pub role: String,
@@ -131,7 +142,7 @@ pub struct Task {
     pub dispatch: Capability,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
     pub target: Option<RouteTarget>,
@@ -140,8 +151,10 @@ pub struct HistoryEntry {
     pub detail: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectConfig {
+    #[serde(default)]
+    pub allowed_scope_roots: Vec<String>,
     pub name: String,
     pub directory: String,
     /// Explicit binding; None means unbound, never the first available session.
@@ -156,8 +169,12 @@ pub struct ProjectConfig {
     pub revision: String,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default)]
+    pub manual_plan: Capability,
+    #[serde(default)]
+    pub planner_prompt: Option<String>,
     pub id: String,
     pub name: String,
     pub directory: String,
@@ -182,7 +199,7 @@ pub struct Project {
     pub available_automation: Vec<String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Device {
     pub id: String,
     pub name: String,
@@ -193,8 +210,10 @@ pub struct Device {
     pub can_execute: bool,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub receipts: Vec<RemoteReceipt>,
     pub projects: Vec<Project>,
     pub selected_workspace_id: Option<String>,
     pub devices: Vec<Device>,
@@ -210,6 +229,7 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            receipts: Vec::new(),
             projects: Vec::new(),
             selected_workspace_id: None,
             devices: Vec::new(),
@@ -223,7 +243,8 @@ impl Default for Snapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
     SelectProject {
         workspace_id: String,
@@ -256,6 +277,10 @@ pub enum Intent {
         target: RouteTarget,
         revision: String,
     },
+    InstallPlanJson {
+        workspace_id: String,
+        json: String,
+    },
     ConfirmPlan {
         workspace_id: String,
         goal_id: String,
@@ -269,6 +294,19 @@ pub enum Intent {
     UseOriginalLayout,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReceipt {
+    pub operation_id: String,
+    pub status: ReceiptStatus,
+    pub detail: String,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReceiptStatus {
+    Acknowledged,
+    Rejected,
+    Uncertain,
+}
 #[derive(Default)]
 pub struct UiState {
     pub view: View,
@@ -283,6 +321,8 @@ pub struct UiState {
     /// Native terminal host slot. Set only for a terminal view with an exact session target.
     pub terminal_rect: Option<egui::Rect>,
     pub terminal_target: Option<RouteTarget>,
+    task_workers: BTreeMap<String, Option<String>>,
+    plan_json: BTreeMap<String, String>,
     active_workspace: Option<String>,
     requested_terminal_target: Option<RouteTarget>,
     requested_task_target: Option<RouteTarget>,

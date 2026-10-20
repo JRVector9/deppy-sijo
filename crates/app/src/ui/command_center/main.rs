@@ -124,6 +124,38 @@ fn home(
         }
     });
     rule(ui, snapshot);
+    if p.manual_plan.enabled {
+        egui::CollapsingHeader::new("배정안 JSON 직접 확인")
+            .id_salt("manual-plan")
+            .show(ui, |ui| {
+                ui.label("메인 응답의 배정안 JSON을 붙여넣으면 프로젝트·설정·범위를 검증합니다.");
+                if let Some(prompt) = &p.planner_prompt {
+                    egui::CollapsingHeader::new("메인에게 전달한 계획 요청").show(ui, |ui| {
+                        ui.add(egui::Label::new(prompt).wrap());
+                    });
+                }
+                let json = state.plan_json.entry(p.id.clone()).or_default();
+                ui.add(
+                    egui::TextEdit::multiline(json)
+                        .desired_rows(5)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(16 * 1024),
+                );
+                if ui
+                    .add_enabled(
+                        !json.trim().is_empty(),
+                        egui::Button::new("배정안 검증 후 표시"),
+                    )
+                    .clicked()
+                {
+                    intents.push(Intent::InstallPlanJson {
+                        workspace_id: p.id.clone(),
+                        json: json.clone(),
+                    });
+                }
+            });
+        rule(ui, snapshot);
+    }
     thread(ui, snapshot, "MAIN", |ui| {
         title(
             ui,
@@ -345,12 +377,36 @@ fn task_detail(
     match state.detail_tab {
         DetailTab::Work => {
             title(ui, snapshot, &t.activity);
-            if t.dispatch.enabled
-                && action(ui, snapshot, text(snapshot, "dispatch_task"), &t.dispatch)
-            {
-                intents.push(Intent::DispatchTask {
-                    target: t.target.clone(),
-                });
+            if t.dispatch.enabled {
+                let selected = state
+                    .task_workers
+                    .entry(format!("{}:{:?}", p.id, t.target.task_id))
+                    .or_default();
+                egui::ComboBox::from_id_salt("task-worker")
+                    .selected_text(
+                        t.eligible_sessions
+                            .iter()
+                            .find(|s| s.target.session_id == *selected)
+                            .map(|s| s.title.as_str())
+                            .unwrap_or("실행 세션 선택"),
+                    )
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(selected, None, "실행 세션 선택");
+                        for session in &t.eligible_sessions {
+                            ui.selectable_value(
+                                selected,
+                                session.target.session_id.clone(),
+                                &session.title,
+                            );
+                        }
+                    });
+                if selected.is_some()
+                    && action(ui, snapshot, text(snapshot, "dispatch_task"), &t.dispatch)
+                {
+                    let mut target = t.target.clone();
+                    target.session_id = selected.clone();
+                    intents.push(Intent::DispatchTask { target });
+                }
             }
             for (key, value) in [
                 ("scope", &t.scope),

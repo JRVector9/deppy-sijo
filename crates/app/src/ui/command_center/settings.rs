@@ -58,6 +58,25 @@ pub(super) fn show(
                 }
             });
     });
+    field(ui, snapshot, "scope", |ui| {
+        let mut roots = draft.allowed_scope_roots.join("\n");
+        if ui
+            .add(
+                egui::TextEdit::multiline(&mut roots)
+                    .hint_text("src\ntests")
+                    .desired_rows(3)
+                    .desired_width(f32::INFINITY),
+            )
+            .changed()
+        {
+            draft.allowed_scope_roots = roots
+                .lines()
+                .map(str::trim)
+                .filter(|r| !r.is_empty())
+                .map(str::to_owned)
+                .collect();
+        }
+    });
     choices(
         ui,
         snapshot,

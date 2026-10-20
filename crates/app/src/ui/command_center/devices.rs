@@ -198,7 +198,8 @@ pub(super) fn show(
                             ui.label(
                                 egui::RichText::new(&device.name)
                                     .size((if mobile { 13.0 } else { 14.0 }) * snapshot.font_scale)
-                                    .strong(),
+                                    .strong()
+                                    .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                             );
                             weak(ui, snapshot, &device.description);
                             if mobile {
@@ -355,7 +356,11 @@ pub(super) fn show(
         .take(32)
     {
         rule(ui, snapshot);
-        ui.label(egui::RichText::new(format!("{} · 연결 확인됨", candidate.name)).strong());
+        ui.label(
+            egui::RichText::new(format!("{} · 연결 확인됨", candidate.name))
+                .strong()
+                .family(crate::fonts::command_center_semibold_family(ui.ctx())),
+        );
         for (label, value) in [
             ("기기 ID", &candidate.device_id),
             ("연결 주소", &candidate.endpoint),

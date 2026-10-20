@@ -99,10 +99,12 @@ pub(super) fn projects(
                 }
                 for p in &snapshot.projects {
                     let active = state.active_workspace.as_ref() == Some(&p.id);
-                    let (r, response) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 34.0 * snapshot.font_scale.max(1.0)),
-                        egui::Sense::click(),
-                    );
+                    let (_, r) = ui.allocate_space(egui::vec2(
+                        ui.available_width(),
+                        34.0 * snapshot.font_scale.max(1.0),
+                    ));
+                    let response =
+                        ui.interact(r, ui.id().with(("project", &p.id)), egui::Sense::click());
                     response.widget_info(|| {
                         egui::WidgetInfo::labeled(
                             egui::WidgetType::Button,
@@ -152,6 +154,7 @@ pub(super) fn projects(
                             egui::RichText::new(&p.name)
                                 .size(12.0 * snapshot.font_scale)
                                 .strong()
+                                .family(crate::fonts::command_center_semibold_family(ui.ctx()))
                                 .color(if active { c.accent } else { c.text }),
                         )
                         .truncate(),
@@ -178,6 +181,8 @@ pub(super) fn projects(
                         if session_row(
                             ui,
                             snapshot,
+                            ui.id()
+                                .with(("task", &p.id, &t.target.task_id, &t.target.session_id)),
                             &t.title,
                             &t.provider,
                             &t.device,
@@ -198,6 +203,7 @@ pub(super) fn projects(
                         if session_row(
                             ui,
                             snapshot,
+                            ui.id().with(("session", &p.id, &session.target.session_id)),
                             &session.title,
                             &session.provider,
                             &session.device,
@@ -266,6 +272,7 @@ pub(super) fn projects(
 fn session_row(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
+    id: egui::Id,
     title: &str,
     provider: &str,
     device: &str,
@@ -274,10 +281,8 @@ fn session_row(
 ) -> egui::Response {
     let c = colors(snapshot);
     let scale = snapshot.font_scale;
-    let (r, response) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), 58.0 * scale.max(1.0)),
-        egui::Sense::click(),
-    );
+    let (_, r) = ui.allocate_space(egui::vec2(ui.available_width(), 58.0 * scale.max(1.0)));
+    let response = ui.interact(r, id, egui::Sense::click());
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), title)
     });
@@ -298,7 +303,15 @@ fn session_row(
     );
     child.set_clip_rect(r.intersect(ui.clip_rect()));
     child.spacing_mut().item_spacing.y = 3.0;
-    child.add(egui::Label::new(egui::RichText::new(title).size(12.0 * scale).strong()).truncate());
+    child.add(
+        egui::Label::new(
+            egui::RichText::new(title)
+                .size(12.0 * scale)
+                .strong()
+                .family(crate::fonts::command_center_semibold_family(ui.ctx())),
+        )
+        .truncate(),
+    );
     child.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 4.0;
         let (dot, _) = ui.allocate_exact_size(egui::vec2(5.0, 12.0), egui::Sense::hover());
@@ -375,7 +388,8 @@ pub(super) fn monitor(
             ui.label(
                 egui::RichText::new(text(snapshot, "workers"))
                     .size(12.0 * scale)
-                    .strong(),
+                    .strong()
+                    .family(crate::fonts::command_center_semibold_family(ui.ctx())),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(12.0);
@@ -481,8 +495,13 @@ pub(super) fn monitor(
                     for t in tasks {
                         ui.add_space(17.0);
                         let background = ui.painter().add(egui::Shape::Noop);
-                        let worker =
-                            ui.push_id((&t.target.workspace_id, &t.target.task_id), |ui| {
+                        let worker = ui.push_id(
+                            (
+                                &t.target.workspace_id,
+                                &t.target.task_id,
+                                &t.target.session_id,
+                            ),
+                            |ui| {
                                 ui.spacing_mut().interact_size.y = 0.0;
                                 ui.horizontal(|ui| {
                                     egui::Frame::NONE
@@ -515,7 +534,12 @@ pub(super) fn monitor(
                                 ui.add_space(12.0);
                                 ui.add(
                                     egui::Label::new(
-                                        egui::RichText::new(&t.title).size(12.0 * scale).strong(),
+                                        egui::RichText::new(&t.title)
+                                            .size(12.0 * scale)
+                                            .strong()
+                                            .family(crate::fonts::command_center_semibold_family(
+                                                ui.ctx(),
+                                            )),
                                     )
                                     .wrap(),
                                 );
@@ -607,7 +631,8 @@ pub(super) fn monitor(
                                         },
                                     );
                                 });
-                            });
+                            },
+                        );
                         if state.view == View::Task && state.selected_task_id == t.target.task_id {
                             ui.painter().set(
                                 background,
@@ -624,7 +649,8 @@ pub(super) fn monitor(
                     ui.label(
                         egui::RichText::new(text(snapshot, "rules"))
                             .small()
-                            .strong(),
+                            .strong()
+                            .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                     );
                     weak(
                         ui,

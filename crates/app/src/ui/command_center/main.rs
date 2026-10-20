@@ -68,7 +68,8 @@ fn title(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
                         14.0
                     }) * snapshot.font_scale,
                 )
-                .strong(),
+                .strong()
+                .family(crate::fonts::command_center_semibold_family(ui.ctx())),
         )
         .wrap(),
     );
@@ -113,6 +114,7 @@ fn home(
                 }) * snapshot.font_scale,
             )
             .strong()
+            .family(crate::fonts::command_center_semibold_family(ui.ctx()))
             .line_height(Some(
                 (if state.last_layout.is_some_and(|l| l.mobile) {
                     25.6
@@ -262,7 +264,15 @@ fn home(
                 .filter(|t| t.target.workspace_id == p.id)
                 .enumerate()
             {
-                assignment_row(ui, state, snapshot, i, t);
+                ui.push_id(
+                    (
+                        "assignment",
+                        &t.target.workspace_id,
+                        &t.target.task_id,
+                        &t.target.session_id,
+                    ),
+                    |ui| assignment_row(ui, state, snapshot, i, t),
+                );
             }
         });
         if !p.tasks.is_empty() {
@@ -368,7 +378,8 @@ fn home(
                                 text(snapshot, "approval_title"),
                                 request.session_title
                             ))
-                            .strong(),
+                            .strong()
+                            .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                         );
                         ui.add(
                             egui::Label::new(
@@ -532,7 +543,10 @@ fn task_list(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, p: &Pr
                                                 (if mobile { 13.0 } else { 14.0 })
                                                     * snapshot.font_scale,
                                             )
-                                            .strong(),
+                                            .strong()
+                                            .family(crate::fonts::command_center_semibold_family(
+                                                ui.ctx(),
+                                            )),
                                     )
                                     .wrap()
                                     .sense(egui::Sense::click()),
@@ -974,7 +988,10 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
                         let label = format!("{} · {}", t.role, t.title);
                         let response = ui.add(
                             egui::Label::new(
-                                egui::RichText::new(&label).size(12.0 * scale).strong(),
+                                egui::RichText::new(&label)
+                                    .size(12.0 * scale)
+                                    .strong()
+                                    .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                             )
                             .wrap()
                             .sense(egui::Sense::click()),
@@ -1072,7 +1089,10 @@ fn history(
                                     egui::Label::new(
                                         egui::RichText::new(&h.text)
                                             .size(13.0 * snapshot.font_scale)
-                                            .strong(),
+                                            .strong()
+                                            .family(crate::fonts::command_center_semibold_family(
+                                                ui.ctx(),
+                                            )),
                                     )
                                     .wrap(),
                                 );

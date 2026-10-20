@@ -248,6 +248,164 @@ fn project_navigation_deduplicates_bound_sessions_and_opens_exact_independent_se
     );
 }
 
+#[test]
+fn removing_an_earlier_session_preserves_keyboard_activation_target() {
+    struct State {
+        ui: UiState,
+        snapshot: Snapshot,
+        intents: Vec<Intent>,
+    }
+    let mut snapshot = fixture();
+    snapshot.projects[0].main_target.session_id = None;
+    for id in ["first", "focused", "later"] {
+        snapshot.projects[0].sessions.push(Session {
+            title: format!("independent {id}"),
+            provider: "Codex".into(),
+            target: RouteTarget {
+                workspace_id: "project-a".into(),
+                session_id: Some(id.into()),
+                task_id: None,
+            },
+            ..Default::default()
+        });
+    }
+    let expected = snapshot.projects[0].sessions[1].target.clone();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state: &mut State| {
+                state
+                    .intents
+                    .extend(show(ui, &mut state.ui, &state.snapshot));
+            },
+            State {
+                ui: UiState::default(),
+                snapshot,
+                intents: Vec::new(),
+            },
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    harness
+        .get_all_by_label("independent focused")
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::Button)
+        .unwrap()
+        .focus();
+    harness.run();
+    harness.state_mut().snapshot.projects[0].sessions.remove(0);
+    harness.run();
+    harness.key_press(egui::Key::Enter);
+    harness.run();
+    assert_eq!(
+        harness
+            .state()
+            .intents
+            .iter()
+            .filter_map(|i| if let Intent::OpenSession(t) = i {
+                Some(t)
+            } else {
+                None
+            })
+            .collect::<Vec<_>>(),
+        vec![&expected]
+    );
+}
+
+#[test]
+fn settings_agent_change_releases_binding_without_executing_or_sending() {
+    let mut snapshot = rich_fixture();
+    let p = &mut snapshot.projects[0];
+    p.config.provider = "Codex".into();
+    p.config.model = "codex-model".into();
+    p.config.effort = "xhigh".into();
+    p.config.main_session_id = p.main_target.session_id.clone();
+    p.sessions.push(Session {
+        target: p.main_target.clone(),
+        title: "existing Codex main".into(),
+        provider: "Codex".into(),
+        model: Some("codex-model".into()),
+        effort: Some("xhigh".into()),
+        device: "이 Mac".into(),
+        ..Default::default()
+    });
+    p.available_providers = vec!["Codex".into(), "Claude".into()];
+    p.available_agents = vec![
+        AgentOption {
+            provider: "Codex".into(),
+            model: "codex-model".into(),
+            effort: "xhigh".into(),
+        },
+        AgentOption {
+            provider: "Claude".into(),
+            model: "claude-model".into(),
+            effort: "high".into(),
+        },
+    ];
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1100.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            HarnessState {
+                ui: UiState {
+                    active_workspace: snapshot.selected_workspace_id.clone(),
+                    view: View::Settings,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    let content = harness.state().ui.last_layout.unwrap().content;
+    harness
+        .get_all_by_value("Codex")
+        .find(|n| content.contains_rect(n.rect()) && n.rect().width() > 150.0)
+        .unwrap()
+        .click();
+    harness.run();
+    harness.get_by_label("Claude").click();
+    harness.run();
+    let config = &harness.state().ui.settings_draft.as_ref().unwrap().1;
+    assert_eq!(
+        (&config.provider, &config.model, &config.effort),
+        (&"Claude".into(), &"claude-model".into(), &"high".into())
+    );
+    assert!(config.main_session_id.is_none());
+    assert!(harness.state().intents.is_empty());
+    harness
+        .get_by_label(text(&snapshot, "execution_rules"))
+        .click();
+    harness.run();
+    harness
+        .get_all_by_value(text(&snapshot, "unbound"))
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ComboBox)
+        .unwrap()
+        .scroll_to_me();
+    harness.run();
+    harness
+        .get_all_by_value(text(&snapshot, "unbound"))
+        .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ComboBox)
+        .unwrap()
+        .click();
+    harness.run();
+    harness
+        .get_by_label("existing Codex main · Codex · 이 Mac")
+        .click();
+    harness.run();
+    let config = &harness.state().ui.settings_draft.as_ref().unwrap().1;
+    assert_eq!(
+        (&config.provider, &config.model, &config.effort),
+        (&"Codex".into(), &"codex-model".into(), &"xhigh".into())
+    );
+    assert_eq!(
+        config.main_session_id,
+        snapshot.projects[0].main_target.session_id
+    );
+    assert!(harness.state().intents.is_empty());
+}
+
 fn rich_fixture() -> Snapshot {
     let mut snapshot = fixture();
     snapshot.status = "로컬 snapshot · 실행 상태는 관측된 근거만 표시".into();
@@ -303,18 +461,12 @@ fn rich_fixture() -> Snapshot {
 }
 
 fn use_korean_font(harness: &mut egui_kittest::Harness<'_, impl Sized>) {
-    if let Ok(font) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
-        let mut fonts = egui::FontDefinitions::default();
-        fonts
-            .font_data
-            .insert("cc-cjk".into(), egui::FontData::from_owned(font).into());
-        fonts
-            .families
-            .entry(egui::FontFamily::Proportional)
-            .or_default()
-            .insert(0, "cc-cjk".into());
-        harness.ctx.set_fonts(fonts);
-    }
+    crate::fonts::install_cjk_fallback(
+        &harness.ctx,
+        None,
+        crate::fonts::DEFAULT_MONO_FONT,
+        crate::fonts::DEFAULT_MONO_WEIGHT,
+    );
 }
 
 #[test]
@@ -736,11 +888,11 @@ fn composer_target_stays_left_and_send_stays_at_right_edge() {
             .get_by_label("프로젝트 A / 메인 에이전트 Codex")
             .rect();
         assert!(
-            composer.right() - send.right() <= 33.0,
+            composer.right() - send.right() <= if width <= 760.0 { 23.0 } else { 35.0 },
             "send at right edge: {send:?} / {composer:?}"
         );
         assert!(
-            caption.left() - composer.left() <= 33.0,
+            caption.left() - composer.left() <= if width <= 760.0 { 28.0 } else { 40.0 },
             "exact target at left edge: {caption:?}"
         );
     }
@@ -799,18 +951,7 @@ fn project_settings_button_stays_inside_header_at_large_font_scale() {
                 },
                 HarnessState::default(),
             );
-        if let Ok(font) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("cc-cjk".into(), egui::FontData::from_owned(font).into());
-            fonts
-                .families
-                .get_mut(&egui::FontFamily::Proportional)
-                .unwrap()
-                .insert(0, "cc-cjk".into());
-            harness.ctx.set_fonts(fonts);
-        }
+        use_korean_font(&mut harness);
         harness.run();
         let header = harness.state().ui.last_layout.unwrap().projectbar;
         let button = harness
@@ -988,6 +1129,7 @@ fn approved_visual_fixture() -> Snapshot {
     p.config.model = p.main_model.clone();
     p.config.provider = p.main_provider.clone();
     p.config.effort = p.main_effort.clone();
+    p.config.main_session_id = p.main_target.session_id.clone();
     p.goal = "모바일 결제 화면을 개선하고, 리뷰와 동작 검증까지 진행해 줘.".into();
     p.main_summary = "메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 계속 확인할 수 있습니다.".into();
     p.available_providers = vec!["Codex".into(), "Claude".into()];

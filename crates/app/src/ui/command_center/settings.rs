@@ -29,11 +29,24 @@ fn form(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
-    ui.heading(text(snapshot, "settings"));
-    weak(
-        ui,
-        snapshot,
-        "메인과 작업 폴더를 정하고, 필요할 때 실행 규칙을 조정하세요.",
+    ui.horizontal(|ui| {
+        ui.heading(text(snapshot, "settings"));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if snapshot.add_project.enabled
+                && ghost_button(ui, snapshot, text(snapshot, "add_project"), 28.0, 12.0).clicked()
+            {
+                intents.push(Intent::AddProject);
+            }
+        });
+    });
+    ui.add(
+        egui::Label::new(
+            egui::RichText::new("메인과 작업 폴더를 정하고, 필요할 때 실행 규칙을 조정하세요.")
+                .size(13.0 * snapshot.font_scale)
+                .line_height(Some(20.15 * snapshot.font_scale))
+                .color(colors(snapshot).muted),
+        )
+        .wrap(),
     );
     if state
         .settings_draft
@@ -65,6 +78,9 @@ fn form(
                 &mut draft.provider,
                 &p.available_providers,
             );
+            if prior != draft.provider {
+                draft.main_session_id = None;
+            }
             if prior != draft.provider
                 && let Some(option) = p
                     .available_agents
@@ -83,6 +99,9 @@ fn form(
                 &mut draft.model,
                 &models_for(p, &draft.provider),
             );
+            if prior != draft.model {
+                draft.main_session_id = None;
+            }
             if prior != draft.model
                 && let Some(option) = p
                     .available_agents
@@ -93,13 +112,17 @@ fn form(
             }
         }
     });
+    if draft.main_session_id.is_none() {
+        weak(ui, snapshot, text(snapshot, "unbound"));
+    }
     ui.add_space(24.0);
-    let rules = egui::CollapsingHeader::new(text(snapshot, "rules"))
+    let rules = egui::CollapsingHeader::new(text(snapshot, "execution_rules"))
         .id_salt("cc-rules")
         .show(ui, |ui| {
             weak(ui, snapshot, "이 프로젝트의 다음 배정부터 적용합니다.");
             inline(ui, |ui, index| {
                 if index == 0 {
+                    let previous = draft.effort.clone();
                     choices(
                         ui,
                         snapshot,
@@ -107,6 +130,9 @@ fn form(
                         &mut draft.effort,
                         &efforts_for(p, &draft.provider, &draft.model),
                     );
+                    if previous != draft.effort {
+                        draft.main_session_id = None;
+                    }
                 } else {
                     field(ui, snapshot, "parallel_limit", |ui| {
                         ui.add_sized(
@@ -139,6 +165,7 @@ fn form(
             );
             ui.checkbox(&mut draft.use_worktrees, text(snapshot, "worktrees"));
             field(ui, snapshot, "main_binding", |ui| {
+                let previous = draft.main_session_id.clone();
                 let selected = p
                     .sessions
                     .iter()
@@ -170,6 +197,16 @@ fn form(
                             );
                         }
                     });
+                if previous != draft.main_session_id
+                    && let Some(session) = p.sessions.iter().find(|s| {
+                        s.target.workspace_id == p.id
+                            && s.target.session_id == draft.main_session_id
+                    })
+                {
+                    draft.provider.clone_from(&session.provider);
+                    draft.model = session.model.clone().unwrap_or_default();
+                    draft.effort = session.effort.clone().unwrap_or_default();
+                }
             });
             field(ui, snapshot, "scope", |ui| {
                 let mut roots = draft.allowed_scope_roots.join("\n");
@@ -224,7 +261,7 @@ fn form(
         if ui
             .add_enabled(
                 p.save_settings.enabled,
-                egui::Button::new(egui::RichText::new(text(snapshot, "save")).color(
+                egui::Button::new(egui::RichText::new(text(snapshot, "save_short")).color(
                     if snapshot.dark_mode {
                         egui::Color32::from_rgb(7, 25, 31)
                     } else {
@@ -267,9 +304,24 @@ fn input(ui: &mut egui::Ui, snapshot: &Snapshot, value: &mut String) {
     );
 }
 fn field(ui: &mut egui::Ui, snapshot: &Snapshot, key: &str, control: impl FnOnce(&mut egui::Ui)) {
-    ui.add_space(19.0);
-    popup::field(ui, text(snapshot, key), None, control);
+    ui.add_space(14.0);
+    ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        ui.label(
+            egui::RichText::new(text(snapshot, key))
+                .size(12.0 * snapshot.font_scale)
+                .line_height(Some(18.6 * snapshot.font_scale))
+                .color(if snapshot.dark_mode {
+                    egui::Color32::from_rgb(189, 200, 212)
+                } else {
+                    egui::Color32::from_rgb(70, 86, 103)
+                }),
+        );
+        ui.add_space(7.0);
+        control(ui);
+    });
 }
+
 fn inline(ui: &mut egui::Ui, mut draw: impl FnMut(&mut egui::Ui, usize)) {
     if ui.ctx().viewport_rect().width() <= 760.0 {
         draw(ui, 0);
@@ -302,11 +354,14 @@ fn choices(
     field(ui, snapshot, key, |ui| {
         ui.add_enabled_ui(!choices.is_empty(), |ui| {
             egui::ComboBox::from_id_salt(key)
-                .selected_text(if value.is_empty() {
-                    text(snapshot, "unbound")
-                } else {
-                    value.as_str()
-                })
+                .selected_text(
+                    egui::RichText::new(if value.is_empty() {
+                        text(snapshot, "unbound")
+                    } else {
+                        value.as_str()
+                    })
+                    .size(14.0 * snapshot.font_scale),
+                )
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
                     for choice in choices {

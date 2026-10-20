@@ -650,9 +650,11 @@ pub const LABELS: &[(&str, &str)] = &[
     ("worktrees", "작업별 독립 worktree"),
     (
         "settings_note",
-        "설정 변경은 다음 배정부터 적용합니다. 기존 작업의 담당과 폴더는 유지됩니다.",
+        "변경한 설정은 진행 중인 작업의 담당·모델·폴더를 바꾸지 않습니다.",
     ),
     ("save", "설정 저장"),
+    ("save_short", "저장"),
+    ("execution_rules", "실행 규칙"),
     ("cancel", "취소"),
     (
         "invalid_settings",
@@ -739,6 +741,7 @@ pub(super) fn colors(snapshot: &Snapshot) -> Colors {
 pub(super) fn setup_style(ui: &mut egui::Ui, snapshot: &Snapshot) {
     let c = colors(snapshot);
     let scale = snapshot.font_scale.clamp(0.75, 2.0);
+    let heading_family = crate::fonts::command_center_semibold_family(ui.ctx());
     let style = ui.style_mut();
     style.visuals.dark_mode = snapshot.dark_mode;
     style.visuals.override_text_color = Some(c.text);
@@ -770,10 +773,12 @@ pub(super) fn setup_style(ui: &mut egui::Ui, snapshot: &Snapshot) {
         (egui::TextStyle::Monospace, 12.0),
     ] {
         style.text_styles.insert(
-            kind,
+            kind.clone(),
             egui::FontId::new(
                 size * scale,
-                if size == 12.0 {
+                if kind == egui::TextStyle::Heading {
+                    heading_family.clone()
+                } else if size == 12.0 {
                     egui::FontFamily::Monospace
                 } else {
                     egui::FontFamily::Proportional
@@ -1170,7 +1175,11 @@ fn header(
         if !l.mobile {
             ui.add_space(76.0);
             brand_mark(ui, snapshot);
-            ui.label(egui::RichText::new("Deppy Sijo").strong());
+            ui.label(
+                egui::RichText::new("Deppy Sijo")
+                    .strong()
+                    .family(crate::fonts::command_center_semibold_family(ui.ctx())),
+            );
             ui.add_space(if l.screen.width() <= 1250.0 {
                 4.0
             } else {
@@ -1387,7 +1396,8 @@ fn projectbar(
                                     .size(
                                         (if l.mobile { 17.0 } else { 19.0 }) * snapshot.font_scale,
                                     )
-                                    .strong(),
+                                    .strong()
+                                    .family(crate::fonts::command_center_semibold_family(ui.ctx())),
                             )
                             .truncate(),
                         );
@@ -1467,7 +1477,8 @@ fn worktop(
         ui.label(
             egui::RichText::new(title)
                 .size((if l.mobile { 12.0 } else { 13.0 }) * snapshot.font_scale)
-                .strong(),
+                .strong()
+                .family(crate::fonts::command_center_semibold_family(ui.ctx())),
         );
         if l.screen.width() > 1250.0
             && state.view == View::Main

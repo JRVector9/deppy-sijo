@@ -156,6 +156,128 @@ fn monitor_actions_keep_full_click_height_and_exact_worker_target() {
 }
 
 #[test]
+fn secondary_content_keeps_left_edges_compact_facts_and_full_width_task_routes() {
+    fn painted(
+        harness: &egui_kittest::Harness<'_, UiState>,
+        value: &str,
+    ) -> egui::epaint::TextShape {
+        let content = harness.state().last_layout.unwrap().content;
+        harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.job.text == value && content.contains(text.pos) =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing painted content: {value}"))
+    }
+    let mut failures = Vec::new();
+    for width in [1440.0, 390.0] {
+        for wrapped in [false, true] {
+            let mut snapshot = approved_visual_fixture();
+            let task = &mut snapshot.projects[0].tasks[1];
+            task.activity = if wrapped {
+                "실제로 확인한 진행 내용을 왼쪽부터 읽습니다. ".repeat(8)
+            } else {
+                "짧은 실제 진행 내용".into()
+            };
+            task.scope = "범위 값".into();
+            task.directory = "/actual/directory".into();
+            task.acceptance_criteria = "완료 조건 값".into();
+            task.device = "검증 기기".into();
+            let mut initial = UiState {
+                active_workspace: snapshot.selected_workspace_id.clone(),
+                ..Default::default()
+            };
+            initial.open_task(task.target.clone());
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(width, 1400.0))
+                .build_ui_state(
+                    |ui, state| {
+                        show(ui, state, &snapshot);
+                    },
+                    initial,
+                );
+            use_korean_font(&mut harness);
+            harness.run();
+            let activity = painted(&harness, &snapshot.projects[0].tasks[1].activity);
+            let heading = painted(&harness, "진행 내용");
+            if (activity.pos.x - heading.pos.x).abs() > 1.0
+                || activity.galley.rows.iter().any(|row| row.pos.x.abs() > 1.0)
+            {
+                failures.push(format!(
+                    "description left edge at {width}/{wrapped}: {:?} vs {:?}",
+                    activity.pos, heading.pos
+                ));
+            }
+            if wrapped {
+                assert!(activity.galley.rows.len() > 1);
+            }
+            let facts = ["범위 값", "/actual/directory", "완료 조건 값", "검증 기기"]
+                .map(|value| painted(&harness, value).pos.y);
+            for pair in facts.windows(2) {
+                if !(27.0..=32.0).contains(&(pair[1] - pair[0])) {
+                    failures.push(format!(
+                        "facts pitch at {width}/{wrapped}: {}",
+                        pair[1] - pair[0]
+                    ));
+                }
+            }
+        }
+    }
+    let snapshot = approved_visual_fixture();
+    let initial = UiState {
+        active_workspace: snapshot.selected_workspace_id.clone(),
+        view: View::Tasks,
+        ..Default::default()
+    };
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    let owner = painted(&harness, "Claude · 구현");
+    let owner_heading = painted(&harness, text(&snapshot, "owner_device"));
+    if (owner.pos.x - owner_heading.pos.x).abs() > 1.0 {
+        failures.push(format!(
+            "task owner column: {} vs header {}",
+            owner.pos.x, owner_heading.pos.x
+        ));
+    }
+    let title = painted(&harness, "결제 화면 구현");
+    let pos = egui::pos2(
+        harness.state().last_layout.unwrap().content.right() - 40.0,
+        title.pos.y + 8.0,
+    );
+    harness.event(egui::Event::PointerMoved(pos));
+    for pressed in [true, false] {
+        harness.event(egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        });
+    }
+    harness.run();
+    if harness.state().view != View::Task
+        || harness.state().selected_task_id != snapshot.projects[0].tasks[0].target.task_id
+    {
+        failures.push("the far edge of a task row must open that exact task".into());
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
 fn settings_default_keeps_advanced_scope_collapsed_and_agent_fields_inline() {
     let snapshot = approved_visual_fixture();
     let initial = UiState {
@@ -1193,6 +1315,7 @@ fn command_center_render_evidence() {
                     snapshot.dark_mode = dark;
                     if mode == "empty" {
                         snapshot.projects[0].tasks.clear();
+                        snapshot.projects[0].history.clear();
                         snapshot.projects[0].goal.clear();
                         snapshot.projects[0].main_summary.clear();
                     } else if mode == "no-project" {
@@ -1247,6 +1370,11 @@ fn command_center_render_evidence() {
                         if dark { "dark" } else { "light" },
                         (scale * 100.0) as u32
                     );
+                    std::fs::write(
+                        output.join(format!("{name}.snapshot.json")),
+                        serde_json::to_vec_pretty(&snapshot).unwrap(),
+                    )
+                    .unwrap();
                     let l = harness.state().last_layout.unwrap();
                     let rect = |r: egui::Rect| [r.left(), r.top(), r.right(), r.bottom()];
                     let title = harness
@@ -1329,6 +1457,36 @@ fn approved_visual_fixture() -> Snapshot {
         task.activity = activity.into();
         task.observed_at = time.into();
     }
+    // These are example records from the approved HTML, never live project data.
+    p.tasks[1].result = Some(
+        "중복 제출 방지와 실패 응답 표시를 검토했습니다. 권고 2건을 메인에게 전달했습니다.".into(),
+    );
+    p.tasks[1].result_revision = Some("fixture-review-result-1".into());
+    p.tasks[1].verification = "코드 검토 의견 · 런타임 테스트 미실행".into();
+    p.history = [
+        (
+            "example-review",
+            1,
+            "14:24",
+            "리뷰 결과를 제출했습니다. 런타임 테스트는 실행하지 않았습니다.",
+        ),
+        (
+            "example-approval",
+            2,
+            "14:23",
+            "모바일 mock 검증 명령의 승인을 요청했습니다.",
+        ),
+        ("example-ui", 0, "14:21", "결제 화면 구현을 시작했습니다."),
+    ]
+    .into_iter()
+    .map(|(id, task, time, text)| HistoryEntry {
+        id: id.into(),
+        target: Some(p.tasks[task].target.clone()),
+        time: time.into(),
+        text: text.into(),
+        detail: String::new(),
+    })
+    .collect();
     snapshot.devices = ["이 Mac", "gpu3090", "휴대폰"]
         .into_iter()
         .enumerate()

@@ -446,20 +446,24 @@ fn home(
 }
 
 fn description(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
-    ui.add_sized(
-        [
-            ui.available_width()
-                .min(72.0 * 7.5586 * snapshot.font_scale),
-            0.0,
-        ],
-        egui::Label::new(
-            egui::RichText::new(value)
-                .size(12.0 * snapshot.font_scale)
-                .line_height(Some(22.2 * snapshot.font_scale))
-                .color(colors(snapshot).muted),
-        )
-        .halign(egui::Align::Min)
-        .wrap(),
+    let width = ui
+        .available_width()
+        .min(72.0 * 7.5586 * snapshot.font_scale);
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, 0.0),
+        egui::Layout::top_down(egui::Align::Min),
+        |ui| {
+            ui.set_max_width(width);
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(value)
+                        .size(12.0 * snapshot.font_scale)
+                        .line_height(Some(22.2 * snapshot.font_scale))
+                        .color(colors(snapshot).muted),
+                )
+                .wrap(),
+            );
+        },
     );
 }
 
@@ -527,80 +531,89 @@ fn task_list(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, p: &Pr
     if p.tasks.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_tasks"));
     }
+    let narrow = ui.ctx().viewport_rect().width() <= 1100.0;
+    let (owner_width, state_width, arrow_width, gap) = if narrow {
+        (140.0, 108.0, 14.0, 10.0)
+    } else {
+        (190.0, 112.0, 20.0, 14.0)
+    };
     if !mobile {
-        ui.horizontal(|ui| {
-            weak(ui, snapshot, "나눈 작업");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                weak(ui, snapshot, "상태");
-                ui.add_space(70.0);
-                weak(ui, snapshot, text(snapshot, "owner_device"));
+        egui::Frame::NONE
+            .inner_margin(egui::Margin::symmetric(12, 9))
+            .show(ui, |ui| {
+                let title_width =
+                    (ui.available_width() - owner_width - state_width - arrow_width - gap * 3.0)
+                        .max(1.0);
+                ui.spacing_mut().interact_size.y = 0.0;
+                ui.spacing_mut().item_spacing.x = gap;
+                ui.horizontal(|ui| {
+                    for (value, width) in [
+                        ("나눈 작업", title_width),
+                        (text(snapshot, "owner_device"), owner_width),
+                        ("상태", state_width),
+                        ("", arrow_width),
+                    ] {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(width, 0.0),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ui.set_min_width(width);
+                                weak(ui, snapshot, value);
+                            },
+                        );
+                    }
+                });
             });
-        });
-        rule(ui, snapshot);
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
+        ui.painter().hline(
+            rect.x_range(),
+            rect.top(),
+            egui::Stroke::new(1.0, colors(snapshot).line),
+        );
     }
     for t in p.tasks.iter().filter(|t| t.target.workspace_id == p.id) {
         let width = ui.available_width();
         let mut clicked = false;
-        let r = egui::Frame::NONE
-            .inner_margin(egui::Margin::symmetric(if mobile { 0 } else { 12 }, 13))
-            .show(ui, |ui| {
-                ui.horizontal_top(|ui| {
-                    let owner = if mobile {
-                        0.0
-                    } else if width < 700.0 {
-                        140.0
-                    } else {
-                        190.0
-                    };
-                    let state_w = 100.0;
-                    ui.allocate_ui_with_layout(
-                        egui::vec2((width - owner - state_w - 40.0).max(60.0), 0.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            clicked = ui
-                                .add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&t.title)
-                                            .size(
-                                                (if mobile { 13.0 } else { 14.0 })
-                                                    * snapshot.font_scale,
-                                            )
-                                            .strong()
-                                            .family(crate::fonts::command_center_semibold_family(
-                                                ui.ctx(),
-                                            )),
-                                    )
-                                    .wrap()
-                                    .sense(egui::Sense::click()),
-                                )
-                                .clicked();
+        let r = ui.push_id(("task-list-row", &t.target.workspace_id, &t.target.task_id, &t.target.session_id), |ui| {
+            egui::Frame::NONE
+                .inner_margin(egui::Margin::symmetric(if mobile { 0 } else { 12 }, if mobile { 15 } else { 13 }))
+                .show(ui, |ui| {
+                    ui.set_min_width(width - if mobile { 0.0 } else { 24.0 });
+                    ui.spacing_mut().interact_size.y = 0.0;
+                    ui.spacing_mut().item_spacing.x = if mobile { 12.0 } else { gap };
+                    let title_width = if mobile { ui.available_width() - state_width - 12.0 } else { ui.available_width() - owner_width - state_width - arrow_width - gap * 3.0 }.max(1.0);
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(egui::vec2(title_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_min_width(title_width);
+                            clicked = ui.add(egui::Label::new(
+                                egui::RichText::new(&t.title)
+                                    .size((if mobile { 13.0 } else { 14.0 }) * snapshot.font_scale)
+                                    .strong().family(crate::fonts::command_center_semibold_family(ui.ctx())),
+                            ).wrap().sense(egui::Sense::click())).clicked();
                             weak(ui, snapshot, &t.scope);
-                            if mobile {
-                                weak(
-                                    ui,
-                                    snapshot,
-                                    format!("{} · {} · {}", t.provider, t.role, t.device),
-                                );
-                            }
-                        },
-                    );
-                    if !mobile {
-                        ui.allocate_ui_with_layout(
-                            egui::vec2(owner, 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.label(
-                                    egui::RichText::new(format!("{} · {}", t.provider, t.role))
-                                        .size(13.0 * snapshot.font_scale),
-                                );
+                            if mobile { weak(ui, snapshot, format!("{} · {} · {}", t.provider, t.role, t.device)); }
+                        });
+                        if !mobile {
+                            ui.allocate_ui_with_layout(egui::vec2(owner_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.set_min_width(owner_width);
+                                ui.label(egui::RichText::new(format!("{} · {}", t.provider, t.role)).size(13.0 * snapshot.font_scale));
                                 weak(ui, snapshot, &t.device);
-                            },
-                        );
-                    }
-                    workers::status(ui, snapshot, t.state);
-                });
-            })
-            .response;
+                            });
+                        }
+                        ui.allocate_ui_with_layout(egui::vec2(state_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                            ui.set_min_width(state_width);
+                            workers::status(ui, snapshot, t.state);
+                        });
+                        if !mobile {
+                            ui.allocate_ui_with_layout(egui::vec2(arrow_width, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                                ui.set_min_width(arrow_width);
+                                weak(ui, snapshot, "›");
+                            });
+                        }
+                    });
+                }).response
+        }).inner;
         ui.painter().hline(
             r.rect.x_range(),
             r.rect.bottom(),
@@ -610,8 +623,12 @@ fn task_list(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, p: &Pr
             || ui
                 .interact(
                     r.rect,
-                    ui.id()
-                        .with(("task-list", &t.target.workspace_id, &t.target.task_id)),
+                    ui.id().with((
+                        "task-list",
+                        &t.target.workspace_id,
+                        &t.target.task_id,
+                        &t.target.session_id,
+                    )),
                     egui::Sense::click(),
                 )
                 .clicked())
@@ -808,33 +825,43 @@ fn task_detail(
                     target: t.target.clone(),
                 });
             }
-            egui::Grid::new(("cc-task-facts", &t.target.workspace_id, &t.target.task_id))
-                .num_columns(2)
-                .min_col_width(if ui.ctx().viewport_rect().width() <= 760.0 {
-                    80.0
-                } else {
-                    110.0
-                })
-                .spacing([16.0, 10.0])
-                .show(ui, |ui| {
-                    for (key, value) in [
-                        ("scope", &t.scope),
-                        ("directory", &t.directory),
-                        ("criteria", &t.acceptance_criteria),
-                        ("device", &t.device),
-                    ] {
-                        if !value.is_empty() {
-                            weak(ui, snapshot, text(snapshot, key));
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(value).size(13.0 * snapshot.font_scale),
-                                )
-                                .wrap(),
-                            );
-                            ui.end_row();
+            ui.scope(|ui| {
+                ui.spacing_mut().interact_size.y = 0.0;
+                egui::Grid::new(("cc-task-facts", &t.target.workspace_id, &t.target.task_id))
+                    .num_columns(2)
+                    .min_col_width(if ui.ctx().viewport_rect().width() <= 760.0 {
+                        80.0
+                    } else {
+                        110.0
+                    })
+                    .spacing([16.0, 10.0])
+                    .show(ui, |ui| {
+                        for (key, value) in [
+                            ("scope", &t.scope),
+                            ("directory", &t.directory),
+                            ("criteria", &t.acceptance_criteria),
+                            ("device", &t.device),
+                        ] {
+                            if !value.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(text(snapshot, key))
+                                        .size(13.0 * snapshot.font_scale)
+                                        .line_height(Some(18.6 * snapshot.font_scale))
+                                        .color(colors(snapshot).muted),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(value)
+                                            .size(13.0 * snapshot.font_scale)
+                                            .line_height(Some(18.6 * snapshot.font_scale)),
+                                    )
+                                    .wrap(),
+                                );
+                                ui.end_row();
+                            }
                         }
-                    }
-                });
+                    });
+            });
             if let Some(a) = &t.approval {
                 rule(ui, snapshot);
                 title(ui, snapshot, text(snapshot, "approval_title"));

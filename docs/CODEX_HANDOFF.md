@@ -1,3 +1,10 @@
+# Current release checkpoint — 0.15.0 rebuild/restart requested, 2026-10-20
+
+- Current user explicitly requested rebuild and restart now. This authorizes replacing running0.14.0 from the same separate feature branch. No main merge/push requested.
+- Source before version update47e85dee (final productd58505a8). Inspected35 accessible worktree root versions and versioned/installed bundles; highest source/bundle0.14.0. Feature additions require minor0.15.0. Canonical Cargo workspace version and27 inherited lock entries updated; package inheritance preserved.
+- Current objective: build app+mcp helper, prepare pinned tunnel helper, produce separate signed local development bundle0.15.0, verify executable and both plist versions/signatures, normally quit old exact app and launch new bundle withDEPPY_COMMAND_CENTER_V2=1, inspect actual UI. Prior0.14.0 bundle is preserved.
+- Build/verify/restart not completed yet. Do not count prior UI regression suite or0.14 artifact as current build success. Exact next command: CARGO_BUILD_JOBS=2 cargo build --offline --locked -p deppy-sijo -p mcp-proxy. No new product behavior changes beyond already verified productd58505a8.
+
 # Active checkpoint — design fidelity and unbound composer completed, 2026-10-20
 
 - **Current objective/completion:** latest user requested direct approved-vs-running comparison, complete discrepancy checklist/fixes, editable unbound main composer, agent configuration inside composer, parallel subagents. Implemented/reviewed C01–C26 on separate feature branch. Root directly observed old running app first; final proof uses actual Chrome/egui fixtures, not a claim that the running app was updated.

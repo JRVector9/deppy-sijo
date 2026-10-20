@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.15.0] - 2026-10-20
+
+- Keep the main composer editable before binding, configure the main agent from the composer, and preserve drafts through configuration and late replies.
+- Restore approved native/web desktop and mobile layout dimensions, combined task/results and scoped history rows and filters.
+- Local signed development build on the separate Command Center branch.
+
 ## Unreleased — Command Center v2 development branch
 
 - Add an opt-in project/main-agent/worker layout with independent task attempts, drafts, approvals, results, Git and history routes; retain the original layout and source rollback point.

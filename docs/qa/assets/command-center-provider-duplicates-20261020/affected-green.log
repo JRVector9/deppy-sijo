@@ -151,4 +151,3 @@ test ui::command_center::tests::verification_failed_retry_uses_host_capability_a
 test ui::command_center::tests::worker_drawer_header_and_footer_remain_visible_with_many_workers ... ok
 
 test result: ok. 146 passed; 0 failed; 1 ignored; 0 measured; 3399 filtered out; finished in 8.91s
-

@@ -70,6 +70,7 @@ fn snapshot(workspace_id: &str) -> CommandCenterSnapshot {
         }],
         events: vec![StoredEvent {
             id: EventId("event-a".into()),
+            kind: String::new(),
             task_id: Some(task_id),
             attempt_id: Some(attempt_id.clone()),
             display_payload: "Working".into(),
@@ -163,6 +164,39 @@ fn work_management_roundtrip_keeps_main_task_drafts_and_dispatch_identity() {
             revision,
             snapshot: expected
         })
+    );
+}
+
+#[test]
+fn work_management_history_kind_roundtrips_without_classifying_legacy_prose() {
+    let fixture = Fixture::new();
+    let mut legacy = serde_json::to_value(snapshot("workspace-a")).unwrap();
+    legacy["events"][0].as_object_mut().unwrap().remove("kind");
+    legacy["events"][0]["display_payload"] =
+        serde_json::json!("승인 설정 작업이라는 단어만 있는 오래된 기록");
+    let decoded: CommandCenterSnapshot = serde_json::from_value(legacy.clone()).unwrap();
+    let encoded = serde_json::to_value(decoded).unwrap();
+    assert_eq!(
+        encoded["events"][0]
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        ""
+    );
+    legacy["events"][0]["kind"] = serde_json::json!("approval");
+    let classified: CommandCenterSnapshot = serde_json::from_value(legacy).unwrap();
+    let mut store = CommandCenterStore::open(&fixture.0).unwrap();
+    saved(store.save_workspace(&classified, None).unwrap());
+    drop(store);
+    let store = CommandCenterStore::open(&fixture.0).unwrap();
+    let loaded = store
+        .load_workspace(&classified.config.workspace_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(loaded.snapshot).unwrap()["events"][0]["kind"],
+        "approval",
+        "an explicit persisted history category must survive the real sidecar round trip"
     );
 }
 

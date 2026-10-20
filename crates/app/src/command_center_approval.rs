@@ -170,6 +170,7 @@ fn history_entries(events: &[stored::StoredEvent], tasks: &[cc::Task]) -> Vec<cc
                 });
             cc::HistoryEntry {
                 id: event.id.0.clone(),
+                kind: event.kind.clone(),
                 text: bounded(&event.display_payload, 2048),
                 target,
                 ..Default::default()
@@ -182,10 +183,40 @@ fn history_entries(events: &[stored::StoredEvent], tasks: &[cc::Task]) -> Vec<cc
 mod tests {
     use super::*;
     #[test]
+    fn history_kind_projection_preserves_explicit_categories_and_legacy_unknowns() {
+        let events: Vec<_> = ["work", "approval", "settings", "", "future-category"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, kind)| stored::StoredEvent {
+                id: work::EventId(format!("event-{i}")),
+                kind: kind.into(),
+                task_id: None,
+                attempt_id: None,
+                display_payload: "승인 설정 작업이라는 단어가 있어도 분류를 추측하지 않습니다."
+                    .into(),
+            })
+            .collect();
+        let history = history_entries(&events, &[]);
+        assert_eq!(
+            history.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+            ["work", "approval", "settings", "", "future-category"]
+        );
+        assert!(
+            history
+                .iter()
+                .all(|e| e.time.is_empty() && e.target.is_none())
+        );
+        let old_json = serde_json::json!({"id":"old", "target":null, "time":"", "text":"승인 설정 작업", "detail":""});
+        let legacy: cc::HistoryEntry = serde_json::from_value(old_json).unwrap();
+        assert!(legacy.kind.is_empty());
+    }
+
+    #[test]
     fn command_center_history_keeps_latest_chronological_events_and_exact_attempt_routes() {
         let events: Vec<_> = (0..105)
             .map(|i| stored::StoredEvent {
                 id: work::EventId(format!("event-{i}")),
+                kind: String::new(),
                 task_id: Some(work::TaskId("task".into())),
                 attempt_id: Some(work::AttemptId(
                     if i == 104 { "current" } else { "old" }.into(),

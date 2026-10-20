@@ -153,6 +153,9 @@ pub struct WorkDraft {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StoredEvent {
     pub id: EventId,
+    /// Explicit source category; legacy events remain unclassified.
+    #[serde(default)]
+    pub kind: String,
     pub task_id: Option<TaskId>,
     pub attempt_id: Option<AttemptId>,
     pub display_payload: String,

@@ -2692,6 +2692,24 @@ fn recover_observation(snapshot: &mut stored::CommandCenterSnapshot) {
     }
 }
 
+/// Categories come from the accepted event variant, never its display prose.
+fn history_kind(kind: &work::WorkEventKind) -> &'static str {
+    match kind {
+        work::WorkEventKind::WaitingApproval | work::WorkEventKind::UserConfirmed { .. } => {
+            "approval"
+        }
+        work::WorkEventKind::InputAdmitted { .. }
+        | work::WorkEventKind::Started
+        | work::WorkEventKind::WaitingInput
+        | work::WorkEventKind::ResultSubmitted { .. }
+        | work::WorkEventKind::VerificationFinished { .. }
+        | work::WorkEventKind::Failed { .. }
+        | work::WorkEventKind::Cancelled
+        | work::WorkEventKind::ObservationLost
+        | work::WorkEventKind::ProcessExited => "work",
+    }
+}
+
 fn apply_user_work_event(
     p: &mut Project,
     target: &cc::RouteTarget,
@@ -2732,6 +2750,7 @@ fn apply_user_work_event(
     };
     let stored_event = stored::StoredEvent {
         id: event.id.clone(),
+        kind: history_kind(&event.kind).into(),
         task_id: Some(event.task_id.clone()),
         attempt_id: Some(event.attempt_id.clone()),
         display_payload: bounded(&display, work::WORK_EVENT_MAX_BYTES),
@@ -3684,6 +3703,60 @@ mod tests {
         assert!(!same_folder("relative/path", "relative/path"));
         assert!(!same_folder("/different-volume/한글", "/tmp/한글"));
     }
+    #[test]
+    fn history_kind_follows_actual_event_variants_through_storage_and_projection() {
+        let (mut p, assignment) = attempted();
+        let target = cc::RouteTarget {
+            workspace_id: p.snapshot.config.workspace_id.0.clone(),
+            task_id: Some(assignment.task.id.0.clone()),
+            session_id: None,
+        };
+        let report = work::TaskResult {
+            revision: work::ResultRevision(1),
+            summary: "actual report".into(),
+            source_revision: None,
+            artifact_revision: None,
+            verification: work::VerificationState::NotRun,
+        };
+        for (kind, expected) in [
+            (work::WorkEventKind::Started, "work"),
+            (work::WorkEventKind::WaitingApproval, "approval"),
+            (
+                work::WorkEventKind::ResultSubmitted { result: report },
+                "work",
+            ),
+            (
+                work::WorkEventKind::VerificationFinished {
+                    result_revision: work::ResultRevision(1),
+                    outcome: work::VerificationState::Passed,
+                },
+                "work",
+            ),
+            (
+                work::WorkEventKind::UserConfirmed {
+                    result_revision: work::ResultRevision(1),
+                },
+                "approval",
+            ),
+        ] {
+            apply_user_work_event(
+                &mut p,
+                &target,
+                &assignment.attempt.id.0,
+                kind,
+                "설정 승인 작업이라는 같은 표시 문구".into(),
+            )
+            .unwrap();
+            assert_eq!(p.snapshot.events.last().unwrap().kind, expected);
+            let history = approval::history(&p, &[]);
+            assert_eq!(history.last().unwrap().kind, expected);
+            assert!(
+                history.last().unwrap().time.is_empty(),
+                "event categories must not invent event times"
+            );
+        }
+    }
+
     #[test]
     fn manual_report_is_bound_to_the_displayed_attempt_and_requires_separate_verification() {
         let (mut p, assignment) = attempted();

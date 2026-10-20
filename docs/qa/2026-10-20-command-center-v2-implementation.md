@@ -2,24 +2,28 @@
 
 ## 최신 통합 checkpoint
 
-기능 브랜치 `feat/agent-command-center-v2-20261020`에서 PR별 커밋을 리뷰·통합 중이다. 최종 source 전체 검사는 아직 완료되지 않았다. 기본 화면은 원안이고 `DEPPY_COMMAND_CENTER_V2=1` opt-in, rollback branch/tag는 원본 `f78ebb69`를 보존한다.
+기능 브랜치 `feat/agent-command-center-v2-20261020`에서 PR별 구현·교차 리뷰·자동 통합 검증을 완료했다. 검사 source `d2b4605c053f423b5d5eac8e5f809f3d92907bc8`에서 최종11 gate가 모두 exit0이다. 기본 화면은 원안이고 `DEPPY_COMMAND_CENTER_V2=1` opt-in, rollback branch/tag는 원본 `f78ebb69`를 보존한다. 제품 릴리스 완료는 아니다.
+
+최종 workspace는 **6041 PASS / 0 FAIL / 67 ignored**(79 Cargo target, nested helper 중복 제외), full App3449 PASS/40 ignored, runtime420 PASS/1 ignored, storage509 PASS다. 별도 native1 PASS/10 PNG, shared Chrome106 assertions, Relay Node17 PASS, production Chrome5 PASS를 실제 확인했다. 상세 명령·지원 경계·최초 실패 및 수정 근거는 [브랜치 인수 기록](2026-10-20-command-center-v2-release.md)에 정리했다.
+
+최종 결과 JSON `/private/tmp/deppy-cc-acceptance-gates-20261020.json`, 로그 `/private/tmp/deppy-cc-acceptance-{gate}-20261020.log`, native PNG `/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020`. root가10장을 모두 열어 대조했으며 760/font1.25 머리글 설정 버튼 잘림 수정도 확인했다.
 
 | 영역 | 구현·리뷰 결과 | 실제 검사 | 남은 확인 |
 |---|---|---|---|
-| 로컬 배정 | 저장된 claim→profile 준비→idle agent→정확한 binding→durable outbox→guarded 입력 | native/host75 PASS,1 ignored cohort | 최종 통합 검사 |
+| 로컬 배정 | 저장된 claim→profile 준비→idle agent→정확한 binding→durable outbox→guarded 입력 | 최종 full App3449 PASS에 포함 | 실제 유료 provider 호출 미실행 |
 | 관측·결과 | Codex exact session/turn/접수 sequence/final response, 타 provider 수동 보고 | stale attempt/lateRejected-after-Admitted 회귀 | 유료 실제 provider 호출 미실행 |
 | 로컬 종료 | retained original launch+현재 attempt/runtime/binding+opaque handle만 종료 | 단위 회귀, 독립 리뷰 차단 결함 없음 | 종료는 작업 완료·검증 통과를 뜻하지 않음 |
 | 실행 서버 | 명시 project ID 매핑/폴더/agents 허용, durable epoch, exact scoped token 복사 | root server4 PASS | loopback listener; 다른 컴퓨터는 보안 터널 사용 |
-| 원격 실행 | pinned TLS/scoped auth/actual PTY/journal, 입력·viewport·종료 | runtime420 PASS,1 ignored; storage26 PASS; App controller31 PASS; strict runtime/storage Clippy PASS | 서로 다른 물리 컴퓨터 검증 미실행 |
-| 원요청 복구 | 원래 launch/input immutable request만 SELECT/query, 원래 접수 sequence/time 반환 | actual TLS+SQLite lostACK fixture PASS | native 명시 조회 버튼 통합·79 PASS; 재시작에 원요청 없으면 Unknown |
+| 원격 실행 | pinned TLS/scoped auth/actual PTY/journal, 입력·viewport·종료 | 최종 runtime420 PASS/1 ignored, storage 전체509 PASS, full App3449 PASS | 서로 다른 물리 컴퓨터 검증 미실행 |
+| 원요청 복구 | 원래 launch/input immutable request만 SELECT/query, 원래 접수 sequence/time 반환 | actual TLS+SQLite lostACK 및 SQLite late-load 회귀, 최종 full App PASS | 재시작에 원요청 없으면 Unknown |
 | PWA 원격 화면 | opaque remote route, View permit 유지, 읽기 전용 실제 화면, max8 watches/5s expiry | work focused11 PASS, Chrome106 assertions PASS | Relay View-only bridge 통합·Node17 PASS·production Chrome PASS |
 | PWA 안정성 | ACK 유실 관측만2s 만료, 숨김/재연결 정리, 정확한 route 스크롤 보존 | reconnect RED→GREEN, hidden120/70→0/0 RED→GREEN | 변경·입력 pending fence는 유지 |
-| 화면 크기 | native10 PNG/1440·1280·1000·760·390/scale1·1.25/양 테마 | actual offscreen1 PASS | 760 scale1.25 버튼 잘림 확인·수정 중 |
+| 화면 크기 | native10 PNG/1440·1280·1000·760·390/scale1·1.25/양 테마 | 최종 actual offscreen1 PASS,10장 직접 대조 | 좁은 머리글 버튼 잘림 수정·확인 완료 |
 | 데이터·복구 | lazy sidecar3, metadata migration 불변, Unknown 자동 replay 금지 | core/storage/reducer 회귀 | 제품 패키지·앱 재실행 미실행 |
 
 발견한 HIGH 경로는 수정됐다. legacy unrestricted TLS token을 새 연결 화면에서 내보내지 않으며, exact device/workspace/grant scoped token만 복사한다. scoped command/event 필터, 기존 연결 회수, queue 최종 effect fence 및 실패한 replacement 보존을 실제 TLS 검사와 독립 리뷰로 확인했다. PWA 원격 입력은 cross-TLS cloud origin revoke fence 미지원으로 비활성화한다. native의 scoped 원격 입력과 별개다.
 
-최신 실제 증거:
+이전 통합 cohort의 실제 증거(최종 source 결과와 별도로 보존):
 
 - `/private/tmp/deppy-cc-final-production-browser-20261020.log`: root production PWA·Relay·mobile Chrome5 PASS/0 FAIL/0 ignored.
 - `/private/tmp/deppy-cc-reconcile-host-green-20261020.log`: UI owner native79 PASS/0 FAIL/1 ignored.
@@ -33,7 +37,7 @@
 - `/private/tmp/deppy-cc-native-final-offscreen-20261020.log`: actual offscreen1 PASS,10 PNG `/private/tmp/deppy-command-center-native-final-evidence-20261020`.
 - `/private/tmp/deppy-cc-freeze-fmt-check-20261020.log`: root fmt check exit0; `/private/tmp/deppy-cc-final-boundary-20261020.log`: boundary exit0 at856b132b.
 
-서로 다른 source cohort의 검사 수를 합쳐 최종 전체 통과로 취급하지 않는다. 최종 source freeze 뒤 fmt/boundary/deps/i18n/strict workspace Clippy/full workspace를 실행한다. 실제 provider 유료 호출·실앱 GUI·서로 다른 물리 컴퓨터·사용자 DB·main 대비 장시간 idle CPU/메모리 비교는 실행하지 않았다. 원격 fixture는 실제 TLS/PTTY/SQLite를 사용하지만 물리 컴퓨터 검증을 대신하지 않는다. native PNG는 fixture의 실제 egui 렌더이며 실행 중인 사용자 앱 캡처가 아니다. source0.13.0은 검사 빌드로, 사용자용 릴리스·버전 검증된 패키지를 전달하지 않았다.
+서로 다른 source cohort의 검사 수를 합쳐 최종 전체 통과로 취급하지 않는다. 최종 source freeze 뒤 fmt/boundary/deps/i18n/strict workspace Clippy/full workspace 및 화면·브라우저 gate를 모두 실행했다. 실제 provider 유료 호출·실앱 GUI·서로 다른 물리 컴퓨터·사용자 DB·main 대비 장시간 idle CPU/메모리 비교는 실행하지 않았다. 원격 fixture는 실제 TLS/PTY/SQLite를 사용하지만 물리 컴퓨터 검증을 대신하지 않는다. native PNG는 fixture의 실제 egui 렌더이며 실행 중인 사용자 앱 캡처가 아니다. source0.13.0은 검사 빌드로, 사용자용 릴리스·버전 검증된 패키지를 전달하지 않았다.
 
 ## 초기 leaf 검사 기록
 

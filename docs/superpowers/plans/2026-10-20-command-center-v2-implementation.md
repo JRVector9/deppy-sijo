@@ -14,7 +14,20 @@
 
 2026-10-20 후속 실행 지시: 사용자가 서브에이전트 병렬 개발과 즉시 원안 복구를 요청했다. 원안 tag/branch와 기능 스위치를 유지한다. **PR2 저장은 기존 metadata DB migration 대신 별도 `command-center-v2.sqlite3` 보조 DB로 변경한다.** workspace 참조는 host가 기존 workspace ID로 검증하며, 보조 DB 내부 goal/task/attempt의 FK·unique·revision 계약은 유지한다. 이는 원안 앱의 DB schema 호환성을 보존하기 위한 변경이다. 아래 최초 계획의 전역 migration 지시는 이 수정으로 대체한다.
 
-- 현재는 **승인된 계획의 병렬 구현·통합 검증 단계**다. 제품 변경은 통합 기능 브랜치에서 PR 범위별 로컬 커밋으로 관리하며, 실제 GitHub PR 생성/push/main 병합은 하지 않았다.
+### 현재 인수 판정
+
+아래 PR별 체크리스트는 최초 요구 목록을 보존한다. 실제 구현·검사·미실행 범위는 이 표와 [브랜치 인수 기록](../../qa/2026-10-20-command-center-v2-release.md)을 기준으로 한다. 물리 기기·유료 provider·제품 릴리스를 실행하지 않은 상태에서 모든 항목에 완료 표시를 하지 않는다.
+
+| PR | 현재 상태 | 별도 확인·지원 경계 |
+|---|---|---|
+| 1–2 | identity/reducer/sidecar3/CAS/outbox/설정·초안 구현·통합 | 원안 metadata migration 불변, 복원 시 불확실 실행 자동 재전송 없음 |
+| 3 | native 레이아웃·두 테마·drawer·설정·원안 전환 구현 | 실제 egui fixture로 대조, 실행 중 사용자 앱 화면 검사는 미실행 |
+| 4–6 | 로컬 생성·guarded 입력·계획 확인·결과/승인/Git/기록 구현·통합 | 지원되는 Codex 관측 자동 연결, 다른 provider는 수동 계획·보고 |
+| 7 | scoped TLS·실제 PTY/SQLite·exact 종료·읽기 전용 복구 구현 | 물리 컴퓨터 간 검증 미실행, loopback listener에는 보안 터널 필요 |
+| 8 | PWA/Relay의 동일 작업 구조·권한·원격 읽기 화면 구현 | cross-TLS cloud origin 입력은 비활성화, 물리 휴대폰 검증 미실행 |
+| 9 | 최종11 gate PASS, workspace6041 PASS, native10 PNG·PWA/Relay 실제 브라우저 검증 완료 | main 비교 장시간 성능·제품 버전/서명/패키징은 미실행 |
+
+- 현재는 **구현·교차 리뷰·자동 통합 검증을 완료한 개발 브랜치**다. 제품 변경은 통합 기능 브랜치에서 PR 범위별 로컬 커밋으로 관리하며, 실제 GitHub PR 생성/push/main 병합은 하지 않았다.
 - 통합 브랜치: `feat/agent-command-center-v2-20261020`.
 - 작업 폴더: `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`.
 - 기준: `git fetch origin` 후 확인한 `origin/main`의 `f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679`.
@@ -229,13 +242,13 @@ PR3의 UI leaf와 PR4의 dispatch 내부는 PR1/2 계약 확정 후 분리 개�
 - [ ] release binary의 `--version`과 bundle의 두 version 필드, 서명·아카이브를 검증한 뒤에만 빌드 전달 완료로 보고한다.
 - [ ] 앱 종료/재실행은 해당 단계의 현재 사용자 요청에 있을 때만 한다. 이전 요청으로 자동 재실행하지 않는다. 실행이 필요한 실화면 확인은 그 시점의 명시적 실행 요청과 연결한다.
 
-**공통 명령(구현 후 실행할 검증이며 이번 계획 단계에서는 미실행):**
+**공통 검사 명령(실제 최종 결과는 상단 인수 기록 참조):**
 
 ```sh
 export CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target
 export CARGO_BUILD_JOBS=2
 cargo fmt --all -- --check
-cargo test --offline --locked --workspace
+cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1
 cargo clippy --offline --locked --workspace --all-targets -- -D warnings
 cargo run --offline --locked -p xtask -- check-boundary
 cargo run --offline --locked -p xtask -- check-deps

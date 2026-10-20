@@ -1,4 +1,75 @@
-# Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
+# Command Center v2 — 구현·자동 검증 완료, 2026-10-20
+
+## Final checkpoint — development branch acceptance
+
+### Objective / completed work
+
+- 승인한1안 발전형을 별도 `feat/agent-command-center-v2-20261020` 브랜치에 PR1–8 기능 범위로 구현·통합했고, GPT-6.1-Sol/xhigh 서브에이전트 병렬 개발·상호 리뷰 후 발견 결함을 수정했다. PR9의 자동 통합 검사·native fixture 대조·사용 문서를 완료했다. 제품 릴리스·실제 기기 검증까지 완료했다는 뜻이 아니다.
+- 최종 검사 source **`d2b4605c053f423b5d5eac8e5f809f3d92907bc8`**, 제품 source는9b5d84f7과 같고 마지막 commit은 remote_dispatch 테스트만 수정한다. 이후 문서 커밋은 제품 source 불변이다. 기존 nominal/cloud WIP 작업 폴더는 보존했다. 실제 GitHub PR/push/main merge/app stop/start는 수행하지 않았다.
+- 원안 기본 화면, `DEPPY_COMMAND_CENTER_V2=1` opt-in, 화면 전환·재진입, rollback branch/tag **`f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679`** 및 승인 HTML/spec/PNG SHA를 보존·확인했다. 별도 sidecar schema3로 원안 metadata migration을 변경하지 않는다.
+
+### Modified files / key decisions
+
+- 제품 범위: `crates/app/src/command_center*.rs`, `ui/command_center/`, `work_management/`; core 계약·storage sidecar·runtime wire35/TLS remote worker·PTY/session admission·web-remote projection/permit·shared PWA·Relay 및5개 locale. 정확한 파일 목록은 `git diff --name-only f78ebb69 d2b4605c`다. 마지막 좁은 수정은 `work_management/remote_dispatch.rs`의 cfg(test)만 해당한다.
+- 문서: `docs/command-center-v2.md`, `docs/command-center-rollback.md`, `docs/qa/2026-10-20-command-center-v2-{implementation,release}.md`, 구현 plan, `CHANGELOG.md` Unreleased, 이 handoff. 원본 mockup/spec/reference는 변경하지 않았다.
+- durable claim→profile 준비→idle CLI→exact runtime binding→outbox ACK→guarded input. 입력 접수/실행 관측/결과/검증/사용자 확인은 별도다. 동일 문장도 신규 입력은 독립 submission이다. 실제 Codex 증거만 자동 연결하며 다른 provider는 수동 계획·결과를 사용한다.
+- local/remote close는 원래 소유한 exact operation/runtime/attempt/binding/opaque execution만 처리한다. Unknown을 자동 replay하지 않는다. read-only reconcile은 원래 sequence/time을 보존하고 생성만 확인된 worker는ObservedIdle+StageDone으로 두며 prompt를 재구성하지 않는다.
+- late SQLite load/CAS 실패에도 정확한 immutable 원attempt/config/binding/task/의존 결과가 일치하는 실제 terminal receipt만 보존한다. 미래 project config와 원attempt 설정을 혼동하지 않는다. 닫힌 idle owner는 새 owner를 가리지 않으며 stale native CreateWorker도 host에서 차단한다.
+- 기기별 scoped TLS token/pin/project mapping·grant 회수와 실제 effect fence를 적용한다. listener는 loopback이므로 다른 컴퓨터에는 보안 터널이 필요하다. PWA 원격 화면은 읽기 전용이며 cross-TLS cloud-origin 입력은 비활성화다. native scoped 원격 입력은 지원한다. remote owned-worktree proof가 없는 use_worktrees 요청은 거부한다.
+
+### Actual final validation
+
+- 최종 **11 gate 모두 exit0**: fmt, boundary, deps, i18n, strict workspace/all-target Clippy, full workspace, migration smoke, native render, shared Chrome, Relay Node, production Chrome. 실제 source/명령/exit/시간/로그는 `/private/tmp/deppy-cc-acceptance-gates-20261020.json`에 있다. root 전용 `target`, jobs2, Rust testthreads1을 사용했고 verifier session92521은exit0으로 종료했다.
+- Full workspace **6041 PASS / 0 FAIL / 67 ignored**, 79 Cargo target,339.492초. 각 Cargo target 마지막 결과만 집계하여 nested subprocess helper 중복을 제외했다. App3449 PASS/40 ignored, runtime420 PASS/1 ignored, storage509 PASS. ignored를 통과로 합산하지 않았다.
+- 별도 native1 PASS/10 PNG, shared Chrome106 assertions PASS(390/760/1280·dark/light), Relay Node17 PASS, production Chrome5 PASS/0 FAIL/0 ignored. native/browser 일부 ignored 검사는 별도 명시 실행했고 다른 ignored performance/수동 검사는 실행하지 않았다.
+- `/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020`의10 PNG를 root가 모두 열어 대조했다. 760/font1.25 머리글 버튼 잘림 수정, 양 테마·drawer·Devices390/1440을 확인했다. 실제 egui fixture 렌더이며 사용자 실행 앱 캡처나 HTML과 pixel 동일성 증거가 아니다.
+- 상세 명령과 지원·미실행 경계는 `docs/qa/2026-10-20-command-center-v2-release.md`. 문서 최종 검사에서 승인 파일6 SHA·rollback refs2·상대 링크4·최종11 gate JSON 대조 PASS, `git diff --check` PASS를 실제 확인했다. 제품 경로의 `git diff d2b4605c`는 비어 있다. 최종 문서 커밋 후 clean 상태를 확인한다.
+
+### Failed approaches / remaining work
+
+- 최초9b 전체 검사는6039 PASS/1 FAIL/67 ignored, 실패 로그 `/private/tmp/deppy-cc-final-workspace-20261020.log`. 오래된 assertion이 capacity-only epoch 갱신을 실제 connection/grant 변경과 동일하게 취급했다. 실제RED→test-only 분리→d2 최종 전체GREEN. 새 초기 launch에는 엄격한 lease 검사를 유지하고 기존 exact 실행의 capacity 갱신만 허용한다. 제품 guard를 완화하지 않았다.
+- 과거 서로 다른 worktree의 Cargo target 공유로 다른 source가 Fresh 재사용된 실패가 있어 target을 분리했다. 이후 root target을 공유하지 않았다. old filtered0 tests·컴파일 실패·서로 다른 source cohort를 최종 PASS로 합산하지 않는다.
+- 실제 유료 provider 호출, 실행 앱·사용자 DB 재시작 복구, 서로 다른 물리 컴퓨터·휴대폰, main 대비 장시간 idle CPU/memory/frame p95는 미실행이다. 이 범위를 전체 서비스 인수 완료로 표시하지 않는다. Cross-TLS cloud 원격 입력과 remote owned-worktree는 위 지원 경계를 유지한다.
+- source version **0.13.0은 검사 빌드**이며 배포 artifact가 없다. 제품 전달 시 최신 shipped를 다시 확인하고 더 높은 minor(잠정0.14.0)로 증가시킨 뒤 CLI/두 macOS plist version·서명·package를 검증한다. 현재 작업에는 앱 재시작·제품 배포·push/main merge 권한이 없다.
+
+### Exact next commands
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020
+git status --short
+git branch --show-current
+git diff --check
+git diff d2b4605c -- crates web third_party Cargo.toml Cargo.lock
+cat docs/qa/2026-10-20-command-center-v2-release.md
+cat docs/command-center-rollback.md
+```
+
+기존 검사 로그를 먼저 읽고 제품 source가 바뀌지 않았다면 같은 전체 검사를 이유 없이 반복하지 않는다. 앱 launch/restart 명령은 현재 사용자의 명시 요청이 있을 때만 수행한다. 아래 checkpoint들은 개발 이력이며 이 최종 상태보다 우선하지 않는다.
+
+## Latest checkpoint — test-only correction integrated / final acceptance rerun
+
+- `7c00523b`→`d2b4605c053f423b5d5eac8e5f809f3d92907bc8` integrated after root diff review. Only `#[cfg(test)]` remote_dispatch assertions changed; product code stays9b. Old capacity-only rejection expectation corrected without weakening initial launch, connection, grant or execution identity checks. Owner actual original RED0PASS/1FAIL, corrected14 remote_dispatch PASS/28 combined actual-source standalone PASS; root Cargo remains final authority.
+- Root final acceptance verifier RUNNING session92521: `python3 /private/tmp/deppy-cc-acceptance-gates-20261020.py`; result JSON `/private/tmp/deppy-cc-acceptance-gates-20261020.json`. New paths preserve original9b failed workspace evidence. At this checkpoint fmt/boundary/deps PASS; subsequent i18n/Clippy/fullworkspace/migrations/native/sharedChrome/RelayNode/productionChrome pending. Root target exclusively `<root>/target`, jobs2, all testthreads1.
+- Later actual rerun checkpoint: i18n and strict workspace/all-target Clippy PASS; actual full App target **3449 PASS / 0 FAIL / 40 ignored** in106.26s, including both corrected epoch tests. Whole-workspace other targets are still running; native/browser gates have not run yet. `/private/tmp/deppy-cc-acceptance-workspace-20261020.log`.
+- Root reviewed new capacity test: explicit strict `validate_lease` and `verified_lease` conflict for stale initial reservation; trusted observation lists exact active op; exact existing execution proof remains usable with original attempt/op/binding and no source-state mutation. Connection or committed grant update invalidates retained proof, registry execution lookup and dispatch. No devices/runtime production changes.
+- Next: wait session92521 (do not start concurrent Cargo), inspect actual JSON/logs and final10PNG, document finalcounts/boundaries, commit docs. Main merge/push/app restart/product release remain unperformed.
+
+## Latest checkpoint — full-workspace failure under investigation
+
+- Initial9b whole-workspace run completed exit101 after479.42s: **6039 PASS / 1 FAIL / 67 ignored** across79 Cargo test/doc-test targets (last result per Cargo target, nested subprocess helper results excluded). Only failure is obsolete capacity-epoch assertion below; connection/grant guards are not weakened. cc_contracts actual same-source standalone RED0PASS/1FAIL then test-only correction14 remote_dispatch PASS/28 combined PASS. New assertions separately reject stale initial launch reservations while retaining exact ongoing work after same-identity capacity-only observations; connection/grant changes revoke old proof and reject dispatch. Narrow commit pending root integration and actual Cargo verification. Root prepared `/private/tmp/deppy-cc-acceptance-gates-20261020.py` to preserve original failed logs/JSON and run all gates on next frozen source.
+- Exact source `9b5d84f7`: fmt/boundary/deps/i18n/strict workspace all-target Clippy actually PASS. Full workspace `--no-fail-fast -- --test-threads=1` is still running, and App reported **3447 PASS / 1 FAIL / 40 ignored**. The failed test is `work_management::remote_dispatch::tests::changed_connection_or_lease_epoch_invalidates_an_inflight_proof`, `remote_dispatch.rs:1089`, expected rejection but got success. Do not claim full gate PASS or product source complete.
+- cc_contracts owns isolated investigation/reproduction/narrow fix in `work_management/remote_dispatch.rs` / `devices.rs` if proven necessary. Root does not edit those files or run concurrent Cargo; root target remains exclusive to session48519. Read-only 9b receipt recovery review previously found no blocking defect. Final verifier will stop after workspace failure; remaining gates have not run.
+- Evidence `/private/tmp/deppy-cc-final-workspace-20261020.log`; final JSON `/private/tmp/deppy-cc-final-gates-20261020.json`. Preserve first failure logs before rerunning on a corrected source. Next: inspect all workspace failures when complete, integrate proven owner fix, rerun appropriate full gates and final native/browser evidence; then docs/commit. App restart/main merge/push/release remain outside current task.
+
+## Latest checkpoint — source freeze / final gates running
+
+- **Frozen product source `9b5d84f7ff59f90e01030833d7b6b102e9e0895b`** on root feature branch. Last fix storage race `59cd7229`→`9b5d84f7`; idle owner fix `aef05c86`, origin rejection order `f4bcb2cc`, header `af57748d`. Docs/user guide/unreleased note are separate commits; no release artifact or version change.
+- Storage recovery now blocks same-workspace query/load overlap and rejects queries while unloaded/storageblocked/queuedLoad/inflightLoad. Actual already-terminal original dispatch receipts survive stale SQLite reload/CAS savefailure using retained private ledger + exact immutable Attempt/config/binding/folder/task definition/source-result payload. Mutable future project settings are NOT used as original attempt identity or copied into old loaded settings. Actual rejection also retained; no replay.
+- Owner actual meaningfulRED original1 PASS/3 FAIL; futureconfig4 PASS/1 FAIL; final command_center_ **73 PASS/0 FAIL/1 ignored**, strict App/tests Clippy exit0, fmt/diffchecks exit0. `/private/tmp/deppy-cc-receipt-race-final-green-20261020.log`, `...race-clippy...log`, `...future-config-red...log`. Earlier rejection fixture wrong String reason was compile-only failure, corrected to AdmissionDenied; not counted as behavioralRED.
+- cc_ui independent idle-owner review: no blocking defect. cc_contracts independently re-reviews last9b storage receipt merge while root gates run; read only/no Cargo. All feature owners frozen. New narrow race tree `/Users/jr/Desktop/projects/deppy-sijo-cc-receipt-race-20261020` uses storage owner's exclusive performance target/jobs2; root target remains exclusive.
+- Root actual fullworkspace strictClippy **PASS before last race integration**, `/private/tmp/deppy-cc-pre-final-workspace-clippy-20261020.log`; not finalsourcePASS. Root full verifier RUNNING PID tool session48519: `python3 /private/tmp/deppy-cc-final-gates-20261020.py`. JSON `/private/tmp/deppy-cc-final-gates-20261020.json` identifies exact9b source and actual command/exit/timing/log per completedgate. At checkpoint fmt/boundary/deps exit0, i18n compiling. Verifier then strictworkspaceClippy→fullworkspace serial→migrations→nativeoffscreen10PNG→sharedChrome→RelayNode→productionChrome. If anygate fails, it stops; inspect log and fix concretecause, rerun appropriategates, never claim pending PASS.
+- New final native folder `/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020` will be generated only after preceding gates pass. Old native10PNG cohort remains separately documented. Original approvedfile/PNG hashes + rollback refs actually verified against f78ebb69; no changes.
+- Remaining: wait tool session48519/outputJSON; handleactualfailures; inspect postfreeze narrow/desktop/mobile images; update QA/release/plan acceptance docs with finalactualcounts + independentreview; commitdocs and verifyclean. Product release/physicaldevices/liveprovider/main-vs-idlebenchmark notperformed; do not synthesize or restartapp to fill these. No app restart/push/mainmerge authorization incurrenttask.
 
 ## Latest checkpoint — final review defects before source freeze
 

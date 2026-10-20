@@ -36,7 +36,43 @@
 
 ## 최종 검사
 
-최종 source freeze 후 실행한 결과를 여기에 갱신한다. 현재 전체 gate의 최종 결과는 아직 미기록이다. 최신 실행 기록은 [구현 검증](2026-10-20-command-center-v2-implementation.md)과 `docs/CODEX_HANDOFF.md`를 기준으로 한다.
+검사 source는 `d2b4605c053f423b5d5eac8e5f809f3d92907bc8`다. 이후 문서 커밋은 제품 source를 변경하지 않는다. root 전용 `target`, `CARGO_BUILD_JOBS=2`, Rust 검사 `--test-threads=1` 조건에서 아래 **11개 gate 모두 exit0**을 실제 확인했다.
+
+| 검사 | 실제 결과 |
+|---|---|
+| `cargo fmt --all -- --check` | PASS |
+| `xtask check-boundary` / `check-deps` | 각각 PASS |
+| `xtask i18n-check` | PASS, 리터럴1694·동적173 호출, 5개 locale |
+| `cargo clippy --offline --locked --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --offline --locked --workspace --no-fail-fast -- --test-threads=1` | **6041 PASS / 0 FAIL / 67 ignored**, 79개 Cargo target, 339.492초 |
+| `xtask smoke-db-migrations` | PASS |
+| native ignored render fixture 명시 실행 | **1 PASS**, 최종10 PNG |
+| shared PWA 실제 Chrome | **106 assertions PASS**, 390/760/1280, dark/light |
+| Relay Node | **17 PASS / 0 FAIL / 0 skipped** |
+| production PWA·Relay·mobile 실제 Chrome | **5 PASS / 0 FAIL / 0 ignored** |
+
+workspace 수치는 Cargo target별 마지막 결과를 집계하여 내부 subprocess helper의 중복 보고를 제외했다. 기본 suite의67 ignored를 통과로 합산하지 않는다. native render와 production browser5개는 위 별도 gate에서 명시 실행했다. 다른 performance/수동 검사는 계속 미실행이다.
+
+최종 명령·source·exit·시간·로그: `/private/tmp/deppy-cc-acceptance-gates-20261020.json`. 원본 로그는 `/private/tmp/deppy-cc-acceptance-{gate}-20261020.log`, 집계는 `/private/tmp/deppy-cc-acceptance-workspace-counts-20261020.json`이다. native10 PNG는 `/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020`에 있으며 root가 10장 모두 열어 대조했다. 760/font1.25 설정 버튼이 머리글 안에 유지되는 것을 확인했다. 이는 fixture의 실제 egui 렌더이며 실행 중 사용자 앱 캡처가 아니다.
+
+화면·브라우저 gate의 재현 명령:
+
+```sh
+export CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target
+export CARGO_BUILD_JOBS=2
+export DEPPY_CC_EVIDENCE_DIR=/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020
+cargo test --offline --locked -p deppy-sijo command_center_render_evidence -- --ignored --nocapture --test-threads=1
+node web/shared/tests/command-center.browser.mjs
+node --test web/relay-shell/tests/reconnect.test.mjs web/relay-shell/tests/channel-concurrency.test.mjs
+cargo test --offline --locked -p web-remote --test command_center_chrome --test relay_shell_chrome --test pwa_unified_chrome --test mobile_shell_chrome -- --ignored --test-threads=1
+```
+
+## 발견·수정·재검토
+
+- 닫힌 recovered idle 실행이 새 유휴 실행을 가리는 선택 오류와 stale native 생성 요청의 UI 우회는 공통 exact-owner 선택기·host guard로 수정했다. actual RED→GREEN 및 독립 리뷰를 완료했다.
+- 원래 실제 접수 receipt가 늦은 SQLite load/CAS 실패로 Uncertain으로 돌아가던 경로는 query/load 직렬화와 정확한 immutable attempt/config/binding/task/source-result 대조로 수정했다. 미래 프로젝트 설정은 원래 실행 identity로 사용하지 않는다. 독립 리뷰에서 남은 차단 결함을 찾지 못했다.
+- View-only Relay 관측 누락, lost read ACK 뒤 갱신 정지, 숨김 DOM의0크기가 원격 스크롤 위치를 덮는 문제, 대형 projection budget, 좁은 머리글 버튼 잘림을 실제 재현하고 회귀로 검증했다.
+- 최초9b workspace 실행은6039 PASS/1 FAIL/67 ignored였다. 실패 원인은 capacity lease epoch가 바뀌면 이미 실행된 exact worker도 거부해야 한다는 오래된 테스트 assertion이었다. 테스트만 분리하여 stale initial launch는 계속 거부하고, 실제 connection/grant 변경도 기존 proof를 무효화하며, capacity-only 관측에서는 기존 실행 입력을 보존하는 것을 확인했다. 제품 guard를 완화하지 않았으며 최종d2 전체 검사로 재확인했다. 최초 실패 로그는 `/private/tmp/deppy-cc-final-workspace-20261020.log`에 보존했다.
 
 ## 배포 전 별도 확인
 

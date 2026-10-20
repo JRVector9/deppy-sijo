@@ -1,5 +1,12 @@
 # Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
 
+## Latest checkpoint — final review defects before source freeze
+
+- Root header `abc09079`→`af57748d`: meaningful actualRED760/font1.25 settingsright765.4 > header752; controls-first/title-remainder allocation fixed. UI owner actual80 PASS/0 FAIL/1 ignored, fmt PASS. Root integrated source laterfocused **86 PASS/0 FAIL/1 ignored**, `/private/tmp/deppy-cc-idle-selection-guard-green-20261020.log` (includes rootserver4 and new2 idle lifecycle cases).
+- cc_storage independentreview found MEDIUM closed recovered idle A hiding later recovered idle B: actualRootRED0PASS1FAIL(`/private/tmp/deppy-cc-idle-selection-red-20261020.log`) then one shared `idle_owner` filters exact project/task/nonclosed binding+lease for target/attempt/capability. Same review found stale native CreateWorker could bypass UI-only disabled state: root realhost guard regressionRED1PASS1FAIL(`/private/tmp/deppy-cc-idle-guard-red-20261020.log`)→ensure_no_idle_worker before anyeffect. Both GREEN in86 cohort. cc_ui independently reviews these narrow corrections; header/source owner otherwise frozen.
+- Remaining MEDIUM found in independentreview: in-flight read query result can be overwritten by RetryStorage/lateLoaded, downgrading actual Admitted outbox to staleUncertain. No automatic replay was found, but durable recovered state could be lost. cc_storage owns only same-workspace pending/load guards + immutable known receipt preservation in host load region, RED/GREEN in isolated worktree/own target. Root does not touch those functions. Final workspace gate begins after this narrow fix integrates.
+- Product build/release/app launch/push/main merge remain unperformed. Code-only development source0.13.0; version increase required before any user-distributed artifact.
+
 ## Latest checkpoint — reconciliation and Relay integration
 
 - Root `f3657039`: runtime read-only query `5c878022`→`856b132b`, native query `be812c00`→`f3657039`, Relay bridge `74e633f0`→`71d37b17`. Unknown 원operation을 SELECT/query하며 새 launch/input을 만들지 않는다. launch 생성 확인은 ObservedIdle+Stage::Done, 초기 지시·assignment 생성은 하지 않는다. immutable request가 없는 재시작은 Unknown을 보존한다.

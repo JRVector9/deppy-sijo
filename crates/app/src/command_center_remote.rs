@@ -102,15 +102,7 @@ impl Pending {
 }
 pub(super) fn target_for(host: &CommandCenterHost, task: &work::Task) -> Option<cc::RouteTarget> {
     let project = host.projects.get(&task.workspace_id.0)?;
-    if task.current_attempt_id.is_none()
-        && let Some((id, _)) = host.remotes.iter().find(|(_, p)| {
-            p.record.task_id == task.id
-                && p.record.workspace == task.workspace_id
-                && p.record.phase == Phase::ObservedIdle
-                && p.record.binding.is_some()
-                && p.lease.is_some()
-        })
-    {
+    if let Some((id, _)) = reconcile::idle_owner(host, task) {
         return Some(cc::RouteTarget {
             workspace_id: task.workspace_id.0.clone(),
             task_id: Some(task.id.0.clone()),
@@ -563,6 +555,7 @@ impl App {
         id: &str,
         target: &cc::RouteTarget,
     ) -> Result<(), String> {
+        reconcile::ensure_no_idle_worker(host, target)?;
         if host.remote_permits.contains_key(id) {
             return Err("이 컴퓨터에서 새 원격 실행을 시작해 주세요.".into());
         }

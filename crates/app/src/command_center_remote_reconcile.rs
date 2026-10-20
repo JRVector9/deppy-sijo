@@ -67,23 +67,49 @@ pub(in super::super) fn idle_attempt(
     host: &CommandCenterHost,
     task: &work::Task,
 ) -> Option<String> {
+    idle_owner(host, task).map(|(_, p)| p.record.attempt_id.0.clone())
+}
+pub(in super::super) fn idle_owner<'a>(
+    host: &'a CommandCenterHost,
+    task: &work::Task,
+) -> Option<(&'a str, &'a Pending)> {
+    if task.current_attempt_id.is_some() {
+        return None;
+    }
     host.remotes
-        .values()
-        .find(|p| {
+        .iter()
+        .find(|(id, p)| {
             p.record.task_id == task.id
                 && p.record.workspace == task.workspace_id
                 && p.record.phase == Phase::ObservedIdle
-                && task.current_attempt_id.is_none()
+                && p.record.binding.is_some()
+                && p.lease.is_some()
+                && !sessions::closed(host, id)
         })
-        .map(|p| p.record.attempt_id.0.clone())
+        .map(|(id, p)| (id.as_str(), p))
 }
 pub(in super::super) fn has_idle(host: &CommandCenterHost, task: &work::Task) -> bool {
-    host.remotes.iter().any(|(id, p)| {
-        p.record.task_id == task.id
-            && p.record.workspace == task.workspace_id
-            && p.record.phase == Phase::ObservedIdle
-            && !sessions::closed(host, id)
-    })
+    idle_owner(host, task).is_some()
+}
+pub(in super::super) fn ensure_no_idle_worker(
+    host: &CommandCenterHost,
+    target: &cc::RouteTarget,
+) -> Result<(), String> {
+    if host
+        .projects
+        .get(&target.workspace_id)
+        .and_then(|project| {
+            project
+                .snapshot
+                .tasks
+                .iter()
+                .find(|task| Some(&task.id.0) == target.task_id.as_ref())
+        })
+        .is_some_and(|task| has_idle(host, task))
+    {
+        return Err("이 작업의 복구된 원격 워커를 먼저 명시적으로 종료해 주세요. 새 실행을 만들지 않았습니다.".into());
+    }
+    Ok(())
 }
 pub(in super::super) fn activity(host: &CommandCenterHost, task: &work::Task) -> Option<String> {
     if has_idle(host, task) {
@@ -309,6 +335,91 @@ mod tests {
             },
         );
         (host, lease, id, token)
+    }
+    #[test]
+    fn recovered_idle_blocks_a_stale_native_new_launch_at_the_host_guard() {
+        let (mut host, lease, _, token) = fixture(true);
+        launch_receipt(
+            &mut host,
+            &RemoteLaunchReceipt {
+                request_id: token,
+                lease,
+                result: runtime::remote_worker::RemoteWorkResult::Launched {
+                    session: runtime::SessionId(7),
+                    execution_generation: 19,
+                },
+            },
+        );
+        let task = &host.projects["workspace-a"].snapshot.tasks[0];
+        let target = target_for(&host, task).unwrap();
+        assert!(ensure_no_idle_worker(&host, &target).is_err());
+    }
+    #[test]
+    fn closed_recovered_idle_does_not_hide_the_next_recovered_worker() {
+        let (mut host, lease, old, token) = fixture(true);
+        launch_receipt(
+            &mut host,
+            &RemoteLaunchReceipt {
+                request_id: token,
+                lease: lease.clone(),
+                result: runtime::remote_worker::RemoteWorkResult::Launched {
+                    session: runtime::SessionId(7),
+                    execution_generation: 19,
+                },
+            },
+        );
+        sessions::session_observed(
+            &mut host,
+            None,
+            wm::remote_controller::RemoteSessionObservation {
+                lease,
+                session: runtime::SessionId(7),
+                execution_generation: 19,
+                terminal: None,
+                detected_status: None,
+                exit_code: Some(Some(0)),
+                connected: true,
+            },
+        );
+        assert!(sessions::closed(&host, &old));
+        let task = host.projects["workspace-a"].snapshot.tasks[0].clone();
+        assert!(!has_idle(&host, &task));
+
+        // The newer operation sorts after the closed one; both historical records remain.
+        let (mut next, mut lease, next_id, _) = fixture(true);
+        let new = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+        let mut worker = next.remotes.remove(&next_id).unwrap();
+        worker.record.operation_id = work::OperationId::from_string(new.into()).unwrap();
+        worker.record.task_id = task.id.clone();
+        lease.request.operation_id = worker.record.operation_id.clone();
+        worker.lease = Some(lease.clone());
+        let attempt = worker.record.attempt_id.0.clone();
+        host.remotes.insert(new.into(), worker);
+        host.reconciles.pending.insert(
+            102,
+            Query {
+                click: uuid::Uuid::new_v4().to_string(),
+                source: Source::Launch(new.into()),
+                lease: lease.clone(),
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+            },
+        );
+        launch_receipt(
+            &mut host,
+            &RemoteLaunchReceipt {
+                request_id: 102,
+                lease,
+                result: runtime::remote_worker::RemoteWorkResult::Launched {
+                    session: runtime::SessionId(8),
+                    execution_generation: 20,
+                },
+            },
+        );
+        let target = target_for(&host, &task).unwrap();
+        assert_eq!(target.session_id, Some(format!("remote:{new}")));
+        assert_eq!(idle_attempt(&host, &task), Some(attempt));
+        assert!(sessions::close_cap(&host, &target).enabled);
+        assert!(has_idle(&host, &task));
     }
     #[test]
     fn recovered_launch_only_installs_owned_idle_binding_and_never_rearms_initial_prompt() {

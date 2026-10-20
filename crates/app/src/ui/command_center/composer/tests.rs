@@ -517,6 +517,7 @@ fn composer_footer_paints_caption_at_left_edge_with_approved_type_and_vector_arr
             .with_size(egui::vec2(width, 600.0))
             .build_ui_state(
                 |ui, state: &mut ComposerState| {
+                    setup_style(ui, &Snapshot::default());
                     composer(
                         ui,
                         &mut state.ui,
@@ -557,6 +558,34 @@ fn composer_footer_paints_caption_at_left_edge_with_approved_type_and_vector_arr
                 .all(|s| s.format.font_id.size == 10.0)
         );
         let hint = text(&Snapshot::default(), "send_hint").to_owned();
+        let painted_hint = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == hint => Some(text),
+                _ => None,
+            });
+        if width > 760.0 {
+            let painted_hint = painted_hint.expect("desktop Enter hint");
+            let expected_x = caption.pos.x + caption.galley.rect.width() + 8.0;
+            assert!(
+                (painted_hint.pos.x - expected_x).abs() <= 1.0,
+                "hint must follow natural caption width +8px, actual={} expected={}",
+                painted_hint.pos.x,
+                expected_x
+            );
+        } else {
+            assert!(painted_hint.is_none(), "mobile Enter hint stays hidden");
+        }
+        assert!(
+            caption
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|s| s.format.font_id.family == egui::FontFamily::Proportional)
+        );
         for shape in &harness.output().shapes {
             if let egui::Shape::Text(text) = &shape.shape {
                 assert_ne!(
@@ -569,7 +598,7 @@ fn composer_footer_paints_caption_at_left_edge_with_approved_type_and_vector_arr
                             .job
                             .sections
                             .iter()
-                            .all(|s| s.format.font_id.size == 10.0)
+                            .all(|s| s.format.font_id == egui::FontId::proportional(10.0))
                     );
                 }
             }

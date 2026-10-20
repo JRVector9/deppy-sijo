@@ -338,7 +338,19 @@ pub(super) fn composer(
             } else {
                 &target_label
             };
-            let caption_width = (label_rect.width()
+            let footer_font = egui::FontId::proportional(10.0);
+            let natural_caption_width = label_ui.fonts_mut(|fonts| {
+                fonts
+                    .layout_no_wrap(
+                        caption.to_owned(),
+                        footer_font.clone(),
+                        colors(snapshot).muted,
+                    )
+                    .size()
+                    .x
+                    .ceil()
+            });
+            let max_caption_width = (label_rect.width()
                 - if alternate {
                     106.0
                 } else if !mobile && label_rect.width() >= 430.0 {
@@ -347,14 +359,19 @@ pub(super) fn composer(
                     0.0
                 })
             .max(1.0);
+            let caption_width = natural_caption_width.clamp(1.0, max_caption_width);
             let anchor = label_ui.add_sized(
                 [caption_width, 34.0],
                 egui::Button::new(egui::Atom::grow())
-                    .left_text(egui::RichText::new(caption).size(10.0).color(if too_long {
-                        colors(snapshot).red
-                    } else {
-                        colors(snapshot).muted
-                    }))
+                    .left_text(
+                        egui::RichText::new(caption)
+                            .font(footer_font.clone())
+                            .color(if too_long {
+                                colors(snapshot).red
+                            } else {
+                                colors(snapshot).muted
+                            }),
+                    )
                     .frame(false)
                     .gap(0.0)
                     .truncate()
@@ -378,7 +395,7 @@ pub(super) fn composer(
                 label_ui.add(
                     egui::Label::new(
                         egui::RichText::new(text(snapshot, "send_hint"))
-                            .size(10.0)
+                            .font(footer_font)
                             .color(colors(snapshot).muted),
                     )
                     .truncate(),

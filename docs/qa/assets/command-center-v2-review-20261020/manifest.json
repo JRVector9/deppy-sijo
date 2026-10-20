@@ -1,0 +1,86 @@
+{
+  "source_commit": "9c0a820a7805c4f25a1a6674f3b657fff464eb06",
+  "note": "Review evidence only. Native fixtures are offscreen renders, not running user app. Probe paths refer to private review tree. See main report for exact limits.",
+  "files": [
+    {
+      "file": "native-desktop.png",
+      "origin": "/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020/desktop-dark.png",
+      "sha256": "43de79fa4660df2237ae3c70e8ccd7f2526ff25dfe70c0fd08d3b4db11c8d778"
+    },
+    {
+      "file": "native-mobile.png",
+      "origin": "/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020/mobile.png",
+      "sha256": "9a253bcef53572c9283722e7b48442197628b8bdee5cb1d05a66b6c2c084965b"
+    },
+    {
+      "file": "native-workers-mobile.png",
+      "origin": "/private/tmp/deppy-command-center-native-postfreeze-evidence-20261020/mobile-workers.png",
+      "sha256": "390b162df25003ec9854d5c41bec3554771b08a0f8d6916de5a48f7f2983ac27"
+    },
+    {
+      "file": "native-settings-desktop.png",
+      "origin": "/private/tmp/deppy-cc-native-design-review-20261020/screenshots/settings-desktop.png",
+      "sha256": "f5ecb82306b6e968a75d8dd8ae7b9d76c3ad22c8457ed93ee9164f05d25f2ca8"
+    },
+    {
+      "file": "native-settings-mobile.png",
+      "origin": "/private/tmp/deppy-cc-native-design-review-20261020/screenshots/settings-mobile.png",
+      "sha256": "64dbdffb413bd5ed0817a6c9aefbfd1405840dc48d894c49c0c665ba44511c1e"
+    },
+    {
+      "file": "approved-desktop.png",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/approved-1440-dark.png",
+      "sha256": "d19a21b63f598cf8038103be21045b6f58c3cf5fc7ea69d62376bb3516bccb64"
+    },
+    {
+      "file": "approved-mobile.png",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/approved-390-dark.png",
+      "sha256": "8bdbc5ebba4c3924aebaf0caad532b90e8f58159aeeb1c975a3d8fd1174c578b"
+    },
+    {
+      "file": "shared-desktop.png",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/shared-1440-dark.png",
+      "sha256": "f54b53c2b03539030523a9b6972790c84f1d97ddaffb1cf295680732412cbe72"
+    },
+    {
+      "file": "production-mobile.png",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/production-390-dark.png",
+      "sha256": "54b914807956b31527b903723849257e212795cf9873de6390e200190134eedd"
+    },
+    {
+      "file": "production-relay-results.json",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/production-relay-results.json",
+      "sha256": "0eb184f0be273176d81cac3cd4149fa7781b3fe54087f99a0bea0492db1851d0"
+    },
+    {
+      "file": "drawer-focus-results.json",
+      "origin": "/private/tmp/deppy-cc-review-pwa-evidence-20261020/drawer-focus-results.json",
+      "sha256": "1717e10be8296b76604047d54113f7dbe2bd780dd9619784eae93707e5cff701"
+    },
+    {
+      "file": "workflow-review.md",
+      "origin": "/private/tmp/deppy-cc-review-workflow-20261020.md",
+      "sha256": "dbbfe136720846f9f0d3a8c850c3e4816b95ab8253ef4851dc60f2de3a546a33"
+    },
+    {
+      "file": "native-review.md",
+      "origin": "/private/tmp/deppy-cc-review-native-20261020.md",
+      "sha256": "b3a9b4c1f2554ec339aa5d5d9f179b6b057b554fd02e263a84215ea0c7eb9daf"
+    },
+    {
+      "file": "pwa-review.md",
+      "origin": "/private/tmp/deppy-cc-review-pwa-20261020.md",
+      "sha256": "a69ec135d21f6126560a9e727591fed3d8c7464cdde3d537daa9c66d6038b9ef"
+    },
+    {
+      "file": "workflow-probe.py",
+      "origin": "/private/tmp/deppy-cc-review-workflow-20261020.py",
+      "sha256": "af601f2b75f842f5c4e255675b46f1c2cdeceef064ac68306b37ebc01805cb59"
+    },
+    {
+      "file": "admission-probe.rs",
+      "origin": "/private/tmp/deppy-cc-review-admission-20261020.rs",
+      "sha256": "ad890f48a4980a2d0d34f3edd795cc425680c497d6cd81b87b5f61fd87134831"
+    }
+  ]
+}

@@ -1,0 +1,172 @@
+{
+  "production": {
+    "normal": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 390,
+        "bottom": 844,
+        "width": 390,
+        "height": 844
+      },
+      "bodyWidth": 390,
+      "appWidth": 390,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "19px",
+      "inputDisabled": false
+    },
+    "visualOnlyKeyboard": {
+      "layoutHeight": 844,
+      "visualHeight": 420,
+      "composerTop": 695,
+      "composerBottom": 807,
+      "hostHeight": 844
+    },
+    "checkboxErrors": {
+      "captured": {
+        "name": "InvalidStateError",
+        "message": "Failed to execute 'setSelectionRange' on 'HTMLInputElement': The input element's type ('checkbox') does not support selection.",
+        "stack": "InvalidStateError: Failed to execute 'setSelectionRange' on 'HTMLInputElement': The input element's type ('checkbox') does not support selection.\n    at renderContent (http://127.0.0.1:63249/app.js:2279:101)\n    at render (http://127.0.0.1:63249/app.js:2312:5)\n    at Object.accept (http://127.0.0.1:63249/app.js:2343:134)\n    at handleMessage (http://127.0.0.1:63249/app.js:2684:23)\n    at http://127.0.0.1:63249/app.js:2610:7\n    at FakeSocket.emit (http://127.0.0.1:63249/fixture.js:13:84)\n    at FakeSocket.message (http://127.0.0.1:63249/fixture.js:14:27)\n    at FakeSocket.publish (http://127.0.0.1:63249/fixture.js:15:43)\n    at <anonymous>:1:206"
+      },
+      "window": []
+    }
+  },
+  "relay": {
+    "390": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 390,
+        "bottom": 844,
+        "width": 390,
+        "height": 844
+      },
+      "bodyWidth": 390,
+      "appWidth": 390,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "19px",
+      "inputDisabled": true
+    },
+    "430": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 430,
+        "bottom": 844,
+        "width": 430,
+        "height": 844
+      },
+      "bodyWidth": 430,
+      "appWidth": 430,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "19px",
+      "inputDisabled": true
+    },
+    "760": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 760,
+        "bottom": 844,
+        "width": 760,
+        "height": 844
+      },
+      "bodyWidth": 760,
+      "appWidth": 760,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "19px",
+      "inputDisabled": true
+    },
+    "1000": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 1000,
+        "bottom": 900,
+        "width": 1000,
+        "height": 900
+      },
+      "bodyWidth": 1000,
+      "appWidth": 1000,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "21px",
+      "inputDisabled": true
+    },
+    "1280": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 1280,
+        "bottom": 900,
+        "width": 1280,
+        "height": 900
+      },
+      "bodyWidth": 1280,
+      "appWidth": 1280,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "21px",
+      "inputDisabled": true
+    },
+    "1440": {
+      "rect": {
+        "top": 0,
+        "left": 0,
+        "right": 1440,
+        "bottom": 900,
+        "width": 1440,
+        "height": 900
+      },
+      "bodyWidth": 1440,
+      "appWidth": 1440,
+      "nav": [
+        "메인",
+        "작업",
+        "기기",
+        "기록",
+        "설정"
+      ],
+      "font": "21px",
+      "inputDisabled": true
+    },
+    "fullFixture": {
+      "status": "ok",
+      "text": "RELAY_SHELL_OK:3e4ca2748e363d95ff6338e489b2543f0fb9b16bf2d7144b44ac51e55504d0348fad6796e622d6458b291c4dd6dc7c83a1a4c02d651e84f30fdeb53268dd9c56"
+    }
+  }
+}

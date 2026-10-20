@@ -1,4 +1,41 @@
-# Command Center v2 — 구현·자동 검증 완료, 2026-10-20
+# Command Center v2 — 병렬 리뷰 완료·수정 필요, 2026-10-20
+
+## Latest checkpoint — parallel code/design review complete; corrections required
+
+### Objective / result
+
+- User requested parallel read-only code review with close approved-design comparison. Reviewed `feat/agent-command-center-v2-20261020` HEAD **9c0a820a7805c4f25a1a6674f3b657fff464eb06** against approved HTML/spec/reference and baselinef78. Three GPT-6.1-Sol/xhigh reviewers covered native, PWA/Relay and workflow/recovery. Root independently checked current source and executed both workflow/admission probes. **15 deduplicated findings: high2, medium13. Design parity and functional acceptance are NOT complete.** Existing gate PASS remains historical test evidence, not coverage of these cases.
+- Full report: `docs/qa/2026-10-20-command-center-v2-review.md`; durable selected PNGs, JSON, detailed three reviewer notes and probe source in `docs/qa/assets/command-center-v2-review-20261020/` with provenance/SHA manifest.
+- High: deferred local first input can reach send after manual task completion; one volatile/project-wide confirmation strands queued work after restart/second goal/settings save. Medium includes native VerificationFailed retry hidden; PWA checkbox snapshot exception and drawer focus/Escape loss; terminal-project cache eviction; actual approval flow unimplemented; native row/drawer/footer/nav/settings deviations and shared monitor/CHECK-LIVE/nav omissions. Report distinguishes true unsupported PTY approval scope from unsafe approval regression.
+
+### Changes / decisions
+
+- Modified only this handoff and added review report/evidence. Product/test source, approved reference files and rollback branch/tag unchanged. No implementation fixes, release build/artifact, version bump, app stop/start, commit, push or main merge. Original default layout/opt-in remains.
+- Root produced seven extra offscreen Settings/empty/no-project PNGs using byte-identical actual UI copies plus a private appended test; actual popup connector_ui, unused credential type shim. No credential behavior claim. Native reviewer opened17 native +3 approved PNGs and measured109px actual row vs62px approved; settings field836px vs620px cap, input20px vs36px.
+- Review skill package lacks mandatory checklist.md, so that optional skill procedure was stopped; direct requested review continued. User informed with exact SKILL link. No setup/telemetry/external posts.
+
+### Actual commands / results
+
+- `/private/tmp/deppy-cc-review-workflow-20261020` exit0: four output scenario checks across three private harness functions, actual reducer/dispatch/queue/SQLite and extracted host/callback. Stubs at service edges; terminal cache fixture synthesized, not four real projects. Root also ran it.
+- `/private/tmp/deppy-cc-review-admission-20261020` exit0: production InputAdmission/AgentInputGuard and real owned shell/cat PTY accepted marker under unchanged idle Codex-editor conditions. Root also ran it. No user app/session/provider launched. Together with exact source trace this confirms no hidden downstream workflow fence; not a single full desktop E2E.
+- `/private/tmp/deppy-cc-native-design-review-20261020/review-harness independent_design_review_extra_states --nocapture`: **1 PASS / 0 FAIL / 17 filtered**,7 PNG. Root opened settingsdesktop/mobile/no-projectmobile; reviewer openedall7.
+- PWA reviewer actual Chrome matched-data matrix1440/1280/1000/760/430/390,dark/light,sharedfont1/1.25: no sampled horizontal overflow; general composer focus/draft/selection retained. Production concat+WS reproduces checkbox InvalidStateError; snapshot drawer Escape control demonstrates failure. Actual Relay modules/WebCrypto fixture6widths view-only, `RELAY_SHELL_OK`. Reports contain exact scripts/results. Historical106assertions/fullworkspace not rerun.
+- Initial private rustc harness mixed serde_core artifact hashes; compatible serde_json rlib fixed. First `--exact` selected0tests, not counted. Reviewer initial harness missing stub and PWA temporary SW fallback errors corrected in private harnesses only; not product failures. Physical keyboard/safe-area and visualViewport simulation explicitly distinguished.
+
+### Remaining work / exact next commands
+
+- Review objective complete; all15 findings remain unmodified. Suggested independent fix batches in report: workflow lifetime/confirmation; retry/cache/approval scope; PWA focus; native geometry; shared structure. Do not auto-implement without a new user instruction. Preserve exact attempt/runtime fences and no automatic replay. App restart still needs explicit current request.
+- Physical mobile/provider/user-DB restart/multiple real machines/performance not verified. No product release; source0.13.0 remains dev test version. Any future delivered behavior-changing artifact needs higher than latest shipped version and bundle verification.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020
+git status --short
+git diff --check
+cat docs/qa/2026-10-20-command-center-v2-review.md
+git diff d2b4605c -- crates web third_party Cargo.toml Cargo.lock
+```
+
+The older acceptance checkpoints below are implementation history, not an assertion that this new review passed.
 
 ## Final checkpoint — development branch acceptance
 

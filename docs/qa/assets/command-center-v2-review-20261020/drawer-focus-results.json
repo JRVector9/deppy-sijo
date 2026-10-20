@@ -1,0 +1,13 @@
+{
+  "opened": {
+    "active": "닫기",
+    "open": true
+  },
+  "escapeBeforeSnapshot": false,
+  "afterSnapshot": {
+    "active": "BODY",
+    "open": true,
+    "dialog": "true"
+  },
+  "escapeAfterSnapshot": true
+}

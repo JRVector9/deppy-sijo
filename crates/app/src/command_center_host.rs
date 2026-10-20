@@ -20,6 +20,8 @@ pub(super) mod launch;
 pub(super) mod layout;
 #[path = "command_center_observe.rs"]
 mod observe;
+#[path = "command_center_remote.rs"]
+mod remote;
 #[path = "command_center_routes.rs"]
 mod routes;
 
@@ -56,6 +58,7 @@ struct Project {
     catalog: Option<launch::Catalog>,
     catalog_requested: bool,
     worktree_root: Option<wm::task_worktree::ProjectWorktreeRootProof>,
+    effect_fence: remote::EffectFence,
 }
 impl Project {
     fn state(&self) -> ProjectWorkState {
@@ -128,6 +131,7 @@ pub(super) struct CommandCenterHost {
     next_token: u64,
     requested_loads: BTreeMap<String, String>,
     launches: BTreeMap<String, launch::Pending>,
+    remotes: BTreeMap<String, remote::Pending>,
     worktrees: wm::task_worktree::TaskWorktreeWorker,
     pending_configs: BTreeMap<String, (String, cc::ProjectConfig)>,
     installed: BTreeMap<u64, launch::Installed>,
@@ -163,6 +167,7 @@ impl CommandCenterHost {
             next_token: 0,
             requested_loads: BTreeMap::new(),
             launches: BTreeMap::new(),
+            remotes: BTreeMap::new(),
             worktrees: {
                 let ctx = ctx.clone();
                 wm::task_worktree::TaskWorktreeWorker::new(move || ctx.request_repaint())
@@ -511,6 +516,7 @@ impl App {
                     catalog: None,
                     catalog_requested: false,
                     worktree_root: None,
+                    effect_fence: remote::EffectFence::new(),
                 });
         }
     }
@@ -592,6 +598,7 @@ impl App {
                 yes()
             };
             let assignment_choices = assignment::choices(p, &host.devices.policies);
+            let ready_tasks = p.ready_tasks().unwrap_or_default();
             let mut tasks = vec![];
             for task in &p.snapshot.tasks {
                 let attempt = task
@@ -644,7 +651,7 @@ impl App {
                 tasks.push(cc::Task {
                     selected_assignment: assignment::selected(task, &assignment_choices),
                     create_worker: if task.execution_device.is_some() {
-                        no("원격 입력 승인 경로를 연결하는 중입니다.")
+                        if ready && matches!(p.confirmed,Some(assignment::Confirmed::Mixed(_))) && ready_tasks.contains(&task.id) && !remote::workspace_preparing(host,&ws.id) && !remote::workspace_unknown(host,&ws.id) && task.execution_device.as_ref().is_some_and(|id|host.devices.can_execute(&ws.id,id)) && !config.use_worktrees && host.devices.policies.iter().any(|d|Some(&d.registration().id)==task.execution_device.as_ref() && d.registration().workspace_id.0==ws.id && d.validate_fresh().is_ok()) {yes()} else {no("배정안·기기 권한·실행 용량을 확인해 주세요. 원격 워크트리는 서버 소유 증명이 필요합니다.")}
                     } else if ready
                         && p.confirmed.is_some()
                         && p.state().can_dispatch(&task.id)
@@ -660,12 +667,12 @@ impl App {
                         no("배정안 확인과 현재 작업·폴더 상태를 먼저 확인해 주세요.")
                     },
                     attempt_id: attempt.map(|a| a.id.0.clone()),
-                    result_report: if ready && attempt.is_some() {
+                    result_report: if ready && attempt.is_some() && !remote::handoff_pending(host,&target) {
                         yes()
                     } else {
                         no("현재 시도가 없습니다.")
                     },
-                    verify_result: if ready && task.result.is_some() {
+                    verify_result: if ready && task.result.is_some() && !remote::handoff_pending(host,&target) {
                         yes()
                     } else {
                         no("제출된 결과가 없습니다.")
@@ -882,7 +889,7 @@ impl App {
         match intent {
             cc::Intent::SetTaskAssignment {target,config_revision,device_id,profile_id}=>return self.amend_command_center_assignment(host,id,target,config_revision,device_id,profile_id),
             cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
-            cc::Intent::CreateWorker {target} => {if host.projects.get(&target.workspace_id).and_then(|p|p.snapshot.tasks.iter().find(|t|Some(&t.id.0)==target.task_id.as_ref())).is_some_and(|t|t.execution_device.is_some()) {return Err("원격 입력 승인 경로를 연결하는 중입니다.".into());} return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref());},
+            cc::Intent::CreateWorker {target} => {if host.projects.get(&target.workspace_id).and_then(|p|p.snapshot.tasks.iter().find(|t|Some(&t.id.0)==target.task_id.as_ref())).is_some_and(|t|t.execution_device.is_some()) {return self.begin_command_center_remote(host,id,&target);} return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref());},
             cc::Intent::ConnectExecutionDevice {workspace_id,request_id}=>return self.connect_command_center_device(host,id,&workspace_id,request_id),
             cc::Intent::GrantExecutionDevice {workspace_id,candidate_id,profile_ids,max_workers}=>return self.grant_command_center_device(host,id,&workspace_id,&candidate_id,profile_ids,max_workers),
             cc::Intent::RevokeExecutionDevice {workspace_id,device_id}=>return self.revoke_command_center_device(host,id,&workspace_id,&device_id),
@@ -894,9 +901,10 @@ impl App {
                 }
             }
             cc::Intent::RetryStorage { workspace_id } => {
+                if remote::project_pending(host,&workspace_id) {return Err("원격 실행·입력의 실제 응답을 확인한 뒤 복구해 주세요.".into());}
                 if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                p.storage_blocked = false; p.loaded = false; p.catalog_requested=false;
+                p.effect_fence.revoke();p.effect_fence=remote::EffectFence::new();p.storage_blocked = false; p.loaded = false; p.catalog_requested=false;
                 host.request_project_load(id,&workspace_id)?;
                 host.publication_dirty = true;
                 return Ok(());
@@ -938,6 +946,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::SaveProject { workspace_id, config } => {
+                if remote::project_pending(host,&workspace_id) {return Err("원격 실행·입력 승인 대기 중에는 실행 설정을 바꿀 수 없습니다.".into());}
                 if config.allowed_scope_roots.len() > 64 || config.allowed_scope_roots.iter().map(String::len).sum::<usize>() > 8192 { return Err("허용 범위는 합계 8KiB, 64개 이하로 지정해 주세요.".into()); }
                 let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded || host.flight.is_some() { return Err("저장 중에는 설정을 변경할 수 없습니다.".into()); }
@@ -980,6 +989,7 @@ impl App {
                 set_draft(p, "settings:agents", &serde_json::to_string(&p.allowed_agents).map_err(|e| e.to_string())?, false)?;
                 p.request = None; p.proposal = None; p.confirmed = None; p.dirty();
                 host.save(&workspace_id, None, Some(id.into()))?;
+                let p=host.projects.get_mut(&workspace_id).unwrap();p.effect_fence.revoke();p.effect_fence=remote::EffectFence::new();
                 return Ok(());
             }
             cc::Intent::Submit { target, text } => {
@@ -1029,13 +1039,14 @@ impl App {
                 return Ok(());
             }
             cc::Intent::ConfirmPlan { workspace_id, goal_id } => {
+                if remote::project_pending(host,&workspace_id) {return Err("원격 입력 승인 후 다음 배정안을 확인해 주세요.".into());}
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if host.flight.is_some() || p.generation != p.saved_generation { return Err("배정안 저장이 완료된 뒤 확인해 주세요.".into()); }
                 let proposal = p.proposal.as_ref().ok_or("검증된 배정안이 없습니다.")?;
                 if proposal.plan().goal_id.0 != goal_id { return Err("배정안이 바뀌었습니다. 현재 배정안을 확인해 주세요.".into()); }
                 let mut state = p.state();
                 let goal=proposal.plan().goal_id.clone();
-                let confirmed=if state.tasks.iter().any(|t|t.goal_id==goal && t.execution_device.is_some()) {assignment::Confirmed::Mixed(wm::remote_dispatch::RemoteConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy(),&host.devices.policies).map_err(|e|e.to_string())?)} else {assignment::Confirmed::Local(wm::dispatch::ConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy()).map_err(|e|e.to_string())?)};
+                let confirmed=if state.tasks.iter().any(|t|t.goal_id==goal && t.execution_device.is_some()) {assignment::Confirmed::Mixed(wm::remote_dispatch::RemoteConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy(),&host.devices.policies).map_err(|e|e.to_string())?)} else {let unchanged=proposal.plan().tasks.iter().all(|original|state.tasks.iter().any(|task|task==original)); let token=if unchanged {wm::orchestrator::confirm_proposal(&mut state,proposal,&p.snapshot.config,&p.policy())}else{wm::dispatch::ConfirmedPlan::confirm(&mut state,&goal,&p.snapshot.config,&p.policy())};assignment::Confirmed::Local(token.map_err(|e|e.to_string())?)};
                 p.confirmed = Some(confirmed); p.proposal = None; p.set_state(state);
                 host.save(&workspace_id,None,Some(id.into()))?;
                 return Ok(());
@@ -1061,6 +1072,7 @@ impl App {
             }
             cc::Intent::Approval { .. } => return Err("이 실행의 정확한 승인 요청을 확인할 수 없습니다. 실제 세션의 승인 UI를 사용해 주세요.".into()),
             cc::Intent::ReportResult { target,attempt_id,text } => {
+                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 결과를 보고해 주세요.".into());}
                 if text.trim().is_empty() || text.len() > work::WORK_EVENT_MAX_BYTES { return Err("실제 작업 결과는 8KiB 이하로 기록해 주세요.".into()); }
                 let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
@@ -1072,6 +1084,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::VerifyResult { target,attempt_id,revision,passed,evidence } => {
+                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 검증해 주세요.".into());}
                 if evidence.trim().is_empty() || evidence.len() > 4096 { return Err("직접 수행한 검증의 명령과 결과를 4KiB 이하로 기록해 주세요.".into()); }
                 let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("현재 작업이 없습니다.")?;
@@ -1081,6 +1094,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::ConfirmResult { target, revision } => {
+                if remote::handoff_pending(host,&target) {return Err("실제 입력 승인 응답을 확인한 뒤 완료를 확인해 주세요.".into());}
                 let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
                 let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
                 let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("현재 시도가 없습니다.")?;
@@ -1112,6 +1126,7 @@ impl App {
             && !host.observations.has_pending()
             && !host.devices.has_pending()
             && host.launches.values().all(|l| l.finished())
+            && !host.remotes.values().any(|p| p.pending())
             && host
                 .projects
                 .values()
@@ -1240,6 +1255,7 @@ impl App {
                                 .ok();
                             }
                             launch::restore_records(&mut host, &workspace);
+                            remote::restore(&mut host, &workspace);
                             let target = host
                                 .main_target(&workspace, host.projects.get(&workspace).unwrap());
                             if let Some(draft) = host.projects[&workspace]
@@ -1296,7 +1312,12 @@ impl App {
                             let p = host.projects.get_mut(&workspace).unwrap();
                             let valid = authorized
                                 && p.snapshot.config.revision == after.config_revision
-                                && live.as_ref().is_some_and(|l| l.capture.prompt.is_some());
+                                && live.as_ref().is_some_and(|l| l.capture.prompt.is_some())
+                                && after
+                                    .input
+                                    .dispatch
+                                    .as_ref()
+                                    .is_none_or(|a| assignment_current(p, a));
                             if valid {
                                 let mut allowed = true;
                                 if let Some(assignment) = &after.input.dispatch {
@@ -1404,6 +1425,7 @@ impl App {
         self.pump_command_center_devices(&mut host, visible);
         self.pump_command_center_observations(&mut host);
         self.pump_command_center_launches(&mut host);
+        self.pump_command_center_remote(&mut host);
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
             && let Some((id, intent)) = host.pending.pop_front()
@@ -1997,6 +2019,23 @@ fn same_folder(a: &str, b: &str) -> bool {
         .is_some_and(|(a, b)| a == b)
 }
 
+fn assignment_current(project: &Project, assignment: &wm::dispatch::DispatchAssignment) -> bool {
+    project.snapshot.tasks.iter().any(|task| {
+        task.id == assignment.task.id
+            && task.current_attempt_id.as_ref() == Some(&assignment.attempt.id)
+            && matches!(
+                task.state,
+                work::WorkState::Queued
+                    | work::WorkState::Running
+                    | work::WorkState::WaitingApproval
+                    | work::WorkState::WaitingInput
+            )
+    }) && project.snapshot.attempts.iter().any(|attempt| {
+        attempt.id == assignment.attempt.id
+            && attempt.runtime_binding == assignment.attempt.runtime_binding
+            && attempt.operation_id == assignment.attempt.operation_id
+    })
+}
 fn apply_delivery_outcome(
     p: &mut Project,
     assignment: &wm::dispatch::DispatchAssignment,
@@ -2171,6 +2210,7 @@ mod tests {
             catalog: None,
             catalog_requested: false,
             worktree_root: None,
+            effect_fence: remote::EffectFence::new(),
         }
     }
     #[test]
@@ -2386,6 +2426,16 @@ mod tests {
             state: stored::DispatchOutboxState::Pending,
         });
         (p, assignment)
+    }
+    #[test]
+    fn delayed_saved_assignment_cannot_send_after_result_or_attempt_replacement() {
+        let (mut project, assignment) = attempted();
+        assert!(assignment_current(&project, &assignment));
+        project.snapshot.tasks[0].state = work::WorkState::ResultSubmitted;
+        assert!(!assignment_current(&project, &assignment));
+        project.snapshot.tasks[0].state = work::WorkState::Queued;
+        project.snapshot.tasks[0].current_attempt_id = Some(work::AttemptId::new());
+        assert!(!assignment_current(&project, &assignment));
     }
     #[test]
     fn known_rejection_frees_attempt_capacity_while_unknown_never_retries() {

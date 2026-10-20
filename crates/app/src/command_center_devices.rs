@@ -23,6 +23,7 @@ pub(super) struct Devices {
     poll_workspace: Option<String>,
     last_poll: std::time::Instant,
     poll_cursor: usize,
+    remote_request: Option<u64>,
 }
 impl Devices {
     pub fn new(data_dir: PathBuf, ctx: &egui::Context) -> Self {
@@ -39,6 +40,7 @@ impl Devices {
             poll_workspace: None,
             last_poll: std::time::Instant::now(),
             poll_cursor: 0,
+            remote_request: None,
         }
     }
     fn next_connected_workspace(&mut self) -> Option<String> {
@@ -60,7 +62,27 @@ impl Devices {
         workspace
     }
     pub fn has_pending(&self) -> bool {
-        self.request.is_some() || self.poll_workspace.is_some()
+        self.request.is_some() || self.poll_workspace.is_some() || self.remote_request.is_some()
+    }
+    pub(super) fn can_execute(&self, workspace: &str, device: &str) -> bool {
+        self.views
+            .get(workspace)
+            .is_some_and(|views| views.iter().any(|d| d.id == device && d.can_execute))
+    }
+    pub(super) fn queue_remote(&mut self, token: u64, job: RemoteDeviceJob) -> Result<(), String> {
+        if self.has_pending() {
+            return Err("기기 워커의 현재 응답을 기다려 주세요.".into());
+        }
+        self.worker.try_submit(job).map_err(|_| {
+            "원격 요청을 접수하지 못했습니다. 새 실행·입력을 보내지 않았습니다.".to_owned()
+        })?;
+        self.remote_request = Some(token);
+        Ok(())
+    }
+    pub(super) fn finish_remote(&mut self, token: u64) {
+        if self.remote_request == Some(token) {
+            self.remote_request = None;
+        }
     }
     fn queue(
         &mut self,
@@ -388,6 +410,7 @@ impl App {
                     devices,
                     receipts,
                     policies,
+                    inputs,
                 } => {
                     if host.devices.poll_workspace.as_deref() == Some(&workspace_id.0) {
                         host.devices.poll_workspace = None;
@@ -398,14 +421,17 @@ impl App {
                         host.devices.policies.extend(policies);
                     }
                     for receipt in receipts {
-                        host.status = format!(
-                            "원격 실행 응답 {} · {:?}",
-                            receipt.request_id, receipt.result
-                        );
+                        remote::launch_receipt(host, receipt);
+                    }
+                    for receipt in inputs {
+                        remote::input_receipt(host, receipt);
                     }
                 }
                 RemoteDeviceOutcome::Failed { request_id, code } => {
-                    if let Some(request) = take_request(&mut host.devices, request_id, None) {
+                    if remote::failed(host, request_id) {
+                        host.devices.finish_remote(request_id);
+                    } else if let Some(request) = take_request(&mut host.devices, request_id, None)
+                    {
                         host.reject(&request.id, format!("기기 요청이 거부되었습니다: {code:?}"));
                     } else {
                         host.devices.poll_workspace = None;
@@ -413,6 +439,7 @@ impl App {
                     }
                 }
                 RemoteDeviceOutcome::ObservationUnknown { correlation } => {
+                    remote::unknown(host, &correlation);
                     let matches = host
                         .devices
                         .request
@@ -444,17 +471,22 @@ impl App {
                     request_id,
                     lease,
                     verified,
-                } => {
-                    let _ = (request_id, lease, verified);
-                    host.status =
-                        "원격 실행 응답은 정확한 작업 시도와 연결한 뒤 반영합니다.".into();
-                }
+                } => remote::launch_pending(host, request_id, lease, verified),
                 RemoteDeviceOutcome::LaunchReceipt(receipt) => {
-                    host.status = format!(
-                        "원격 실행 응답 {} · {:?}",
-                        receipt.request_id, receipt.result
-                    );
+                    remote::launch_receipt(host, receipt)
                 }
+                RemoteDeviceOutcome::ExecutionObserved {
+                    request_id,
+                    lease,
+                    execution,
+                    verified,
+                } => remote::observed(host, request_id, lease, execution, verified),
+                RemoteDeviceOutcome::InputPending {
+                    request_id,
+                    lease,
+                    operation_id,
+                } => remote::input_pending(host, request_id, &lease, &operation_id),
+                RemoteDeviceOutcome::InputReceipt(receipt) => remote::input_receipt(host, receipt),
             }
             if previous_views
                 .as_ref()
@@ -488,7 +520,7 @@ impl App {
             .views
             .values()
             .any(|rows| rows.iter().any(|d| d.connected));
-        if visible && connected {
+        if (visible || host.remotes.values().any(|p| p.pending())) && connected {
             if host.devices.last_poll.elapsed() >= std::time::Duration::from_millis(500)
                 && let Some(workspace) = host.devices.next_connected_workspace()
             {

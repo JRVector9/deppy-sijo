@@ -605,6 +605,12 @@ impl App {
         if host.flight.is_some() {
             return Err("상태 저장을 마친 뒤 실행해 주세요.".into());
         }
+        if remote::workspace_preparing(host, workspace) {
+            return Err("이 프로젝트의 다른 실행 준비를 기다려 주세요.".into());
+        }
+        if remote::workspace_unknown(host, workspace) {
+            return Err("관측하지 못한 이전 원격 실행을 먼저 복구해 주세요.".into());
+        }
         if host.launches.len() >= work::WORK_DRAFT_MAX_COUNT {
             return Err(
                 "저장된 실행 기록 한도입니다. 실행 기록을 보존한 채 새 요청을 거부했습니다.".into(),

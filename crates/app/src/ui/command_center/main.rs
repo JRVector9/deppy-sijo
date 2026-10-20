@@ -480,8 +480,13 @@ fn task_detail(
                     intents.push(Intent::DispatchTask { target });
                 }
             }
-            if t.create_worker.enabled
-                && action(ui, snapshot, "새 워커 생성 후 배정", &t.create_worker)
+            if matches!(
+                t.state,
+                TaskState::PlanReview
+                    | TaskState::Queued
+                    | TaskState::Failed
+                    | TaskState::Cancelled
+            ) && action(ui, snapshot, "새 워커 생성 후 배정", &t.create_worker)
             {
                 intents.push(Intent::CreateWorker {
                     target: t.target.clone(),

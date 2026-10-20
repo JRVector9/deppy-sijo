@@ -3112,11 +3112,11 @@ impl Worker {
         }
         let reject = |code| R::Rejected { code };
         let id = &request.identity;
-        if id.device_id != host.config.device_id
-            || id.workspace_id != host.config.workspace_id
-            || id.incarnation.as_str() != self.instance_token
-        {
+        if id.device_id != host.config.device_id || id.workspace_id != host.config.workspace_id {
             return P::Complete(reject(E::WrongWorker));
+        }
+        if id.incarnation.as_str() != self.instance_token {
+            return P::Complete(R::ObservationUnknown);
         }
         if id.grant_epoch != host.config.grant_epoch {
             return P::Complete(R::ObservationUnknown);

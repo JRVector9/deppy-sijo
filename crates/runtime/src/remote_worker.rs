@@ -1269,4 +1269,33 @@ mod tests {
         server.shutdown();
         std::fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn remote_compute_same_worker_previous_boot_is_uncertain_and_never_replayed() {
+        let root = std::env::temp_dir().join(format!("deppy-stale-boot-{}", uuid::Uuid::new_v4()));
+        let (server, pin) = worker(&root, "boot", Arc::new(Journal::default()));
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+                .unwrap();
+        let rx = client.subscribe();
+        let proof = inspect(&client, &rx);
+        let mut request = request(&proof, "previous-boot-op");
+        request.identity.incarnation = RuntimeIncarnationId("previous-runtime-boot".into());
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork { request })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::ObservationUnknown,
+                ..
+            }
+        ));
+        assert!(!root.join("launches").exists());
+        drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

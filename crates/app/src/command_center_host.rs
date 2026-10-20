@@ -2610,6 +2610,30 @@ mod tests {
         assert!(h.flight.is_none());
     }
     #[test]
+    fn completed_launch_history_does_not_limit_a_valid_sixty_four_task_project_to_thirty_two() {
+        let mut h = host();
+        let mut p = project();
+        for _ in 0..64 {
+            let record = launch::Record {
+                operation_id: work::OperationId::new(),
+                attempt_id: work::AttemptId::new(),
+                workspace: p.snapshot.config.workspace_id.clone(),
+                task_id: Some(work::TaskId::new()),
+                config_revision: p.snapshot.config.revision,
+                selection: p.snapshot.config.worker_agent.clone(),
+                folder: p.snapshot.config.folder.clone(),
+                phase: launch::Phase::Completed,
+            };
+            launch::save_record(&mut p, &record).unwrap();
+        }
+        h.projects.insert("workspace-a".into(), p);
+        launch::restore_records(&mut h, "workspace-a");
+        assert_eq!(h.launches.len(), 64);
+        assert!(!h.projects["workspace-a"].storage_blocked);
+        assert!(!launch::workspace_uncertain(&h.launches, "workspace-a"));
+        assert_eq!(h.launches.values().filter(|p| p.preparing()).count(), 0);
+    }
+    #[test]
     fn corrupt_launch_marker_blocks_project_instead_of_losing_dedup_history() {
         let mut h = host();
         let mut p = project();

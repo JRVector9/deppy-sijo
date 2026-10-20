@@ -436,6 +436,17 @@ pub(super) fn save_record(p: &mut Project, record: &Record) -> Result<(), String
     set_draft(p, &key, &text, uncertain)
 }
 
+fn reject_worktree_preparation(
+    pending: &mut Pending,
+    error: wm::task_worktree::TaskWorktreeError,
+) -> String {
+    pending.record.phase = Phase::Rejected;
+    pending.stage = Stage::Done;
+    format!(
+        "전용 워크트리 소유권을 확인하지 못했습니다: {}. 에이전트는 생성하지 않았습니다. 같은 작업 폴더는 자동 재생성하지 않습니다.",
+        error.as_str()
+    )
+}
 fn accept_spawn_result(
     pending: &mut Pending,
     workspace: &str,
@@ -496,14 +507,14 @@ pub(super) fn restore_records(host: &mut CommandCenterHost, workspace: &str) {
         .filter(|d| d.target_key.starts_with("launch:"))
         .map(|d| serde_json::from_str::<Record>(&d.text))
         .collect();
-    if records.iter().any(Result::is_err) || records.len() > 32 {
+    if records.iter().any(Result::is_err) || records.len() > work::WORK_DRAFT_MAX_COUNT {
         host.projects.get_mut(workspace).unwrap().storage_blocked = true;
         host.status =
             "이전 실행 기록을 검증하지 못했습니다. 프로젝트 저장 상태를 복구해 주세요.".into();
         return;
     }
     let records = records.into_iter().filter_map(Result::ok);
-    for mut record in records.take(32) {
+    for mut record in records.take(work::WORK_DRAFT_MAX_COUNT) {
         if record.workspace.0 != workspace || host.launches.contains_key(&record.operation_id.0) {
             continue;
         }
@@ -542,9 +553,14 @@ impl App {
         if host.flight.is_some() {
             return Err("상태 저장을 마친 뒤 실행해 주세요.".into());
         }
-        if host.launches.len() >= 32 {
+        if host.launches.len() >= work::WORK_DRAFT_MAX_COUNT {
             return Err(
-                "자동 실행 기록 한도입니다. 미확인 실행을 다시 시작하지 않았습니다.".into(),
+                "저장된 실행 기록 한도입니다. 실행 기록을 보존한 채 새 요청을 거부했습니다.".into(),
+            );
+        }
+        if host.launches.values().filter(|p| p.preparing()).count() >= 32 {
+            return Err(
+                "동시에 준비할 수 있는 새 실행은 32개입니다. 현재 응답을 기다려 주세요.".into(),
             );
         }
         let runtime = self
@@ -678,6 +694,22 @@ impl App {
                                 p.worktree_root = catalog.root.clone();
                             }
                             p.catalog = Some(catalog);
+                            if p.request.is_none() {
+                                if let Some(goal) = p
+                                    .snapshot
+                                    .goals
+                                    .iter()
+                                    .rev()
+                                    .find(|g| g.state == work::WorkState::PlanReview)
+                                {
+                                    p.request = wm::plan::PlannerRequest::new(
+                                        goal,
+                                        &p.snapshot.config,
+                                        &p.policy(),
+                                    )
+                                    .ok();
+                                }
+                            }
                         }
                         Err(error) => host.status = error,
                     };
@@ -801,16 +833,15 @@ impl App {
                         pending.stage = Stage::Durable;
                     }
                     Err(error) => {
-                        pending.record.phase = Phase::Unknown;
-                        pending.stage = Stage::Done;
-                        host.finish(&id,cc::ReceiptStatus::Uncertain,format!("전용 워크트리 소유권을 확인하지 못했습니다: {}. 자동 재시도하지 않습니다.",error.as_str()));
+                        let message = reject_worktree_preparation(pending, error);
+                        host.reject(&id, message);
                     }
                     _ => {
-                        pending.record.phase = Phase::Unknown;
+                        pending.record.phase = Phase::Rejected;
                         pending.stage = Stage::Done;
                         host.finish(
                             &id,
-                            cc::ReceiptStatus::Uncertain,
+                            cc::ReceiptStatus::Rejected,
                             "전용 워크트리의 소유 작업·루트가 바뀌었습니다.",
                         );
                     }
@@ -1442,6 +1473,26 @@ mod tests {
         launches.insert(identity.operation_id.0, p);
         assert!(workspace_uncertain(&launches, "workspace-a"));
         assert!(!workspace_uncertain(&launches, "workspace-b"));
+    }
+    #[test]
+    fn worktree_failure_never_claims_unknown_cli_or_blocks_independent_work() {
+        use wm::task_worktree::TaskWorktreeError as E;
+        for error in [
+            E::InvalidJob,
+            E::InvalidFolder,
+            E::OwnershipConflict,
+            E::CreationUncertain,
+            E::Unavailable,
+        ] {
+            let mut p = pending();
+            p.stage = Stage::Worktree;
+            let message = reject_worktree_preparation(&mut p, error);
+            assert!(message.contains("에이전트는 생성하지 않았습니다"));
+            assert_eq!(p.record.phase, Phase::Rejected);
+            let mut launches = BTreeMap::new();
+            launches.insert(p.record.operation_id.0.clone(), p);
+            assert!(!workspace_uncertain(&launches, "workspace-a"));
+        }
     }
     #[test]
     fn worktree_callback_cannot_substitute_task_attempt_config_or_project() {

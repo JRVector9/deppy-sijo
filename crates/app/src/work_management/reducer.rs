@@ -133,12 +133,42 @@ impl ProjectWorkState {
         persistent_binding: Option<PersistentBinding>,
         runtime_binding: RuntimeBinding,
     ) -> Result<AttemptId, ValidationError> {
+        let attempt_id = self
+            .attempts
+            .iter()
+            .find(|a| a.operation_id == operation_id)
+            .map(|a| a.id.clone())
+            .unwrap_or_else(AttemptId::new);
+        self.begin_attempt_with_id(
+            task_id,
+            attempt_id,
+            operation_id,
+            config,
+            folder,
+            persistent_binding,
+            runtime_binding,
+        )
+    }
+    /// Preserve an identity durably reserved by the host before a runtime is spawned.
+    /// The eventual exact runtime binding is still required before beginning the attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_attempt_with_id(
+        &mut self,
+        task_id: &TaskId,
+        attempt_id: AttemptId,
+        operation_id: OperationId,
+        config: ProjectConfig,
+        folder: String,
+        persistent_binding: Option<PersistentBinding>,
+        runtime_binding: RuntimeBinding,
+    ) -> Result<AttemptId, ValidationError> {
         if let Some(attempt) = self
             .attempts
             .iter()
             .find(|a| a.operation_id == operation_id)
         {
-            return if &attempt.task_id == task_id
+            return if attempt.id == attempt_id
+                && &attempt.task_id == task_id
                 && attempt.config == config
                 && attempt.folder == folder
                 && attempt.persistent_binding == persistent_binding
@@ -150,6 +180,9 @@ impl ProjectWorkState {
                     "operation payload conflicts with existing attempt".into(),
                 ))
             };
+        }
+        if self.attempts.iter().any(|attempt| attempt.id == attempt_id) {
+            return Err(ValidationError("attempt identity already reserved".into()));
         }
         if !self.can_dispatch(task_id) {
             return Err(ValidationError(
@@ -184,7 +217,7 @@ impl ProjectWorkState {
             .ok_or_else(|| ValidationError("attempt number exhausted".into()))?;
         let attempt = Attempt {
             workspace_id: self.workspace_id.clone(),
-            id: AttemptId::new(),
+            id: attempt_id,
             task_id: task_id.clone(),
             number,
             operation_id,

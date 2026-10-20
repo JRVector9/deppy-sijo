@@ -456,14 +456,54 @@ pub fn prepare_dispatch(
     config: &ProjectConfig,
     policy: &ExecutionPolicy,
 ) -> Result<PrepareOutcome, ValidationError> {
+    let attempt_id = ledger
+        .records
+        .iter()
+        .find(|(a, _)| a.attempt.operation_id == request.operation_id)
+        .map(|(a, _)| a.attempt.id.clone())
+        .or_else(|| {
+            state
+                .attempts
+                .iter()
+                .find(|a| a.operation_id == request.operation_id)
+                .map(|a| a.id.clone())
+        })
+        .unwrap_or_else(AttemptId::new);
+    prepare_dispatch_with_attempt_id(
+        state, ledger, confirmed, request, attempt_id, config, policy,
+    )
+}
+
+/// Use a host-reserved launch identity after observing the exact new runtime binding.
+/// This preparation never spawns or mutates its source state and never retries a send.
+pub fn prepare_dispatch_with_attempt_id(
+    state: &ProjectWorkState,
+    ledger: &DeliveryLedger,
+    confirmed: &ConfirmedPlan,
+    request: DispatchRequest,
+    attempt_id: AttemptId,
+    config: &ProjectConfig,
+    policy: &ExecutionPolicy,
+) -> Result<PrepareOutcome, ValidationError> {
     confirmed.validate_current(state, config, policy)?;
+    if state
+        .attempts
+        .iter()
+        .any(|a| a.id == attempt_id && a.operation_id != request.operation_id)
+        || ledger.records.iter().any(|(a, _)| {
+            a.attempt.id == attempt_id && a.attempt.operation_id != request.operation_id
+        })
+    {
+        return Err(ValidationError("attempt identity already reserved".into()));
+    }
     if let Some((existing, delivery)) = ledger
         .records
         .iter()
         .find(|(a, _)| a.attempt.operation_id == request.operation_id)
     {
         let a = &existing.attempt;
-        if a.task_id != request.task_id
+        if a.id != attempt_id
+            || a.task_id != request.task_id
             || a.config != *config
             || a.folder != request.folder.path
             || a.persistent_binding != request.persistent_binding
@@ -481,7 +521,8 @@ pub fn prepare_dispatch(
         .iter()
         .find(|a| a.operation_id == request.operation_id)
     {
-        if a.task_id != request.task_id
+        if a.id != attempt_id
+            || a.task_id != request.task_id
             || a.config != *config
             || a.folder != request.folder.path
             || a.persistent_binding != request.persistent_binding
@@ -535,8 +576,9 @@ pub fn prepare_dispatch(
         ));
     }
     let mut next_state = state.clone();
-    let id = next_state.begin_attempt(
+    let id = next_state.begin_attempt_with_id(
         &request.task_id,
+        attempt_id,
         request.operation_id,
         config.clone(),
         request.folder.path,
@@ -684,6 +726,131 @@ pub(crate) mod tests {
             PrepareOutcome::Ready(next) => next,
             _ => panic!("expected new dispatch"),
         }
+    }
+
+    #[test]
+    fn work_management_dispatch_preallocated_attempt_matches_durable_launch_identity() {
+        let (mut state, cfg, policy, goal) = fixture();
+        let token = ConfirmedPlan::confirm(&mut state, &goal, &cfg, &policy).unwrap();
+        let mut ledger = DeliveryLedger::default();
+        let req = request(&state.tasks[0], &policy);
+        let reserved = AttemptId::new();
+        let before = format!("{state:?}");
+        let prepared = ready(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                req.clone(),
+                reserved.clone(),
+                &cfg,
+                &policy,
+            )
+            .unwrap(),
+        );
+        assert_eq!(format!("{state:?}"), before);
+        assert_eq!(prepared.assignment.attempt.id, reserved);
+        assert_eq!(
+            prepared.assignment.task.current_attempt_id.as_ref(),
+            Some(&reserved)
+        );
+        state = prepared.next_state;
+        assert!(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                req.clone(),
+                AttemptId::new(),
+                &cfg,
+                &policy
+            )
+            .is_err()
+        );
+        ledger.record_durable(prepared.assignment).unwrap();
+        assert!(
+            matches!(prepare_dispatch_with_attempt_id(&state, &ledger, &token, req.clone(), reserved.clone(), &cfg, &policy).unwrap(), PrepareOutcome::Existing{attempt_id,..} if attempt_id == reserved)
+        );
+        assert!(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                req.clone(),
+                AttemptId::new(),
+                &cfg,
+                &policy
+            )
+            .is_err()
+        );
+        assert!(
+            matches!(prepare_dispatch(&state, &ledger, &token, req, &cfg, &policy).unwrap(), PrepareOutcome::Existing{attempt_id,..} if attempt_id == reserved)
+        );
+    }
+
+    #[test]
+    fn work_management_dispatch_preallocated_collision_is_rejected_before_mutation() {
+        let (mut state, cfg, policy, goal) = fixture();
+        let token = ConfirmedPlan::confirm(&mut state, &goal, &cfg, &policy).unwrap();
+        let mut ledger = DeliveryLedger::default();
+        let reserved = AttemptId::new();
+        let prepared = ready(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                request(&state.tasks[0], &policy),
+                reserved.clone(),
+                &cfg,
+                &policy,
+            )
+            .unwrap(),
+        );
+        // Even a durable ledger without the swapped live state owns its reserved identity.
+        ledger.record_durable(prepared.assignment.clone()).unwrap();
+        let before = format!("{state:?}");
+        assert!(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                request(&state.tasks[1], &policy),
+                reserved.clone(),
+                &cfg,
+                &policy
+            )
+            .is_err()
+        );
+        assert_eq!(format!("{state:?}"), before);
+        state = prepared.next_state;
+        let before = format!("{state:?}");
+        assert!(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &DeliveryLedger::default(),
+                &token,
+                request(&state.tasks[1], &policy),
+                reserved,
+                &cfg,
+                &policy
+            )
+            .is_err()
+        );
+        let mut invalid = request(&state.tasks[1], &policy);
+        invalid.folder.path = "/outside/project".into();
+        assert!(
+            prepare_dispatch_with_attempt_id(
+                &state,
+                &ledger,
+                &token,
+                invalid,
+                AttemptId::new(),
+                &cfg,
+                &policy
+            )
+            .is_err()
+        );
+        assert_eq!(format!("{state:?}"), before);
     }
 
     #[test]

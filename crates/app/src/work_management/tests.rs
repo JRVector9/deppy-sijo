@@ -95,6 +95,81 @@ fn begin(state: &mut ProjectWorkState, index: usize) -> AttemptId {
         .unwrap()
 }
 
+#[test]
+fn work_management_preallocated_attempt_is_exact_and_retries_cannot_rebind_identity() {
+    let mut state = fixture(2);
+    let task = state.tasks[0].id.clone();
+    let reserved = AttemptId::new();
+    let operation = OperationId::new();
+    let cfg = config(&state.workspace_id);
+    let binding = runtime();
+    let start = |state: &mut ProjectWorkState, id: AttemptId, op: OperationId| {
+        state.begin_attempt_with_id(
+            &task,
+            id,
+            op,
+            cfg.clone(),
+            "/fixture/worktree".into(),
+            None,
+            binding.clone(),
+        )
+    };
+    assert_eq!(
+        start(&mut state, reserved.clone(), operation.clone()).unwrap(),
+        reserved
+    );
+    assert_eq!(state.attempts[0].id, reserved);
+    assert_eq!(
+        start(&mut state, reserved.clone(), operation.clone()).unwrap(),
+        reserved
+    );
+    let before = format!("{state:?}");
+    assert!(start(&mut state, AttemptId::new(), operation.clone()).is_err());
+    assert!(start(&mut state, reserved.clone(), OperationId::new()).is_err());
+    assert_eq!(format!("{state:?}"), before);
+    assert_eq!(
+        state
+            .begin_attempt(
+                &task,
+                operation,
+                cfg,
+                "/fixture/worktree".into(),
+                None,
+                binding
+            )
+            .unwrap(),
+        reserved
+    );
+}
+
+#[test]
+fn work_management_preallocated_attempt_collision_and_invalid_input_are_atomic() {
+    let mut state = fixture(2);
+    let reserved = begin(&mut state, 0);
+    let task = state.tasks[1].id.clone();
+    let before = format!("{state:?}");
+    for (id, folder) in [
+        (reserved, "/fixture/worktree".to_string()),
+        (AttemptId::new(), String::new()),
+        (AttemptId(String::new()), "/fixture/worktree".to_string()),
+    ] {
+        assert!(
+            state
+                .begin_attempt_with_id(
+                    &task,
+                    id,
+                    OperationId::new(),
+                    config(&state.workspace_id),
+                    folder,
+                    None,
+                    runtime()
+                )
+                .is_err()
+        );
+        assert_eq!(format!("{state:?}"), before);
+    }
+}
+
 fn event(
     state: &ProjectWorkState,
     attempt: &AttemptId,

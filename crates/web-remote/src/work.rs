@@ -95,6 +95,7 @@ pub fn validate_intent(v: &Value) -> bool {
                         "model",
                         "effort",
                         "worker_providers",
+                        "allowed_scope_roots",
                         "parallel_limit",
                         "automation",
                         "use_worktrees",

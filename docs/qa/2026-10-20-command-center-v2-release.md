@@ -1,3 +1,17 @@
+# Command Center v2 — 로컬 0.15.1 빌드·실행 완료
+
+메인 에이전트/작업자 목록 중복 수정46f9938a를 포함한 별도 기능 브랜치의 source `77fd328ac41ac47e20f0ac0c0e9d6b05a05f85d4`를 재빌드·재실행했다. 마지막 실행본0.15.0에서 patch0.15.1로 올렸고, workspace27개 패키지의 버전 상속을 유지했다.
+
+- 실제 build exit0,39.318초. pinned cloudflared2026.9.1 준비 후 기존 Developer ID로 local dev bundle 서명.
+- CLI `Deppy Sijo 0.15.1`, macOS 두 bundle version 모두0.15.1. 로컬 개발 모드 package 검증 script exit0.
+- 기존PID87668 정상 종료를 확인한 후 `DEPPY_COMMAND_CENTER_V2=1`과 정확한 새 bundle 경로로 실행했다. 새 executablePID40133 확인. CUA로 새 Command Center와 프로젝트 설정 화면을 관찰했다. 사용자 설정 저장·작업 전송은 하지 않았다.
+- 실제 명령/로그/버전/서명/binary digest: [build-result.json](assets/command-center-v2-local-0.15.1-20261020/build-result.json) 및 같은 폴더. 앞선 수정 회귀146통과·Chrome237검증은 해당 제품 소스의 검사이며, 버전만 올린 뒤 재실행했다고 주장하지 않는다.
+- 승인한 `docs/mockups/multi-agent-command-center-v2-2026-10-20.html` 시안을 Chrome에 다시 열었다. HTML 원본은 수정하지 않았다.
+
+bundle은 `target/bundle-0.15.1/Deppy Sijo.app`이며 기존0.15.0을 보존했다. 공증된 production 배포나 외부 업로드는 아니다. 아래는 이전 릴리스 기록이다.
+
+---
+
 # Command Center v2 — 로컬 0.15.0 빌드·실행 완료
 
 사용자의 재빌드·재실행 요청에 따라0.14.0에서0.15.0으로 갱신했다. 별도 기능 브랜치 `feat/agent-command-center-v2-20261020`, source `cb6f15d0e573feb160deca86ab0743b04c3a2191`을 빌드했다. 승인 시안 보정, 연결 전 메인 입력과 입력창 내 에이전트 설정, 초안·설정 보호 및 이력 분류 변경을 포함한다.

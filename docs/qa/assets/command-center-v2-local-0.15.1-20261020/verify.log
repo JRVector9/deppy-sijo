@@ -1,0 +1,17 @@
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo: valid on disk
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo: satisfies its Designated Requirement
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: valid on disk
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy: satisfies its Designated Requirement
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: valid on disk
+target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared: satisfies its Designated Requirement
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--validated:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-mcp-proxy
+--prepared:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+--validated:/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-cloudflared
+target/bundle-0.15.1/Deppy Sijo.app: valid on disk
+target/bundle-0.15.1/Deppy Sijo.app: satisfies its Designated Requirement
+package verification OK: explicitly untrusted development bundle

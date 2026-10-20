@@ -1,0 +1,41 @@
+{
+  "kind": "local signed development build, debug profile; not notarized production distribution",
+  "branch": "feat/agent-command-center-v2-20261020",
+  "source_commit": "77fd328ac41ac47e20f0ac0c0e9d6b05a05f85d4",
+  "version_change": {
+    "source_old": "0.15.0",
+    "last_shipped": "0.15.0",
+    "new": "0.15.1"
+  },
+  "source_delta": "Version bump committed; no uncommitted product changes",
+  "previous_product_source": "46f9938a2931d3424a005ffdf4b93b7bc7a805c4",
+  "changes": "Deduplicate main agent and worker-provider settings choices while preserving all model/effort tuples",
+  "version_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "reported_version": "Deppy Sijo 0.15.1",
+  "plist_versions": {
+    "CFBundleVersion": "0.15.1",
+    "CFBundleShortVersionString": "0.15.1"
+  },
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app",
+  "opt_in": "DEPPY_COMMAND_CENTER_V2=1",
+  "binary_sha256": {
+    "deppy-sijo": "66e4989d1068e20a8a4debcdcbc27ef797a4b5566406409be93da86a85a49f6b",
+    "deppy-cloudflared": "09a05998e52662fe519705f1b9611943a1be4c31cc261fb24d5b48bcd06bff9f",
+    "deppy-mcp-proxy": "b60b7b0a0daa36e629674887961f14006cfe2e5265f8bb4d9a86d83e22d58e0f"
+  },
+  "launch": {
+    "pid": 40133,
+    "executable": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+    "old_pid": 87668,
+    "old_pid_exited": true,
+    "launch_command": [
+      "open",
+      "-n",
+      "--env",
+      "DEPPY_COMMAND_CENTER_V2=1",
+      "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app"
+    ],
+    "ui_verified": true,
+    "ui_evidence": "CUA on exact new bundle displayed Command Center and editable composer, then actual project settings. No user input sent or configuration saved."
+  }
+}

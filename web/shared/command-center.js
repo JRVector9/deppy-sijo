@@ -153,7 +153,11 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
           draftTotal -= draft.size; drafts.delete(item.draftKey);
           if (currentKey === item.draftKey && input.value === item.raw) input.value = '';
         }
-        if (item.settingsVersion !== undefined && settings.get(item.workspace)?.version === item.settingsVersion) settings.delete(item.workspace);
+        if (item.settingsVersion !== undefined) {
+          const draft = settings.get(item.workspace), saved = list(snapshot.projects).find(p => p.id === item.workspace)?.config;
+          if (draft === item.settingsDraft && draft?.version === item.settingsVersion) settings.delete(item.workspace);
+          else if (draft && saved) draft.config.revision = saved.revision;
+        }
         if (item.agentVersion !== undefined) {
           const draft = agentDrafts.get(item.workspace), saved = list(snapshot.projects).find(p => p.id === item.workspace)?.config;
           if (draft && saved) { if (draft.version === item.agentVersion) draft.config = copy(saved); else draft.config.revision = saved.revision; }
@@ -623,7 +627,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const save = button(label('save', '저장'), () => {
       if (!enabled(p.save_settings) || !bindingValid) return;
       if (!Number.isInteger(draft.config.parallel_limit) || draft.config.parallel_limit < 1 || draft.config.parallel_limit > 8 || !draft.config.name.trim() || !draft.config.directory.trim()) { say('이름·폴더와 동시 작업 수 1–8을 확인해 주세요.'); return; }
-      emit({type: 'save_project', workspace_id: p.id, config: copy(draft.config)}, 'save:' + p.id, {workspace: p.id, settingsVersion: draft.version});
+      emit({type: 'save_project', workspace_id: p.id, config: copy(draft.config)}, 'save:' + p.id, {workspace: p.id, settingsVersion: draft.version, settingsDraft: draft});
     }, 'cc-button cc-primary'); save.disabled = !enabled(p.save_settings) || !connected || !bindingValid || isPending('save:' + p.id); save.title = !bindingValid ? '입력 가능한 메인 세션을 선택하거나 연결을 해제해 주세요.' : str(p.save_settings?.reason);
     const cancel = button('취소', () => { settings.delete(p.id); navigate('main'); }, 'cc-button cc-ghost'); cancel.dataset.ccSettingsCancel = '';
     const actions = node('div', 'cc-actions'); actions.append(save, cancel); fields.append(actions); content.append(fields);

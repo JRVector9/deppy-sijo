@@ -1,0 +1,667 @@
+//! Bounded compute registrations. A Relay viewer is never an execution grant.
+use deppy_core::WorkspaceId;
+use deppy_core::work_management::{AgentSelection, AttemptId, OperationId, RuntimeIncarnationId};
+use std::net::SocketAddr;
+
+pub const EXECUTION_DEVICE_MAX: usize = 32;
+pub const EXECUTION_PROFILE_MAX: usize = 32;
+pub const EXECUTION_LEASE_MAX: usize = 256;
+pub const EXECUTION_FRESHNESS_MS: u64 = 30_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredDevice {
+    pub id: String,
+    pub name: String,
+    pub endpoint: SocketAddr,
+    pub pinned_fingerprint: String,
+    pub workspace_id: WorkspaceId,
+    pub folder: String,
+    pub folder_anchor: String,
+    pub allowed_agents: Vec<AgentSelection>,
+    pub max_workers: u8,
+    pub grant_epoch: u64,
+    pub execution_granted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerProfile {
+    pub id: String,
+    pub agent: AgentSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerObservation {
+    pub device_id: String,
+    pub pinned_fingerprint: String,
+    pub connection_epoch: u64,
+    pub incarnation: RuntimeIncarnationId,
+    pub workspace_id: WorkspaceId,
+    pub folder: String,
+    pub folder_anchor: String,
+    pub grant_epoch: u64,
+    pub lease_epoch: u64,
+    pub profiles: Vec<WorkerProfile>,
+    pub max_workers: u8,
+    pub active_workers: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseRequest {
+    pub device_id: String,
+    pub workspace_id: WorkspaceId,
+    pub attempt_id: AttemptId,
+    pub operation_id: OperationId,
+    pub folder: String,
+    pub agent: AgentSelection,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionLease {
+    pub request: LeaseRequest,
+    pub folder_anchor: String,
+    pub profile_id: String,
+    pub grant_epoch: u64,
+    pub lease_epoch: u64,
+    pub connection_epoch: u64,
+    pub incarnation: RuntimeIncarnationId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeviceUnavailable {
+    Invalid,
+    Full,
+    ViewerOnly,
+    Missing,
+    Revoked,
+    Disconnected,
+    Stale,
+    IdentityChanged,
+    FolderChanged,
+    UnsupportedAgent,
+    Capacity,
+    Conflict,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceView {
+    pub id: String,
+    pub name: String,
+    pub connected: bool,
+    pub can_execute: bool,
+    pub unavailable: Option<DeviceUnavailable>,
+    pub profiles: Vec<WorkerProfile>,
+}
+
+struct DeviceEntry {
+    registration: RegisteredDevice,
+    observation: Option<(WorkerObservation, u64)>,
+    disconnected_through: u64,
+}
+
+#[derive(Default)]
+pub struct DeviceRegistry {
+    entries: Vec<DeviceEntry>,
+    leases: Vec<ExecutionLease>,
+    viewers: Vec<(String, String, WorkspaceId, bool)>,
+}
+
+impl DeviceRegistry {
+    pub fn register_viewer(
+        &mut self,
+        id: String,
+        name: String,
+        workspace: WorkspaceId,
+        connected: bool,
+    ) -> Result<(), DeviceUnavailable> {
+        if !valid_id(&id)
+            || name.is_empty()
+            || name.len() > 256
+            || name.chars().any(char::is_control)
+            || !valid_id(&workspace.0)
+        {
+            return Err(DeviceUnavailable::Invalid);
+        }
+        if self.entries.iter().any(|e| e.registration.id == id) {
+            return Err(DeviceUnavailable::Conflict);
+        }
+        if let Some(viewer) = self.viewers.iter_mut().find(|v| v.0 == id) {
+            *viewer = (id, name, workspace, connected);
+            return Ok(());
+        }
+        if self.entries.len() + self.viewers.len() >= EXECUTION_DEVICE_MAX {
+            return Err(DeviceUnavailable::Full);
+        }
+        self.viewers.push((id, name, workspace, connected));
+        Ok(())
+    }
+    pub fn disconnect(&mut self, device: &str, connection_epoch: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.registration.id == device)
+        {
+            entry.disconnected_through = entry.disconnected_through.max(connection_epoch);
+            if entry
+                .observation
+                .as_ref()
+                .is_some_and(|(p, _)| p.connection_epoch <= connection_epoch)
+            {
+                entry.observation = None;
+            }
+        }
+    }
+    /// Must be checked immediately before a first send. An idempotent reserve is not replay permission.
+    pub fn validate_lease(
+        &self,
+        lease: &ExecutionLease,
+        now_ms: u64,
+    ) -> Result<(), DeviceUnavailable> {
+        if !self.leases.contains(lease) {
+            return Err(DeviceUnavailable::Missing);
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.registration.id == lease.request.device_id)
+            .ok_or(DeviceUnavailable::Missing)?;
+        let proof = fresh_observation(entry, now_ms)?;
+        if proof.connection_epoch != lease.connection_epoch
+            || proof.incarnation != lease.incarnation
+            || proof.grant_epoch != lease.grant_epoch
+            || proof.lease_epoch != lease.lease_epoch
+            || proof.folder_anchor != lease.folder_anchor
+            || !proof
+                .profiles
+                .iter()
+                .any(|p| p.id == lease.profile_id && p.agent == lease.request.agent)
+        {
+            return Err(DeviceUnavailable::Conflict);
+        }
+        Ok(())
+    }
+    /// Call only after an exact operation completion/rejection receipt, never on timeout or disconnect.
+    pub fn complete(&mut self, lease: &ExecutionLease) -> bool {
+        if let Some(index) = self.leases.iter().position(|l| l == lease) {
+            self.leases.remove(index);
+            true
+        } else {
+            false
+        }
+    }
+    pub fn snapshot(&self, workspace: &WorkspaceId, now_ms: u64) -> Vec<DeviceView> {
+        let mut views: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| e.registration.workspace_id == *workspace)
+            .map(|e| {
+                let proof = fresh_observation(e, now_ms);
+                let unavailable = proof.as_ref().err().copied().or_else(|| {
+                    let p = proof.as_ref().ok()?;
+                    let reserved = self
+                        .leases
+                        .iter()
+                        .filter(|l| l.request.device_id == e.registration.id)
+                        .count();
+                    (reserved + usize::from(p.active_workers)
+                        >= usize::from(e.registration.max_workers.min(p.max_workers)))
+                    .then_some(DeviceUnavailable::Capacity)
+                });
+                DeviceView {
+                    id: e.registration.id.clone(),
+                    name: e.registration.name.clone(),
+                    connected: e.observation.is_some(),
+                    can_execute: unavailable.is_none(),
+                    unavailable,
+                    profiles: proof
+                        .ok()
+                        .map(|p| {
+                            p.profiles
+                                .iter()
+                                .filter(|p| e.registration.allowed_agents.contains(&p.agent))
+                                .cloned()
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+            .collect();
+        views.extend(
+            self.viewers
+                .iter()
+                .filter(|v| v.2 == *workspace)
+                .map(|v| DeviceView {
+                    id: v.0.clone(),
+                    name: v.1.clone(),
+                    connected: v.3,
+                    can_execute: false,
+                    unavailable: Some(DeviceUnavailable::ViewerOnly),
+                    profiles: vec![],
+                }),
+        );
+        views
+    }
+    pub fn register(&mut self, device: RegisteredDevice) -> Result<(), DeviceUnavailable> {
+        validate_registration(&device)?;
+        if self.viewers.iter().any(|v| v.0 == device.id) {
+            return Err(DeviceUnavailable::ViewerOnly);
+        }
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|e| e.registration.id == device.id)
+        {
+            if entry.registration == device {
+                return Ok(());
+            }
+            if device.grant_epoch <= entry.registration.grant_epoch {
+                return Err(DeviceUnavailable::Conflict);
+            }
+            entry.registration = device;
+            entry.observation = None;
+            return Ok(());
+        }
+        if self.entries.len() + self.viewers.len() >= EXECUTION_DEVICE_MAX {
+            return Err(DeviceUnavailable::Full);
+        }
+        self.entries.push(DeviceEntry {
+            registration: device,
+            observation: None,
+            disconnected_through: 0,
+        });
+        Ok(())
+    }
+
+    pub fn observe(
+        &mut self,
+        proof: WorkerObservation,
+        now_ms: u64,
+    ) -> Result<(), DeviceUnavailable> {
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.registration.id == proof.device_id)
+            .ok_or(DeviceUnavailable::Missing)?;
+        if proof.connection_epoch <= entry.disconnected_through {
+            return Err(DeviceUnavailable::Conflict);
+        }
+        let device = &entry.registration;
+        if proof.pinned_fingerprint != device.pinned_fingerprint {
+            return Err(DeviceUnavailable::IdentityChanged);
+        }
+        if proof.workspace_id != device.workspace_id
+            || proof.folder != device.folder
+            || proof.folder_anchor != device.folder_anchor
+        {
+            return Err(DeviceUnavailable::FolderChanged);
+        }
+        if !device.execution_granted || proof.grant_epoch != device.grant_epoch {
+            return Err(DeviceUnavailable::Revoked);
+        }
+        if proof.connection_epoch == 0
+            || proof.lease_epoch == 0
+            || !valid_id(proof.incarnation.as_str())
+            || proof.max_workers == 0
+            || proof.max_workers > 8
+            || proof.active_workers > proof.max_workers
+            || proof.profiles.is_empty()
+            || proof.profiles.len() > EXECUTION_PROFILE_MAX
+        {
+            return Err(DeviceUnavailable::Invalid);
+        }
+        for (i, profile) in proof.profiles.iter().enumerate() {
+            if !valid_id(&profile.id)
+                || profile.agent.validate().is_err()
+                || proof.profiles[..i].iter().any(|p| p.id == profile.id)
+            {
+                return Err(DeviceUnavailable::Invalid);
+            }
+        }
+        if let Some((previous, observed_at)) = &entry.observation {
+            if proof.connection_epoch < previous.connection_epoch
+                || now_ms < *observed_at
+                || (proof.connection_epoch == previous.connection_epoch
+                    && (proof.incarnation != previous.incarnation
+                        || proof.lease_epoch < previous.lease_epoch))
+            {
+                return Err(DeviceUnavailable::Conflict);
+            }
+        }
+        entry.observation = Some((proof, now_ms));
+        Ok(())
+    }
+
+    pub fn reserve(
+        &mut self,
+        request: LeaseRequest,
+        now_ms: u64,
+    ) -> Result<ExecutionLease, DeviceUnavailable> {
+        if let Some(existing) = self.leases.iter().find(|l| {
+            l.request.operation_id == request.operation_id
+                || l.request.attempt_id == request.attempt_id
+        }) {
+            return if existing.request == request {
+                Ok(existing.clone())
+            } else {
+                Err(DeviceUnavailable::Conflict)
+            };
+        }
+        if self.viewers.iter().any(|v| v.0 == request.device_id) {
+            return Err(DeviceUnavailable::ViewerOnly);
+        }
+        if !valid_id(request.attempt_id.as_str())
+            || !valid_id(request.operation_id.as_str())
+            || request.agent.validate().is_err()
+        {
+            return Err(DeviceUnavailable::Invalid);
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.registration.id == request.device_id)
+            .ok_or(DeviceUnavailable::Missing)?;
+        let proof = fresh_observation(entry, now_ms)?;
+        if request.workspace_id != entry.registration.workspace_id
+            || request.folder != entry.registration.folder
+        {
+            return Err(DeviceUnavailable::FolderChanged);
+        }
+        if !entry.registration.allowed_agents.contains(&request.agent) {
+            return Err(DeviceUnavailable::UnsupportedAgent);
+        }
+        let profile = proof
+            .profiles
+            .iter()
+            .find(|p| p.agent == request.agent)
+            .ok_or(DeviceUnavailable::UnsupportedAgent)?;
+        let reserved = self
+            .leases
+            .iter()
+            .filter(|l| l.request.device_id == request.device_id)
+            .count();
+        // A reservation remains occupied through uncertain delivery. Never reclaim on timeout.
+        if reserved + usize::from(proof.active_workers)
+            >= usize::from(entry.registration.max_workers.min(proof.max_workers))
+        {
+            return Err(DeviceUnavailable::Capacity);
+        }
+        if self.leases.len() == EXECUTION_LEASE_MAX {
+            return Err(DeviceUnavailable::Full);
+        }
+        let lease = ExecutionLease {
+            request,
+            folder_anchor: proof.folder_anchor.clone(),
+            profile_id: profile.id.clone(),
+            grant_epoch: proof.grant_epoch,
+            lease_epoch: proof.lease_epoch,
+            connection_epoch: proof.connection_epoch,
+            incarnation: proof.incarnation.clone(),
+        };
+        self.leases.push(lease.clone());
+        Ok(lease)
+    }
+}
+
+fn valid_id(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+
+fn valid_folder(value: &str) -> bool {
+    value.len() <= 8192
+        && std::path::Path::new(value).is_absolute()
+        && !value.chars().any(char::is_control)
+        && !std::path::Path::new(value)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+}
+
+fn validate_registration(device: &RegisteredDevice) -> Result<(), DeviceUnavailable> {
+    let fingerprint = device.pinned_fingerprint.as_bytes();
+    let valid_pin = fingerprint.len() == 95
+        && fingerprint.iter().enumerate().all(|(i, b)| {
+            if i % 3 == 2 {
+                *b == b':'
+            } else {
+                b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
+            }
+        });
+    if !valid_id(&device.id)
+        || device.name.is_empty()
+        || device.name.len() > 256
+        || device.name.chars().any(char::is_control)
+        || !valid_pin
+        || device.workspace_id.0.is_empty()
+        || device.workspace_id.0.len() > 128
+        || !valid_folder(&device.folder)
+        || !valid_id(&device.folder_anchor)
+        || device.allowed_agents.is_empty()
+        || device.allowed_agents.len() > EXECUTION_PROFILE_MAX
+        || device.allowed_agents.iter().any(|a| a.validate().is_err())
+        || !(1..=8).contains(&device.max_workers)
+        || device.grant_epoch == 0
+    {
+        return Err(DeviceUnavailable::Invalid);
+    }
+    Ok(())
+}
+
+fn fresh_observation(
+    entry: &DeviceEntry,
+    now_ms: u64,
+) -> Result<&WorkerObservation, DeviceUnavailable> {
+    if !entry.registration.execution_granted {
+        return Err(DeviceUnavailable::Revoked);
+    }
+    let (proof, observed_at) = entry
+        .observation
+        .as_ref()
+        .ok_or(DeviceUnavailable::Disconnected)?;
+    if now_ms
+        .checked_sub(*observed_at)
+        .is_none_or(|age| age > EXECUTION_FRESHNESS_MS)
+    {
+        return Err(DeviceUnavailable::Stale);
+    }
+    Ok(proof)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn registration() -> RegisteredDevice {
+        RegisteredDevice {
+            id: "worker-a".into(),
+            name: "Worker A".into(),
+            endpoint: "127.0.0.1:9000".parse().unwrap(),
+            pinned_fingerprint: vec!["aa"; 32].join(":"),
+            workspace_id: WorkspaceId("workspace-a".into()),
+            folder: "/fixture/a".into(),
+            folder_anchor: "anchor-a".into(),
+            allowed_agents: vec![AgentSelection {
+                provider: "codex".into(),
+                model: Some("gpt-6.1-sol".into()),
+                effort: Some("xhigh".into()),
+            }],
+            max_workers: 1,
+            grant_epoch: 1,
+            execution_granted: true,
+        }
+    }
+    fn proof(device: &RegisteredDevice) -> WorkerObservation {
+        WorkerObservation {
+            device_id: device.id.clone(),
+            pinned_fingerprint: device.pinned_fingerprint.clone(),
+            connection_epoch: 1,
+            incarnation: RuntimeIncarnationId("incarnation-a".into()),
+            workspace_id: device.workspace_id.clone(),
+            folder: device.folder.clone(),
+            folder_anchor: device.folder_anchor.clone(),
+            grant_epoch: device.grant_epoch,
+            lease_epoch: 1,
+            profiles: vec![WorkerProfile {
+                id: "profile-a".into(),
+                agent: device.allowed_agents[0].clone(),
+            }],
+            max_workers: 1,
+            active_workers: 0,
+        }
+    }
+    fn request(device: &RegisteredDevice) -> LeaseRequest {
+        LeaseRequest {
+            device_id: device.id.clone(),
+            workspace_id: device.workspace_id.clone(),
+            attempt_id: AttemptId("attempt-a".into()),
+            operation_id: OperationId("operation-a".into()),
+            folder: device.folder.clone(),
+            agent: device.allowed_agents[0].clone(),
+        }
+    }
+    #[test]
+    fn registered_compute_requires_exact_fresh_proof_and_reserves_capacity() {
+        let mut registry = DeviceRegistry::default();
+        let device = registration();
+        registry.register(device.clone()).unwrap();
+        assert_eq!(
+            registry.reserve(request(&device), 10),
+            Err(DeviceUnavailable::Disconnected)
+        );
+        registry.observe(proof(&device), 10).unwrap();
+        let first = registry.reserve(request(&device), 11).unwrap();
+        assert_eq!(registry.reserve(request(&device), 12).unwrap(), first);
+        let mut other = request(&device);
+        other.attempt_id = AttemptId("attempt-b".into());
+        other.operation_id = OperationId("operation-b".into());
+        assert_eq!(
+            registry.reserve(other, 12),
+            Err(DeviceUnavailable::Capacity)
+        );
+        let mut wrong = request(&device);
+        wrong.folder = "/fixture/b".into();
+        assert_eq!(
+            registry.reserve(wrong, 12),
+            Err(DeviceUnavailable::Conflict)
+        );
+    }
+    #[test]
+    fn stale_pin_folder_and_grant_proofs_never_enable_execution() {
+        let mut registry = DeviceRegistry::default();
+        let device = registration();
+        registry.register(device.clone()).unwrap();
+        let mut wrong = proof(&device);
+        wrong.pinned_fingerprint = vec!["bb"; 32].join(":");
+        assert_eq!(
+            registry.observe(wrong, 10),
+            Err(DeviceUnavailable::IdentityChanged)
+        );
+        wrong = proof(&device);
+        wrong.folder_anchor = "moved-folder".into();
+        assert_eq!(
+            registry.observe(wrong, 10),
+            Err(DeviceUnavailable::FolderChanged)
+        );
+        registry.observe(proof(&device), 10).unwrap();
+        assert_eq!(
+            registry.reserve(request(&device), 10 + EXECUTION_FRESHNESS_MS + 1),
+            Err(DeviceUnavailable::Stale)
+        );
+    }
+    #[test]
+    fn viewer_reconnect_and_revocation_do_not_grant_or_replay_compute() {
+        let mut registry = DeviceRegistry::default();
+        let mut device = registration();
+        registry
+            .register_viewer(
+                "relay".into(),
+                "Phone viewer".into(),
+                device.workspace_id.clone(),
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            registry.snapshot(&device.workspace_id, 10)[0].unavailable,
+            Some(DeviceUnavailable::ViewerOnly)
+        );
+        let mut viewer_request = request(&device);
+        viewer_request.device_id = "relay".into();
+        assert_eq!(
+            registry.reserve(viewer_request, 10),
+            Err(DeviceUnavailable::ViewerOnly)
+        );
+        registry.register(device.clone()).unwrap();
+        registry.observe(proof(&device), 10).unwrap();
+        let lease = registry.reserve(request(&device), 10).unwrap();
+        registry.disconnect(&device.id, 1);
+        assert_eq!(
+            registry.validate_lease(&lease, 11),
+            Err(DeviceUnavailable::Disconnected)
+        );
+        assert_eq!(
+            registry.observe(proof(&device), 11),
+            Err(DeviceUnavailable::Conflict)
+        );
+        let mut fresh = proof(&device);
+        fresh.connection_epoch = 2;
+        fresh.lease_epoch = 2;
+        registry.observe(fresh, 12).unwrap();
+        assert_eq!(
+            registry.validate_lease(&lease, 12),
+            Err(DeviceUnavailable::Conflict)
+        );
+        assert_eq!(registry.reserve(request(&device), 12).unwrap(), lease);
+        registry.disconnect(&device.id, 1); // A late close cannot disarm the new connection.
+        assert!(
+            registry
+                .snapshot(&device.workspace_id, 12)
+                .iter()
+                .find(|d| d.id == device.id)
+                .unwrap()
+                .connected
+        );
+        device.grant_epoch = 2;
+        device.execution_granted = false;
+        registry.register(device.clone()).unwrap();
+        assert_eq!(
+            registry.validate_lease(&lease, 13),
+            Err(DeviceUnavailable::Revoked)
+        );
+        assert!(registry.complete(&lease));
+        assert!(!registry.complete(&lease));
+        assert_eq!(
+            registry
+                .snapshot(&device.workspace_id, 13)
+                .iter()
+                .find(|d| d.id == device.id)
+                .unwrap()
+                .unavailable,
+            Some(DeviceUnavailable::Revoked)
+        );
+    }
+    #[test]
+    fn malformed_registrations_and_cross_worker_aliases_are_rejected() {
+        let mut registry = DeviceRegistry::default();
+        let mut device = registration();
+        device.folder = "/fixture/../escape".into();
+        assert_eq!(registry.register(device), Err(DeviceUnavailable::Invalid));
+        let a = registration();
+        registry.register(a.clone()).unwrap();
+        registry.observe(proof(&a), 10).unwrap();
+        let lease = registry.reserve(request(&a), 10).unwrap();
+        let mut b = a.clone();
+        b.id = "worker-b".into();
+        b.folder = "/fixture/b".into();
+        b.folder_anchor = "anchor-b".into();
+        registry.register(b.clone()).unwrap();
+        registry.observe(proof(&b), 10).unwrap();
+        let mut alias = request(&b);
+        assert_eq!(
+            registry.reserve(alias.clone(), 10),
+            Err(DeviceUnavailable::Conflict)
+        );
+        alias.operation_id = OperationId("operation-b".into());
+        alias.attempt_id = AttemptId("attempt-b".into());
+        assert_eq!(
+            registry.reserve(alias, 10).unwrap().request.device_id,
+            "worker-b"
+        );
+        assert!(registry.complete(&lease));
+    }
+}

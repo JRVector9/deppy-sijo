@@ -8,6 +8,8 @@ pub mod provider_adapter;
 pub mod orchestrator;
 pub use reducer::{ApplyOutcome, ProjectWorkState};
 
+pub(crate) mod devices;
+pub(crate) mod remote_execution;
+pub(crate) mod repository_worker;
 #[cfg(test)]
 mod tests;
-pub(crate) mod repository_worker;

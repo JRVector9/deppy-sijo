@@ -158,10 +158,9 @@ impl DeliveryLedger {
             .records
             .iter_mut()
             .find(|(a, _)| &a.attempt.operation_id == operation)
+            && matches!(stage, DeliveryState::Durable | DeliveryState::Sent)
         {
-            if matches!(stage, DeliveryState::Durable | DeliveryState::Sent) {
-                *stage = DeliveryState::Uncertain;
-            }
+            *stage = DeliveryState::Uncertain;
         }
     }
     pub fn note_admitted(
@@ -486,12 +485,35 @@ pub fn prepare_dispatch_with_attempt_id(
     policy: &ExecutionPolicy,
 ) -> Result<PrepareOutcome, ValidationError> {
     confirmed.validate_current(state, config, policy)?;
+    if let Some(existing) = existing_dispatch(state, ledger, &request, &attempt_id, config)? {
+        return Ok(existing);
+    }
+    if !super::queue::ready_tasks(state, confirmed, config, policy, ledger)?
+        .contains(&request.task_id)
+    {
+        return Err(ValidationError(
+            "task is not ready: confirmation, dependencies, capacity or file scope".into(),
+        ));
+    }
+    validate_dispatch_folder(state, &request, config, policy)?;
+    Ok(PrepareOutcome::Ready(Box::new(prepare_assignment(
+        state, request, attempt_id, config,
+    )?)))
+}
+
+pub(crate) fn existing_dispatch(
+    state: &ProjectWorkState,
+    ledger: &DeliveryLedger,
+    request: &DispatchRequest,
+    attempt_id: &AttemptId,
+    config: &ProjectConfig,
+) -> Result<Option<PrepareOutcome>, ValidationError> {
     if state
         .attempts
         .iter()
-        .any(|a| a.id == attempt_id && a.operation_id != request.operation_id)
+        .any(|a| &a.id == attempt_id && a.operation_id != request.operation_id)
         || ledger.records.iter().any(|(a, _)| {
-            a.attempt.id == attempt_id && a.attempt.operation_id != request.operation_id
+            &a.attempt.id == attempt_id && a.attempt.operation_id != request.operation_id
         })
     {
         return Err(ValidationError("attempt identity already reserved".into()));
@@ -502,7 +524,7 @@ pub fn prepare_dispatch_with_attempt_id(
         .find(|(a, _)| a.attempt.operation_id == request.operation_id)
     {
         let a = &existing.attempt;
-        if a.id != attempt_id
+        if &a.id != attempt_id
             || a.task_id != request.task_id
             || a.config != *config
             || a.folder != request.folder.path
@@ -511,17 +533,17 @@ pub fn prepare_dispatch_with_attempt_id(
         {
             return Err(ValidationError("operation assignment changed".into()));
         }
-        return Ok(PrepareOutcome::Existing {
+        return Ok(Some(PrepareOutcome::Existing {
             attempt_id: a.id.clone(),
             delivery: *delivery,
-        });
+        }));
     }
     if let Some(a) = state
         .attempts
         .iter()
         .find(|a| a.operation_id == request.operation_id)
     {
-        if a.id != attempt_id
+        if &a.id != attempt_id
             || a.task_id != request.task_id
             || a.config != *config
             || a.folder != request.folder.path
@@ -532,18 +554,20 @@ pub fn prepare_dispatch_with_attempt_id(
                 "restored operation assignment changed".into(),
             ));
         }
-        return Ok(PrepareOutcome::Existing {
+        return Ok(Some(PrepareOutcome::Existing {
             attempt_id: a.id.clone(),
             delivery: DeliveryState::Uncertain,
-        });
+        }));
     }
-    if !super::queue::ready_tasks(state, confirmed, config, policy, ledger)?
-        .contains(&request.task_id)
-    {
-        return Err(ValidationError(
-            "task is not ready: confirmation, dependencies, capacity or file scope".into(),
-        ));
-    }
+    Ok(None)
+}
+
+pub(crate) fn validate_dispatch_folder(
+    state: &ProjectWorkState,
+    request: &DispatchRequest,
+    config: &ProjectConfig,
+    policy: &ExecutionPolicy,
+) -> Result<(), ValidationError> {
     validate_folder(&request.folder.path)?;
     if config.use_worktrees {
         let root = policy
@@ -575,6 +599,15 @@ pub fn prepare_dispatch_with_attempt_id(
             "folder belongs to another worktree task".into(),
         ));
     }
+    Ok(())
+}
+
+pub(crate) fn prepare_assignment(
+    state: &ProjectWorkState,
+    request: DispatchRequest,
+    attempt_id: AttemptId,
+    config: &ProjectConfig,
+) -> Result<PreparedDispatch, ValidationError> {
     let mut next_state = state.clone();
     let id = next_state.begin_attempt_with_id(
         &request.task_id,
@@ -627,7 +660,7 @@ pub fn prepare_dispatch_with_attempt_id(
         ));
     }
     validate_input(&prompt)?;
-    Ok(PrepareOutcome::Ready(Box::new(PreparedDispatch {
+    Ok(PreparedDispatch {
         next_state,
         assignment: DispatchAssignment {
             task,
@@ -635,7 +668,7 @@ pub fn prepare_dispatch_with_attempt_id(
             source_results,
             prompt,
         },
-    })))
+    })
 }
 
 #[cfg(test)]

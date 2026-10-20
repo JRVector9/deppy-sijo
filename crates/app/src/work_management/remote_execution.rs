@@ -37,6 +37,14 @@ impl RemoteExecutionLedger {
         }
         let mut ledger = Self::default();
         for mut record in records {
+            if let DeliveryStatus::Running(binding) = &record.status {
+                if binding.incarnation != record.lease.incarnation
+                    || binding.execution_generation == 0
+                    || binding.session_id.0 == 0
+                {
+                    return Err(DeliveryError::Invalid);
+                }
+            }
             if ledger.records.iter().any(|r| {
                 r.lease.request.operation_id == record.lease.request.operation_id
                     || r.lease.request.attempt_id == record.lease.request.attempt_id
@@ -59,7 +67,8 @@ impl RemoteExecutionLedger {
         lease: ExecutionLease,
         prompt: String,
     ) -> Result<(), DeliveryError> {
-        if prompt.is_empty()
+        if lease.validate().is_err()
+            || prompt.is_empty()
             || prompt.len() > deppy_core::work_management::WORK_INPUT_MAX_BYTES
             || prompt.contains('\0')
             || lease.grant_epoch == 0
@@ -113,7 +122,7 @@ impl RemoteExecutionLedger {
             .ok_or(DeliveryError::Missing)?;
         if record.lease != *lease
             || binding.incarnation != lease.incarnation
-            || binding.execution_generation != lease.lease_epoch
+            || binding.execution_generation == 0
             || binding.session_id.0 == 0
         {
             return Err(DeliveryError::Conflict);
@@ -243,5 +252,29 @@ mod tests {
             ])
             .is_err()
         );
+    }
+    #[test]
+    fn lease_epoch_and_runtime_generation_are_distinct_and_restore_rejects_invalid_identity() {
+        let lease = lease();
+        let mut ledger = RemoteExecutionLedger::default();
+        ledger.record_durable(lease.clone(), "work".into()).unwrap();
+        ledger.claim_send(&lease.request.operation_id).unwrap();
+        let mut actual = binding();
+        actual.execution_generation = 99;
+        ledger.admit(&lease, actual).unwrap();
+        let mut invalid = lease.clone();
+        invalid.profile_id.clear();
+        assert_eq!(
+            RemoteExecutionLedger::default().record_durable(invalid, "work".into()),
+            Err(DeliveryError::Invalid)
+        );
+        let mut records = ledger.records().to_vec();
+        records[0].lease.request.workspace_id.0.clear();
+        assert!(RemoteExecutionLedger::restore(records).is_err());
+        let mut records = ledger.records().to_vec();
+        if let DeliveryStatus::Running(binding) = &mut records[0].status {
+            binding.incarnation = RuntimeIncarnationId("wrong".into());
+        }
+        assert!(RemoteExecutionLedger::restore(records).is_err());
     }
 }

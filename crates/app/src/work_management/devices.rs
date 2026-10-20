@@ -43,6 +43,7 @@ pub struct WorkerObservation {
     pub profiles: Vec<WorkerProfile>,
     pub max_workers: u8,
     pub active_workers: u8,
+    pub active_operation_ids: Vec<OperationId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +65,27 @@ pub struct ExecutionLease {
     pub lease_epoch: u64,
     pub connection_epoch: u64,
     pub incarnation: RuntimeIncarnationId,
+}
+
+impl ExecutionLease {
+    pub fn validate(&self) -> Result<(), DeviceUnavailable> {
+        if !valid_id(&self.request.device_id)
+            || !valid_id(&self.request.workspace_id.0)
+            || !valid_id(self.request.attempt_id.as_str())
+            || !valid_id(self.request.operation_id.as_str())
+            || !valid_folder(&self.request.folder)
+            || self.request.agent.validate().is_err()
+            || !valid_id(&self.folder_anchor)
+            || !valid_id(&self.profile_id)
+            || !valid_id(self.incarnation.as_str())
+            || self.grant_epoch == 0
+            || self.lease_epoch == 0
+            || self.connection_epoch == 0
+        {
+            return Err(DeviceUnavailable::Invalid);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +222,10 @@ impl DeviceRegistry {
                     let reserved = self
                         .leases
                         .iter()
-                        .filter(|l| l.request.device_id == e.registration.id)
+                        .filter(|l| {
+                            l.request.device_id == e.registration.id
+                                && !p.active_operation_ids.contains(&l.request.operation_id)
+                        })
                         .count();
                     (reserved + usize::from(p.active_workers)
                         >= usize::from(e.registration.max_workers.min(p.max_workers)))
@@ -303,6 +328,14 @@ impl DeviceRegistry {
             || proof.max_workers == 0
             || proof.max_workers > 8
             || proof.active_workers > proof.max_workers
+            || proof.active_operation_ids.len() > usize::from(proof.active_workers)
+            || proof
+                .active_operation_ids
+                .iter()
+                .enumerate()
+                .any(|(i, id)| {
+                    !valid_id(id.as_str()) || proof.active_operation_ids[..i].contains(id)
+                })
             || proof.profiles.is_empty()
             || proof.profiles.len() > EXECUTION_PROFILE_MAX
         {
@@ -376,7 +409,10 @@ impl DeviceRegistry {
         let reserved = self
             .leases
             .iter()
-            .filter(|l| l.request.device_id == request.device_id)
+            .filter(|l| {
+                l.request.device_id == request.device_id
+                    && !proof.active_operation_ids.contains(&l.request.operation_id)
+            })
             .count();
         // A reservation remains occupied through uncertain delivery. Never reclaim on timeout.
         if reserved + usize::from(proof.active_workers)
@@ -503,6 +539,7 @@ mod tests {
             }],
             max_workers: 1,
             active_workers: 0,
+            active_operation_ids: vec![],
         }
     }
     fn request(device: &RegisteredDevice) -> LeaseRequest {
@@ -663,5 +700,34 @@ mod tests {
             "worker-b"
         );
         assert!(registry.complete(&lease));
+    }
+    #[test]
+    fn admitted_local_leases_are_not_double_counted_but_unrelated_work_is() {
+        let mut device = registration();
+        device.max_workers = 2;
+        let mut registry = DeviceRegistry::default();
+        registry.register(device.clone()).unwrap();
+        let mut observed = proof(&device);
+        observed.max_workers = 2;
+        registry.observe(observed.clone(), 10).unwrap();
+        let first = registry.reserve(request(&device), 10).unwrap();
+        observed.active_workers = 1;
+        observed.active_operation_ids = vec![first.request.operation_id.clone()];
+        registry.observe(observed.clone(), 11).unwrap();
+        let mut second = request(&device);
+        second.operation_id = OperationId("operation-b".into());
+        second.attempt_id = AttemptId("attempt-b".into());
+        registry.reserve(second, 11).unwrap();
+        assert!(!registry.snapshot(&device.workspace_id, 11)[0].can_execute);
+        registry.complete(&first);
+        observed.active_operation_ids.clear();
+        registry.observe(observed, 12).unwrap();
+        let mut third = request(&device);
+        third.operation_id = OperationId("operation-c".into());
+        third.attempt_id = AttemptId("attempt-c".into());
+        assert_eq!(
+            registry.reserve(third, 12),
+            Err(DeviceUnavailable::Capacity)
+        );
     }
 }

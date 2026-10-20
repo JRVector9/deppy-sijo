@@ -270,6 +270,9 @@ impl CommandCenterHost {
             })
     }
     fn request_project_load(&mut self, id: &str, workspace: &str) -> Result<(), String> {
+        if remote::reconcile::project_pending(self, workspace) {
+            return Err("원래 원격 요청의 상태 조회가 끝난 뒤 저장 상태를 복구해 주세요.".into());
+        }
         if self.requested_loads.contains_key(workspace)
             || matches!(&self.flight,Some(Flight::Load {workspace:inflight,..}) if inflight==workspace)
         {
@@ -368,6 +371,104 @@ fn bounded(text: &str, bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+fn preserve_known_delivery_receipts(
+    loaded: &mut stored::CommandCenterSnapshot,
+    current: &Project,
+) -> bool {
+    fn same_origin(a: &work::Attempt, b: &work::Attempt) -> bool {
+        let mut a = a.clone();
+        let mut b = b.clone();
+        for attempt in [&mut a, &mut b] {
+            attempt.state = work::WorkState::Queued;
+            attempt.last_event_sequence = 0;
+        }
+        a == b
+    }
+    let mut merged = false;
+    for (assignment, delivery) in &current.ledger.records {
+        let terminal = match delivery {
+            wm::dispatch::DeliveryState::Admitted => stored::DispatchOutboxState::Admitted,
+            wm::dispatch::DeliveryState::Rejected => stored::DispatchOutboxState::Acknowledged,
+            _ => continue,
+        };
+        let identity = |outbox: &stored::DispatchOutbox| {
+            outbox.attempt_id == assignment.attempt.id
+                && outbox.operation_id == assignment.attempt.operation_id
+        };
+        if !current
+            .snapshot
+            .outbox
+            .iter()
+            .any(|outbox| identity(outbox) && outbox.state == terminal)
+        {
+            continue;
+        }
+        let Some(outbox) = loaded.outbox.iter().position(|outbox| {
+            identity(outbox)
+                && matches!(
+                    outbox.state,
+                    stored::DispatchOutboxState::Pending | stored::DispatchOutboxState::Uncertain
+                )
+        }) else {
+            continue;
+        };
+        let Some(task) = loaded
+            .tasks
+            .iter()
+            .position(|task| task.id == assignment.task.id)
+        else {
+            continue;
+        };
+        let Some(attempt) = loaded
+            .attempts
+            .iter()
+            .position(|attempt| attempt.id == assignment.attempt.id)
+        else {
+            continue;
+        };
+        let Some(current_task) = current
+            .snapshot
+            .tasks
+            .iter()
+            .find(|task| task.id == assignment.task.id)
+        else {
+            continue;
+        };
+        let Some(current_attempt) = current
+            .snapshot
+            .attempts
+            .iter()
+            .find(|attempt| attempt.id == assignment.attempt.id)
+        else {
+            continue;
+        };
+        if loaded.tasks[task].current_attempt_id.as_ref() != Some(&assignment.attempt.id)
+            || current_task.current_attempt_id.as_ref() != Some(&assignment.attempt.id)
+            || !wm::dispatch::same_task_definition(&loaded.tasks[task], &assignment.task)
+            || !wm::dispatch::same_task_definition(current_task, &assignment.task)
+            || loaded.tasks[task].result != current_task.result
+            || !same_origin(&loaded.attempts[attempt], &assignment.attempt)
+            || !same_origin(current_attempt, &assignment.attempt)
+            || loaded.attempts[attempt].last_event_sequence > current_attempt.last_event_sequence
+            || assignment.source_results.iter().any(|source| {
+                [&*loaded, &current.snapshot].iter().any(|snapshot| {
+                    !snapshot.tasks.iter().any(|task| {
+                        task.id == source.task_id && task.result.as_ref() == Some(&source.result)
+                    })
+                })
+            })
+        {
+            continue;
+        }
+        // Only a retained terminal receipt for the exact immutable dispatch may
+        // survive a failed save followed by an older load. This never arms input.
+        loaded.outbox[outbox].state = terminal;
+        loaded.tasks[task] = current_task.clone();
+        loaded.attempts[attempt] = current_attempt.clone();
+        merged = true;
+    }
+    merged
 }
 fn yes() -> cc::Capability {
     cc::Capability {
@@ -1235,7 +1336,7 @@ impl App {
                     match result {
                         Ok(record) => {
                             let p = host.projects.get_mut(&workspace).unwrap();
-                            if let Some(record) = record {
+                            if let Some(mut record) = record {
                                 let preserved: Vec<_> = p
                                     .snapshot
                                     .drafts
@@ -1243,6 +1344,7 @@ impl App {
                                     .filter(|d| !d.target_key.starts_with("settings:"))
                                     .cloned()
                                     .collect();
+                                preserve_known_delivery_receipts(&mut record.snapshot, p);
                                 p.revision = Some(record.revision);
                                 p.snapshot = record.snapshot;
                                 for draft in preserved {

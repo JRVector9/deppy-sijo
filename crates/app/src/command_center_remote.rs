@@ -155,7 +155,8 @@ pub(super) fn handoff_pending(host: &CommandCenterHost, target: &cc::RouteTarget
         })
 }
 pub(super) fn project_pending(host: &CommandCenterHost, workspace: &str) -> bool {
-    local_close::project_pending(host, workspace)
+    reconcile::project_pending(host, workspace)
+        || local_close::project_pending(host, workspace)
         || sessions::project_pending(host, workspace)
         || host
             .inputs

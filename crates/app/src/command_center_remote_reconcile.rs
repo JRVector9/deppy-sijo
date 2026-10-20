@@ -1,6 +1,9 @@
 //! A user-requested query can reconcile a retained receipt; it never re-arms an effect.
 use super::*;
 use wm::remote_controller::{RemoteDeviceJob, RemoteInputReceipt, RemoteLaunchReceipt};
+#[cfg(test)]
+#[path = "command_center_remote_reconcile_storage_tests.rs"]
+mod storage_tests;
 enum Source {
     Launch(String),
     Dispatch(String),
@@ -18,6 +21,19 @@ pub(in super::super) struct Queries {
 }
 pub(in super::super) fn pending(host: &CommandCenterHost) -> bool {
     !host.reconciles.pending.is_empty()
+}
+pub(in super::super) fn project_pending(host: &CommandCenterHost, workspace: &str) -> bool {
+    host.reconciles
+        .pending
+        .values()
+        .any(|query| query.lease.request.workspace_id.0 == workspace)
+}
+fn storage_ready(host: &CommandCenterHost, workspace: &str) -> bool {
+    host.projects
+        .get(workspace)
+        .is_some_and(|project| project.loaded && !project.storage_blocked)
+        && !host.requested_loads.contains_key(workspace)
+        && !matches!(&host.flight, Some(Flight::Load { workspace: loading, .. }) if loading == workspace)
 }
 fn candidate(
     host: &CommandCenterHost,
@@ -53,7 +69,9 @@ pub(in super::super) fn capability(
     host: &CommandCenterHost,
     target: &cc::RouteTarget,
 ) -> cc::Capability {
-    if pending(host) {
+    if !storage_ready(host, &target.workspace_id) {
+        no("프로젝트 저장 복구와 불러오기를 마친 뒤 원래 요청의 상태를 확인해 주세요.")
+    } else if pending(host) {
         no("현재 원래 요청의 상태를 조회하고 있습니다.")
     } else if candidate(host, target).is_some() {
         yes()
@@ -131,6 +149,11 @@ pub(in super::super) fn begin(
 ) -> Result<(), String> {
     if host.remote_permits.contains_key(id) {
         return Err("이 컴퓨터에서 원래 원격 요청의 상태를 확인해 주세요.".into());
+    }
+    if !storage_ready(host, &target.workspace_id) {
+        return Err(
+            "프로젝트 저장 복구와 불러오기를 마친 뒤 원래 요청의 상태를 확인해 주세요.".into(),
+        );
     }
     if pending(host) || host.devices.has_pending() {
         return Err("현재 기기 조회 응답을 기다려 주세요.".into());

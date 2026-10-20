@@ -1476,7 +1476,7 @@ fn worktop(
             View::Tasks | View::Task => text(snapshot, "tasks"),
             View::Terminal => text(snapshot, "terminal"),
             View::Devices => text(snapshot, "devices"),
-            View::History => text(snapshot, "history"),
+            View::History => "프로젝트 기록",
             View::Settings => text(snapshot, "settings"),
         };
         ui.label(

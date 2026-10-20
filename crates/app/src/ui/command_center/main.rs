@@ -48,7 +48,7 @@ pub(super) fn body(
                             View::Task => task_detail(ui, state, snapshot, p, intents),
                             View::Settings => settings::show(ui, state, snapshot, p, intents),
                             View::Devices => devices::show(ui, state, snapshot, p, intents),
-                            View::History => history(ui, snapshot, p, None, intents),
+                            View::History => history(ui, state, snapshot, p, None),
                             View::Terminal => terminal(ui, state, snapshot, p, intents),
                         }
                     },
@@ -982,7 +982,7 @@ fn task_detail(
                 weak(ui, snapshot, &t.git.reason);
             }
         }
-        DetailTab::History => history(ui, snapshot, p, Some(&t.target), intents),
+        DetailTab::History => history(ui, state, snapshot, p, Some(&t.target)),
         DetailTab::Terminal => {
             if action(ui, snapshot, text(snapshot, "open_terminal"), &t.terminal) {
                 intents.push(Intent::OpenSession(t.target.clone()));
@@ -1110,73 +1110,239 @@ fn assignment_row(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, i
         .vline(owner_left, response.rect.y_range().shrink(12.0), line);
 }
 
+fn history_button(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    label: &str,
+    selected: bool,
+    height: f32,
+) -> egui::Response {
+    let c = colors(snapshot);
+    let width = ui
+        .painter()
+        .layout_no_wrap(
+            label.into(),
+            egui::FontId::proportional(12.0 * snapshot.font_scale),
+            c.text,
+        )
+        .size()
+        .x
+        + 16.0;
+    ui.scope(|ui| {
+        ui.spacing_mut().interact_size.y = 0.0;
+        ui.spacing_mut().button_padding = egui::vec2(8.0, 0.0);
+        ui.add_sized(
+            [width, height],
+            egui::Button::new(
+                egui::RichText::new(label)
+                    .size(12.0 * snapshot.font_scale)
+                    .color(if selected { c.accent } else { c.text }),
+            )
+            .stroke(egui::Stroke::new(
+                1.0,
+                if selected { c.accent } else { c.line },
+            )),
+        )
+    })
+    .inner
+}
+
 fn history(
     ui: &mut egui::Ui,
+    state: &mut UiState,
     snapshot: &Snapshot,
     p: &Project,
     target: Option<&RouteTarget>,
-    intents: &mut Vec<Intent>,
 ) {
-    ui.heading(text(snapshot, "history"));
+    let mobile = ui.ctx().viewport_rect().width() <= 760.0;
+    let scale = snapshot.font_scale;
+    if target.is_none() {
+        ui.heading("프로젝트 기록");
+        ui.label(
+            egui::RichText::new(format!(
+                "{} · 배정·승인·결과를 해당 작업과 연결합니다.",
+                p.name
+            ))
+            .size(13.0 * scale)
+            .color(colors(snapshot).muted),
+        );
+        ui.add_space(10.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().interact_size.y = 0.0;
+            ui.spacing_mut().item_spacing.x = 8.0;
+            for (kind, label) in [
+                ("", "전체"),
+                ("work", "작업"),
+                ("approval", "승인"),
+                ("settings", "설정"),
+            ] {
+                if history_button(
+                    ui,
+                    snapshot,
+                    label,
+                    state.history_filter == kind,
+                    if mobile { 36.0 } else { 28.0 },
+                )
+                .clicked()
+                {
+                    state.history_filter = kind.into();
+                }
+            }
+        });
+        ui.add_space(10.0);
+    }
     let entries: Vec<_> = p
         .history
         .iter()
-        .filter(|h| target.is_none() || h.target.as_ref() == target)
+        .filter(|h| {
+            if let Some(target) = target {
+                h.target.as_ref() == Some(target)
+            } else {
+                state.history_filter.is_empty() || h.kind == state.history_filter
+            }
+        })
         .collect();
     if entries.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_history"));
     }
-    for h in entries {
-        ui.push_id(&h.id, |ui| {
-            let width = ui.available_width();
-            let row = egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(0, 13))
-                .show(ui, |ui| {
-                    ui.horizontal_top(|ui| {
-                        ui.allocate_ui(
-                            egui::vec2(if width < 500.0 { 35.0 } else { 50.0 }, 0.0),
-                            |ui| weak(ui, snapshot, &h.time),
-                        );
-                        ui.allocate_ui_with_layout(
-                            egui::vec2((width - 80.0).max(1.0), 0.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&h.text)
-                                            .size(13.0 * snapshot.font_scale)
-                                            .strong()
-                                            .family(crate::fonts::command_center_semibold_family(
-                                                ui.ctx(),
-                                            )),
-                                    )
-                                    .wrap(),
+    ui.scope(|ui| {
+        ui.spacing_mut().item_spacing.y = 0.0;
+        for h in entries {
+            ui.push_id(
+                (
+                    "history-row",
+                    &p.id,
+                    &h.id,
+                    h.target
+                        .as_ref()
+                        .map(|target| (&target.workspace_id, &target.task_id, &target.session_id)),
+                ),
+                |ui| {
+                    let width = ui.available_width();
+                    let time_width = if mobile { 35.0 } else { 50.0 };
+                    let gap = if mobile { 10.0 } else { 14.0 };
+                    let owner = h
+                        .target
+                        .as_ref()
+                        .filter(|target| target.workspace_id == p.id)
+                        .and_then(|target| p.tasks.iter().find(|task| task.target == *target));
+                    let action_width = if target.is_none() && owner.is_some() && !mobile {
+                        ui.painter()
+                            .layout_no_wrap(
+                                "작업 보기".into(),
+                                egui::FontId::proportional(12.0 * scale),
+                                colors(snapshot).text,
+                            )
+                            .size()
+                            .x
+                            + 16.0
+                    } else {
+                        0.0
+                    };
+                    let body_width = (width
+                        - time_width
+                        - gap
+                        - if action_width > 0.0 {
+                            gap + action_width
+                        } else {
+                            0.0
+                        })
+                    .max(1.0);
+                    let row = egui::Frame::NONE
+                        .inner_margin(egui::Margin::symmetric(0, 13))
+                        .show(ui, |ui| {
+                            ui.set_min_width(width);
+                            ui.spacing_mut().interact_size.y = 0.0;
+                            ui.spacing_mut().item_spacing.x = gap;
+                            ui.horizontal_top(|ui| {
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(time_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(time_width);
+                                        ui.add_space(2.0);
+                                        ui.label(
+                                            egui::RichText::new(&h.time)
+                                                .size(11.0 * scale)
+                                                .line_height(Some(17.05 * scale))
+                                                .color(colors(snapshot).muted),
+                                        );
+                                    },
                                 );
-                                weak(ui, snapshot, &h.detail);
-                                if let Some(target) = &h.target
-                                    && ghost_button(
-                                        ui,
-                                        snapshot,
-                                        text(snapshot, "open_history"),
-                                        28.0,
-                                        11.0,
-                                    )
-                                    .clicked()
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(body_width, 0.0),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        ui.set_min_width(body_width);
+                                        ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&h.text)
+                                                .size(13.0 * scale)
+                                                .line_height(Some(20.15 * scale))
+                                                .family(
+                                                    crate::fonts::command_center_semibold_family(
+                                                        ui.ctx(),
+                                                    ),
+                                                ),
+                                        )
+                                        .wrap(),
+                                    );
+                                        ui.add_space(4.0);
+                                        let metadata = owner
+                                            .map(|task| {
+                                                format!(
+                                                    "{} · {} · {}",
+                                                    task.provider, task.role, task.device
+                                                )
+                                            })
+                                            .unwrap_or_else(|| "프로젝트 기록".into());
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(metadata)
+                                                    .size(11.0 * scale)
+                                                    .line_height(Some(17.05 * scale))
+                                                    .color(colors(snapshot).muted),
+                                            )
+                                            .wrap(),
+                                        );
+                                        if !h.detail.is_empty() {
+                                            ui.add_space(4.0);
+                                            weak(ui, snapshot, &h.detail);
+                                        }
+                                    },
+                                );
+                                if action_width > 0.0
+                                    && history_button(ui, snapshot, "작업 보기", false, 28.0)
+                                        .clicked()
                                 {
-                                    intents.push(Intent::OpenHistory(target.clone()));
+                                    state.open_task(h.target.clone().expect("exact matching task"));
                                 }
-                            },
-                        );
-                    });
-                })
-                .response;
-            ui.painter().hline(
-                row.rect.x_range(),
-                row.rect.bottom(),
-                egui::Stroke::new(1.0, colors(snapshot).line),
+                            });
+                            if mobile && target.is_none() && owner.is_some() {
+                                ui.add_space(10.0);
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 0.0;
+                                    ui.add_space(time_width + gap);
+                                    if history_button(ui, snapshot, "작업 보기", false, 28.0)
+                                        .clicked()
+                                    {
+                                        state.open_task(
+                                            h.target.clone().expect("exact matching task"),
+                                        );
+                                    }
+                                });
+                            }
+                        })
+                        .response;
+                    ui.painter().hline(
+                        row.rect.x_range(),
+                        row.rect.bottom(),
+                        egui::Stroke::new(1.0, colors(snapshot).line),
+                    );
+                },
             );
-        });
-    }
+        }
+    });
 }
 
 fn terminal(

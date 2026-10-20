@@ -312,6 +312,197 @@ fn settings_default_keeps_advanced_scope_collapsed_and_agent_fields_inline() {
 }
 
 #[test]
+fn populated_history_keeps_columns_full_width_and_opens_the_exact_recorded_task() {
+    let mut failures = Vec::new();
+    for width in [1440.0, 390.0] {
+        let snapshot = approved_visual_fixture();
+        let initial = UiState {
+            active_workspace: snapshot.selected_workspace_id.clone(),
+            view: View::History,
+            ..Default::default()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 1100.0))
+            .build_ui_state(
+                |ui, state| {
+                    show(ui, state, &snapshot);
+                },
+                initial,
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        let content = harness.state().last_layout.unwrap().content;
+        let paint = |value: &str| {
+            harness
+                .output()
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text)
+                        if text.galley.job.text == value && content.contains(text.pos) =>
+                    {
+                        Some(text.pos)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing history text {value}"))
+        };
+        let time = paint("14:24");
+        let record = paint(&snapshot.projects[0].history[0].text);
+        let expected = if width <= 760.0 { 45.0 } else { 64.0 };
+        if (record.x - time.x - expected).abs() > 1.0 {
+            failures.push(format!(
+                "history time column at {width}: {}",
+                record.x - time.x
+            ));
+        }
+        let wide_dividers = harness
+            .output()
+            .shapes
+            .iter()
+            .filter(|shape| match &shape.shape {
+                egui::Shape::LineSegment { points, .. } => {
+                    (points[0].x - time.x).abs() < 1.0
+                        && (points[1].x - points[0].x) >= content.width() - 64.0
+                        && points[0].y > time.y
+                        && points[0].y < content.bottom()
+                }
+                _ => false,
+            })
+            .count();
+        if wide_dividers < 3 {
+            failures.push(format!(
+                "history rows must have full reading-width dividers at {width}: {wide_dividers}"
+            ));
+        }
+        if harness
+            .query_by_label("nomorevibe · 배정·승인·결과를 해당 작업과 연결합니다.")
+            .is_none()
+        {
+            failures.push("project history intro must identify the actual project".into());
+        }
+        let clicked = if let Some(button) = harness
+            .query_all_by_label("작업 보기")
+            .find(|node| content.contains(node.rect().center()))
+        {
+            if width > 760.0 && button.rect().left() < content.right() - 120.0 {
+                failures.push("desktop history action must align right".into());
+            }
+            if width <= 760.0 && (button.rect().left() - record.x).abs() > 1.0 {
+                failures.push("mobile history action must align with record content".into());
+            }
+            button.click();
+            true
+        } else {
+            failures.push(format!("history task action missing at {width}"));
+            false
+        };
+        if clicked {
+            harness.run();
+            assert_eq!(
+                harness.state().requested_task_target,
+                snapshot.projects[0].history[0].target
+            );
+            if harness.state().view != View::Task
+                || harness.state().selected_task_id != snapshot.projects[0].tasks[1].target.task_id
+            {
+                failures.push("history action must open the exact recorded task".into());
+            }
+            harness.state_mut().detail_tab = DetailTab::History;
+            harness.run();
+            assert!(
+                harness
+                    .query_all_by_label("작업 보기")
+                    .all(|node| !content.contains(node.rect().center()))
+            );
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn history_filters_use_only_stored_categories_and_preserve_unknown_records_in_all() {
+    let mut snapshot = approved_visual_fixture();
+    snapshot.projects[0].history[0].kind = "work".into();
+    snapshot.projects[0].history[1].kind = "approval".into();
+    snapshot.projects[0].history[2].kind = "work".into();
+    snapshot.projects[0].history.push(HistoryEntry {
+        id: "old-unknown".into(),
+        text: "작업 승인 설정이라는 단어가 있어도 분류 미상인 기록".into(),
+        ..Default::default()
+    });
+    snapshot.projects[0].history.push(HistoryEntry {
+        id: "real-settings".into(),
+        kind: "settings".into(),
+        text: "저장된 설정 변경 기록".into(),
+        ..Default::default()
+    });
+    let initial = UiState {
+        active_workspace: snapshot.selected_workspace_id.clone(),
+        view: View::History,
+        ..Default::default()
+    };
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1100.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    let all = harness.state().last_layout.unwrap().content;
+    for (category, expected, absent) in [
+        (
+            "승인",
+            "모바일 mock 검증 명령의 승인을 요청했습니다.",
+            "리뷰 결과를 제출했습니다. 런타임 테스트는 실행하지 않았습니다.",
+        ),
+        (
+            "설정",
+            "저장된 설정 변경 기록",
+            "모바일 mock 검증 명령의 승인을 요청했습니다.",
+        ),
+        (
+            "작업",
+            "리뷰 결과를 제출했습니다. 런타임 테스트는 실행하지 않았습니다.",
+            "저장된 설정 변경 기록",
+        ),
+        (
+            "전체",
+            "작업 승인 설정이라는 단어가 있어도 분류 미상인 기록",
+            "never-present-record",
+        ),
+    ] {
+        harness
+            .query_all_by_label(category)
+            .find(|node| {
+                all.contains(node.rect().center())
+                    && node.accesskit_node().role() == egui::accesskit::Role::Button
+            })
+            .unwrap_or_else(|| panic!("missing category {category}"))
+            .click();
+        harness.run();
+        assert!(
+            harness.query_by_label(expected).is_some(),
+            "stored category {category}"
+        );
+        assert!(
+            harness.query_by_label(absent).is_none(),
+            "other category excluded {category}"
+        );
+        if category != "전체" {
+            assert!(
+                harness
+                    .query_by_label("작업 승인 설정이라는 단어가 있어도 분류 미상인 기록")
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[test]
 fn project_navigation_deduplicates_bound_sessions_and_opens_exact_independent_session() {
     let mut snapshot = rich_fixture();
     let p = &mut snapshot.projects[0];
@@ -1487,7 +1678,12 @@ fn approved_visual_fixture() -> Snapshot {
         time: time.into(),
         text: text.into(),
         detail: String::new(),
-        ..Default::default()
+        kind: if id == "example-approval" {
+            "approval"
+        } else {
+            "work"
+        }
+        .into(),
     })
     .collect();
     snapshot.devices = ["이 Mac", "gpu3090", "휴대폰"]

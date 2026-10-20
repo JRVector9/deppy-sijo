@@ -1,3 +1,6 @@
+#[path = "command_center_host.rs"]
+mod command_center_host;
+
 #[path = "file_delete.rs"]
 pub(crate) mod file_delete;
 
@@ -9510,6 +9513,7 @@ struct RelayDashboardSink {
     baseline: Option<Arc<runtime::TerminalViewportSnapshot>>,
     last_dash: u64,
     last_cloud: u64,
+    last_work: u64,
     route: relay_protocol::RouteId,
     principal: Option<web_remote::relay::repository::RelayDeviceRecord>,
     cloud_control_origin: Option<web_remote::cloud::CloudControlOriginGuard>,
@@ -9550,6 +9554,7 @@ impl RelayDashboardSink {
             baseline: None,
             last_dash: 0,
             last_cloud: 0,
+            last_work: 0,
             route,
             principal: None,
             cloud_control_origin: None,
@@ -9574,6 +9579,7 @@ impl RelayDashboardSink {
         self.handshake.activated();
         self.last_dash = 0;
         self.last_cloud = 0;
+        self.last_work = 0;
         self.viewport_seq = 0;
         self.registration_ready = known;
         self.registration_deadline = (!known).then(|| unix_now_secs().saturating_add(30));
@@ -9893,6 +9899,17 @@ impl RelayDashboardSink {
             };
             frames.push(frame);
             self.last_cloud = version;
+        }
+        if let Some((version, json)) = self
+            .core
+            .dashboard()
+            .work_snapshot_for_permissions(self.last_work, self.permissions.permissions())
+        {
+            let Some(frame) = self.gate.seal(json.as_bytes()) else {
+                return;
+            };
+            frames.push(frame);
+            self.last_work = version;
         }
         if let Some(session) = self.watched.clone()
             && self
@@ -10328,6 +10345,8 @@ struct AgentDetectInputSnapshot {
 }
 
 pub struct App {
+    command_center_layout: command_center_host::layout::LayoutSwitch,
+    command_center: Option<Box<command_center_host::CommandCenterHost>>,
     cloud_agent: crate::cloud_agent::CloudAgent,
     config: Config,
     config_path: PathBuf,
@@ -11877,6 +11896,10 @@ const PROMPT_DELIVERY_MAX_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Clone)]
 enum PromptDeliveryOrigin {
+    CommandCenter {
+        operation_id: String,
+        automatic: bool,
+    },
     Composer {
         draft_key: String,
         submission_id: u64,
@@ -11899,7 +11922,10 @@ fn notify_prompt_rejection(
     outcome: ui::composer::PromptAdmissionOutcome,
 ) {
     // Composer already retains the exact outcome in its input card.
-    if matches!(origin, PromptDeliveryOrigin::Composer { .. }) {
+    if matches!(
+        origin,
+        PromptDeliveryOrigin::Composer { .. } | PromptDeliveryOrigin::CommandCenter { .. }
+    ) {
         return;
     }
     let key = if outcome == ui::composer::PromptAdmissionOutcome::Unknown {
@@ -17445,6 +17471,10 @@ impl App {
             environment_ui: ui::environment::EnvironmentUi::default(),
             activity_ui: ui::activity::ActivityUi::new(),
             agent_terminal_ui: ui::agent_terminal::AgentTerminalUi::new(),
+            command_center_layout: command_center_host::layout::LayoutSwitch::from_flag(
+                std::env::var("DEPPY_COMMAND_CENTER_V2").ok().as_deref(),
+            ),
+            command_center: None,
             fleet_ui: ui::fleet::FleetUi::default(),
             pending_batch_spawn: None,
             activity_rows_cache: None,
@@ -28180,6 +28210,10 @@ impl App {
                 continue;
             };
             match intent {
+                CloudControlIntent::CommandCenter {
+                    operation_id,
+                    intent,
+                } => self.command_center_remote_intent(operation_id, intent),
                 CloudControlIntent::RevokeConnection { connection_id } => {
                     self.cloud_agent.revoke_connection(&connection_id)
                 }
@@ -33946,7 +33980,12 @@ impl App {
         };
         let automatic = matches!(
             origin,
-            PromptDeliveryOrigin::Broadcast | PromptDeliveryOrigin::FollowUp { .. }
+            PromptDeliveryOrigin::Broadcast
+                | PromptDeliveryOrigin::FollowUp { .. }
+                | PromptDeliveryOrigin::CommandCenter {
+                    automatic: true,
+                    ..
+                }
         );
         let submit = !matches!(origin, PromptDeliveryOrigin::SelectedPaste);
         let admission = execution.map(|execution| {
@@ -33959,7 +33998,10 @@ impl App {
                 execution.input_admission_for(runtime::AgentInputIntent::ExplicitAppend, deadline)
             }
         });
-        let operation_id = format!("prompt:{}", uuid::Uuid::new_v4());
+        let operation_id = match &origin {
+            PromptDeliveryOrigin::CommandCenter { operation_id, .. } => operation_id.clone(),
+            _ => format!("prompt:{}", uuid::Uuid::new_v4()),
+        };
         let queued = self
             .runtime_by_instance_mut(runtime_instance)
             .filter(|runtime| runtime.id == workspace_id)
@@ -34038,6 +34080,9 @@ impl App {
         outcome: ui::composer::PromptAdmissionOutcome,
     ) {
         match origin {
+            PromptDeliveryOrigin::CommandCenter { operation_id, .. } => {
+                self.command_center_input_outcome(operation_id, outcome)
+            }
             PromptDeliveryOrigin::Composer {
                 draft_key,
                 submission_id,
@@ -34133,6 +34178,11 @@ impl App {
                 continue;
             }
             match &pending.origin {
+                PromptDeliveryOrigin::CommandCenter { operation_id, .. } => self
+                    .command_center_input_outcome(
+                        operation_id,
+                        ui::composer::PromptAdmissionOutcome::Accepted,
+                    ),
                 PromptDeliveryOrigin::Composer {
                     draft_key,
                     submission_id,
@@ -35551,6 +35601,7 @@ impl eframe::App for App {
         // 폰 대시보드가 볼 워크스페이스 스냅샷(전체 + 해석된 세션 이름) 동기화.
         // ui()가 아닌 logic()에서 — 창이 숨겨져도 폰에는 최신 구성이 보여야 한다.
         // 브리지가 변화 없으면 무시하므로(값 비교) 유휴 프레임 비용은 사실상 0이다.
+        self.pump_command_center(ctx);
         self.sync_web_workspaces(std::time::Instant::now());
         // Relay 페어링 시계와 기기 목록. 시계는 항상 흘리고(만료는 화면과 무관), 목록은 설정
         // 창이 열려 있을 때만 스로틀해 읽는다.
@@ -35577,6 +35628,25 @@ impl eframe::App for App {
         // 뒤섞여 text를 읽기 때문에 self.i18n을 직접 들고 있으면 borrow 충돌이 난다 —
         // 그래서 여전히 clone한 값을 쓴다.
         let text = self.i18n.clone();
+        if self.command_center_layout.mode == command_center_host::layout::LayoutMode::CommandCenter
+            && self.command_center.is_some()
+        {
+            self.show_command_center(ui);
+            return;
+        }
+        if self.command_center_layout.available {
+            egui::Area::new(egui::Id::new("command-center-reentry"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-110.0, 5.0))
+                .order(egui::Order::Foreground)
+                .show(ui.ctx(), |ui| {
+                    if ui
+                        .small_button(text.t("command_center.title", &[]))
+                        .clicked()
+                    {
+                        self.command_center_layout.open();
+                    }
+                });
+        }
         let mut unread_before = 0;
         // 벨 팝오버의 최근 알림 클릭 — 설정→알림(notif_click)과 같은 네비게이션 경로로
         // 아래에서 함께 처리한다.

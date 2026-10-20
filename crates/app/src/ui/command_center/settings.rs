@@ -113,6 +113,22 @@ pub(super) fn show(
                     }
                 });
             });
+            for session in p
+                .sessions
+                .iter()
+                .filter(|s| draft.worker_providers.contains(&s.provider))
+            {
+                weak(
+                    ui,
+                    snapshot,
+                    format!(
+                        "{} · {} · {}",
+                        session.provider,
+                        session.model.as_deref().unwrap_or("—"),
+                        session.effort.as_deref().unwrap_or("—")
+                    ),
+                );
+            }
             field(ui, snapshot, "parallel_limit", |ui| {
                 ui.add(egui::DragValue::new(&mut draft.parallel_limit).range(1..=8));
             });

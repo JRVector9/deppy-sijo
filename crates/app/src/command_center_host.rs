@@ -1,0 +1,1873 @@
+//! App-owned Command Center adapter. Rendering never opens the sidecar or sends input.
+use super::*;
+use crate::fleet::{FleetPromptTarget, FleetTarget};
+use crate::ui::command_center as cc;
+use crate::work_management::{self as wm, ProjectWorkState};
+use crate::workspace_add::WorkspaceAddPurpose;
+use deppy_core::WorkspaceId;
+use deppy_core::work_management as work;
+use std::collections::{BTreeMap, VecDeque};
+use storage::work_management as stored;
+use unicode_normalization::UnicodeNormalization as _;
+use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
+#[path = "command_center_switch.rs"]
+pub(super) mod layout;
+#[path = "command_center_routes.rs"]
+mod routes;
+
+#[derive(Clone, Debug, PartialEq)]
+struct Capture {
+    workspace: String,
+    target: FleetTarget,
+    prompt: Option<FleetPromptTarget>,
+}
+#[derive(Clone, PartialEq)]
+struct LiveRoute {
+    capture: Capture,
+    title: String,
+    agent: Option<work::AgentSelection>,
+    state: cc::TaskState,
+    cwd: Option<String>,
+    watch: Option<String>,
+}
+struct Project {
+    snapshot: stored::CommandCenterSnapshot,
+    revision: Option<stored::ProjectRevision>,
+    generation: u64,
+    saved_generation: u64,
+    loaded: bool,
+    storage_blocked: bool,
+    scopes: Vec<String>,
+    allowed_agents: Vec<work::AgentSelection>,
+    request: Option<wm::plan::PlannerRequest>,
+    proposal: Option<wm::plan::ValidatedPlan>,
+    confirmed: Option<wm::dispatch::ConfirmedPlan>,
+    ledger: wm::dispatch::DeliveryLedger,
+}
+impl Project {
+    fn state(&self) -> ProjectWorkState {
+        ProjectWorkState {
+            workspace_id: self.snapshot.config.workspace_id.clone(),
+            goals: self.snapshot.goals.clone(),
+            tasks: self.snapshot.tasks.clone(),
+            attempts: self.snapshot.attempts.clone(),
+        }
+    }
+    fn set_state(&mut self, state: ProjectWorkState) {
+        self.snapshot.goals = state.goals;
+        self.snapshot.tasks = state.tasks;
+        self.snapshot.attempts = state.attempts;
+        self.dirty();
+    }
+    fn ack_saved(&mut self, revision: stored::ProjectRevision, generation: u64) {
+        self.revision = Some(revision);
+        self.saved_generation = generation;
+    }
+    fn dirty(&mut self) {
+        self.generation = self.generation.saturating_add(1);
+    }
+    fn policy(&self) -> wm::dispatch::ExecutionPolicy {
+        wm::dispatch::ExecutionPolicy {
+            workspace_id: self.snapshot.config.workspace_id.clone(),
+            config_revision: self.snapshot.config.revision,
+            project_folder: self.snapshot.config.folder.clone(),
+            worktree_root: None,
+            allowed_agents: self.allowed_agents.clone(),
+            allowed_scope_roots: self.scopes.clone(),
+            max_workers: self.snapshot.config.max_workers,
+        }
+    }
+}
+struct Input {
+    target: cc::RouteTarget,
+    draft: String,
+    dispatch: Option<wm::dispatch::DispatchAssignment>,
+}
+struct AfterSave {
+    id: String,
+    input: Input,
+    prompt: String,
+    config_revision: work::ConfigRevision,
+}
+enum Flight {
+    Load {
+        workspace: String,
+        token: u64,
+    },
+    Save {
+        workspace: String,
+        generation: u64,
+        after: Option<AfterSave>,
+        receipt: Option<String>,
+    },
+}
+pub(super) struct CommandCenterHost {
+    pub ui: cc::UiState,
+    routes: routes::RouteRegistry<Capture>,
+    live: Vec<LiveRoute>,
+    projects: BTreeMap<String, Project>,
+    repository: RepositoryWorker,
+    flight: Option<Flight>,
+    next_token: u64,
+    pending: VecDeque<(String, cc::Intent)>,
+    inputs: BTreeMap<String, Input>,
+    // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
+    operations: BTreeMap<String, cc::Intent>,
+    receipts: VecDeque<cc::RemoteReceipt>,
+    status: String,
+    published: bool,
+    publication_dirty: bool,
+    generations: Vec<(String, u64, bool)>,
+    pending_git: Option<(cc::RouteTarget, ui::git_panel::GitPanelAction)>,
+    aux_loading: Option<(cc::RouteTarget, cc::DetailTab)>,
+    aux_ready: Option<cc::RouteTarget>,
+}
+impl CommandCenterHost {
+    fn new(data_dir: PathBuf, ctx: &egui::Context) -> Self {
+        let wake = ctx.clone();
+        Self {
+            ui: cc::UiState::default(),
+            routes: routes::RouteRegistry::new(uuid::Uuid::new_v4().to_string()),
+            live: vec![],
+            projects: BTreeMap::new(),
+            repository: RepositoryWorker::new(data_dir, move || wake.request_repaint()),
+            flight: None,
+            next_token: 0,
+            pending: VecDeque::new(),
+            inputs: BTreeMap::new(),
+            operations: BTreeMap::new(),
+            receipts: VecDeque::new(),
+            status: String::new(),
+            published: false,
+            publication_dirty: true,
+            generations: vec![],
+            pending_git: None,
+            aux_loading: None,
+            aux_ready: None,
+        }
+    }
+    fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
+        let detail = bounded(&detail.into(), 512);
+        self.publication_dirty = true;
+        self.status = detail.clone();
+        if let Some(receipt) = self.receipts.iter_mut().find(|r| r.operation_id == id) {
+            receipt.status = status;
+            receipt.detail = detail;
+        } else {
+            if self.receipts.len() == 64 {
+                self.receipts.pop_front();
+            }
+            self.receipts.push_back(cc::RemoteReceipt {
+                operation_id: id.into(),
+                status,
+                detail,
+            });
+        }
+    }
+    fn reject(&mut self, id: &str, detail: impl Into<String>) {
+        self.finish(id, cc::ReceiptStatus::Rejected, detail);
+    }
+    fn route(&self, target: &cc::RouteTarget) -> Option<&LiveRoute> {
+        let capture = self.routes.get(target.session_id.as_deref()?)?;
+        if capture.workspace != target.workspace_id {
+            return None;
+        }
+        self.live.iter().find(|live| &live.capture == capture)
+    }
+    fn target(&self, live: &LiveRoute) -> cc::RouteTarget {
+        cc::RouteTarget {
+            workspace_id: live.capture.workspace.clone(),
+            session_id: self.routes.key(&live.capture).map(str::to_owned),
+            task_id: None,
+        }
+    }
+    fn main_target(&self, ws: &str, project: &Project) -> cc::RouteTarget {
+        let session = self.live.iter().find(|live| {
+            live.capture.workspace == ws
+                && persistent(live).as_ref() == project.snapshot.main_binding.as_ref()
+                && project.snapshot.main_binding.is_some()
+        });
+        session
+            .map(|s| self.target(s))
+            .unwrap_or_else(|| cc::RouteTarget {
+                workspace_id: ws.into(),
+                ..Default::default()
+            })
+    }
+    fn enqueue(&mut self, id: String, intent: cc::Intent) {
+        if let cc::Intent::DraftChanged { target, .. } = &intent {
+            if let Some((_, queued)) = self
+                .pending
+                .iter_mut()
+                .find(|(_, i)| matches!(i,cc::Intent::DraftChanged { target:t,.. } if t == target))
+            {
+                *queued = intent;
+                return;
+            }
+            if self.pending.len() < 64 {
+                self.pending.push_back((id, intent));
+            }
+            return;
+        }
+        if matches!(
+            intent,
+            cc::Intent::SelectProject { .. }
+                | cc::Intent::OpenSession(_)
+                | cc::Intent::OpenGit(_)
+                | cc::Intent::OpenHistory(_)
+                | cc::Intent::SetTheme { .. }
+                | cc::Intent::UseOriginalLayout
+        ) {
+            if self.pending.len() < 64 {
+                self.pending.push_back((id, intent));
+            }
+            return;
+        }
+        if let Some(existing) = self.operations.get(&id) {
+            if existing != &intent {
+                self.status = "같은 작업 ID에 다른 요청을 사용할 수 없습니다.".into();
+            }
+            return;
+        }
+        if self.operations.len() >= 1024 || self.pending.len() >= 64 {
+            self.reject(
+                &id,
+                "요청 기록 한도에 도달했습니다. 미확인 입력을 재전송하지 않았습니다.",
+            );
+            return;
+        }
+        self.operations.insert(id.clone(), intent.clone());
+        self.pending.push_back((id, intent));
+    }
+    fn save(
+        &mut self,
+        ws: &str,
+        after: Option<AfterSave>,
+        receipt: Option<String>,
+    ) -> Result<(), String> {
+        if self.flight.is_some() {
+            return Err("저장 작업이 진행 중입니다. 잠시 뒤 다시 시도해 주세요.".into());
+        }
+        let p = self
+            .projects
+            .get(ws)
+            .ok_or("프로젝트를 찾을 수 없습니다.")?;
+        if !p.loaded || p.storage_blocked {
+            return Err("저장 상태를 먼저 다시 확인해 주세요. 초안은 보존되어 있습니다.".into());
+        }
+        let generation = p.generation;
+        self.repository
+            .try_request(RepositoryJob::Save {
+                snapshot: Box::new(p.snapshot.clone()),
+                expected: p.revision,
+                edit_generation: generation,
+            })
+            .map_err(|_| "저장 작업을 시작하지 못했습니다.".to_owned())?;
+        self.flight = Some(Flight::Save {
+            workspace: ws.into(),
+            generation,
+            after,
+            receipt,
+        });
+        Ok(())
+    }
+}
+fn bounded(text: &str, bytes: usize) -> String {
+    let mut end = text.len().min(bytes);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}
+fn yes() -> cc::Capability {
+    cc::Capability {
+        enabled: true,
+        reason: String::new(),
+    }
+}
+fn no(reason: &str) -> cc::Capability {
+    cc::Capability {
+        enabled: false,
+        reason: reason.into(),
+    }
+}
+fn persistent(live: &LiveRoute) -> Option<work::PersistentBinding> {
+    match &live.capture.target {
+        FleetTarget::Pty { pane, .. } => Some(work::PersistentBinding::Pane {
+            pane_id: pane.clone(),
+        }),
+        FleetTarget::Structured { .. } => None, // a local controller ID is not a persistent provider thread.
+    }
+}
+fn binding(live: &LiveRoute, key: &str) -> Option<work::RuntimeBinding> {
+    let prompt = live.capture.prompt.as_ref()?;
+    Some(work::RuntimeBinding {
+        incarnation: work::RuntimeIncarnationId::from_string(key.into()).ok()?,
+        session_id: prompt.session,
+        execution_generation: 1,
+    })
+}
+fn project_snapshot(ws: &storage::WorkspaceRow) -> stored::CommandCenterSnapshot {
+    let agent = work::AgentSelection {
+        provider: "unbound".into(),
+        model: None,
+        effort: None,
+    };
+    stored::CommandCenterSnapshot {
+        config: work::ProjectConfig {
+            workspace_id: WorkspaceId(ws.id.clone()),
+            revision: work::ConfigRevision(1),
+            name: App::workspace_display_name(ws),
+            folder: ws.path.clone(),
+            main_agent: agent.clone(),
+            worker_agent: agent,
+            max_workers: 3,
+            confirm_plan: true,
+            use_worktrees: false,
+        },
+        main_binding: None,
+        goals: vec![],
+        tasks: vec![],
+        attempts: vec![],
+        events: vec![],
+        outbox: vec![],
+        drafts: vec![],
+    }
+}
+impl App {
+    fn refresh_command_center_routes(&self, host: &mut CommandCenterHost) {
+        let old_live = host.live.clone();
+        host.live = self
+            .build_fleet_sessions(&self.i18n)
+            .into_iter()
+            .map(|session| {
+                let (agent, cwd, watch) = match &session.target {
+                    FleetTarget::Pty { session: sid, .. } => {
+                        let rt = if session.workspace_id == self.active.id {
+                            Some(&self.active)
+                        } else {
+                            self.warm.get(&session.workspace_id)
+                        };
+                        let agent = rt
+                            .and_then(|rt| self.agent_kinds.get(&(rt.runtime_instance, *sid)))
+                            .map(|a| work::AgentSelection {
+                                provider: format!("{:?}", a.kind).to_ascii_lowercase(),
+                                model: a.model.clone(),
+                                effort: a.effort.clone(),
+                            });
+                        let watch = (session.workspace_id == self.active.id)
+                            .then(|| {
+                                self.active.workspace_ui.mux().and_then(|mux| {
+                                    ui::inbox_waiting::find_persistent_session_id(mux, *sid)
+                                })
+                            })
+                            .flatten();
+                        (agent, self.cached_session_cwd(*sid), watch)
+                    }
+                    FleetTarget::Structured { .. } => (None, None, None),
+                };
+                use crate::agent_surface::AgentVisualState as V;
+                let state = match session.state {
+                    V::Active => cc::TaskState::Running,
+                    V::Waiting => cc::TaskState::WaitingApproval,
+                    V::NeedsResponse => cc::TaskState::WaitingInput,
+                    V::Error => cc::TaskState::Failed,
+                    V::Off => cc::TaskState::ObservationUnknown,
+                    V::Idle | V::Complete => cc::TaskState::Queued,
+                };
+                LiveRoute {
+                    capture: Capture {
+                        workspace: session.workspace_id,
+                        target: session.target,
+                        prompt: session.prompt_target,
+                    },
+                    title: session.title,
+                    agent,
+                    state,
+                    cwd,
+                    watch,
+                }
+            })
+            .collect();
+        if host.live != old_live {
+            host.publication_dirty = true;
+        }
+        host.routes
+            .refresh(host.live.iter().map(|l| l.capture.clone()).collect());
+        for ws in self
+            .workspaces
+            .iter()
+            .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
+        {
+            host.projects
+                .entry(ws.id.clone())
+                .or_insert_with(|| Project {
+                    snapshot: project_snapshot(ws),
+                    revision: None,
+                    generation: 0,
+                    saved_generation: 0,
+                    loaded: false,
+                    storage_blocked: false,
+                    scopes: vec![],
+                    allowed_agents: vec![],
+                    request: None,
+                    proposal: None,
+                    confirmed: None,
+                    ledger: Default::default(),
+                });
+        }
+    }
+    pub(crate) fn command_center_snapshot(&self) -> cc::Snapshot {
+        let Some(host) = &self.command_center else {
+            return cc::Snapshot::default();
+        };
+        let mut snapshot = cc::Snapshot {
+            selected_workspace_id: Some(self.active.id.clone()),
+            dark_mode: self.last_theme_dark,
+            font_scale: 1.0,
+            status: host.status.clone(),
+            add_project: yes(),
+            manage_devices: yes(),
+            receipts: host.receipts.iter().cloned().collect(),
+            ..Default::default()
+        };
+        for (suffix, fallback) in cc::LABELS {
+            let key = format!("command_center.{suffix}");
+            let translated = self.i18n.t(&key, &[]);
+            snapshot.labels.insert(
+                key.clone(),
+                if translated == key {
+                    (*fallback).into()
+                } else {
+                    translated
+                },
+            );
+        }
+        for ws in self
+            .workspaces
+            .iter()
+            .filter(|ws| workspace_visible_after_close(&self.closed_workspaces, &ws.id))
+        {
+            let Some(p) = host.projects.get(&ws.id) else {
+                continue;
+            };
+            let config = &p.snapshot.config;
+            let main_target = host.main_target(&ws.id, p);
+            let policy = p.policy();
+            let ready = p.loaded && !p.storage_blocked && host.flight.is_none();
+            let configured = policy.validate_config(config).is_ok();
+            let sessions: Vec<_> = host
+                .live
+                .iter()
+                .filter(|l| l.capture.workspace == ws.id)
+                .map(|live| cc::Session {
+                    model: live.agent.as_ref().and_then(|a| a.model.clone()),
+                    effort: live.agent.as_ref().and_then(|a| a.effort.clone()),
+                    terminal_session_id: live.watch.clone(),
+                    target: host.target(live),
+                    title: live.title.clone(),
+                    provider: live
+                        .agent
+                        .as_ref()
+                        .map(|a| a.provider.clone())
+                        .unwrap_or_else(|| "App Server".into()),
+                    device: "로컬".into(),
+                    state: live.state,
+                    input: if live.capture.prompt.is_some() {
+                        yes()
+                    } else {
+                        no("현재 실행의 입력 승인 경로가 없습니다.")
+                    },
+                })
+                .collect();
+            let main_live = host.route(&main_target);
+            let main_input = if !ready {
+                no("프로젝트 상태를 저장하거나 불러오는 중입니다.")
+            } else if !configured {
+                no(
+                    "프로젝트 설정에서 실행 공급자와 허용 범위를 지정해 주세요. 워크트리는 준비된 전용 경로가 필요합니다.",
+                )
+            } else if main_live.is_none_or(|l| {
+                l.capture.prompt.is_none() || l.agent.as_ref() != Some(&config.main_agent)
+            }) {
+                no("프로젝트 설정에서 현재 실행과 일치하는 메인 세션을 명시적으로 연결해 주세요.")
+            } else {
+                yes()
+            };
+            let mut tasks = vec![];
+            for task in &p.snapshot.tasks {
+                let attempt = task
+                    .current_attempt_id
+                    .as_ref()
+                    .and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id));
+                let live = attempt
+                    .and_then(|a| a.runtime_binding.as_ref())
+                    .and_then(|b| {
+                        host.live.iter().find(|l| {
+                            host.routes
+                                .key(&l.capture)
+                                .is_some_and(|key| binding(l, key).as_ref() == Some(b))
+                        })
+                    });
+                let mut target = live
+                    .map(|l| host.target(l))
+                    .unwrap_or_else(|| cc::RouteTarget {
+                        workspace_id: ws.id.clone(),
+                        ..Default::default()
+                    });
+                target.task_id = Some(task.id.0.clone());
+                let eligible: Vec<_> = host
+                    .live
+                    .iter()
+                    .filter(|l| {
+                        l.capture.workspace == ws.id
+                            && l.capture.prompt.is_some()
+                            && l.agent.as_ref() == Some(&task.assigned_agent)
+                            && l.state == cc::TaskState::Queued
+                            && l.cwd
+                                .as_deref()
+                                .is_some_and(|cwd| same_folder(cwd, &config.folder))
+                            && persistent(l) != p.snapshot.main_binding
+                    })
+                    .take(16)
+                    .map(|l| cc::Session {
+                        target: host.target(l),
+                        title: l.title.clone(),
+                        provider: task.assigned_agent.provider.clone(),
+                        input: yes(),
+                        ..Default::default()
+                    })
+                    .collect();
+                let dispatch = ready
+                    && p.confirmed.is_some()
+                    && !eligible.is_empty()
+                    && p.state().can_dispatch(&task.id);
+                tasks.push(cc::Task {
+                    terminal_session_id: live.and_then(|l| l.watch.clone()),
+                    eligible_sessions: eligible,
+                    target,
+                    title: bounded(&task.title, 256),
+                    role: task.role.clone(),
+                    scope: bounded(&task.scope, 1024),
+                    acceptance_criteria: bounded(&task.acceptance_criteria, 1024),
+                    provider: task.assigned_agent.provider.clone(),
+                    device: "로컬".into(),
+                    directory: attempt
+                        .map(|a| a.folder.clone())
+                        .unwrap_or_else(|| config.folder.clone()),
+                    state: work_state(task.state),
+                    activity: format!("{:?}", task.state),
+                    result: task.result.as_ref().map(|r| bounded(&r.summary, 2048)),
+                    result_revision: task.result.as_ref().map(|r| r.revision.0.to_string()),
+                    terminal: if live.is_some() {
+                        yes()
+                    } else {
+                        no("이 작업에 연결된 현재 실행이 없습니다.")
+                    },
+                    git: if live.is_some() {
+                        yes()
+                    } else {
+                        no("실행 폴더를 확인할 수 없습니다.")
+                    },
+                    input: if live.is_some_and(|l| l.capture.prompt.is_some()) {
+                        yes()
+                    } else {
+                        no("이 작업에 연결된 입력 대상이 없습니다.")
+                    },
+                    dispatch: if dispatch {
+                        yes()
+                    } else {
+                        no("계획 확인과 일치하는 유휴 실행 세션이 필요합니다.")
+                    },
+                    confirm_result: if task.state == work::WorkState::AwaitingUserConfirmation {
+                        yes()
+                    } else {
+                        no("검증을 통과한 결과만 완료 확인할 수 있습니다.")
+                    },
+                    ..Default::default()
+                });
+            }
+            let mut agents: Vec<_> = host
+                .live
+                .iter()
+                .filter(|l| l.capture.workspace == ws.id)
+                .filter_map(|l| l.agent.clone())
+                .collect();
+            agents.sort_by_key(|a| a.provider.clone());
+            agents.dedup();
+            let providers = agents.iter().map(|a| a.provider.clone()).collect();
+            let models = agents.iter().filter_map(|a| a.model.clone()).collect();
+            let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
+            snapshot.projects.push(cc::Project { storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary: if p.loaded { "메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.".into() } else { "저장된 작업 상태를 불러오는 중입니다.".into() }, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+        }
+        snapshot.devices.push(cc::Device {
+            id: "local".into(),
+            name: "이 Mac".into(),
+            description: "현재 앱의 로컬 실행 세션".into(),
+            capabilities: "현재 실행과 입력 승인 경로를 확인한 세션".into(),
+            connection: "로컬".into(),
+            connected: true,
+            can_execute: true,
+        });
+        snapshot
+    }
+    pub(crate) fn command_center_remote_intent(
+        &mut self,
+        operation_id: String,
+        value: serde_json::Value,
+    ) {
+        if !self.command_center_layout.available || uuid::Uuid::parse_str(&operation_id).is_err() {
+            return;
+        }
+        let Ok(intent) = serde_json::from_value::<cc::Intent>(value) else {
+            return;
+        };
+        if !matches!(
+            intent,
+            cc::Intent::Submit { .. }
+                | cc::Intent::Approval { .. }
+                | cc::Intent::ConfirmResult { .. }
+                | cc::Intent::ConfirmPlan { .. }
+                | cc::Intent::DispatchTask { .. }
+                | cc::Intent::SaveProject { .. }
+                | cc::Intent::InstallPlanJson { .. }
+        ) {
+            return;
+        }
+        if let Some(host) = self.command_center.as_mut() {
+            host.enqueue(operation_id, intent);
+            self.egui_ctx.request_repaint();
+        }
+    }
+    fn command_center_intent(
+        &mut self,
+        host: &mut CommandCenterHost,
+        id: &str,
+        intent: cc::Intent,
+    ) -> Result<(), String> {
+        match intent {
+            cc::Intent::RetryStorage { workspace_id } => {
+                if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
+                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                p.storage_blocked = false; p.loaded = false;
+                host.publication_dirty = true;
+                return Ok(());
+            }
+            cc::Intent::UseOriginalLayout => self.command_center_layout.use_original(),
+            cc::Intent::SetTheme { dark_mode } => {
+                self.config.ui.theme = if dark_mode { crate::config::Theme::Dark } else { crate::config::Theme::Light };
+                self.pending_settings_config_apply = true;
+            }
+            cc::Intent::AddProject => { self.command_center_layout.use_original(); self.open_workspace_add_dialog(WorkspaceAddPurpose::SwitchRuntime); }
+            cc::Intent::ManageDevices { .. } => { self.command_center_layout.use_original(); self.settings_open = true; self.settings_category = ui::settings::Category::CloudAgents; }
+            cc::Intent::SelectProject { workspace_id } => {
+                if !host.projects.contains_key(&workspace_id) { return Err("프로젝트가 더 이상 존재하지 않습니다.".into()); }
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SwitchWorkspace(workspace_id));
+            }
+            navigation @ (cc::Intent::OpenSession(_) | cc::Intent::OpenGit(_) | cc::Intent::OpenHistory(_)) => {
+                let (target, tab_kind) = match navigation { cc::Intent::OpenGit(t) => (t, cc::DetailTab::Git), cc::Intent::OpenHistory(t) => (t, cc::DetailTab::History), cc::Intent::OpenSession(t) => (t, cc::DetailTab::Terminal), _ => unreachable!() };
+                let route = host.route(&target).ok_or("실행 대상이 바뀌었습니다. 현재 세션을 다시 선택해 주세요.")?.clone();
+                match &route.capture.target {
+                    FleetTarget::Pty { tab, pane, .. } => {
+                        self.reveal_terminal_session();
+                        self.stage_workspace_controller_action(WorkspaceControllerAction::FocusSession { workspace_id: target.workspace_id.clone(), tab: tab.clone(), pane: pane.clone() });
+                        if target.task_id.is_some() { host.ui.open_task(target.clone()); host.ui.detail_tab = tab_kind; }
+                        else { host.ui.open_terminal(target.clone()); }
+                        if matches!(tab_kind,cc::DetailTab::Git | cc::DetailTab::History) { host.aux_loading = Some((target,tab_kind)); host.aux_ready = None; }
+                    }
+                    FleetTarget::Structured { session_id } => {
+                        if self.agent_sessions_ui.open_session(session_id) { self.agent_sessions_ui.open(); self.command_center_layout.use_original(); }
+                    }
+                }
+            }
+            cc::Intent::DraftChanged { target, text } => {
+                work::validate_input(&text).or_else(|e| if text.is_empty() { Ok(()) } else { Err(e) }).map_err(|e| e.to_string())?;
+                let key = draft_key(host, &target)?;
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded { return Err("상태를 불러오는 중입니다.".into()); }
+                set_draft(p, &key, &text, false)?;
+                host.ui.set_draft(target, text);
+                return Ok(());
+            }
+            cc::Intent::SaveProject { workspace_id, config } => {
+                if config.allowed_scope_roots.len() > 64 || config.allowed_scope_roots.iter().map(String::len).sum::<usize>() > 8192 { return Err("허용 범위는 합계 8KiB, 64개 이하로 지정해 주세요.".into()); }
+                let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded || host.flight.is_some() { return Err("저장 중에는 설정을 변경할 수 없습니다.".into()); }
+                if config.revision != p.snapshot.config.revision.0.to_string() { return Err("설정이 변경되었습니다. 최신 설정을 다시 열어 주세요.".into()); }
+                // Folder resolution belongs to the existing workspace registration worker.
+                let actual_folder = self.workspaces.iter().find(|ws| ws.id == workspace_id).map(|ws| ws.path.as_str()).ok_or("프로젝트가 없습니다.")?;
+                if !same_folder(&config.directory,actual_folder) { return Err("폴더 변경은 기존 프로젝트 관리에서 검증 후 적용해 주세요.".into()); }
+                let target = cc::RouteTarget { workspace_id: workspace_id.clone(), session_id: config.main_session_id.clone(), task_id: None };
+                let live = host.route(&target);
+                let selection = work::AgentSelection { provider: config.provider.clone(), model: (!config.model.is_empty()).then_some(config.model.clone()), effort: (!config.effort.is_empty()).then_some(config.effort.clone()) };
+                if config.main_session_id.is_some() && live.is_none_or(|l| l.agent.as_ref() != Some(&selection) || persistent(l).is_none()) { return Err("메인 공급자·모델·강도가 현재 선택한 실행과 일치하지 않습니다.".into()); }
+                let main_binding = live.and_then(persistent);
+                if config.worker_providers.is_empty() { return Err("실제 워커 공급자를 하나 이상 선택해 주세요.".into()); }
+                let mut allowed_agents: Vec<_> = host.live.iter().filter(|l| l.capture.workspace == workspace_id).filter_map(|l| l.agent.as_ref()).filter(|a| config.worker_providers.contains(&a.provider)).cloned().collect();
+                allowed_agents.dedup();
+                if config.worker_providers.iter().any(|provider| !allowed_agents.iter().any(|a| &a.provider == provider)) { return Err("선택한 워커 공급자의 실제 모델·강도 설정을 확인할 수 없습니다.".into()); }
+                let worker = allowed_agents.first().cloned().ok_or("현재 실행 중인 워커 공급자를 선택해 주세요.")?;
+                let p = host.projects.get_mut(&workspace_id).unwrap();
+                let next = work::ProjectConfig { workspace_id: WorkspaceId(workspace_id.clone()), revision: p.snapshot.config.revision.next().ok_or("설정 리비전 한도입니다.")?, name: config.name.trim().into(), folder: actual_folder.to_owned(), main_agent: selection, worker_agent: worker, max_workers: config.parallel_limit, confirm_plan: true, use_worktrees: config.use_worktrees };
+                next.validate().map_err(|e| e.to_string())?;
+                let mut policy = p.policy(); policy.config_revision = next.revision; policy.project_folder = next.folder.clone(); policy.allowed_agents = allowed_agents.clone(); policy.allowed_scope_roots = config.allowed_scope_roots.clone(); policy.max_workers = next.max_workers;
+                policy.validate_config(&next).map_err(|e| e.to_string())?;
+                p.snapshot.config = next; p.snapshot.main_binding = main_binding; p.scopes = config.allowed_scope_roots; p.allowed_agents = allowed_agents;
+                let scopes = serde_json::to_string(&p.scopes).map_err(|e| e.to_string())?;
+                set_draft(p, "settings:scopes", &scopes, false)?;
+                set_draft(p, "settings:agents", &serde_json::to_string(&p.allowed_agents).map_err(|e| e.to_string())?, false)?;
+                p.request = None; p.proposal = None; p.confirmed = None; p.dirty();
+                host.save(&workspace_id, None, Some(id.into()))?;
+                return Ok(());
+            }
+            cc::Intent::Submit { target, text } => {
+                work::validate_input(&text).map_err(|e| e.to_string())?;
+                if host.inputs.values().any(|pending| pending.target == target) { return Err("이 대상의 입력 승인 응답을 기다리고 있습니다. 자동 재전송하지 않습니다.".into()); }
+                let live = host.route(&target).ok_or("입력 대상의 현재 실행을 확인할 수 없습니다.")?.clone();
+                if live.capture.prompt.is_none() { return Err("현재 세션은 상관관계가 확인된 입력 승인 경로를 지원하지 않습니다.".into()); }
+                let key = draft_key(host, &target)?;
+                let is_main = host.projects.get(&target.workspace_id).is_some_and(|p| host.main_target(&target.workspace_id,p) == target);
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded || host.flight.is_some() { return Err("저장 또는 불러오기가 완료된 뒤 입력해 주세요.".into()); }
+                if p.snapshot.drafts.iter().any(|d| d.target_key == format!("operation:{id}")) || p.snapshot.goals.iter().any(|g| g.submission_id.0 == id) {
+                    return Err("이미 저장된 입력 ID입니다. 승인 상태가 불명확한 입력을 다시 보내지 않았습니다.".into());
+                }
+                let mut prompt = text.clone();
+                if is_main {
+                    let policy = p.policy(); policy.validate_config(&p.snapshot.config).map_err(|e| e.to_string())?;
+                    if live.agent.as_ref() != Some(&p.snapshot.config.main_agent) { return Err("메인 실행의 공급자 설정이 바뀌었습니다.".into()); }
+                    let mut state = p.state();
+                    let goal_id = state.submit_goal(work::SubmissionId::from_string(id.into()).map_err(|e| e.to_string())?, bounded(&text,256), text.clone()).map_err(|e| e.to_string())?;
+                    let goal = state.goals.iter().find(|g| g.id == goal_id).unwrap();
+                    let request = wm::plan::PlannerRequest::new(goal,&p.snapshot.config,&policy).map_err(|e| e.to_string())?.with_runtime_binding(binding(&live,target.session_id.as_deref().unwrap()).ok_or("현재 메인 실행 바인딩이 없습니다.")?).map_err(|e| e.to_string())?;
+                    prompt = request.to_prompt().map_err(|e| e.to_string())?;
+                    p.request = Some(request); p.proposal = None; p.set_state(state);
+                } else if let Some(task_id) = &target.task_id {
+                    let task = p.snapshot.tasks.iter().find(|t| &t.id.0 == task_id).ok_or("작업이 없습니다.")?;
+                    let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("작업의 현재 시도가 없습니다.")?;
+                    if attempt.runtime_binding.as_ref() != binding(&live,target.session_id.as_deref().unwrap()).as_ref() { return Err("작업의 현재 실행 대상이 바뀌었습니다.".into()); }
+                }
+                set_draft(p,&format!("operation:{id}"),&serde_json::to_string(&target).map_err(|e| e.to_string())?,true)?;
+                set_draft(p,&key,&text,true)?;
+                let revision = p.snapshot.config.revision;
+                let after = AfterSave { id: id.into(), input: Input { target: target.clone(), draft: text.clone(), dispatch: None }, prompt, config_revision: revision };
+                host.save(&target.workspace_id,Some(after),None)?;
+                return Ok(());
+            }
+            cc::Intent::InstallPlanJson { workspace_id, json } => {
+                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                let request = p.request.as_ref().ok_or("확인 중인 메인 계획 요청이 없습니다.")?;
+                let policy = p.policy();
+                let proposal = wm::provider_adapter::accept_manual_json(request,&json,&p.snapshot.config,&policy).map_err(|e| e.to_string())?;
+                let mut state = p.state();
+                wm::orchestrator::install_proposal(&mut state,&proposal,&p.snapshot.config,&policy).map_err(|e| e.to_string())?;
+                p.proposal = Some(proposal); p.set_state(state);
+                host.save(&workspace_id,None,Some(id.into()))?;
+                return Ok(());
+            }
+            cc::Intent::ConfirmPlan { workspace_id, goal_id } => {
+                let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if host.flight.is_some() || p.generation != p.saved_generation { return Err("배정안 저장이 완료된 뒤 확인해 주세요.".into()); }
+                let proposal = p.proposal.as_ref().ok_or("검증된 배정안이 없습니다.")?;
+                if proposal.plan().goal_id.0 != goal_id { return Err("배정안이 바뀌었습니다. 현재 배정안을 확인해 주세요.".into()); }
+                let mut state = p.state();
+                let confirmed = wm::orchestrator::confirm_proposal(&mut state,proposal,&p.snapshot.config,&p.policy()).map_err(|e| e.to_string())?;
+                p.confirmed = Some(confirmed); p.proposal = None; p.set_state(state);
+                host.save(&workspace_id,None,Some(id.into()))?;
+                return Ok(());
+            }
+            cc::Intent::DispatchTask { target } => {
+                let live = host.route(&target).ok_or("실행 세션을 명시적으로 선택해 주세요.")?.clone();
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if live.state != cc::TaskState::Queued || !live.cwd.as_deref().is_some_and(|cwd| same_folder(cwd,&p.snapshot.config.folder)) || persistent(&live) == p.snapshot.main_binding { return Err("선택한 세션은 현재 프로젝트 폴더의 유휴 워커가 아닙니다.".into()); }
+                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
+                if live.agent.as_ref() != Some(&task.assigned_agent) { return Err("워커 공급자·모델·강도가 배정안과 일치하지 않습니다.".into()); }
+                let confirmed = p.confirmed.as_ref().ok_or("먼저 현재 배정안을 확인해 주세요.")?;
+                let request = wm::dispatch::DispatchRequest { task_id: task.id.clone(), operation_id: work::OperationId::from_string(id.into()).map_err(|e| e.to_string())?, folder: wm::dispatch::DispatchFolder { path: p.snapshot.config.folder.clone(), worktree_owner: None }, persistent_binding: persistent(&live), runtime_binding: binding(&live,target.session_id.as_deref().unwrap()).ok_or("실행 세대가 확인되지 않습니다.")? };
+                let prepared = wm::dispatch::prepare_dispatch(&p.state(),&p.ledger,confirmed,request,&p.snapshot.config,&p.policy()).map_err(|e| e.to_string())?;
+                let prepared = match prepared { wm::dispatch::PrepareOutcome::Ready(prepared) => prepared, wm::dispatch::PrepareOutcome::Existing { attempt_id,delivery } => return Err(format!("이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",attempt_id.0)) };
+                let assignment = prepared.assignment;
+                p.set_state(prepared.next_state);
+                p.snapshot.outbox.push(stored::DispatchOutbox { attempt_id: assignment.attempt.id.clone(), operation_id: assignment.attempt.operation_id.clone(), state: stored::DispatchOutboxState::Pending });
+                let after = AfterSave { id: id.into(), prompt: assignment.prompt.clone(), input: Input { target: target.clone(), draft: String::new(), dispatch: Some(assignment) }, config_revision: p.snapshot.config.revision };
+                host.save(&target.workspace_id,Some(after),None)?;
+                return Ok(());
+            }
+            cc::Intent::Approval { .. } => return Err("이 실행의 정확한 승인 요청을 확인할 수 없습니다. 실제 세션의 승인 UI를 사용해 주세요.".into()),
+            cc::Intent::ConfirmResult { target, revision } => {
+                let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
+                let task = p.snapshot.tasks.iter().find(|t| Some(&t.id.0) == target.task_id.as_ref()).ok_or("작업이 없습니다.")?;
+                let attempt = task.current_attempt_id.as_ref().and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id)).ok_or("현재 시도가 없습니다.")?;
+                let result = task.result.as_ref().ok_or("검증된 결과가 없습니다.")?;
+                if result.revision.0.to_string() != revision { return Err("결과 리비전이 변경되었습니다.".into()); }
+                let event = work::WorkEvent { id: work::EventId::new(), workspace_id: WorkspaceId(target.workspace_id.clone()), task_id: task.id.clone(), attempt_id: attempt.id.clone(), runtime_binding: attempt.runtime_binding.clone().ok_or("현재 실행 바인딩이 없습니다.")?, sequence: attempt.last_event_sequence.saturating_add(1), kind: work::WorkEventKind::UserConfirmed { result_revision: result.revision } };
+                let mut state = p.state(); state.apply_event(event).map_err(|e| e.to_string())?; p.set_state(state);
+                host.save(&target.workspace_id,None,Some(id.into()))?;
+                return Ok(());
+            }
+        }
+        host.finish(id, cc::ReceiptStatus::Acknowledged, "요청을 적용했습니다.");
+        Ok(())
+    }
+    pub(super) fn pump_command_center(&mut self, ctx: &egui::Context) {
+        if !self.command_center_layout.available {
+            return;
+        }
+        let mut host = self.command_center.take().unwrap_or_else(|| {
+            Box::new(CommandCenterHost::new(self.data_dir().to_path_buf(), ctx))
+        });
+        let visible = self.command_center_layout.mode == layout::LayoutMode::CommandCenter;
+        if !visible
+            && host.flight.is_none()
+            && host.pending.is_empty()
+            && host.inputs.is_empty()
+            && host
+                .projects
+                .values()
+                .all(|p| p.generation == p.saved_generation)
+        {
+            if host.published {
+                if let Some(core) = &self.session_core {
+                    let _ = core.publish_work_snapshot(serde_json::Value::Null);
+                }
+                host.published = false;
+            }
+            self.command_center = Some(host);
+            return;
+        }
+        self.refresh_command_center_routes(&mut host);
+        if let Some((target, action)) = host.pending_git.take() {
+            if host
+                .route(&target)
+                .is_some_and(|route| self.command_center_route_focused(route))
+            {
+                self.apply_command_center_git_action(ctx, action);
+            }
+        }
+        if let Some((target, tab)) = host.aux_loading.clone() {
+            if let Some(route) = host
+                .route(&target)
+                .filter(|route| self.command_center_route_focused(route))
+                .cloned()
+            {
+                self.sync_session_aux_scope();
+                if tab == cc::DetailTab::Git {
+                    self.request_git_panel_io_at(
+                        ctx,
+                        route.cwd.map(PathBuf::from),
+                        ui::git_panel::GitPanelIoRequest::Snapshot,
+                    );
+                }
+                if tab == cc::DetailTab::History {
+                    self.enter_work_history_tab();
+                }
+                host.aux_ready = Some(target);
+                host.aux_loading = None;
+            }
+        }
+        let mut send: Option<(FleetPromptTarget, String, String)> = None;
+        if let Some(result) = host.repository.try_recv() {
+            let flight = host.flight.take();
+            match (flight, result) {
+                (
+                    Some(Flight::Load { workspace, token }),
+                    Ok(RepositoryResult::Loaded {
+                        workspace_id,
+                        token: found,
+                        result,
+                    }),
+                ) if workspace_id.0 == workspace && found == token => {
+                    match result {
+                        Ok(record) => {
+                            let p = host.projects.get_mut(&workspace).unwrap();
+                            if let Some(record) = record {
+                                let preserved: Vec<_> = p
+                                    .snapshot
+                                    .drafts
+                                    .iter()
+                                    .filter(|d| !d.target_key.starts_with("settings:"))
+                                    .cloned()
+                                    .collect();
+                                p.revision = Some(record.revision);
+                                p.snapshot = record.snapshot;
+                                for draft in preserved {
+                                    if let Some(existing) = p
+                                        .snapshot
+                                        .drafts
+                                        .iter_mut()
+                                        .find(|d| d.target_key == draft.target_key)
+                                    {
+                                        *existing = draft;
+                                    } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
+                                        p.snapshot.drafts.push(draft);
+                                    }
+                                }
+                                p.scopes = p
+                                    .snapshot
+                                    .drafts
+                                    .iter()
+                                    .find(|d| d.target_key == "settings:scopes")
+                                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                                    .unwrap_or_default();
+                                p.allowed_agents = p
+                                    .snapshot
+                                    .drafts
+                                    .iter()
+                                    .find(|d| d.target_key == "settings:agents")
+                                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                                    .unwrap_or_else(|| {
+                                        vec![p.snapshot.config.worker_agent.clone()]
+                                    });
+                                // Recovery never replays an operation whose writer ACK was lost.
+                                for outbox in &mut p.snapshot.outbox {
+                                    if matches!(
+                                        outbox.state,
+                                        stored::DispatchOutboxState::Pending
+                                            | stored::DispatchOutboxState::Admitted
+                                    ) {
+                                        outbox.state = stored::DispatchOutboxState::Uncertain;
+                                    }
+                                }
+                                for task in &mut p.snapshot.tasks {
+                                    if task.current_attempt_id.is_some()
+                                        && !matches!(
+                                            task.state,
+                                            work::WorkState::Completed
+                                                | work::WorkState::Failed
+                                                | work::WorkState::Cancelled
+                                        )
+                                    {
+                                        task.state = work::WorkState::ObservationUnknown;
+                                    }
+                                }
+                                for attempt in &mut p.snapshot.attempts {
+                                    if !matches!(
+                                        attempt.state,
+                                        work::WorkState::Completed
+                                            | work::WorkState::Failed
+                                            | work::WorkState::Cancelled
+                                    ) {
+                                        attempt.state = work::WorkState::ObservationUnknown;
+                                    }
+                                }
+                                p.dirty();
+                            }
+                            p.loaded = true;
+                            p.storage_blocked = false;
+                            if let Some(goal) = p
+                                .snapshot
+                                .goals
+                                .iter()
+                                .rev()
+                                .find(|g| g.state == work::WorkState::PlanReview)
+                            {
+                                p.request = wm::plan::PlannerRequest::new(
+                                    goal,
+                                    &p.snapshot.config,
+                                    &p.policy(),
+                                )
+                                .ok();
+                            }
+                            let target = host
+                                .main_target(&workspace, host.projects.get(&workspace).unwrap());
+                            if let Some(draft) = host.projects[&workspace]
+                                .snapshot
+                                .drafts
+                                .iter()
+                                .find(|d| d.target_key == "main")
+                            {
+                                host.ui.set_draft(target, draft.text.clone());
+                            }
+                        }
+                        Err(_) => {
+                            if let Some(p) = host.projects.get_mut(&workspace) {
+                                p.storage_blocked = true;
+                            }
+                            host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
+                        }
+                    }
+                }
+                (
+                    Some(Flight::Save {
+                        workspace,
+                        generation,
+                        after,
+                        receipt,
+                    }),
+                    Ok(RepositoryResult::Saved {
+                        workspace_id,
+                        edit_generation,
+                        result,
+                    }),
+                ) if workspace_id.0 == workspace && edit_generation == generation => match result {
+                    Ok(stored::SaveOutcome::Saved { revision }) => {
+                        if let Some(p) = host.projects.get_mut(&workspace) {
+                            p.ack_saved(revision, generation);
+                        }
+                        if let Some(after) = after {
+                            let live = host.route(&after.input.target).cloned();
+                            let p = host.projects.get_mut(&workspace).unwrap();
+                            let valid = p.snapshot.config.revision == after.config_revision
+                                && live.as_ref().is_some_and(|l| l.capture.prompt.is_some());
+                            if valid {
+                                let mut allowed = true;
+                                if let Some(assignment) = &after.input.dispatch {
+                                    allowed = p.ledger.record_durable(assignment.clone()).is_ok()
+                                        && p.ledger.claim_send(&assignment.attempt.operation_id);
+                                }
+                                if allowed {
+                                    let prompt_target = live.unwrap().capture.prompt.unwrap();
+                                    send = Some((prompt_target, after.prompt, after.id.clone()));
+                                    host.inputs.insert(after.id, after.input);
+                                } else {
+                                    host.reject(&after.id,"실행 요청은 이미 처리되었거나 유효하지 않습니다. 다시 보내지 않았습니다.");
+                                }
+                            } else {
+                                host.finish(&after.id,cc::ReceiptStatus::Uncertain,"저장 후 실행 대상 또는 설정이 바뀌었습니다. 입력을 보내지 않았습니다.");
+                            }
+                        }
+                        if let Some(id) = receipt {
+                            host.finish(
+                                &id,
+                                cc::ReceiptStatus::Acknowledged,
+                                "프로젝트 상태를 저장했습니다.",
+                            );
+                        }
+                    }
+                    Ok(stored::SaveOutcome::Conflict { .. }) | Err(_) => {
+                        if let Some(p) = host.projects.get_mut(&workspace) {
+                            p.storage_blocked = true;
+                        }
+                        if let Some(after) = after {
+                            if let Some(assignment) = &after.input.dispatch {
+                                if let Some(p) = host.projects.get_mut(&workspace) {
+                                    apply_delivery_outcome(
+                                        p,
+                                        assignment,
+                                        ui::composer::PromptAdmissionOutcome::Rejected,
+                                    );
+                                }
+                            }
+                            host.reject(
+                                &after.id,
+                                "상태 저장에 실패하여 입력을 보내지 않았습니다. 초안은 보존됩니다.",
+                            );
+                        }
+                        if let Some(id) = receipt {
+                            host.reject(&id,"상태 저장에 실패했습니다. 다른 앱의 변경 또는 저장소 상태를 확인해 주세요.");
+                        }
+                        host.status =
+                            "프로젝트 저장에 실패했습니다. 현재 초안과 실행 상태는 보존됩니다."
+                                .into();
+                    }
+                },
+                (flight, _) => {
+                    if let Some(Flight::Save {
+                        workspace,
+                        after,
+                        receipt,
+                        ..
+                    }) = flight
+                    {
+                        if let Some(p) = host.projects.get_mut(&workspace) {
+                            p.storage_blocked = true;
+                        }
+                        if let Some(after) = after {
+                            if let Some(assignment) = &after.input.dispatch {
+                                if let Some(p) = host.projects.get_mut(&workspace) {
+                                    apply_delivery_outcome(
+                                        p,
+                                        assignment,
+                                        ui::composer::PromptAdmissionOutcome::Rejected,
+                                    );
+                                }
+                            }
+                            host.reject(
+                                &after.id,
+                                "저장 응답을 확인할 수 없어 입력을 보내지 않았습니다.",
+                            );
+                        }
+                        if let Some(id) = receipt {
+                            host.reject(&id, "저장 응답을 확인할 수 없습니다.");
+                        }
+                    }
+                    host.status = "작업 저장 worker의 응답을 확인할 수 없습니다.".into();
+                }
+            }
+        }
+        // Mutations are staged by render and run here, through the same guarded host pipeline.
+        if host.flight.is_none()
+            && let Some((id, intent)) = host.pending.pop_front()
+        {
+            if let Err(error) = self.command_center_intent(&mut host, &id, intent) {
+                host.reject(&id, error);
+            }
+        }
+        if host.flight.is_none() && send.is_none() {
+            if let Some(workspace) = host
+                .projects
+                .iter()
+                .find(|(_, p)| !p.loaded && !p.storage_blocked)
+                .map(|(id, _)| id.clone())
+            {
+                host.next_token = host.next_token.saturating_add(1);
+                let token = host.next_token;
+                if host
+                    .repository
+                    .try_request(RepositoryJob::Load {
+                        workspace_id: WorkspaceId(workspace.clone()),
+                        token,
+                    })
+                    .is_ok()
+                {
+                    host.flight = Some(Flight::Load { workspace, token });
+                }
+            } else if let Some(workspace) = host
+                .projects
+                .iter()
+                .find(|(_, p)| p.loaded && !p.storage_blocked && p.generation != p.saved_generation)
+                .map(|(id, _)| id.clone())
+            {
+                let _ = host.save(&workspace, None, None);
+            }
+        }
+        self.command_center = Some(host);
+        if let Some((target, prompt, id)) = send {
+            self.broadcast_prompt_to(
+                &target,
+                &prompt,
+                PromptDeliveryOrigin::CommandCenter {
+                    automatic: self
+                        .command_center
+                        .as_ref()
+                        .and_then(|h| h.inputs.get(&id))
+                        .is_some_and(|input| input.dispatch.is_some()),
+                    operation_id: id,
+                },
+            );
+        }
+        let generations: Vec<_> = self
+            .command_center
+            .as_ref()
+            .unwrap()
+            .projects
+            .iter()
+            .map(|(id, p)| (id.clone(), p.generation, p.loaded))
+            .collect();
+        let dirty = self
+            .command_center
+            .as_ref()
+            .is_some_and(|h| h.publication_dirty || h.generations != generations || !h.published);
+        if dirty && visible {
+            if let Some(core) = &self.session_core {
+                if let Ok(value) = serde_json::to_value(self.command_center_snapshot()) {
+                    let _ = core.publish_work_snapshot(value);
+                }
+            }
+            if let Some(host) = self.command_center.as_mut() {
+                host.published = true;
+                host.publication_dirty = false;
+                host.generations = generations;
+            }
+        } else if !visible && self.command_center.as_ref().is_some_and(|h| h.published) {
+            if let Some(core) = &self.session_core {
+                let _ = core.publish_work_snapshot(serde_json::Value::Null);
+            }
+            self.command_center.as_mut().unwrap().published = false;
+        }
+    }
+    pub(super) fn command_center_input_outcome(
+        &mut self,
+        id: &str,
+        outcome: ui::composer::PromptAdmissionOutcome,
+    ) {
+        let Some(mut host) = self.command_center.take() else {
+            return;
+        };
+        let Some(input) = host.inputs.remove(id) else {
+            self.command_center = Some(host);
+            return;
+        };
+        let accepted = outcome == ui::composer::PromptAdmissionOutcome::Accepted;
+        let unknown = outcome == ui::composer::PromptAdmissionOutcome::Unknown;
+        if let Some(p) = host.projects.get_mut(&input.target.workspace_id) {
+            if let Some(assignment) = &input.dispatch {
+                apply_delivery_outcome(p, assignment, outcome);
+            }
+        }
+        let key = draft_key(&host, &input.target).ok();
+        if accepted && clear_admitted_draft(&mut host.ui, &input.target, &input.draft) {
+            if let (Some(key), Some(p)) = (key, host.projects.get_mut(&input.target.workspace_id)) {
+                let _ = set_draft(p, &key, "", false);
+            }
+        }
+        host.finish(
+            id,
+            if accepted {
+                cc::ReceiptStatus::Acknowledged
+            } else if unknown {
+                cc::ReceiptStatus::Uncertain
+            } else {
+                cc::ReceiptStatus::Rejected
+            },
+            if accepted {
+                "현재 실행의 입력 승인을 확인했습니다."
+            } else if unknown {
+                "입력 승인 여부를 확인할 수 없습니다. 자동 재전송하지 않습니다."
+            } else {
+                "현재 실행이 입력을 거부했습니다. 초안은 보존됩니다."
+            },
+        );
+        // Keep unknown operations live for a correlated late ACK and block implicit retry.
+        if unknown {
+            host.inputs.insert(id.into(), input);
+        }
+        self.command_center = Some(host);
+        self.egui_ctx.request_repaint();
+    }
+    fn command_center_route_focused(&self, route: &LiveRoute) -> bool {
+        if route.capture.workspace != self.active.id {
+            return false;
+        }
+        match &route.capture.target {
+            FleetTarget::Pty { tab, pane, session } => {
+                self.active.workspace_ui.mux().is_some_and(|mux| {
+                    mux.active_tab.as_ref() == Some(tab)
+                        && mux.focused_pane.as_ref() == Some(pane)
+                        && mux.tabs.iter().any(|t| {
+                            &t.id == tab
+                                && t.panes
+                                    .iter()
+                                    .any(|p| &p.id == pane && p.session_id == Some(*session))
+                        })
+                })
+            }
+            FleetTarget::Structured { .. } => false,
+        }
+    }
+    fn apply_command_center_git_action(
+        &mut self,
+        ctx: &egui::Context,
+        action: ui::git_panel::GitPanelAction,
+    ) {
+        use ui::git_panel::{GitPanelAction as A, GitPanelIoRequest as R};
+        match action {
+            A::Refresh => self.request_git_panel_io_at(
+                ctx,
+                self.session_aux.current.git_panel_cwd.clone(),
+                R::Snapshot,
+            ),
+            A::OpenRemoteBranch => self.open_git_panel_remote(ctx),
+            A::ShowFileDiff { rel_path, mode } => {
+                let view = &mut self.session_aux.current;
+                view.diff_viewer_ui.open(rel_path.clone(), mode);
+                view.diff_viewer_ui
+                    .set_path_target(view.git_panel_ui.path_target(&rel_path, mode));
+                self.request_git_panel_io_at(
+                    ctx,
+                    self.session_aux.current.git_panel_cwd.clone(),
+                    R::FileDiff { rel_path, mode },
+                );
+            }
+            A::LoadCommitFiles { sha } => self.request_git_panel_io_at(
+                ctx,
+                self.session_aux.current.git_panel_cwd.clone(),
+                R::CommitFiles { sha },
+            ),
+            A::OpenWorktreeShell { path } => {
+                self.stage_workspace_controller_action(WorkspaceControllerAction::SpawnShellAt {
+                    cwd: Some(path),
+                });
+            }
+            A::InsertPath { path } => {
+                if let Some(session) = self.active.workspace_ui.focused_session() {
+                    let bytes = ui::workspace::path_insert_paste_bytes(
+                        &path,
+                        self.active.workspace_ui.session_shell_kind(session),
+                        self.active.workspace_ui.session_bracketed_paste(session),
+                    );
+                    self.stage_workspace_controller_action(WorkspaceControllerAction::Runtime(
+                        runtime::RuntimeCommand::WriteInput { session, bytes },
+                    ));
+                }
+            }
+            A::RevealInFinder { path } => {
+                if self.pending_app_host_action.is_none()
+                    && let Some(folder) = existing_reveal_folder(&path)
+                {
+                    self.pending_app_host_action = Some(AppHostIoAction::OpenPath(folder));
+                }
+            }
+        }
+    }
+    pub(super) fn show_command_center(&mut self, ui: &mut egui::Ui) {
+        let snapshot = self.command_center_snapshot();
+        let Some(mut host) = self.command_center.take() else {
+            return;
+        };
+        let intents = cc::show(ui, &mut host.ui, &snapshot);
+        for intent in intents {
+            host.enqueue(uuid::Uuid::new_v4().to_string(), intent);
+        }
+        let slot = host
+            .ui
+            .terminal_rect
+            .zip(host.ui.terminal_target.clone())
+            .and_then(|(rect, target)| host.route(&target).cloned().map(|route| (rect, route)));
+        let text = self.i18n.clone();
+        let name = self
+            .workspaces
+            .iter()
+            .find(|ws| ws.id == self.active.id)
+            .map(Self::workspace_display_name);
+        self.active.workspace_ui.set_project_name(name);
+        self.active
+            .workspace_ui
+            .set_ui_scale(self.config.ui.ui_scale);
+        self.active
+            .workspace_ui
+            .set_agent_send_presets(self.config.ui.agent_send_presets.clone());
+        let events: Vec<_> = self.active.pending_events.drain(..).collect();
+        let mut rendered = false;
+        if let Some((rect, route)) = slot
+            && route.capture.workspace == self.active.id
+            && let FleetTarget::Pty { tab, pane, session } = &route.capture.target
+        {
+            let focused = self.active.workspace_ui.mux().is_some_and(|mux| {
+                mux.active_tab.as_ref() == Some(tab)
+                    && mux.focused_pane.as_ref() == Some(pane)
+                    && mux.tabs.iter().any(|t| {
+                        &t.id == tab
+                            && t.panes
+                                .iter()
+                                .any(|p| &p.id == pane && p.session_id == Some(*session))
+                    })
+            });
+            if focused {
+                let mut terminal = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .id_salt("command-center-native-terminal"),
+                );
+                terminal.set_clip_rect(rect.intersect(ui.clip_rect()));
+                let output = self.active.workspace_ui.show_with_input(
+                    &mut terminal,
+                    &self.config.terminal,
+                    &events,
+                    &text,
+                    !host.ui.composer_focused,
+                );
+                if let Some((kind, intent)) = output.aux_tab_intent {
+                    match kind {
+                        ui::workspace::PaneAuxTabKind::History => {
+                            self.apply_work_history_tab_intent(intent)
+                        }
+                        ui::workspace::PaneAuxTabKind::Git => {
+                            self.apply_git_tab_intent(ui.ctx(), intent)
+                        }
+                        ui::workspace::PaneAuxTabKind::Document(id) => {
+                            self.apply_document_tab_intent(id, intent)
+                        }
+                    }
+                }
+                self.frame_terminal_owner = if host.ui.composer_focused {
+                    FrameTerminalOwner::None
+                } else {
+                    FrameTerminalOwner::Primary
+                };
+                rendered = true;
+            }
+        }
+        if !rendered {
+            if let Some(target) = host.ui.terminal_target.clone() {
+                if host.route(&target).is_some()
+                    && !host
+                        .pending
+                        .iter()
+                        .any(|(_, i)| matches!(i,cc::Intent::OpenSession(t) if t == &target))
+                {
+                    host.enqueue(
+                        uuid::Uuid::new_v4().to_string(),
+                        cc::Intent::OpenSession(target),
+                    );
+                }
+            }
+            self.active
+                .workspace_ui
+                .update_hidden(ui.ctx(), &events, &text);
+            self.frame_terminal_owner = FrameTerminalOwner::None;
+        }
+        if let Some((rect, target)) = host.ui.aux_rect.zip(host.ui.aux_target.clone()) {
+            if host.aux_ready.as_ref() == Some(&target)
+                && host
+                    .route(&target)
+                    .is_some_and(|route| self.command_center_route_focused(route))
+            {
+                let mut aux = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .id_salt("command-center-native-aux"),
+                );
+                aux.set_clip_rect(rect.intersect(ui.clip_rect()));
+                aux.painter()
+                    .rect_filled(rect, 0.0, aux.visuals().panel_fill);
+                match host.ui.aux_tab {
+                    Some(cc::DetailTab::Git) => {
+                        if let Some(action) = self.render_git_tab_body(&mut aux, rect, &text, false)
+                        {
+                            host.pending_git = Some((target, action));
+                        }
+                    }
+                    Some(cc::DetailTab::History) => {
+                        let name = self
+                            .workspaces
+                            .iter()
+                            .find(|ws| ws.id == self.active.id)
+                            .map(Self::workspace_display_name)
+                            .unwrap_or_default();
+                        if let Some(action) =
+                            self.render_work_history_tab_body(&mut aux, rect, &name, None, &text)
+                        {
+                            self.pending_work_history_action = Some(action);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.command_center = Some(host);
+        self.active.workspace_ui.flush_render_side_effects(ui.ctx());
+        for runtime in self.warm.values_mut() {
+            runtime.workspace_ui.flush_render_side_effects(ui.ctx());
+        }
+        crate::native_key_monitor::discard_unclaimed_move_paste();
+        self.flush_workspace_terminal_protocol_tail(ui.ctx());
+        self.frame_stats.end();
+    }
+}
+fn same_folder(a: &str, b: &str) -> bool {
+    fn normalized(path: &str) -> Option<Vec<String>> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return None;
+        }
+        path.components()
+            .map(|c| match c {
+                std::path::Component::RootDir => Some("/".into()),
+                std::path::Component::Normal(s) => s.to_str().map(|s| s.nfc().collect()),
+                std::path::Component::CurDir => Some(String::new()),
+                _ => None,
+            })
+            .collect()
+    }
+    normalized(a)
+        .zip(normalized(b))
+        .is_some_and(|(a, b)| a == b)
+}
+
+fn apply_delivery_outcome(
+    p: &mut Project,
+    assignment: &wm::dispatch::DispatchAssignment,
+    outcome: ui::composer::PromptAdmissionOutcome,
+) {
+    let Some(binding) = assignment.attempt.runtime_binding.as_ref() else {
+        return;
+    };
+    let Some(current) = p
+        .snapshot
+        .attempts
+        .iter()
+        .find(|a| a.id == assignment.attempt.id && a.runtime_binding.as_ref() == Some(binding))
+    else {
+        return;
+    };
+    let accepted = outcome == ui::composer::PromptAdmissionOutcome::Accepted;
+    let unknown = outcome == ui::composer::PromptAdmissionOutcome::Unknown;
+    let kind = if accepted {
+        p.ledger.note_admitted(
+            &assignment.attempt.operation_id,
+            &assignment.attempt.id,
+            binding,
+        );
+        work::WorkEventKind::InputAdmitted {
+            operation_id: assignment.attempt.operation_id.clone(),
+        }
+    } else if unknown {
+        p.ledger.mark_uncertain(&assignment.attempt.operation_id);
+        work::WorkEventKind::ObservationLost
+    } else {
+        p.ledger.note_rejected(
+            &assignment.attempt.operation_id,
+            &assignment.attempt.id,
+            binding,
+        );
+        work::WorkEventKind::Failed {
+            message: "입력이 승인되지 않아 작업을 실행하지 않았습니다.".into(),
+        }
+    };
+    let event = work::WorkEvent {
+        id: work::EventId::new(),
+        workspace_id: assignment.task.workspace_id.clone(),
+        task_id: assignment.task.id.clone(),
+        attempt_id: assignment.attempt.id.clone(),
+        runtime_binding: binding.clone(),
+        sequence: current.last_event_sequence.saturating_add(1),
+        kind,
+    };
+    let mut state = p.state();
+    if matches!(state.apply_event(event), Ok(wm::ApplyOutcome::Applied)) {
+        p.set_state(state);
+    }
+    if let Some(outbox) = p
+        .snapshot
+        .outbox
+        .iter_mut()
+        .find(|o| o.operation_id == assignment.attempt.operation_id)
+    {
+        outbox.state = if accepted {
+            stored::DispatchOutboxState::Admitted
+        } else if unknown {
+            stored::DispatchOutboxState::Uncertain
+        } else {
+            stored::DispatchOutboxState::Acknowledged
+        };
+        p.dirty();
+    }
+}
+
+fn clear_admitted_draft(ui: &mut cc::UiState, target: &cc::RouteTarget, submitted: &str) -> bool {
+    if submitted.is_empty() || ui.draft(target) != submitted {
+        return false;
+    }
+    ui.clear_draft(target);
+    true
+}
+
+fn draft_key(host: &CommandCenterHost, target: &cc::RouteTarget) -> Result<String, String> {
+    let p = host
+        .projects
+        .get(&target.workspace_id)
+        .ok_or("프로젝트가 없습니다.")?;
+    if let Some(task) = &target.task_id {
+        if !p.snapshot.tasks.iter().any(|t| &t.id.0 == task) {
+            return Err("현재 프로젝트의 작업이 아닙니다.".into());
+        }
+        return Ok(format!("task:{task}"));
+    }
+    if host.main_target(&target.workspace_id, p) == *target {
+        return Ok("main".into());
+    }
+    let live = host
+        .route(target)
+        .ok_or("초안의 실행 대상이 바뀌었습니다.")?;
+    persistent(live)
+        .and_then(|b| serde_json::to_string(&b).ok())
+        .map(|b| format!("session:{b}"))
+        .ok_or_else(|| "세션 초안을 영구 바인딩할 수 없습니다.".into())
+}
+fn set_draft(p: &mut Project, key: &str, text: &str, uncertain: bool) -> Result<(), String> {
+    if let Some(draft) = p.snapshot.drafts.iter_mut().find(|d| d.target_key == key) {
+        draft.text = text.into();
+        draft.delivery_uncertain = uncertain;
+    } else {
+        if p.snapshot.drafts.len() >= work::WORK_DRAFT_MAX_COUNT {
+            return Err("초안 저장 한도입니다.".into());
+        }
+        p.snapshot.drafts.push(stored::WorkDraft {
+            target_key: key.into(),
+            text: text.into(),
+            delivery_uncertain: uncertain,
+        });
+    }
+    p.dirty();
+    Ok(())
+}
+fn work_state(state: work::WorkState) -> cc::TaskState {
+    use work::WorkState as W;
+    match state {
+        W::PlanReview => cc::TaskState::PlanReview,
+        W::Queued => cc::TaskState::Queued,
+        W::Running => cc::TaskState::Running,
+        W::WaitingApproval => cc::TaskState::WaitingApproval,
+        W::WaitingInput => cc::TaskState::WaitingInput,
+        W::ResultSubmitted => cc::TaskState::ResultSubmitted,
+        W::VerificationFailed => cc::TaskState::VerificationFailed,
+        W::AwaitingUserConfirmation => cc::TaskState::AwaitingUserConfirmation,
+        W::Completed => cc::TaskState::Completed,
+        W::Failed => cc::TaskState::Failed,
+        W::Cancelled => cc::TaskState::Cancelled,
+        W::ObservationUnknown => cc::TaskState::ObservationUnknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn host() -> CommandCenterHost {
+        CommandCenterHost::new(
+            std::env::temp_dir().join(format!("cc-inert-{}", uuid::Uuid::new_v4())),
+            &egui::Context::default(),
+        )
+    }
+    fn target() -> cc::RouteTarget {
+        cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            session_id: Some("opaque-current-route".into()),
+            task_id: None,
+        }
+    }
+    fn project() -> Project {
+        let ws = storage::WorkspaceRow {
+            id: "workspace-a".into(),
+            name: "A".into(),
+            path: "/real/project".into(),
+            created_at: String::new(),
+        };
+        Project {
+            snapshot: project_snapshot(&ws),
+            revision: None,
+            generation: 0,
+            saved_generation: 0,
+            loaded: true,
+            storage_blocked: false,
+            scopes: vec![],
+            allowed_agents: vec![],
+            request: None,
+            proposal: None,
+            confirmed: None,
+            ledger: Default::default(),
+        }
+    }
+    #[test]
+    fn operation_payload_and_unknown_receipt_cannot_be_replayed_after_receipt_eviction() {
+        let mut h = host();
+        let id = uuid::Uuid::new_v4().to_string();
+        let intent = cc::Intent::Submit {
+            target: target(),
+            text: "actual input".into(),
+        };
+        h.enqueue(id.clone(), intent.clone());
+        assert_eq!(h.pending.len(), 1);
+        h.pending.clear();
+        h.finish(&id, cc::ReceiptStatus::Uncertain, "writer ACK unknown");
+        for _ in 0..70 {
+            h.finish(
+                &uuid::Uuid::new_v4().to_string(),
+                cc::ReceiptStatus::Acknowledged,
+                "other",
+            );
+        }
+        assert_eq!(h.receipts.len(), 64);
+        h.enqueue(id.clone(), intent);
+        assert!(
+            h.pending.is_empty(),
+            "evicting display receipts cannot reopen an operation ID"
+        );
+        h.enqueue(
+            id,
+            cc::Intent::Submit {
+                target: target(),
+                text: "changed input".into(),
+            },
+        );
+        assert!(h.pending.is_empty());
+    }
+    #[test]
+    fn frequent_draft_changes_coalesce_without_consuming_operation_capacity() {
+        let mut h = host();
+        for n in 0..2048 {
+            h.enqueue(
+                uuid::Uuid::new_v4().to_string(),
+                cc::Intent::DraftChanged {
+                    target: target(),
+                    text: n.to_string(),
+                },
+            );
+        }
+        assert!(h.operations.is_empty());
+        assert_eq!(h.pending.len(), 1);
+        assert!(matches!(&h.pending[0].1,cc::Intent::DraftChanged { text,.. } if text == "2047"));
+    }
+    #[test]
+    fn saved_revision_ack_does_not_replace_newer_text_or_dirty_generation() {
+        let mut p = project();
+        set_draft(&mut p, "main", "saved text", true).unwrap();
+        let admitted_generation = p.generation;
+        let persisted = p.snapshot.clone();
+        set_draft(&mut p, "main", "new text while saving", false).unwrap();
+        p.ack_saved(
+            stored::ProjectRevision::new(1).unwrap(),
+            admitted_generation,
+        );
+        assert_eq!(p.snapshot.drafts[0].text, "new text while saving");
+        assert_eq!(persisted.drafts[0].text, "saved text");
+        assert!(p.generation > p.saved_generation);
+    }
+    #[test]
+    fn admission_only_clears_the_same_target_and_unchanged_draft() {
+        let mut state = cc::UiState::default();
+        let target = target();
+        state.set_draft(target.clone(), "submitted".into());
+        state.set_draft(target.clone(), "edited after submit".into());
+        assert!(!clear_admitted_draft(&mut state, &target, "submitted"));
+        assert_eq!(state.draft(&target), "edited after submit");
+        state.set_draft(target.clone(), "submitted".into());
+        assert!(clear_admitted_draft(&mut state, &target, "submitted"));
+        assert_eq!(state.draft(&target), "");
+    }
+    #[test]
+    fn native_dto_encodes_through_the_actual_permission_filtered_web_boundary() {
+        let config = cc::ProjectConfig {
+            name: "Actual project".into(),
+            directory: "/real/project".into(),
+            allowed_scope_roots: vec!["src".into()],
+            revision: "1".into(),
+            ..Default::default()
+        };
+        let snapshot = cc::Snapshot {
+            selected_workspace_id: Some("workspace-a".into()),
+            projects: vec![cc::Project {
+                id: "workspace-a".into(),
+                main_target: target(),
+                config: config.clone(),
+                sessions: vec![cc::Session {
+                    target: target(),
+                    terminal_session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    model: Some("observed-model".into()),
+                    effort: Some("observed-effort".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let value = serde_json::to_value(snapshot).unwrap();
+        for (input, approval) in [(true, true), (true, false), (false, true), (false, false)] {
+            assert!(web_remote::work::encode_frame(&value, input, approval).is_ok());
+        }
+        let intent = cc::Intent::SaveProject {
+            workspace_id: "workspace-a".into(),
+            config,
+        };
+        assert!(web_remote::work::validate_intent(
+            &serde_json::to_value(intent).unwrap()
+        ));
+        assert_eq!(bounded("한글문자", 7), "한글");
+    }
+    fn attempted() -> (Project, wm::dispatch::DispatchAssignment) {
+        let mut p = project();
+        let mut state = p.state();
+        let goal = state
+            .submit_goal(
+                work::SubmissionId::new(),
+                "Goal".into(),
+                "actual goal".into(),
+            )
+            .unwrap();
+        let task = work::Task {
+            workspace_id: state.workspace_id.clone(),
+            id: work::TaskId::new(),
+            goal_id: goal.clone(),
+            parent_task_id: None,
+            role: "actual role".into(),
+            scope: "src".into(),
+            assigned_agent: p.snapshot.config.worker_agent.clone(),
+            execution_device: None,
+            title: "Actual task".into(),
+            instructions: "actual instructions".into(),
+            acceptance_criteria: "actual criteria".into(),
+            state: work::WorkState::PlanReview,
+            current_attempt_id: None,
+            dependencies: vec![],
+            result: None,
+        };
+        let task_id = task.id.clone();
+        state
+            .install_plan(work::WorkPlan {
+                workspace_id: state.workspace_id.clone(),
+                goal_id: goal.clone(),
+                tasks: vec![task],
+            })
+            .unwrap();
+        state.confirm_plan(&goal).unwrap();
+        let binding = work::RuntimeBinding {
+            incarnation: work::RuntimeIncarnationId::new(),
+            session_id: runtime::SessionId(1),
+            execution_generation: 1,
+        };
+        state
+            .begin_attempt(
+                &task_id,
+                work::OperationId::new(),
+                p.snapshot.config.clone(),
+                p.snapshot.config.folder.clone(),
+                None,
+                binding,
+            )
+            .unwrap();
+        let assignment = wm::dispatch::DispatchAssignment {
+            task: state.tasks[0].clone(),
+            attempt: state.attempts[0].clone(),
+            source_results: vec![],
+            prompt: "actual prompt".into(),
+        };
+        p.set_state(state);
+        p.ledger.record_durable(assignment.clone()).unwrap();
+        assert!(p.ledger.claim_send(&assignment.attempt.operation_id));
+        p.snapshot.outbox.push(stored::DispatchOutbox {
+            attempt_id: assignment.attempt.id.clone(),
+            operation_id: assignment.attempt.operation_id.clone(),
+            state: stored::DispatchOutboxState::Pending,
+        });
+        (p, assignment)
+    }
+    #[test]
+    fn known_rejection_frees_attempt_capacity_while_unknown_never_retries() {
+        let (mut rejected, assignment) = attempted();
+        apply_delivery_outcome(
+            &mut rejected,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Rejected,
+        );
+        assert_eq!(rejected.snapshot.tasks[0].state, work::WorkState::Failed);
+        assert!(rejected.state().can_dispatch(&assignment.task.id));
+        assert_eq!(
+            rejected.snapshot.outbox[0].state,
+            stored::DispatchOutboxState::Acknowledged
+        );
+        let (mut unknown, assignment) = attempted();
+        apply_delivery_outcome(
+            &mut unknown,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Unknown,
+        );
+        assert_eq!(
+            unknown.snapshot.tasks[0].state,
+            work::WorkState::ObservationUnknown
+        );
+        assert!(!unknown.state().can_dispatch(&assignment.task.id));
+        assert_eq!(
+            unknown.snapshot.outbox[0].state,
+            stored::DispatchOutboxState::Uncertain
+        );
+    }
+    #[test]
+    fn admission_is_not_a_provider_turn_start_or_success() {
+        let (mut p, assignment) = attempted();
+        apply_delivery_outcome(
+            &mut p,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert_eq!(p.snapshot.tasks[0].state, work::WorkState::Queued);
+        assert!(p.snapshot.tasks[0].result.is_none());
+        assert!(!p.state().goal_is_complete(&assignment.task.goal_id));
+    }
+    #[test]
+    fn same_folder_handles_macos_unicode_and_lexical_components_without_symlink_claims() {
+        assert!(same_folder("/tmp/한글/./src/", "/tmp/한글/src"));
+        assert!(!same_folder("/tmp/a/../b", "/tmp/b"));
+        assert!(!same_folder("relative/path", "relative/path"));
+        assert!(!same_folder("/different-volume/한글", "/tmp/한글"));
+    }
+}

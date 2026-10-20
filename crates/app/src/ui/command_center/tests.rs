@@ -398,3 +398,43 @@ fn snapshot_and_exact_target_intents_roundtrip_without_ui_state() {
             .is_err()
     );
 }
+
+#[test]
+fn task_native_aux_and_terminal_preserve_detail_header_and_composer() {
+    let mut snapshot = fixture();
+    let mut task = Task {
+        target: snapshot.projects[0].main_target.clone(),
+        ..Default::default()
+    };
+    task.target.task_id = Some("task-a".into());
+    snapshot.projects[0].tasks.push(task);
+    let state = UiState {
+        active_workspace: snapshot.selected_workspace_id.clone(),
+        view: View::Task,
+        selected_task_id: Some("task-a".into()),
+        detail_tab: DetailTab::Git,
+        ..Default::default()
+    };
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            state,
+        );
+    harness.run();
+    let state = harness.state();
+    assert!(state.terminal_rect.is_none());
+    assert_eq!(
+        state.aux_target.as_ref().unwrap().task_id.as_deref(),
+        Some("task-a")
+    );
+    let layout = state.last_layout.unwrap();
+    assert!(state.aux_rect.unwrap().top() > layout.content.top() + 100.0);
+    harness.state_mut().detail_tab = DetailTab::Terminal;
+    harness.run();
+    let state = harness.state();
+    assert!(state.aux_rect.is_none());
+    assert!(state.terminal_rect.unwrap().top() > layout.content.top() + 100.0);
+}

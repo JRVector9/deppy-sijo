@@ -76,6 +76,15 @@ fn home(
     p: &Project,
     intents: &mut Vec<Intent>,
 ) {
+    if p.storage_retry.enabled {
+        ui.label(&p.storage_retry.reason);
+        if ui.button("저장 상태 다시 확인").clicked() {
+            intents.push(Intent::RetryStorage {
+                workspace_id: p.id.clone(),
+            });
+        }
+        rule(ui, snapshot);
+    }
     weak(
         ui,
         snapshot,
@@ -370,6 +379,14 @@ fn task_detail(
                 .clicked()
             {
                 state.detail_tab = tab;
+                if t.target.session_id.is_some() {
+                    match tab {
+                        DetailTab::Git => intents.push(Intent::OpenGit(t.target.clone())),
+                        DetailTab::History => intents.push(Intent::OpenHistory(t.target.clone())),
+                        DetailTab::Terminal => intents.push(Intent::OpenSession(t.target.clone())),
+                        _ => {}
+                    }
+                }
             }
         }
     });

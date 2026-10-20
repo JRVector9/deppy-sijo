@@ -96,6 +96,10 @@ pub struct Capability {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Session {
     #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
     pub terminal_session_id: Option<String>,
     pub target: RouteTarget,
     pub title: String,
@@ -172,6 +176,8 @@ pub struct ProjectConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
+    pub storage_retry: Capability,
+    #[serde(default)]
     pub manual_plan: Capability,
     #[serde(default)]
     pub planner_prompt: Option<String>,
@@ -246,6 +252,9 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    RetryStorage {
+        workspace_id: String,
+    },
     SelectProject {
         workspace_id: String,
     },
@@ -321,6 +330,9 @@ pub struct UiState {
     /// Native terminal host slot. Set only for a terminal view with an exact session target.
     pub terminal_rect: Option<egui::Rect>,
     pub terminal_target: Option<RouteTarget>,
+    pub aux_rect: Option<egui::Rect>,
+    pub aux_target: Option<RouteTarget>,
+    pub aux_tab: Option<DetailTab>,
     task_workers: BTreeMap<String, Option<String>>,
     plan_json: BTreeMap<String, String>,
     active_workspace: Option<String>,
@@ -744,7 +756,28 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot) -> Vec<
             }
         })
         .filter(|target| target.session_id.is_some());
-    state.terminal_rect = state.terminal_target.as_ref().map(|_| layout.content);
+    let native_rect = if state.view == View::Task {
+        egui::Rect::from_min_max(
+            egui::pos2(
+                layout.content.left() + 16.0,
+                (layout.content.top() + 146.0).min(layout.content.bottom()),
+            ),
+            layout.content.max - egui::vec2(16.0, 8.0),
+        )
+    } else {
+        layout.content
+    };
+    state.terminal_rect = state.terminal_target.as_ref().map(|_| native_rect);
+    state.aux_target = p
+        .and_then(|p| {
+            (state.view == View::Task
+                && matches!(state.detail_tab, DetailTab::Git | DetailTab::History))
+            .then(|| selected_task(state, p).map(|t| t.target.clone()))
+            .flatten()
+        })
+        .filter(|t| t.session_id.is_some());
+    state.aux_rect = state.aux_target.as_ref().map(|_| native_rect);
+    state.aux_tab = state.aux_target.as_ref().map(|_| state.detail_tab);
     if !layout.mobile {
         state.left_drawer = false;
     }

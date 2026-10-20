@@ -328,6 +328,8 @@ fn filter(value: &mut Value, input: bool, approval: bool) {
                         "launch",
                         "create_main",
                         "create_worker",
+                        "close_worker",
+                        "revoke",
                         "save_settings",
                         "add_project",
                         "manage_devices",
@@ -411,7 +413,7 @@ mod tests {
     }
     #[test]
     fn work_read_only_projection_strips_controls_and_approval_command() {
-        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"create_main":{"enabled":true},"manual_plan":{"enabled":true},"storage_retry":{"enabled":true},"tasks":[{"create_worker":{"enabled":true},"approval":{"command":"private command"},"dispatch":{"enabled":true},"result_report":{"enabled":true},"verify_result":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[]});
+        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"create_main":{"enabled":true},"manual_plan":{"enabled":true},"storage_retry":{"enabled":true},"tasks":[{"create_worker":{"enabled":true},"close_worker":{"enabled":true},"approval":{"command":"private command"},"dispatch":{"enabled":true},"result_report":{"enabled":true},"verify_result":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[{"revoke":{"enabled":true}}]});
         let frame: Value =
             serde_json::from_str(&encode_frame(&value, false, false).unwrap()).unwrap();
         assert_eq!(frame["type"], "work_snapshot");
@@ -422,12 +424,18 @@ mod tests {
         for key in ["manual_plan", "storage_retry", "create_main"] {
             assert_eq!(frame["snapshot"]["projects"][0][key]["enabled"], false);
         }
-        for key in ["result_report", "verify_result", "create_worker"] {
+        for key in [
+            "result_report",
+            "verify_result",
+            "create_worker",
+            "close_worker",
+        ] {
             assert_eq!(
                 frame["snapshot"]["projects"][0]["tasks"][0][key]["enabled"],
                 false
             );
         }
+        assert_eq!(frame["snapshot"]["devices"][0]["revoke"]["enabled"], false);
         assert!(frame["snapshot"]["projects"][0]["tasks"][0]["approval"].is_null());
         assert_eq!(value["projects"][0]["main_input"]["enabled"], true);
     }

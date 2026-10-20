@@ -6,6 +6,9 @@
 - Persist work in a separate sidecar and admit local or explicitly granted remote workers through durable operation identities. Recover uncertain remote receipts by read-only lookup without replaying work.
 - Add pinned, project-scoped TLS worker connections, exact owned-worker termination, and read-only remote terminal views in the PWA and paired Relay shell.
 - Preserve mobile remote scroll positions and resume read-only observation after lost receipts while retaining mutating-operation fences.
+- Restore the approved native row, drawer, footer and settings dimensions, and the PWA monitor, MAIN/CHECK/LIVE and exact terminal navigation. Preserve focused controls and scroll positions across snapshots.
+- Keep per-goal review evidence with explicit current-policy reconfirmation after recovery, preserve productive attempts, and evict only clean completed project caches.
+- Bind supported structured command approvals to the exact live owner, turn and provider request, fence actual writes against revocation, and defer unsupported execution scopes to the original session.
 
 This branch has no distributed release artifact. See [usage and capability boundaries](docs/command-center-v2.md) and [verification evidence](docs/qa/2026-10-20-command-center-v2-implementation.md).
 

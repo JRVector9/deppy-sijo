@@ -1,6 +1,6 @@
 | Priority | Location | Finding | Impact | Next step |
 | --- | --- | --- | --- | --- |
-| high | command_center_observe.rs:294 | 완료 처리한 작업의 지연 입력이 살아 있음 | 완료 뒤 원래 CLI에 지시가 전송될 수 있음 | 지연 전송·실제 입력 접수에서 attempt 유효성 재검사 |
+| low | command_center_observe.rs:294 | F01 기존 경합 재현 주장 철회 | 실제 host guard가 완료 처리를 차단함 | 지연 입력의 추가 방어 검사로 재분류 |
 | high | command_center_host.rs:1186 | 배정 확인이 단일 메모리 토큰임 | 재시작·다음 목표 확인 후 기존 대기 작업 배정 불가 | 목표별 확인 보존·검증된 복원 경로 제공 |
 | medium | ui/command_center/main.rs:500 | 검증 실패 상태의 새 워커 재시도 숨김 | 원격 작업의 수정 시도를 새로 시작할 수 없음 | host capability와 UI 표시 조건 통일 |
 | medium | web/shared/command-center.js:424 | 체크박스 포커스 중 snapshot 예외 | 설정 편집 중 상태 갱신 일부 중단 | 선택 범위를 지원하는 텍스트 입력에만 복원 |
@@ -16,15 +16,19 @@
 | medium | web/shared/command-center.js:414 | 메인의 CHECK·LIVE 영역 누락 | 확인할 작업과 최근 진행을 메인에서 볼 수 없음 | 주의 항목·작업별 최근 기록 렌더 |
 | medium | web/shared/command-center.js:446 | 상단 터미널 메뉴가 설정으로 대체됨 | 시안과 탐색 경로가 달라짐 | 정확한 세션의 터미널 메뉴 복원 |
 
+**수정 단계 정정(F01):** 실제 `command_center_remote::handoff_pending`은 원격뿐 아니라 로컬 `host.inputs`도 검사한다(remote.rs148–151). 기존 probe는 host intent를 거치지 않고 reducer를 직접 호출했으므로, 실제 사용자가 완료 뒤 입력을 받는 경합을 입증하지 못했다. F01의 high 분류·재현 주장을 철회하고 지연 입력의 방어 보강으로 재분류한다. 아래 원 리뷰는 당시 기록이며, 수정 결과는 별도 교정 보고서에 기록한다. 사용자에게 정정을 알렸다.
+
 # Command Center v2 병렬 코드·디자인 리뷰
 
-2026-10-20. **시안과 동일하게 구현됐다고 판단할 수 없다.** 재현·소스 확인한 주요 결함과 시안 불일치 **15건(높음2, 중간13)**이다. 네이티브·PWA·작업 실행/복구를 GPT-6.1-Sol/xhigh 서브에이전트 세 명이 병렬 검토했고, root가 핵심 경로와 증거를 다시 대조했다. 위 표의 `command_center*.rs`는 `crates/app/src/`, `ui/`는 `crates/app/src/ui/` 아래다.
+2026-10-20. **시안과 동일하게 구현됐다고 판단할 수 없다.** 재현·소스 확인한 주요 결함과 시안 불일치는 **정정 후14건(높음1, 중간13)**이며, 별도 F01은 방어 보강 항목이다. 네이티브·PWA·작업 실행/복구를 GPT-6.1-Sol/xhigh 서브에이전트 세 명이 병렬 검토했고, root가 핵심 경로와 증거를 다시 대조했다. 위 표의 `command_center*.rs`는 `crates/app/src/`, `ui/`는 `crates/app/src/ui/` 아래다.
 
 검토 대상은 `feat/agent-command-center-v2-20261020`의 **9c0a820a7805c4f25a1a6674f3b657fff464eb06**. 제품 소스는 최종 검사 source d2b4605c와 같다. 기준은 [승인 HTML](../mockups/multi-agent-command-center-v2-2026-10-20.html), [디자인 명세](../superpowers/specs/2026-10-20-command-center-v2-design.md), [원본 참조 manifest](../design/command-center-v2/reference.json)다. 승인 파일6개의 hash는 모두 일치했다. 검토 결과물과 handoff만 추가·변경했으며 제품 코드는 수정하지 않았다. 앱 시작/중지/재시작, 배포 빌드, 커밋, push, main merge는 하지 않았다.
 
 ## 1. 우선 고쳐야 할 동작
 
-**F01 — 완료 뒤 지연된 초기 입력이 전송되는 경합.** 저장 ACK에서의 `assignment_current` 검사는 host:1454–1460에 있지만, 이후 Codex NativeIdentity 조회를 기다리는 동안 입력이 `Observations.delayed`에 남는다. 동일 attempt를 수동 결과 등록 → 검증 → 최종 확인으로 완료할 수 있다. 콜백은 observe:283–323에서 세션·runtime·토큰·시간만 확인하며 완료된 attempt를 다시 검사하지 않는다. send:343–348도 입력 map과 cloud permit만 검사한다. `app.rs:33945–34108`의 실제 전송 경로와 runtime guard는 살아 있는 CLI/editor를 확인하지만 작업 완료 상태는 모른다. 따라서 여전히 idle인 원래 CLI라면 완료 표시 후에도 지시를 받을 수 있다.
+**F01 — 철회된 재현 주장: 방어 보강으로 재분류.** 아래 당시 분석은 실제 host의 `handoff_pending` 보호를 누락했다. 사용자가 완료 처리를 통과할 수 있다는 근거로 사용하지 않는다. 교정 결과는 [수정 보고서](2026-10-20-command-center-v2-fixes.md)에 기록한다.
+
+당시 주장: 저장 ACK에서의 `assignment_current` 검사는 host:1454–1460에 있지만, 이후 Codex NativeIdentity 조회를 기다리는 동안 입력이 `Observations.delayed`에 남는다. 동일 attempt를 수동 결과 등록 → 검증 → 최종 확인으로 완료할 수 있다. 콜백은 observe:283–323에서 세션·runtime·토큰·시간만 확인하며 완료된 attempt를 다시 검사하지 않는다. send:343–348도 입력 map과 cloud permit만 검사한다. `app.rs:33945–34108`의 실제 전송 경로와 runtime guard는 살아 있는 CLI/editor를 확인하지만 작업 완료 상태는 모른다. 따라서 여전히 idle인 원래 CLI라면 완료 표시 후에도 지시를 받을 수 있다.
 
 실제 reducer/콜백 소스를 사용한 별도 harness에서 Completed 뒤 broadcast 호출을 확인했다. 이어 실제 `InputAdmission`·`AgentInputGuard`와 직접 소유한 무해한 `/bin/sh`→`/bin/cat` PTY로 입력 접수·수신을 확인했다. 두 개의 분리된 증거이며 전체 앱/유료 Codex의 단일 E2E 실행을 했다는 뜻은 아니다. 수정은 **미해결 로컬 초기 입력이 있는 동안 결과 완료를 차단하거나 정확한 원 attempt의 입력 허가를 회수**하고, 지연 전송과 접수 시점에 동일성을 재검사해야 한다. 새 operation으로 자동 재전송해서 해결하면 안 된다.
 

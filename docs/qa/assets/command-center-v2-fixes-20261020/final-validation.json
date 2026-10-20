@@ -1,0 +1,787 @@
+{
+  "final_product_source": "d50160a65d3ac9715df6ad59ff8f2b7f0778ea0b",
+  "initial_integration_source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+  "cohort_note": "Initial full workspace and workspace lint precede provider-scope followup. Final full App+strict App lint on d50160a6 supersede the old App cohort; non-App product files unchanged. Initial runner source records launch commit: native render happened after protocol WIP began, so native evidence is verified by8exactUI source hashes and10byte-identicalselectedPNGs, not by the launch-commit label. Browser assets are byte-identical across these commits.",
+  "initial_gates": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 2.518,
+      "log": "/private/tmp/deppy-cc-fixes-final-fmt-20261020.log"
+    },
+    {
+      "name": "boundary",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-boundary"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 4.379,
+      "log": "/private/tmp/deppy-cc-fixes-final-boundary-20261020.log"
+    },
+    {
+      "name": "deps",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "check-deps"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 0.23,
+      "log": "/private/tmp/deppy-cc-fixes-final-deps-20261020.log"
+    },
+    {
+      "name": "i18n",
+      "command": [
+        "cargo",
+        "run",
+        "-p",
+        "xtask",
+        "--",
+        "i18n-check"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 71.675,
+      "log": "/private/tmp/deppy-cc-fixes-final-i18n-20261020.log"
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 27.78,
+      "log": "/private/tmp/deppy-cc-fixes-final-clippy-20261020.log"
+    },
+    {
+      "name": "workspace",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--",
+        "--test-threads=1"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 391.348,
+      "log": "/private/tmp/deppy-cc-fixes-final-workspace-20261020.log"
+    },
+    {
+      "name": "native",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "ui::command_center::tests::command_center_render_evidence",
+        "--bin",
+        "deppy-sijo",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 42.963,
+      "log": "/private/tmp/deppy-cc-fixes-final-native-20261020.log"
+    },
+    {
+      "name": "production",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "web-remote",
+        "--test",
+        "command_center_chrome",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 15.068,
+      "log": "/private/tmp/deppy-cc-fixes-final-production-20261020.log"
+    },
+    {
+      "name": "relaychrome",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "web-remote",
+        "--test",
+        "relay_shell_chrome",
+        "--",
+        "--ignored",
+        "--nocapture",
+        "--test-threads=1"
+      ],
+      "source": "36caca2ebeb5e7d0338e26e7f4f6d788eb53caed",
+      "exit": 0,
+      "seconds": 1.766,
+      "log": "/private/tmp/deppy-cc-fixes-final-relaychrome-20261020.log"
+    }
+  ],
+  "final_scope_gates": [
+    {
+      "name": "fmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--",
+        "--check"
+      ],
+      "source": "d50160a65d3ac9715df6ad59ff8f2b7f0778ea0b",
+      "exit": 0,
+      "seconds": 2.465,
+      "log": "/private/tmp/deppy-cc-final-scope-fmt-20261020.log"
+    },
+    {
+      "name": "app",
+      "command": [
+        "cargo",
+        "test",
+        "-p",
+        "deppy-sijo",
+        "--",
+        "--test-threads=1"
+      ],
+      "source": "d50160a65d3ac9715df6ad59ff8f2b7f0778ea0b",
+      "exit": 0,
+      "seconds": 141.483,
+      "log": "/private/tmp/deppy-cc-final-scope-app-20261020.log"
+    },
+    {
+      "name": "clippy",
+      "command": [
+        "cargo",
+        "clippy",
+        "-p",
+        "deppy-sijo",
+        "--all-targets",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "source": "d50160a65d3ac9715df6ad59ff8f2b7f0778ea0b",
+      "exit": 0,
+      "seconds": 0.266,
+      "log": "/private/tmp/deppy-cc-final-scope-clippy-20261020.log"
+    }
+  ],
+  "workspace_counts": {
+    "targets": 79,
+    "passed": 6069,
+    "failed": 0,
+    "ignored": 67,
+    "rows": [
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/agent_mcp-2a14f7785b649e2d)",
+        "passed": 92,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/audit-74f35264f4c20551)",
+        "passed": 65,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/auth-ebe2826210c03458)",
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/connector_contract-1680feb9147406e8)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/connector_service-a9827b8f6d3e4463)",
+        "passed": 83,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/connector_ui-241de05460285630)",
+        "passed": 35,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/deppy_core-069f9d987e05c88f)",
+        "passed": 20,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/main.rs (target/debug/deps/deppy_sijo-d32b867ee7cf329d)",
+        "passed": 3474,
+        "failed": 0,
+        "ignored": 40
+      },
+      {
+        "target": "Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-073c7c982f44275c)",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-aa9732062ce91c53)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-873fd157e0d380a8)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-777115552342bd9a)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/logging_policy.rs (target/debug/deps/logging_policy-b4ebd15a24f92ec8)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-ccdabc1c5a72ac41)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/http_client-08286015c759b14f)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/i18n-30f33c0fc75d7d06)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/mcp-8a4c991102cb0201)",
+        "passed": 105,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/main.rs (target/debug/deps/deppy_mcp_proxy-29a5da1323a52a07)",
+        "passed": 109,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/hook_task_prompt.rs (target/debug/deps/hook_task_prompt-3905a15ab640c56b)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/mcp_store-b4e318619e5faa93)",
+        "passed": 42,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/mux-54f69123258ba623)",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/persist-27401a6b0867f1a3)",
+        "passed": 29,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/platform-674bd4e461848e0d)",
+        "passed": 2,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/pty-c04b928f33c3a1f1)",
+        "passed": 70,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/relay_protocol-af0a12037e427b38)",
+        "passed": 13,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/relay_wire_vectors.rs (target/debug/deps/relay_wire_vectors-1c7ff82f32b31174)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/relay_server-06e42f74a13b48a9)",
+        "passed": 36,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/main.rs (target/debug/deps/relay_server-c29c0caccc19b6af)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/deploy_manifests.rs (target/debug/deps/deploy_manifests-c9a9ea10dfb22bb8)",
+        "passed": 6,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/shutdown.rs (target/debug/deps/shutdown-d779b4bf214fa22c)",
+        "passed": 3,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/transport_contract.rs (target/debug/deps/transport_contract-4598cdb10c06d3a1)",
+        "passed": 9,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/runtime-1030f435738a81b4)",
+        "passed": 420,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/secret-1f4efc7e9e7b21e1)",
+        "passed": 80,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/session-3c3183c695333ff5)",
+        "passed": 81,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/storage-aa01f4a1b0d930e2)",
+        "passed": 511,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/background_agent_lifecycle.rs (target/debug/deps/background_agent_lifecycle-b5ebac3221bc5f85)",
+        "passed": 8,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/storage_core-39914de22acfcb71)",
+        "passed": 7,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/terminal-0ccd4eb69cb2da3a)",
+        "passed": 138,
+        "failed": 0,
+        "ignored": 4
+      },
+      {
+        "target": "Running unittests src/lib.rs (target/debug/deps/web_remote-372f57d74e1f272b)",
+        "passed": 406,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/chrome_support_contract.rs (target/debug/deps/chrome_support_contract-8a9720597cbb5860)",
+        "passed": 1,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/cloud_results_chrome.rs (target/debug/deps/cloud_results_chrome-d65b9b3ab86eeb78)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/command_center_chrome.rs (target/debug/deps/command_center_chrome-4cc9806de0af3b6b)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/mobile_shell_chrome.rs (target/debug/deps/mobile_shell_chrome-b888a56cf16adec1)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/mobile_usability_chrome.rs (target/debug/deps/mobile_usability_chrome-d6f407c4a30b59e6)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/pwa_unified_chrome.rs (target/debug/deps/pwa_unified_chrome-bd9fe50c01ea037b)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      },
+      {
+        "target": "Running tests/relay_shell_chrome.rs (target/debug/deps/relay_shell_chrome-d9b6bd40d67c07cb)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/relay_shell_deploy.rs (target/debug/deps/relay_shell_deploy-f24090612e9a8ed6)",
+        "passed": 10,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/relay_webcrypto_vectors.rs (target/debug/deps/relay_webcrypto_vectors-9513ce2d781ac455)",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/transport_independence.rs (target/debug/deps/transport_independence-f8bc5741abfed486)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/viewer_core_chrome.rs (target/debug/deps/viewer_core_chrome-49092666882bae10)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/viewer_grapheme_chrome.rs (target/debug/deps/viewer_grapheme_chrome-4e84d00eb1f50136)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/viewer_history_chrome.rs (target/debug/deps/viewer_history_chrome-32eacda485394d50)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/viewer_readability_chrome.rs (target/debug/deps/viewer_readability_chrome-836b37c7165ac9ef)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/viewer_reading_chrome.rs (target/debug/deps/viewer_reading_chrome-43025b4ae495993f)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running unittests src/main.rs (target/debug/deps/xtask-537ca765e9401a35)",
+        "passed": 16,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests agent_mcp",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests audit",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests auth",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests connector_contract",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests connector_service",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests connector_ui",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests deppy_core",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests http_client",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests i18n",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests mcp",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests mcp_store",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests mux",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests persist",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests platform",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests pty",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests relay_protocol",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests relay_server",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests runtime",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests secret",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests session",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests storage",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests storage_core",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests terminal",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Doc-tests web_remote",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 0
+      }
+    ]
+  },
+  "final_app_counts": {
+    "targets": 7,
+    "passed": 3514,
+    "failed": 0,
+    "ignored": 43,
+    "rows": [
+      {
+        "target": "Running unittests src/main.rs (target/debug/deps/deppy_sijo-7f5cae03ddf8caf5)",
+        "passed": 3475,
+        "failed": 0,
+        "ignored": 40
+      },
+      {
+        "target": "Running tests/agent_state_boundary.rs (target/debug/deps/agent_state_boundary-ef54a28b68197f72)",
+        "passed": 4,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/alloc_phys_footprint_release.rs (target/debug/deps/alloc_phys_footprint_release-115b0d5515026305)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 1
+      },
+      {
+        "target": "Running tests/dotenv_launch_boundary.rs (target/debug/deps/dotenv_launch_boundary-2f1002f7dd50389b)",
+        "passed": 5,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/lazy_bounded_worker.rs (target/debug/deps/lazy_bounded_worker-1eb8001ea167b6c3)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/logging_policy.rs (target/debug/deps/logging_policy-2f9c9aef041acfdb)",
+        "passed": 15,
+        "failed": 0,
+        "ignored": 0
+      },
+      {
+        "target": "Running tests/scrollback_rss_end_to_end.rs (target/debug/deps/scrollback_rss_end_to_end-fc78830748a895da)",
+        "passed": 0,
+        "failed": 0,
+        "ignored": 2
+      }
+    ]
+  },
+  "shared_chrome": {
+    "ok": true,
+    "checks": 150,
+    "widths": [
+      390,
+      760,
+      1280,
+      1440
+    ],
+    "themes": [
+      "dark",
+      "light"
+    ]
+  },
+  "native": {
+    "png_count": 120,
+    "selected_byte_identical": 10,
+    "actual_app_render_passed": 1,
+    "ui_source_hashes": {
+      "crates/app/src/ui/command_center/devices.rs": "1dd01048683384f2a7676d75cddc2a799e5456ba7de76db1610d1737e538574c",
+      "crates/app/src/ui/command_center/layout.rs": "72125b3fb5d84347336cf11d16ee1835ce2de51d988551efe36d5e6d213f010e",
+      "crates/app/src/ui/command_center/main.rs": "e99d3a196c2bcb4ebf5fe2b511f660ebb162d7127976d88346a140f563029b8b",
+      "crates/app/src/ui/command_center/mod.rs": "7018fd0e39cb9e68cb33d0eead0f53b28ca8ba9f3e52aec14e4b4172e5d38929",
+      "crates/app/src/ui/command_center/server.rs": "1811d4386f1e3d599469ddd6a44354405102f6e7bbbb1b92f2b37e09f2b2932d",
+      "crates/app/src/ui/command_center/settings.rs": "20730725c43ba495896a623241de6e6e572b3fbe60049f3cd6c6a2105389b27e",
+      "crates/app/src/ui/command_center/tests.rs": "1785719d9922f1978046ca1156058bff6fa8603dfd3168b04018d6e2851c9a30",
+      "crates/app/src/ui/command_center/workers.rs": "7f23dea55a7865e41efab2ee7a3d0fca595354a1a13e8511e8893cf0c8010608"
+    }
+  },
+  "source_sha256": {
+    "crates/app/src/agent_session.rs": "a8c4fe43d26e6fbbe1d801d1d06ec8f0eea46533a6f17d635640661d9119f078",
+    "crates/app/src/codex_app_server.rs": "e6b35814fefff31a46a15fb5f6817cf923617ce86ddd6a53b50b21473829325a",
+    "crates/app/src/ui/agent_sessions.rs": "cabb53a59b32344f29600a6462e67addd199c1a412ed95eebad4f649e05292df",
+    "crates/app/src/command_center_approval.rs": "c9d862b27b59ebb40cc84a4f0ce07e1df44fb5f4ce8e40b5ce8b694f5a959a0b",
+    "crates/app/src/command_center_host.rs": "cb1a229047fee0585562f85973e84e3e2a7f11e87c399ec0f2eb2ccbb9aef753",
+    "web/shared/command-center.js": "ee53c89094d5b9f90394ec76c9d33ba5e410a00aac28e5fcff74912a57819af7",
+    "web/shared/command-center.css": "ba85ff7523126830d939d4d870e7d945eda3ba6a5d298d02bd659d60d072e1c9",
+    "crates/storage/src/work_management.rs": "67e06a534193dc587da41d4bca5e9c6a74cde4fed84b0a4d1a651470a2f83740",
+    "crates/app/src/ui/command_center/devices.rs": "1dd01048683384f2a7676d75cddc2a799e5456ba7de76db1610d1737e538574c",
+    "crates/app/src/ui/command_center/layout.rs": "72125b3fb5d84347336cf11d16ee1835ce2de51d988551efe36d5e6d213f010e",
+    "crates/app/src/ui/command_center/main.rs": "e99d3a196c2bcb4ebf5fe2b511f660ebb162d7127976d88346a140f563029b8b",
+    "crates/app/src/ui/command_center/mod.rs": "7018fd0e39cb9e68cb33d0eead0f53b28ca8ba9f3e52aec14e4b4172e5d38929",
+    "crates/app/src/ui/command_center/server.rs": "1811d4386f1e3d599469ddd6a44354405102f6e7bbbb1b92f2b37e09f2b2932d",
+    "crates/app/src/ui/command_center/settings.rs": "20730725c43ba495896a623241de6e6e572b3fbe60049f3cd6c6a2105389b27e",
+    "crates/app/src/ui/command_center/tests.rs": "1785719d9922f1978046ca1156058bff6fa8603dfd3168b04018d6e2851c9a30",
+    "crates/app/src/ui/command_center/workers.rs": "7f23dea55a7865e41efab2ee7a3d0fca595354a1a13e8511e8893cf0c8010608"
+  },
+  "not_run": [
+    "physical phone/multicomputer/provider paid-session E2E",
+    "user app restart or user database recovery",
+    "release packaging/version/bundle delivery",
+    "long-running production performance comparison"
+  ]
+}

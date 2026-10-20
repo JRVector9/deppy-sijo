@@ -317,9 +317,8 @@ impl ControllerState {
                 r.registration.id == registration.id && r.registration.workspace_id == workspace
             })
             .cloned();
-        let mut registry = self.registry.clone();
-        registry
-            .register(registration.clone())
+        self.registry
+            .check_registration_update(&registration)
             .map_err(|_| RemoteDeviceError::Conflict)?;
         let candidate = self.candidates.remove(index);
         let secret_id = format!("cc-device-token-{}", candidate.view.candidate_id);
@@ -337,7 +336,10 @@ impl ControllerState {
                 return Err(RemoteDeviceError::Persistence);
             }
         };
-        self.registry = registry;
+        // The live fence changes only after the sidecar transaction succeeds.
+        self.registry
+            .register(registration.clone())
+            .map_err(|_| RemoteDeviceError::Conflict)?;
         if let Some(old) = self
             .connections
             .iter()

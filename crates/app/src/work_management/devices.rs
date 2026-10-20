@@ -159,7 +159,7 @@ struct DeviceEntry {
     fence: Arc<AtomicBool>,
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct DeviceRegistry {
     entries: Vec<DeviceEntry>,
     leases: Vec<ExecutionLease>,
@@ -418,11 +418,26 @@ impl DeviceRegistry {
         );
         views
     }
-    pub fn register(&mut self, device: RegisteredDevice) -> Result<(), DeviceUnavailable> {
-        validate_registration(&device)?;
+    pub(crate) fn check_registration_update(
+        &self,
+        device: &RegisteredDevice,
+    ) -> Result<(), DeviceUnavailable> {
+        validate_registration(device)?;
         if self.viewers.iter().any(|v| v.0 == device.id) {
             return Err(DeviceUnavailable::ViewerOnly);
         }
+        if let Some(entry) = self.entries.iter().find(|e| e.registration.id == device.id) {
+            if entry.registration != *device && device.grant_epoch <= entry.registration.grant_epoch
+            {
+                return Err(DeviceUnavailable::Conflict);
+            }
+        } else if self.entries.len() + self.viewers.len() >= EXECUTION_DEVICE_MAX {
+            return Err(DeviceUnavailable::Full);
+        }
+        Ok(())
+    }
+    pub fn register(&mut self, device: RegisteredDevice) -> Result<(), DeviceUnavailable> {
+        self.check_registration_update(&device)?;
         if let Some(entry) = self
             .entries
             .iter_mut()
@@ -724,6 +739,35 @@ mod tests {
             folder: device.folder.clone(),
             agent: device.allowed_agents[0].clone(),
         }
+    }
+    #[test]
+    fn speculative_registration_validation_never_retires_the_live_grant() {
+        let mut registry = DeviceRegistry::default();
+        let device = registration();
+        registry.register(device.clone()).unwrap();
+        registry.observe(proof(&device), 10).unwrap();
+        let live = registry
+            .verified_devices(&device.workspace_id, 10)
+            .remove(0);
+        let mut proposed = device.clone();
+        proposed.grant_epoch += 1;
+        registry.check_registration_update(&proposed).unwrap();
+        assert!(
+            live.validate_fresh().is_ok(),
+            "uncommitted replacement cannot revoke the existing live grant"
+        );
+        assert!(
+            registry
+                .verified_devices(&device.workspace_id, 11)
+                .remove(0)
+                .validate_fresh()
+                .is_ok()
+        );
+        registry.register(proposed).unwrap();
+        assert!(
+            live.validate_fresh().is_err(),
+            "only committed replacement retires old proofs"
+        );
     }
     #[test]
     fn same_agent_profile_aliases_never_choose_an_unapproved_profile() {

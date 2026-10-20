@@ -184,6 +184,8 @@ pub struct ProjectConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
+    pub loaded: bool,
+    #[serde(default)]
     pub storage_retry: Capability,
     #[serde(default)]
     pub manual_plan: Capability,
@@ -260,6 +262,9 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    LoadProject {
+        workspace_id: String,
+    },
     ReportResult {
         target: RouteTarget,
         attempt_id: String,

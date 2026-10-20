@@ -93,6 +93,7 @@ enum Flight {
     Load {
         workspace: String,
         token: u64,
+        receipt: Option<String>,
     },
     Save {
         workspace: String,
@@ -109,6 +110,7 @@ pub(super) struct CommandCenterHost {
     repository: RepositoryWorker,
     flight: Option<Flight>,
     next_token: u64,
+    requested_loads: BTreeMap<String, String>,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
@@ -135,6 +137,7 @@ impl CommandCenterHost {
             repository: RepositoryWorker::new(data_dir, move || wake.request_repaint()),
             flight: None,
             next_token: 0,
+            requested_loads: BTreeMap::new(),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -663,7 +666,7 @@ impl App {
                     structured_final_response: false,
                     tool_execution_restricted: false,
                 });
-            snapshot.projects.push(cc::Project { storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            snapshot.projects.push(cc::Project { loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),
@@ -690,9 +693,12 @@ impl App {
         };
         if !matches!(
             intent,
-            cc::Intent::Submit { .. }
+            cc::Intent::LoadProject { .. }
+                | cc::Intent::Submit { .. }
                 | cc::Intent::Approval { .. }
                 | cc::Intent::ConfirmResult { .. }
+                | cc::Intent::ReportResult { .. }
+                | cc::Intent::VerifyResult { .. }
                 | cc::Intent::ConfirmPlan { .. }
                 | cc::Intent::DispatchTask { .. }
                 | cc::Intent::SaveProject { .. }
@@ -741,10 +747,19 @@ impl App {
             );
         }
         match intent {
+            cc::Intent::LoadProject { workspace_id } => {
+                let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
+                if !p.loaded {
+                    if host.requested_loads.len() >= 64 { return Err("프로젝트 불러오기 대기 한도입니다.".into()); }
+                    host.requested_loads.entry(workspace_id).or_insert_with(|| id.into());
+                    return Ok(());
+                }
+            }
             cc::Intent::RetryStorage { workspace_id } => {
                 if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 p.storage_blocked = false; p.loaded = false;
+                host.requested_loads.insert(workspace_id,id.into());
                 host.publication_dirty = true;
                 return Ok(());
             }
@@ -938,6 +953,7 @@ impl App {
         if !visible
             && host.flight.is_none()
             && host.pending.is_empty()
+            && host.requested_loads.is_empty()
             && host.inputs.is_empty()
             && host
                 .projects
@@ -994,88 +1010,108 @@ impl App {
             let flight = host.flight.take();
             match (flight, result) {
                 (
-                    Some(Flight::Load { workspace, token }),
+                    Some(Flight::Load {
+                        workspace,
+                        token,
+                        receipt,
+                    }),
                     Ok(RepositoryResult::Loaded {
                         workspace_id,
                         token: found,
                         result,
                     }),
-                ) if workspace_id.0 == workspace && found == token => match result {
-                    Ok(record) => {
-                        let p = host.projects.get_mut(&workspace).unwrap();
-                        if let Some(record) = record {
-                            let preserved: Vec<_> = p
-                                .snapshot
-                                .drafts
-                                .iter()
-                                .filter(|d| !d.target_key.starts_with("settings:"))
-                                .cloned()
-                                .collect();
-                            p.revision = Some(record.revision);
-                            p.snapshot = record.snapshot;
-                            for draft in preserved {
-                                if let Some(existing) = p
+                ) if workspace_id.0 == workspace && found == token => {
+                    let succeeded = result.is_ok();
+                    match result {
+                        Ok(record) => {
+                            let p = host.projects.get_mut(&workspace).unwrap();
+                            if let Some(record) = record {
+                                let preserved: Vec<_> = p
                                     .snapshot
                                     .drafts
-                                    .iter_mut()
-                                    .find(|d| d.target_key == draft.target_key)
-                                {
-                                    *existing = draft;
-                                } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
-                                    p.snapshot.drafts.push(draft);
+                                    .iter()
+                                    .filter(|d| !d.target_key.starts_with("settings:"))
+                                    .cloned()
+                                    .collect();
+                                p.revision = Some(record.revision);
+                                p.snapshot = record.snapshot;
+                                for draft in preserved {
+                                    if let Some(existing) = p
+                                        .snapshot
+                                        .drafts
+                                        .iter_mut()
+                                        .find(|d| d.target_key == draft.target_key)
+                                    {
+                                        *existing = draft;
+                                    } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
+                                        p.snapshot.drafts.push(draft);
+                                    }
                                 }
+                                p.scopes = p
+                                    .snapshot
+                                    .drafts
+                                    .iter()
+                                    .find(|d| d.target_key == "settings:scopes")
+                                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                                    .unwrap_or_default();
+                                p.allowed_agents = p
+                                    .snapshot
+                                    .drafts
+                                    .iter()
+                                    .find(|d| d.target_key == "settings:agents")
+                                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                                    .unwrap_or_else(|| {
+                                        vec![p.snapshot.config.worker_agent.clone()]
+                                    });
+                                recover_observation(&mut p.snapshot);
+                                p.dirty();
                             }
-                            p.scopes = p
+                            p.loaded = true;
+                            p.storage_blocked = false;
+                            if let Some(goal) = p
+                                .snapshot
+                                .goals
+                                .iter()
+                                .rev()
+                                .find(|g| g.state == work::WorkState::PlanReview)
+                            {
+                                p.request = wm::plan::PlannerRequest::new(
+                                    goal,
+                                    &p.snapshot.config,
+                                    &p.policy(),
+                                )
+                                .ok();
+                            }
+                            let target = host
+                                .main_target(&workspace, host.projects.get(&workspace).unwrap());
+                            if let Some(draft) = host.projects[&workspace]
                                 .snapshot
                                 .drafts
                                 .iter()
-                                .find(|d| d.target_key == "settings:scopes")
-                                .and_then(|d| serde_json::from_str(&d.text).ok())
-                                .unwrap_or_default();
-                            p.allowed_agents = p
-                                .snapshot
-                                .drafts
-                                .iter()
-                                .find(|d| d.target_key == "settings:agents")
-                                .and_then(|d| serde_json::from_str(&d.text).ok())
-                                .unwrap_or_else(|| vec![p.snapshot.config.worker_agent.clone()]);
-                            recover_observation(&mut p.snapshot);
-                            p.dirty();
+                                .find(|d| d.target_key == "main")
+                            {
+                                host.ui.set_draft(target, draft.text.clone());
+                            }
                         }
-                        p.loaded = true;
-                        p.storage_blocked = false;
-                        if let Some(goal) = p
-                            .snapshot
-                            .goals
-                            .iter()
-                            .rev()
-                            .find(|g| g.state == work::WorkState::PlanReview)
-                        {
-                            p.request = wm::plan::PlannerRequest::new(
-                                goal,
-                                &p.snapshot.config,
-                                &p.policy(),
-                            )
-                            .ok();
-                        }
-                        let target =
-                            host.main_target(&workspace, host.projects.get(&workspace).unwrap());
-                        if let Some(draft) = host.projects[&workspace]
-                            .snapshot
-                            .drafts
-                            .iter()
-                            .find(|d| d.target_key == "main")
-                        {
-                            host.ui.set_draft(target, draft.text.clone());
+                        Err(_) => {
+                            if let Some(p) = host.projects.get_mut(&workspace) {
+                                p.storage_blocked = true;
+                            }
+                            host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
                         }
                     }
-                    Err(_) => {
-                        if let Some(p) = host.projects.get_mut(&workspace) {
-                            p.storage_blocked = true;
+                    if let Some(id) = receipt {
+                        if succeeded {
+                            host.finish(
+                                &id,
+                                cc::ReceiptStatus::Acknowledged,
+                                "프로젝트 상태를 불러왔습니다.",
+                            );
+                        } else {
+                            host.reject(&id, "프로젝트 상태를 불러오지 못했습니다.");
                         }
-                        host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
                     }
-                },
+                }
                 (
                     Some(Flight::Save {
                         workspace,
@@ -1163,6 +1199,17 @@ impl App {
                     }
                 },
                 (flight, _) => {
+                    if let Some(Flight::Load {
+                        workspace, receipt, ..
+                    }) = &flight
+                    {
+                        if let Some(p) = host.projects.get_mut(workspace) {
+                            p.storage_blocked = true;
+                        }
+                        if let Some(id) = receipt {
+                            host.reject(id, "프로젝트 읽기 응답을 확인할 수 없습니다.");
+                        }
+                    }
                     if let Some(Flight::Save {
                         workspace,
                         after,
@@ -1205,23 +1252,47 @@ impl App {
             }
         }
         if host.flight.is_none() && send.is_none() {
-            if let Some(workspace) = host
-                .projects
-                .iter()
-                .find(|(_, p)| !p.loaded && !p.storage_blocked)
-                .map(|(id, _)| id.clone())
-            {
-                host.next_token = host.next_token.saturating_add(1);
-                let token = host.next_token;
-                if host
-                    .repository
-                    .try_request(RepositoryJob::Load {
-                        workspace_id: WorkspaceId(workspace.clone()),
-                        token,
-                    })
-                    .is_ok()
+            let next_load = host.requested_loads.keys().next().cloned().or_else(|| {
+                host.projects
+                    .get(&self.active.id)
+                    .filter(|p| !p.loaded && !p.storage_blocked)
+                    .map(|_| self.active.id.clone())
+            });
+            if let Some(workspace) = next_load {
+                let expired = host
+                    .requested_loads
+                    .get(&workspace)
+                    .and_then(|id| host.remote_permits.get(id))
+                    .is_some_and(|permit| !permit.is_current());
+                if expired {
+                    if let Some(id) = host.requested_loads.remove(&workspace) {
+                        host.reject(&id, "프로젝트 읽기 권한이 만료되었습니다.");
+                    }
+                } else if let Err(error) =
+                    admit_project_load(&mut host, &workspace, &self.active.id)
                 {
-                    host.flight = Some(Flight::Load { workspace, token });
+                    if let Some(id) = host.requested_loads.remove(&workspace) {
+                        host.reject(&id, error.clone());
+                    }
+                    host.status = error;
+                } else {
+                    host.next_token = host.next_token.saturating_add(1);
+                    let token = host.next_token;
+                    if host
+                        .repository
+                        .try_request(RepositoryJob::Load {
+                            workspace_id: WorkspaceId(workspace.clone()),
+                            token,
+                        })
+                        .is_ok()
+                    {
+                        let receipt = host.requested_loads.remove(&workspace);
+                        host.flight = Some(Flight::Load {
+                            workspace,
+                            token,
+                            receipt,
+                        });
+                    }
                 }
             } else if let Some(workspace) = host
                 .projects
@@ -1275,7 +1346,9 @@ impl App {
         });
         if dirty && visible {
             let result = if let Some(core) = &self.session_core {
-                serde_json::to_value(self.command_center_snapshot())
+                let mut remote = self.command_center_snapshot();
+                remote.font_scale = self.config.ui.ui_scale;
+                serde_json::to_value(remote)
                     .map_err(|_| ())
                     .and_then(|value| core.publish_work_snapshot(value).map_err(|_| ()))
             } else {
@@ -1581,6 +1654,60 @@ impl App {
         self.frame_stats.end();
     }
 }
+fn admit_project_load(
+    host: &mut CommandCenterHost,
+    workspace: &str,
+    active: &str,
+) -> Result<(), String> {
+    if host.projects.get(workspace).is_some_and(|p| p.loaded) {
+        return Ok(());
+    }
+    if host.projects.values().filter(|p| p.loaded).count() < 4 {
+        return Ok(());
+    }
+    let evict = host
+        .projects
+        .iter()
+        .find(|(id, p)| {
+            id.as_str() != active
+                && id.as_str() != workspace
+                && p.loaded
+                && p.generation == p.saved_generation
+                && !p.storage_blocked
+                && p.request.is_none()
+                && p.proposal.is_none()
+                && p.confirmed.is_none()
+                && !p.snapshot.tasks.iter().any(|t| {
+                    matches!(
+                        t.state,
+                        work::WorkState::Queued
+                            | work::WorkState::Running
+                            | work::WorkState::WaitingApproval
+                            | work::WorkState::WaitingInput
+                            | work::WorkState::ObservationUnknown
+                    )
+                })
+                && !host.inputs.values().any(|i| &i.target.workspace_id == *id)
+        })
+        .map(|(id, _)| id.clone());
+    let id = evict.ok_or("작업 중이거나 저장되지 않은 프로젝트가 4개 열려 있습니다. 작업을 확인한 뒤 다른 프로젝트를 불러와 주세요.")?;
+    let p = host.projects.get_mut(&id).unwrap();
+    p.snapshot.goals.clear();
+    p.snapshot.tasks.clear();
+    p.snapshot.attempts.clear();
+    p.snapshot.events.clear();
+    p.snapshot.outbox.clear();
+    p.snapshot.drafts.clear();
+    p.scopes.clear();
+    p.allowed_agents.clear();
+    p.ledger = Default::default();
+    p.loaded = false;
+    p.generation = 0;
+    p.saved_generation = 0;
+    p.revision = None;
+    host.publication_dirty = true;
+    Ok(())
+}
 fn project_transaction<T>(
     host: &mut CommandCenterHost,
     workspace: Option<&str>,
@@ -1606,7 +1733,8 @@ fn active_workspace_cwd(
 }
 fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
     match intent {
-        cc::Intent::SaveProject { workspace_id, .. }
+        cc::Intent::LoadProject { workspace_id }
+        | cc::Intent::SaveProject { workspace_id, .. }
         | cc::Intent::InstallPlanJson { workspace_id, .. }
         | cc::Intent::ConfirmPlan { workspace_id, .. }
         | cc::Intent::RetryStorage { workspace_id } => Some(workspace_id),
@@ -2017,6 +2145,30 @@ mod tests {
         assert!(web_remote::work::validate_intent(
             &serde_json::to_value(intent).unwrap()
         ));
+        for intent in [
+            cc::Intent::ReportResult {
+                target: cc::RouteTarget {
+                    task_id: Some("actual-task".into()),
+                    ..target()
+                },
+                attempt_id: "exact-attempt".into(),
+                text: "Actual operator report".into(),
+            },
+            cc::Intent::VerifyResult {
+                target: cc::RouteTarget {
+                    task_id: Some("actual-task".into()),
+                    ..target()
+                },
+                attempt_id: "exact-attempt".into(),
+                revision: "7".into(),
+                passed: true,
+                evidence: "cargo test: pass".into(),
+            },
+        ] {
+            assert!(web_remote::work::validate_intent(
+                &serde_json::to_value(intent).unwrap()
+            ));
+        }
         assert_eq!(bounded("한글문자", 7), "한글");
     }
     fn attempted() -> (Project, wm::dispatch::DispatchAssignment) {
@@ -2272,5 +2424,41 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(host.projects["workspace-a"].snapshot.config, original);
         assert_eq!(host.projects["workspace-a"].generation, 0);
+    }
+    #[test]
+    fn bounded_project_load_evicts_only_clean_inactive_and_preserves_pending_work() {
+        let mut h = host();
+        for name in ["active", "clean", "dirty", "working"] {
+            let mut p = project();
+            if name == "dirty" {
+                p.dirty();
+            }
+            if name == "working" {
+                p = attempted().0;
+                p.saved_generation = p.generation;
+            }
+            h.projects.insert(name.into(), p);
+        }
+        h.projects.insert(
+            "requested".into(),
+            Project {
+                loaded: false,
+                ..project()
+            },
+        );
+        admit_project_load(&mut h, "requested", "active").unwrap();
+        assert!(!h.projects["clean"].loaded);
+        assert!(h.projects["active"].loaded);
+        assert!(h.projects["dirty"].loaded);
+        assert!(h.projects["working"].loaded);
+        h.projects.get_mut("requested").unwrap().loaded = true;
+        h.projects.insert(
+            "another".into(),
+            Project {
+                loaded: false,
+                ..project()
+            },
+        );
+        assert!(admit_project_load(&mut h, "another", "requested").is_ok());
     }
 }

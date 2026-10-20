@@ -56,7 +56,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   let currentKey = '', currentTarget = null, currentCapability = null, draftTotal = 0, draftSerial = 0, compositionEndedAt = -Infinity;
   let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null, monitorFilter = 'all', monitorCollapsed = false;
   let remoteWatchTimer = null, agentPicker = null, contentIdentity = '';
-  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map(), agentDrafts = new Map();
+  const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map(), agentDrafts = new Map(), historyFilters = new Map();
   const element = node('section', 'cc-shell'); element.hidden = true;
   const reopen = button('지휘 터미널 열기', () => setOpen(true), 'cc-button cc-reopen'); reopen.dataset.ccOpen = '';
   const app = node('section', 'cc-app'); app.setAttribute('aria-label', '에이전트 지휘 터미널');
@@ -442,10 +442,22 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function renderHistory(entries, destination = content) {
     if (!entries.length) { destination.append(node('p', 'cc-empty', label('no_history', '아직 기록이 없습니다.'))); return; }
-    for (const entry of entries.slice(-100).reverse()) {
-      const row = node('div', 'cc-history-row'), body = node('div'); body.append(node('p', '', entry.text), node('small', 'cc-muted', entry.detail)); row.append(node('time', '', entry.time), body);
-      if (entry.target?.workspace_id === workspaceId && entry.target?.task_id) row.append(button('작업 보기', () => navigate('task', entry.target.task_id), 'cc-button cc-ghost')); destination.append(row);
+    const full = destination === content;
+    for (const entry of entries.slice(0, 100)) {
+      const owner = entry.target?.workspace_id === workspaceId && entry.target?.task_id ? list(project()?.tasks).find(task => routeKey(task.target) === routeKey(entry.target)) : null;
+      const row = node('div', 'cc-history-row'), body = node('div'); row.dataset.ccHistoryId = str(entry.id);
+      body.append(node('p', full ? 'cc-history-title' : '', entry.text), node('small', 'cc-muted', full ? owner ? [owner.provider, owner.role, owner.device].filter(Boolean).join(' · ') : '프로젝트 기록' : entry.detail)); row.append(node('time', '', entry.time), body);
+      if (owner && screen !== 'task') row.append(button('작업 보기', () => openTaskDetail(owner), full ? 'cc-button cc-history-action' : 'cc-button cc-ghost')); destination.append(row);
     }
+  }
+  function renderProjectHistory(p) {
+    title('프로젝트 기록', p.name + ' · 배정·승인·결과를 해당 작업과 연결합니다.');
+    const filter = historyFilters.get(p.id) || 'all', controls = node('div', 'cc-history-filter'); controls.setAttribute('aria-label', '기록 분류');
+    for (const [key, caption] of [['all', '전체'], ['work', '작업'], ['approval', '승인'], ['settings', '설정']]) {
+      const control = button(caption, () => { if (!historyFilters.has(p.id) && historyFilters.size >= 64) historyFilters.delete(historyFilters.keys().next().value); historyFilters.set(p.id, key); render(); });
+      control.dataset.ccHistoryFilter = key; control.dataset.ccFocus = 'history-filter:' + key; control.setAttribute('aria-pressed', String(filter === key)); controls.append(control);
+    }
+    content.append(controls); renderHistory(list(p.history).filter(entry => filter === 'all' || entry.kind === filter));
   }
   function renderMain(p) {
     const tasks = list(p.tasks), goal = node('section', 'cc-goal');
@@ -521,7 +533,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     }
     content.append(tabs);
     if (detailTab === 'terminal' && isRemoteTask(task)) { renderRemoteTerminal(task); return; }
-    if (detailTab === 'history') { renderHistory(list(p.history).filter(h => h.target?.task_id === task.target?.task_id)); return; }
+    if (detailTab === 'history') { renderHistory(list(p.history).filter(h => routeKey(h.target) === routeKey(task.target))); return; }
     if (detailTab === 'git') { content.append(node('p', 'cc-empty', str(task.git?.reason) || '이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다.')); return; }
     content.append(node('h2', '', '진행 내용'), node('p', 'cc-activity', task.activity), facts([[label('scope', '배정 범위'), task.scope], [label('directory', '작업 폴더'), task.directory], [label('criteria', '완료 조건'), task.acceptance_criteria], ['최근 관측', task.observed_at]]));
     if (task.approval && !readOnly) {
@@ -647,7 +659,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     } else if (!p) title('프로젝트를 선택해 주세요', '호스트에서 등록한 프로젝트가 이곳에 표시됩니다.');
     else if (screen === 'task') renderTask(p, selectedTask());
     else if (screen === 'settings') renderSettings(p);
-    else if (screen === 'history') { title('프로젝트 기록'); renderHistory(list(p.history)); }
+    else if (screen === 'history') renderProjectHistory(p);
     else if (screen === 'tasks') {
       title('프로젝트 작업', p.name + ' · ' + list(p.tasks).length + '개 독립 작업');
       if (!list(p.tasks).length) content.append(node('p', 'cc-empty', '메인에게 목표를 보내 작업을 배정하세요.'));
@@ -750,7 +762,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       if (destroyed) return; rememberDraft(); connected = false; for (const [id, item] of pending) { if (item.observation) pending.delete(id); else item.status = 'uncertain'; } say('연결이 끊겼습니다. 초안은 보존되며 요청을 자동으로 다시 보내지 않습니다.'); render();
     },
     destroy() {
-      if (destroyed) return; destroyed = true; syncRemoteWatch(); observer?.disconnect(); element.removeEventListener('keydown', onKey); element.removeEventListener('pointerdown', onPickerOutside); content.removeEventListener('scroll', rememberRemotePosition, true); document.removeEventListener('visibilitychange', syncRemoteWatch); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); remotePositions.clear(); agentDrafts.clear(); element.remove(); notifyVisibility(false);
+      if (destroyed) return; destroyed = true; syncRemoteWatch(); observer?.disconnect(); element.removeEventListener('keydown', onKey); element.removeEventListener('pointerdown', onPickerOutside); content.removeEventListener('scroll', rememberRemotePosition, true); document.removeEventListener('visibilitychange', syncRemoteWatch); pending.clear(); drafts.clear(); settings.clear(); plans.clear(); resultDrafts.clear(); workerSelections.clear(); remotePositions.clear(); agentDrafts.clear(); historyFilters.clear(); element.remove(); notifyVisibility(false);
     },
   };
 }

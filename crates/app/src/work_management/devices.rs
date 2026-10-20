@@ -82,10 +82,14 @@ impl VerifiedExecutionDevice {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifiedExecutionLease {
     lease: ExecutionLease,
+    registration: RegisteredDevice,
     observed_at: std::time::Instant,
     fence: Arc<AtomicBool>,
 }
 impl VerifiedExecutionLease {
+    pub(crate) fn registration(&self) -> &RegisteredDevice {
+        &self.registration
+    }
     pub(crate) fn lease(&self) -> &ExecutionLease {
         &self.lease
     }
@@ -207,6 +211,7 @@ impl DeviceRegistry {
             .ok_or(DeviceUnavailable::Stale)?;
         Ok(VerifiedExecutionLease {
             lease: lease.clone(),
+            registration: entry.registration.clone(),
             fence: Arc::clone(&entry.fence),
             observed_at: std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_millis(age))
@@ -257,15 +262,20 @@ impl DeviceRegistry {
             .iter_mut()
             .find(|e| e.registration.id == device)
         {
-            entry.fence.store(false, Ordering::Release);
             entry.disconnected_through = entry.disconnected_through.max(connection_epoch);
             if entry
                 .observation
                 .as_ref()
                 .is_some_and(|(p, _)| p.connection_epoch <= connection_epoch)
             {
+                entry.fence.store(false, Ordering::Release);
                 entry.observation = None;
             }
+        }
+    }
+    pub(crate) fn invalidate_all(&self) {
+        for entry in &self.entries {
+            entry.fence.store(false, Ordering::Release);
         }
     }
     /// Must be checked immediately before a first send. An idempotent reserve is not replay permission.
@@ -288,6 +298,36 @@ impl DeviceRegistry {
             || proof.grant_epoch != lease.grant_epoch
             || proof.lease_epoch != lease.lease_epoch
             || proof.folder_anchor != lease.folder_anchor
+            || !proof
+                .profiles
+                .iter()
+                .any(|p| p.id == lease.profile_id && p.agent == lease.request.agent)
+        {
+            return Err(DeviceUnavailable::Conflict);
+        }
+        Ok(())
+    }
+    /// Ongoing exact execution bindings survive a newer capacity lease observation, while
+    /// current connection, incarnation, grant, folder and profile remain mandatory.
+    pub(crate) fn validate_execution_lease(
+        &self,
+        lease: &ExecutionLease,
+        now_ms: u64,
+    ) -> Result<(), DeviceUnavailable> {
+        if !self.leases.contains(lease) {
+            return Err(DeviceUnavailable::Missing);
+        }
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.registration.id == lease.request.device_id)
+            .ok_or(DeviceUnavailable::Missing)?;
+        let proof = fresh_observation(entry, now_ms)?;
+        if proof.connection_epoch != lease.connection_epoch
+            || proof.incarnation != lease.incarnation
+            || proof.grant_epoch != lease.grant_epoch
+            || proof.folder_anchor != lease.folder_anchor
+            || entry.registration.folder != lease.request.folder
             || !proof
                 .profiles
                 .iter()
@@ -705,6 +745,11 @@ mod tests {
         let policy = registry
             .verified_devices(&device.workspace_id, 20)
             .remove(0);
+        registry.disconnect(&device.id, 1);
+        assert!(
+            policy.validate_fresh().is_ok(),
+            "stale close cannot revoke a newer connection"
+        );
         registry.revoke(&device.id);
         assert!(policy.validate_fresh().is_err());
     }

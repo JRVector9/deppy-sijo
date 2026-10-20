@@ -220,6 +220,8 @@ pub struct ProjectConfig {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
     #[serde(default)]
+    pub available_agents: Vec<AgentOption>,
+    #[serde(default)]
     pub pending_approvals: Vec<PendingApproval>,
     #[serde(default)]
     pub create_main: Capability,
@@ -253,6 +255,14 @@ pub struct Project {
     pub available_models: Vec<String>,
     pub available_efforts: Vec<String>,
     pub available_automation: Vec<String>,
+}
+
+/// One installed provider's compatible model and reasoning choice.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentOption {
+    pub provider: String,
+    pub model: String,
+    pub effort: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

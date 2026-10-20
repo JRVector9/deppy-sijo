@@ -180,6 +180,10 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function chooseProject(id) {
     if (!rememberDraft()) return; workspaceId = id; screen = 'main'; taskId = null; closeDrawers(); render(); content.scrollTop = 0;
+    if (project()?.loaded === false) {
+      if (readOnly) say('Mac에서 이 프로젝트를 열면 저장된 작업 화면이 표시됩니다.');
+      else emit({type: 'load_project', workspace_id: id}, 'load:' + id);
+    }
   }
   function closeDrawers() {
     drawer = null; app.classList.remove('cc-left-open', 'cc-right-open');

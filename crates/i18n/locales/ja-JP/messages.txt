@@ -2022,3 +2022,4 @@ command_center.state_completed = Confirmed complete
 command_center.state_failed = 失敗
 command_center.state_cancelled = キャンセル済み
 command_center.state_unknown = Observation unavailable
+command_center.title = エージェント コマンドセンター

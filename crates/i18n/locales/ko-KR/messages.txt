@@ -2022,3 +2022,4 @@ command_center.state_completed = 확인 완료
 command_center.state_failed = 실패
 command_center.state_cancelled = 취소됨
 command_center.state_unknown = 관측 확인 필요
+command_center.title = 에이전트 지휘 터미널

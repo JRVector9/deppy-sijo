@@ -2022,3 +2022,4 @@ command_center.state_completed = Confirmed complete
 command_center.state_failed = 失敗
 command_center.state_cancelled = 已取消
 command_center.state_unknown = Observation unavailable
+command_center.title = 智慧代理指揮中心

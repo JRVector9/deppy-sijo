@@ -59,6 +59,7 @@ pub fn validate_intent(v: &Value) -> bool {
         return false;
     }
     match v["type"].as_str() {
+        Some("load_project") => keys(v, &["type", "workspace_id"]) && identity(&v["workspace_id"]),
         Some("submit") => {
             keys(v, &["type", "target", "text"])
                 && target(&v["target"])
@@ -142,7 +143,9 @@ pub fn validate_intent(v: &Value) -> bool {
 }
 
 pub fn required_action(v: &Value) -> RelayAction {
-    if v["type"] == "approval" {
+    if v["type"] == "load_project" {
+        RelayAction::View
+    } else if v["type"] == "approval" {
         RelayAction::Approval
     } else {
         RelayAction::Input
@@ -272,6 +275,12 @@ mod tests {
         assert!(validate_intent(&approval));
         assert_eq!(required_action(&approval), RelayAction::Approval);
         assert!(!validate_intent(&json!({"type":"use_original_layout"})));
+        let view = json!({"type":"load_project","workspace_id":"workspace-b"});
+        assert!(validate_intent(&view));
+        assert_eq!(required_action(&view), RelayAction::View);
+        assert!(!validate_intent(
+            &json!({"type":"load_project","workspace_id":"w","path":"/untrusted"})
+        ));
     }
     #[test]
     fn work_result_forms_require_exact_attempt_and_bounded_user_evidence() {
@@ -404,6 +413,18 @@ mod tests {
         );
         assert!(!core.dashboard().request_cloud_control(&origin, intent));
         assert!(rx.try_recv().is_err());
+        // Hydrating a known project's read model needs view authority only.
+        let load = CloudControlIntent::CommandCenter {
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            intent: json!({"type":"load_project","workspace_id":"workspace-b"}),
+        };
+        assert!(core.dashboard().request_cloud_control(&origin, load));
+        let (_, mut permit) = core
+            .authorize_cloud_control_deferred(rx.try_recv().unwrap())
+            .expect("view-only project read is authorized");
+        assert!(permit.is_current());
+        origin.revoke();
+        assert!(!permit.is_current());
     }
     #[test]
     fn work_relay_outbound_rejects_unfiltered_approval_or_input_capability() {

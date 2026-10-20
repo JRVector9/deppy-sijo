@@ -35,15 +35,22 @@
 
 ## Latest verified integration
 
+- 후속 사용자 `이어서 진행해` 및 병렬 진행 재확인. GPT-6.1-Sol/xhigh3명 계속 병렬, 원안 tag/branch/기본기존화면/별도DB 유지. 앱 stop/launch/restart 없음.
+- 4194e3b7→1adbfe39: native Report/Verify typedbridge, webfontscale, explicit LoadProject/View, active-only autoload, clean inactive4project cache. 6010410c→e2fc778d: trusted host-only exactattempt pinnedfoldergrant32, active/pending host replacement 차단. 8e3ad05b→a966d15d: previous sameworker incarnation Unknown/no replay. 00226788→12c1b8b8 +2408c810→5e2893ca +26e9c320→a2691f50: lazy independentGitworktree/ownedproof/rootvalidation, production digest 재사용.
+- Root PWA explicit projectread +viewonlyauthority regression 추가. 실제Chrome leaf **91 assertionsPASS**, 390/760/1280·dark/light (`/private/tmp/deppy-cc-leaf-load-browser-20261020.log`). 새viewload는Relayoutbound를늘리지않고Relayreadonly는Mac에서열기설명만표시.
+- 실제 i18n interim2/3 **실패**: root dependency storage rlib가다른worktree에서생긴옛sourceartifact로Fresh재사용되어remotejournalexports없음. .d의상대경로+새remote파일누락으로확인. Root/cc_ui/performance target독점분리, rootworkspacepackageartifactclean후재검증. 이전fullcohort는그시점실제실행결과이지만최종통합source증거로확대하지않음.
+- 같은 actualAppcompile에서 worktreehelper sha2가dev-only이고0.11digestLowerHex미지원발견. 26e9c320실제수정; standalone원래sha2old0.10선택한검증한계기록. actualworkspace최종compile아직pending.
+- Root i18n5catalog title누락추가, full i18n-check PASS아직주장금지. root boundary/deps interimPASS. cc_storage serialruntime416PASS0FAIL1ignored보고(4개wire/staticmaintenance미통합), initialparallel407PASS9FAIL1ignored도기록; root최종실행별도.
+
 - PR8b2ff5bda actual fullweb402PASS1ignored, 7realChrome testsPASS (newproductionbundle/Relay/기존mobile4targets), strictweballtargetsClippyPASS. Sharedleaf86assertionsPASS including exactresultattempt/revision/manualforms newerACKdraft/fontscale/read-only. Fixture first font expected desktop21px while mobile19px corrected responsive expectation, productCSS unchanged.
 - Native followupf87c4565→23f89353 integrated: actual host17PASS, native11PASS1ignored, transactionrollback/ignoredconfirmationreject/warmcwdscope/reviewstaterestore/deferredpermit. New report/verify remote nativeallowlist followscc_ui nextcommit; rootworkwire+PWAformsready.
 - Runtime reviewae304a74 integrated (revoked Pending Resolve retained; currentincarnationstalegrant Unknown; absbinaryrequired). Actual agentruntime4PASS incl revoke-during-result-journalcommit. Sidecarjournal/schema2 adapter + host launch integration pending.
 
 ## Ownership / remaining / exact next commands
 
-- cc_ui `/Users/jr/Desktop/projects/deppy-sijo-cc-ui-20261020`: App host, app.rs, nativeDTO. Current result/verify/staleattempt/recovery/deferredpermit followup, then automaticnewworker/profile/worktree/actualproviderhooks. Uses root integration Cargo target/jobs2; root no concurrent heavy Cargo.
-- cc_storage `/Users/jr/Desktop/projects/deppy-sijo-cc-devices-20261020`: remote atomicspawn+asyncjournal+sidecar migration2; twoTLSfixtures. Uses performance target/jobs2. Root reviewedvendor; remainingruntime/journal commitreview.
-- cc_contracts `/Users/jr/Desktop/projects/deppy-sijo-cc-pwa-20261020`: preallocatedidentity committed, now independentnativehost review. No root edits.
+- cc_ui `/Users/jr/Desktop/projects/deppy-sijo-cc-ui-20261020`: Apphost/app.rs/nativeDTO; automaticlocalworker/profile/exactbinding/worktree/actualproviderhooks. **独自target/jobs2**、root target共有禁止。LoadProject重複op silentlyqueued指摘済、distinctpending/inflightreject回帰を追加予定。
+- cc_storage `/Users/jr/Desktop/projects/deppy-sijo-cc-devices-20261020`: remoteatomic/journal/twoTLSfixtures/wiremaintenance、次にnewremote_controller.rs productiontrustedTLS registry/dispatch bridge。performance target独占/jobs2。host/app.rs直接変更禁止。
+- cc_contracts `/Users/jr/Desktop/projects/deppy-sijo-cc-pwa-20261020`: ownedtaskworktree完了、次にnewobservation.rs exactCodexTracker/rolloutfinaltext/approvalproofoffframe。host/app.rs変更禁止、cc_uiとAPI調整。
 - Root: PWA production/Relay tests+wireallowlist afterDTO, reviewedsequentialcherrypick, docs/version/finalgates. Do not mark entireplancomplete until automaticlocal/remote execution, correctresultsource, approvals/recovery and actual checks match requirements.
 
 ```sh

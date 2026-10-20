@@ -22,6 +22,7 @@ struct Flight {
     request_id: u64,
     lease: ExecutionLease,
     request: RemoteWorkRequest,
+    registration: RegisteredDevice,
     result: Option<RemoteWorkResult>,
     pending_result: Option<RemoteWorkResult>,
     execution: Option<RemoteExecutionProof>,
@@ -120,7 +121,9 @@ impl ControllerState {
             | RemoteDeviceJob::ObserveSession { request_id, .. }
             | RemoteDeviceJob::CloseSession { request_id, .. }
             | RemoteDeviceJob::ObserveExecution { request_id, .. }
-            | RemoteDeviceJob::DeliverInput { request_id, .. } => *request_id,
+            | RemoteDeviceJob::DeliverInput { request_id, .. }
+            | RemoteDeviceJob::ReconcileLaunch { request_id, .. }
+            | RemoteDeviceJob::ReconcileInput { request_id, .. } => *request_id,
             _ => 0,
         };
         self.candidates
@@ -180,6 +183,14 @@ impl ControllerState {
                 prompt,
                 authority,
             ),
+            RemoteDeviceJob::ReconcileLaunch { request_id, lease } => {
+                Ok(self.reconcile_launch(request_id, lease))
+            }
+            RemoteDeviceJob::ReconcileInput {
+                request_id,
+                lease,
+                operation_id,
+            } => Ok(self.reconcile_input(request_id, lease, operation_id)),
             RemoteDeviceJob::ReserveLaunch {
                 request_id,
                 request,
@@ -550,6 +561,7 @@ impl ControllerState {
             request_id,
             lease: lease.clone(),
             request: wire,
+            registration: verified.registration().clone(),
             result: result.clone(),
             pending_result: None,
             execution: None,
@@ -566,6 +578,108 @@ impl ControllerState {
                 verified,
                 lease,
             },
+        })
+    }
+    // Recovery is read-only and may use a newly authenticated connection to the SAME
+    // immutable registration and worker incarnation. It never reauthorizes an old lease
+    // for execution, and never reserves, claims, launches, delivers, or closes anything.
+    fn reconciliation_connection(&mut self, flight: usize) -> Result<usize> {
+        let original = &self.flights[flight];
+        if !self
+            .records
+            .iter()
+            .any(|r| r.registration == original.registration && r.registration.execution_granted)
+        {
+            return Err(RemoteDeviceError::NotGranted);
+        }
+        let index = self
+            .connections
+            .iter()
+            .position(|c| {
+                c.device_id == original.lease.request.device_id
+                    && c.workspace == original.lease.request.workspace_id
+                    && c.pin == original.registration.pinned_fingerprint
+            })
+            .ok_or(RemoteDeviceError::Disconnected)?;
+        let query = self.next_query()?;
+        let caps = inspect_exact(&mut self.connections[index], query)?;
+        let original = &self.flights[flight];
+        if caps.device_id != original.request.identity.device_id
+            || caps.workspace_id != original.request.identity.workspace_id
+            || caps.incarnation != original.request.identity.incarnation
+            || caps.grant_epoch != original.request.identity.grant_epoch
+            || caps.folder != original.request.folder
+            || caps.folder_anchor != original.request.folder_anchor
+            || !caps.profiles.iter().any(|p| {
+                p.id == original.request.profile_id && p.agent == original.lease.request.agent
+            })
+        {
+            return Err(RemoteDeviceError::WrongTarget);
+        }
+        let now = self.now();
+        self.registry
+            .observe(observation(&self.connections[index], caps), now)
+            .map_err(|_| RemoteDeviceError::WrongTarget)?;
+        Ok(index)
+    }
+    fn reconcile_launch(&mut self, request_id: u64, lease: ExecutionLease) -> RemoteDeviceOutcome {
+        let result = (|| -> Result<RemoteWorkResult> {
+            if request_id == 0 { return Err(RemoteDeviceError::Invalid); }
+            let flight = self.flights.iter().position(|f| f.lease == lease).ok_or(RemoteDeviceError::WrongTarget)?;
+            let connection = self.reconciliation_connection(flight)?;
+            let query = self.next_query()?;
+            let request = self.flights[flight].request.clone();
+            self.connections[connection].client.send_command(RuntimeCommand::QueryRemoteWork { request_id: query, request: request.clone() }).map_err(|_| RemoteDeviceError::Transport)?;
+            let response = await_query(&mut self.connections[connection], |event| matches!(event,
+                RuntimeEvent::RemoteWorkQueried { request_id, identity, .. } if *request_id == query && *identity == request.identity))?;
+            let RuntimeEvent::RemoteWorkQueried { result, .. } = response else { return Err(RemoteDeviceError::WrongTarget); };
+            if result != RemoteWorkResult::ObservationUnknown {
+                let identity = operation_identity(&request)?;
+                self.store()?.resolve_remote_operation(&identity, &to_stored(&result)?).map_err(|_| RemoteDeviceError::Persistence)?;
+                if matches!(result, RemoteWorkResult::Rejected { .. }) { self.registry.complete(&lease); }
+                self.flights[flight].result = Some(result.clone());
+                self.flights[flight].pending_result = None;
+            }
+            Ok(result)
+        })().unwrap_or(RemoteWorkResult::ObservationUnknown);
+        RemoteDeviceOutcome::LaunchReceipt(RemoteLaunchReceipt {
+            request_id,
+            lease,
+            result,
+        })
+    }
+    fn reconcile_input(
+        &mut self,
+        request_id: u64,
+        lease: ExecutionLease,
+        operation_id: OperationId,
+    ) -> RemoteDeviceOutcome {
+        let found = (|| -> Result<(RemoteTaskInputResult, Option<RemoteInputAcceptance>)> {
+            if request_id == 0 { return Err(RemoteDeviceError::Invalid); }
+            let flight = self.flights.iter().position(|f| f.lease == lease).ok_or(RemoteDeviceError::WrongTarget)?;
+            let input = self.inputs.iter().position(|i| i.lease == lease && i.operation_id == operation_id).ok_or(RemoteDeviceError::WrongTarget)?;
+            let original = self.inputs[input].request.clone();
+            let connection = self.reconciliation_connection(flight)?;
+            let query = self.next_query()?;
+            self.connections[connection].client.send_command(RuntimeCommand::RemoteTaskInput { request: RemoteTaskInputRequest::QueryInput {
+                target: original.target().clone(), request_id: query, operation_id: operation_id.clone(), request_digest: original.digest().map_err(|_| RemoteDeviceError::Invalid)?,
+            } }).map_err(|_| RemoteDeviceError::Transport)?;
+            let response = await_query(&mut self.connections[connection], |event| matches!(event,
+                RuntimeEvent::RemoteTaskInput { target, reply: RemoteTaskInputReply::InputQueried { request_id, operation_id: op, .. } }
+                    if *request_id == query && *target == *original.target() && *op == operation_id))?;
+            let RuntimeEvent::RemoteTaskInput { reply: RemoteTaskInputReply::InputQueried { result, accepted, .. }, .. } = response else { return Err(RemoteDeviceError::WrongTarget); };
+            let accepted = accepted.map(|a| RemoteInputAcceptance { sequence: a.sequence, at_micros: a.at_micros });
+            if result != RemoteTaskInputResult::ObservationUnknown {
+                self.inputs[input].result = Some(result.clone()); self.inputs[input].accepted = accepted.clone(); self.inputs[input].emitted = true;
+            }
+            Ok((result, accepted))
+        })().unwrap_or((RemoteTaskInputResult::ObservationUnknown, None));
+        RemoteDeviceOutcome::InputReceipt(RemoteInputReceipt {
+            request_id,
+            lease,
+            operation_id,
+            result: found.0,
+            accepted: found.1,
         })
     }
     fn exact_connection(&self, lease: &ExecutionLease) -> Result<usize> {
@@ -1271,6 +1385,36 @@ fn valid_pin(pin: &str) -> bool {
             }
         })
 }
+fn await_query(
+    connection: &mut Connection,
+    accept: impl Fn(&RuntimeEvent) -> bool,
+) -> Result<RuntimeEvent> {
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        let mut events = connection.events.drain().into_iter();
+        while let Some(event) = events.next() {
+            if accept(&event) {
+                let remaining: Vec<_> = events.collect();
+                if connection.deferred.len() + remaining.len() > 256 {
+                    return Err(RemoteDeviceError::Full);
+                }
+                connection.deferred.extend(remaining);
+                return Ok(event);
+            }
+            if connection.deferred.len() >= 256 {
+                return Err(RemoteDeviceError::Full);
+            }
+            connection.deferred.push(event);
+        }
+        if connection.events.is_disconnected()
+            || connection.events.take_overflowed()
+            || Instant::now() >= until
+        {
+            return Err(RemoteDeviceError::Disconnected);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 fn inspect_exact(connection: &mut Connection, id: u64) -> Result<RemoteWorkerCapabilities> {
     connection
         .client
@@ -1368,3 +1512,7 @@ fn from_stored(result: RemoteOperationResult) -> Result<RemoteWorkResult> {
         RemoteOperationResult::ObservationUnknown => RemoteWorkResult::ObservationUnknown,
     })
 }
+
+#[cfg(all(test, unix))]
+#[path = "remote_reconcile_tests.rs"]
+mod reconcile_tests;

@@ -501,6 +501,11 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                         || execution.as_ref().is_some_and(|e| {
                             e.target != *target
                                 || e.profile.validate().is_err()
+                                || [e.execution, e.foreground].iter().any(|p| {
+                                    p.pid == 0
+                                        || p.pid > i32::MAX as u32
+                                        || p.birth.microseconds >= 1_000_000
+                                })
                                 || uuid::Uuid::parse_str(&e.execution_handle).is_err()
                         })
                     {
@@ -520,6 +525,25 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                         return Err("invalid remote session snapshot");
                     }
                 }
+                R::InputQueried {
+                    request_id,
+                    operation_id,
+                    result,
+                    accepted,
+                } => {
+                    if *request_id == 0
+                        || uuid::Uuid::parse_str(operation_id.as_str()).is_err()
+                        || accepted.as_ref().is_some_and(|a| {
+                            a.sequence == 0
+                                || a.at_micros <= 0
+                                || *result != crate::remote_input::RemoteTaskInputResult::Admitted
+                        })
+                        || (*result == crate::remote_input::RemoteTaskInputResult::Admitted
+                            && accepted.is_none())
+                    {
+                        return Err("invalid remote input receipt");
+                    }
+                }
                 R::Delivered { operation_id, .. } | R::SessionClosed { operation_id, .. } => {
                     if uuid::Uuid::parse_str(operation_id.as_str()).is_err() {
                         return Err("invalid remote input operation");
@@ -533,9 +557,14 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
         } if *request_id == 0 || capabilities.as_ref().is_some_and(|c| !c.is_valid()) => {
             return Err("remote worker proof invalid");
         }
+        RuntimeEvent::RemoteWorkQueried { request_id: 0, .. } => {
+            return Err("remote work query invalid");
+        }
         RuntimeEvent::RemoteWorkResolved { identity, result }
-            if !identity.is_valid()
-                || matches!(result,crate::remote_worker::RemoteWorkResult::Launched{session,execution_generation} if session.0==0 || *execution_generation==0) =>
+        | RuntimeEvent::RemoteWorkQueried {
+            identity, result, ..
+        } if !identity.is_valid()
+            || matches!(result,crate::remote_worker::RemoteWorkResult::Launched{session,execution_generation} if session.0==0 || *execution_generation==0) =>
         {
             return Err("remote work result invalid");
         }
@@ -3149,9 +3178,9 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        assert_eq!(PROTO_VERSION, 34);
+        assert_eq!(PROTO_VERSION, 35);
         for version in [
-            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
+            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
         ] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,
@@ -3693,6 +3722,62 @@ mod tests {
             bracketed_paste: false,
         };
         assert!(validate_event(&bad_viewport).is_err());
+        // Exact-target remote session replies contain the same untrusted terminal grid.
+        // Nested malformed snapshots must fail before reaching the native renderer too.
+        let RuntimeEvent::Viewport { snapshot, .. } = &bad_viewport else {
+            unreachable!()
+        };
+        let target = crate::remote_input::RemoteTaskTarget {
+            identity: crate::remote_worker::RemoteWorkIdentity {
+                device_id: "test-device".into(),
+                workspace_id: deppy_core::WorkspaceId("test-workspace".into()),
+                attempt_id: deppy_core::work_management::AttemptId::new(),
+                operation_id: deppy_core::work_management::OperationId::new(),
+                incarnation: deppy_core::work_management::RuntimeIncarnationId::new(),
+                grant_epoch: 1,
+                lease_epoch: 1,
+            },
+            session: SessionId(1),
+            execution_generation: 1,
+        };
+        let nested = RuntimeEvent::RemoteTaskInput {
+            target: target.clone(),
+            reply: crate::remote_input::RemoteTaskInputReply::SessionObserved {
+                request_id: 1,
+                snapshot: Some(Box::new(crate::remote_input::RemoteSessionSnapshot {
+                    terminal: Some(Arc::clone(snapshot)),
+                    detected_status: None,
+                    exit_code: None,
+                })),
+            },
+        };
+        assert!(validate_event(&nested).is_err());
+        let forged_process = deppy_core::process_identity::ProcessIdentity {
+            pid: 0,
+            birth: deppy_core::process_identity::ProcessBirth {
+                seconds: 1,
+                microseconds: 0,
+            },
+        };
+        let forged = RuntimeEvent::RemoteTaskInput {
+            target: target.clone(),
+            reply: crate::remote_input::RemoteTaskInputReply::Observed {
+                request_id: 1,
+                execution: Some(Box::new(crate::remote_input::RemoteExecutionProof {
+                    target,
+                    execution_handle: uuid::Uuid::new_v4().to_string(),
+                    foreground: forged_process,
+                    execution: forged_process,
+                    profile: deppy_core::work_management::AgentSelection {
+                        provider: "claude".into(),
+                        model: None,
+                        effort: None,
+                    },
+                })),
+            },
+        };
+        assert!(validate_event(&forged).is_err());
+
         assert!(layout_ratios_valid(&crate::LayoutNode::Pane(
             deppy_core::MuxPaneId::new()
         )));
@@ -4071,6 +4156,7 @@ mod tests {
             RuntimeEvent::TerminalHistoryResult { .. } => "TerminalHistoryResult",
             RuntimeEvent::RemoteWorkerObserved { .. } => "RemoteWorkerObserved",
             RuntimeEvent::RemoteWorkResolved { .. } => "RemoteWorkResolved",
+            RuntimeEvent::RemoteWorkQueried { .. } => "RemoteWorkQueried",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
             RuntimeEvent::SessionTitleChanged { .. } => "SessionTitleChanged",
             RuntimeEvent::SessionInputAccepted { .. } => "SessionInputAccepted",

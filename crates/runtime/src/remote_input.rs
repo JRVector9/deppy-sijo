@@ -34,6 +34,12 @@ pub enum RemoteTaskInputRequest {
         operation_id: OperationId,
         deadline_unix_ms: u64,
     },
+    QueryInput {
+        target: RemoteTaskTarget,
+        request_id: u64,
+        operation_id: OperationId,
+        request_digest: String,
+    },
 }
 impl std::fmt::Debug for RemoteTaskInputRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -55,6 +61,11 @@ pub enum RemoteTaskInputResult {
     Admitted,
     Rejected { reason: PtyInputRejectReason },
     ObservationUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteInputAcceptance {
+    pub sequence: u64,
+    pub at_micros: i64,
 }
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RemoteSessionSnapshot {
@@ -86,6 +97,12 @@ pub enum RemoteTaskInputReply {
         operation_id: OperationId,
         result: RemoteSessionCloseResult,
     },
+    InputQueried {
+        request_id: u64,
+        operation_id: OperationId,
+        result: RemoteTaskInputResult,
+        accepted: Option<RemoteInputAcceptance>,
+    },
 }
 impl RemoteTaskInputRequest {
     pub fn target(&self) -> &RemoteTaskTarget {
@@ -93,7 +110,8 @@ impl RemoteTaskInputRequest {
             Self::Observe { target, .. }
             | Self::ObserveSession { target, .. }
             | Self::Deliver { target, .. }
-            | Self::CloseSession { target, .. } => target,
+            | Self::CloseSession { target, .. }
+            | Self::QueryInput { target, .. } => target,
         }
     }
     pub fn is_valid(&self) -> bool {
@@ -104,6 +122,19 @@ impl RemoteTaskInputRequest {
         match self {
             Self::Observe { request_id, .. } | Self::ObserveSession { request_id, .. } => {
                 *request_id > 0
+            }
+            Self::QueryInput {
+                request_id,
+                operation_id,
+                request_digest,
+                ..
+            } => {
+                *request_id > 0
+                    && uuid::Uuid::parse_str(operation_id.as_str()).is_ok()
+                    && request_digest.len() == 64
+                    && request_digest
+                        .bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
             }
             Self::CloseSession {
                 execution_handle,
@@ -148,6 +179,11 @@ impl RemoteTaskInputRequest {
             + i.incarnation.0.capacity();
         base + match self {
             Self::Observe { .. } | Self::ObserveSession { .. } => 0,
+            Self::QueryInput {
+                operation_id,
+                request_digest,
+                ..
+            } => operation_id.0.capacity() + request_digest.capacity(),
             Self::Deliver {
                 execution_handle,
                 operation_id,
@@ -166,13 +202,23 @@ impl RemoteTaskInputRequest {
             Self::Observe { target, .. }
             | Self::ObserveSession { target, .. }
             | Self::Deliver { target, .. }
-            | Self::CloseSession { target, .. } => target,
+            | Self::CloseSession { target, .. }
+            | Self::QueryInput { target, .. } => target,
         };
         t.identity.device_id.shrink_to_fit();
         t.identity.workspace_id.0.shrink_to_fit();
         t.identity.attempt_id.0.shrink_to_fit();
         t.identity.operation_id.0.shrink_to_fit();
         t.identity.incarnation.0.shrink_to_fit();
+        if let Self::QueryInput {
+            operation_id,
+            request_digest,
+            ..
+        } = self
+        {
+            operation_id.0.shrink_to_fit();
+            request_digest.shrink_to_fit();
+        }
         if let Self::CloseSession {
             execution_handle,
             operation_id,
@@ -203,13 +249,19 @@ pub fn unix_millis() -> Option<u64> {
         .try_into()
         .ok()
 }
+pub(crate) type RecordedInput = (
+    OperationId,
+    String,
+    RemoteTaskInputResult,
+    Option<RemoteInputAcceptance>,
+);
 pub(crate) struct ExecutionRecord {
     pub target: RemoteTaskTarget,
     pub owner: Option<ProcessIdentity>,
     pub wrapped: bool,
     pub profile: AgentSelection,
     pub proof: Option<RemoteExecutionProof>,
-    pub inputs: Vec<(OperationId, String, RemoteTaskInputResult)>,
+    pub inputs: Vec<RecordedInput>,
     pub closes: Vec<(OperationId, String, RemoteSessionCloseResult)>,
 }
 

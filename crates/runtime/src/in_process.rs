@@ -2800,6 +2800,17 @@ impl Worker {
         operation_id: Option<&str>,
         append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
     ) -> Result<(), pty::PtyInputRejectReason> {
+        self.admit_input_batch_recording(session, parts, admission, operation_id, append, &mut None)
+    }
+    fn admit_input_batch_recording(
+        &mut self,
+        session: SessionId,
+        parts: &[&[u8]],
+        admission: Option<&crate::InputAdmission>,
+        operation_id: Option<&str>,
+        append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
+        accepted: &mut Option<crate::remote_input::RemoteInputAcceptance>,
+    ) -> Result<(), pty::PtyInputRejectReason> {
         if !self.sessions.contains_key(&session) {
             return Err(pty::PtyInputRejectReason::SessionClosed);
         }
@@ -2875,6 +2886,10 @@ impl Worker {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
                 if nonempty {
                     self.input_sequences.insert(session, next_sequence);
+                    *accepted = Some(crate::remote_input::RemoteInputAcceptance {
+                        sequence: next_sequence,
+                        at_micros,
+                    });
                     self.emit(RuntimeEvent::SessionInputAccepted {
                         session,
                         sequence: next_sequence,
@@ -2982,6 +2997,53 @@ impl Worker {
         });
     }
 
+    fn remote_query_result(
+        &self,
+        request: &crate::remote_worker::RemoteWorkRequest,
+        host: &crate::remote_worker::RemoteWorkerHost,
+    ) -> Option<crate::remote_worker::RemoteWorkResult> {
+        use crate::remote_worker::{RemoteWorkLookup as L, RemoteWorkResult as R};
+        if request.identity.device_id != host.config.device_id
+            || request.identity.workspace_id != host.config.workspace_id
+            || request.identity.grant_epoch != host.config.grant_epoch
+            || request.identity.incarnation.as_str() != self.instance_token
+        {
+            return Some(R::ObservationUnknown);
+        }
+        match host.journal.lookup(request) {
+            Ok(L::Pending) => None,
+            Ok(L::Resolved(result)) => Some(result),
+            Ok(L::Unknown | L::Conflict) | Err(_) => Some(R::ObservationUnknown),
+        }
+    }
+    fn query_remote_work(
+        &mut self,
+        request_id: u64,
+        request: crate::remote_worker::RemoteWorkRequest,
+    ) {
+        let shared = Arc::clone(&self.remote_worker);
+        let mut result = Some(crate::remote_worker::RemoteWorkResult::ObservationUnknown);
+        if let Ok(mut slot) = shared.lock()
+            && let Some(host) = slot.host.as_mut()
+        {
+            result = self.remote_query_result(&request, host);
+            if result.is_none() {
+                if host.queries.len() < 32 && !host.queries.iter().any(|(id, _)| *id == request_id)
+                {
+                    host.queries.push((request_id, request.clone()));
+                } else {
+                    result = Some(crate::remote_worker::RemoteWorkResult::ObservationUnknown);
+                }
+            }
+        }
+        if let Some(result) = result {
+            self.emit(RuntimeEvent::RemoteWorkQueried {
+                request_id,
+                identity: request.identity,
+                result,
+            });
+        }
+    }
     fn spawn_remote_work(&mut self, request: crate::remote_worker::RemoteWorkRequest) {
         use crate::remote_worker::{
             PendingPhase, PendingWork, Progress, RemoteWorkError as E, RemoteWorkResult as R,
@@ -3073,6 +3135,17 @@ impl Worker {
             .filter(|host| !host.pending.is_empty())
             .collect();
         if let Some(host) = slot.host.as_mut() {
+            for (request_id, request) in std::mem::take(&mut host.queries) {
+                if let Some(result) = self.remote_query_result(&request, host) {
+                    self.emit(RuntimeEvent::RemoteWorkQueried {
+                        request_id,
+                        identity: request.identity,
+                        result,
+                    });
+                } else {
+                    host.queries.push((request_id, request));
+                }
+            }
             let pending = std::mem::take(&mut host.pending);
             for work in pending {
                 match self.progress_remote_work(&work.request, host, work.phase) {
@@ -3276,6 +3349,24 @@ impl Worker {
                 _ => crate::AgentPromptKind::Other,
             };
             match &request {
+                Q::QueryInput {
+                    request_id,
+                    operation_id,
+                    request_digest,
+                    ..
+                } => {
+                    let found = record
+                        .inputs
+                        .iter()
+                        .find(|(op, digest, _, _)| op == operation_id && digest == request_digest);
+                    Some(R::InputQueried {
+                        request_id: *request_id,
+                        operation_id: operation_id.clone(),
+                        result: found
+                            .map_or(I::ObservationUnknown, |(_, _, result, _)| result.clone()),
+                        accepted: found.and_then(|(_, _, _, accepted)| accepted.clone()),
+                    })
+                }
                 Q::Observe { request_id, .. } => {
                     let effects = self.collect_session_pump_effects(&[target.session], false, true);
                     self.finish_session_pump_effects(effects);
@@ -3371,7 +3462,7 @@ impl Worker {
                         >= 256
                         || host.executions.iter().any(|r| {
                             r.closes.iter().any(|(op, _, _)| op == operation_id)
-                                || r.inputs.iter().any(|(op, _, _)| op == operation_id)
+                                || r.inputs.iter().any(|(op, _, _, _)| op == operation_id)
                         })
                     {
                         return reject();
@@ -3453,8 +3544,10 @@ impl Worker {
                         });
                     }
                     let digest = request.digest().ok()?;
-                    if let Some((_, previous, result)) =
-                        record.inputs.iter().find(|(op, _, _)| op == operation_id)
+                    if let Some((_, previous, result, _)) = record
+                        .inputs
+                        .iter()
+                        .find(|(op, _, _, _)| op == operation_id)
                     {
                         return Some(R::Delivered {
                             operation_id: operation_id.clone(),
@@ -3486,7 +3579,7 @@ impl Worker {
                         .sum::<usize>()
                         >= 256
                         || host.executions.iter().any(|r| {
-                            r.inputs.iter().any(|(op, _, _)| op == operation_id)
+                            r.inputs.iter().any(|(op, _, _, _)| op == operation_id)
                                 || r.closes.iter().any(|(op, _, _)| op == operation_id)
                         })
                     {
@@ -3500,6 +3593,7 @@ impl Worker {
                         operation_id.clone(),
                         digest,
                         I::ObservationUnknown,
+                        None,
                     ));
                     let admission = crate::InputAdmission::new(
                         crate::InputPermit::new(),
@@ -3519,11 +3613,14 @@ impl Worker {
                     })
                     .with_bracketed_paste_required();
                     let paste = format!("\x1b[200~{prompt}\x1b[201~");
-                    let result = self.admit_input_batch_for_operation(
+                    let mut accepted = None;
+                    let result = self.admit_input_batch_recording(
                         target.session,
                         &[paste.as_bytes(), b"\r"],
                         Some(&admission),
                         Some(operation_id.as_str()),
+                        SessionLog::append_redacted_output,
+                        &mut accepted,
                     );
                     self.emit(RuntimeEvent::InputAdmitted {
                         session: target.session,
@@ -3534,8 +3631,10 @@ impl Worker {
                         Ok(()) => I::Admitted,
                         Err(reason) => I::Rejected { reason },
                     };
-                    if let Some((_, _, stored)) = host.executions[index].inputs.last_mut() {
+                    if let Some((_, _, stored, receipt)) = host.executions[index].inputs.last_mut()
+                    {
                         *stored = result.clone();
+                        *receipt = accepted;
                     }
                     Some(R::Delivered {
                         operation_id: operation_id.clone(),
@@ -3545,6 +3644,16 @@ impl Worker {
             }
         })()
         .unwrap_or(match request {
+            Q::QueryInput {
+                request_id,
+                operation_id,
+                ..
+            } => R::InputQueried {
+                request_id,
+                operation_id,
+                result: I::ObservationUnknown,
+                accepted: None,
+            },
             Q::Observe { request_id, .. } => R::Observed {
                 request_id,
                 execution: None,
@@ -3587,6 +3696,10 @@ impl Worker {
             }
             RuntimeCommand::SpawnRemoteWork { request } => self.spawn_remote_work(request),
             RuntimeCommand::RemoteTaskInput { request } => self.remote_task_input(request),
+            RuntimeCommand::QueryRemoteWork {
+                request_id,
+                request,
+            } => self.query_remote_work(request_id, request),
             RuntimeCommand::SpawnAgentBeside { .. } => {
                 unreachable!("split launch normalized above")
             }

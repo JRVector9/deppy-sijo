@@ -418,7 +418,8 @@ pub(crate) fn runtime_command_retained_bytes(
             retained_add(&mut total, request.retained_bytes())?
         }
         RuntimeCommand::InspectRemoteWorker { .. } => {}
-        RuntimeCommand::SpawnRemoteWork { request } => {
+        RuntimeCommand::SpawnRemoteWork { request }
+        | RuntimeCommand::QueryRemoteWork { request, .. } => {
             retained_add(&mut total, request.retained_bytes())?
         }
         RuntimeCommand::SpawnAgent {
@@ -627,7 +628,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
     match command {
         RuntimeCommand::RemoteTaskInput { request } => request.canonicalize(),
         RuntimeCommand::InspectRemoteWorker { .. } => {}
-        RuntimeCommand::SpawnRemoteWork { request } => request.canonicalize(),
+        RuntimeCommand::SpawnRemoteWork { request }
+        | RuntimeCommand::QueryRemoteWork { request, .. } => request.canonicalize(),
         RuntimeCommand::SpawnAgent {
             agent_config_id,
             command,
@@ -848,7 +850,11 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
                 return Err(admission_error("remote_worker_request_invalid"));
             }
         }
-        RuntimeCommand::SpawnRemoteWork { request } => {
+        RuntimeCommand::QueryRemoteWork { request_id: 0, .. } => {
+            return Err(admission_error("remote_work_query_invalid"));
+        }
+        RuntimeCommand::SpawnRemoteWork { request }
+        | RuntimeCommand::QueryRemoteWork { request, .. } => {
             if !request.is_valid() {
                 return Err(admission_error("remote_work_invalid"));
             }
@@ -1458,11 +1464,23 @@ pub enum RuntimeCommand {
     RemoteTaskInput {
         request: crate::remote_input::RemoteTaskInputRequest,
     },
+    QueryRemoteWork {
+        request_id: u64,
+        request: crate::remote_worker::RemoteWorkRequest,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::QueryRemoteWork {
+                request_id,
+                request,
+            } => f
+                .debug_struct("QueryRemoteWork")
+                .field("request_id", request_id)
+                .field("identity", &request.identity)
+                .finish(),
             RuntimeCommand::RemoteTaskInput { request } => f
                 .debug_struct("RemoteTaskInput")
                 .field("target", request.target())
@@ -2952,6 +2970,7 @@ mod tests {
                 "InspectRemoteWorker",
                 "SpawnRemoteWork",
                 "RemoteTaskInput",
+                "QueryRemoteWork",
             ]
         );
     }

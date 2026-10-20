@@ -71,7 +71,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v31: actual accepted input sequence and operation identity, appended event.
 /// v33: server-captured, guarded task input on scoped remote work.
 /// v34: execution-scoped, bounded read-only remote session observation.
-pub(crate) const PROTO_VERSION: u16 = 34;
+/// v35: read-only exact-operation launch/input reconciliation.
+pub(crate) const PROTO_VERSION: u16 = 35;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -598,6 +599,6 @@ mod tests {
         assert!(command_source.contains("excluded_names"));
         assert!(command_source.contains("transient_args"));
         assert!(command_source.contains("relaunch_command"));
-        assert_eq!(PROTO_VERSION, 34);
+        assert_eq!(PROTO_VERSION, 35);
     }
 }

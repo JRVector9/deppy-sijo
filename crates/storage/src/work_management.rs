@@ -19,7 +19,9 @@ use std::collections::{HashMap, HashSet};
 
 #[path = "work_management_remote.rs"]
 mod remote_operations;
-pub use remote_operations::{RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationResult};
+pub use remote_operations::{
+    RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationLookup, RemoteOperationResult,
+};
 #[path = "work_devices.rs"]
 mod devices;
 pub use devices::{RegisteredExecutionDevice, StoredExecutionDevice};

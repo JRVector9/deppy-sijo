@@ -94,11 +94,23 @@ pub enum RemoteWorkClaim {
     Conflict,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteWorkLookup {
+    Pending,
+    Resolved(RemoteWorkResult),
+    Unknown,
+    Conflict,
+}
 /// Nonblocking durable admission port. Backends enqueue SQLite work on their own bounded worker.
 /// New is returned only after claim commit; Pending yields to the runtime event loop.
 /// Existing unresolved claims return ObservationUnknown and are never reclaimed as New.
 /// resolve returns true only after the result commit, false while its worker is pending.
 pub trait RemoteWorkJournal: Send + Sync {
+    /// Read-only: implementations must never claim, insert, launch, or replay a missing operation.
+    fn lookup(&self, _request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkLookup> {
+        Ok(RemoteWorkLookup::Unknown)
+    }
+
     fn claim(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim>;
     fn resolve(
         &self,
@@ -312,6 +324,7 @@ pub struct RemoteWorkerHost {
     pub(crate) active: Vec<(OperationId, SessionId)>,
     pub(crate) executions: Vec<crate::remote_input::ExecutionRecord>,
     pub(crate) pending: Vec<PendingWork>,
+    pub(crate) queries: Vec<(u64, RemoteWorkRequest)>,
     pub(crate) attempt_folders: Vec<(AttemptFolderGrant, Arc<RemoteDirectory>)>,
 }
 impl RemoteWorkerHost {
@@ -354,6 +367,7 @@ impl RemoteWorkerHost {
             active: vec![],
             executions: vec![],
             pending: vec![],
+            queries: vec![],
             attempt_folders: vec![],
         })
     }
@@ -526,6 +540,26 @@ mod tests {
     #[derive(Default)]
     struct Journal(Mutex<Vec<(String, RemoteWorkIdentity, Option<RemoteWorkResult>)>>);
     impl RemoteWorkJournal for Journal {
+        fn lookup(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkLookup> {
+            let digest = request.digest()?;
+            let rows = self.0.lock().unwrap();
+            Ok(
+                match rows.iter().find(|(_, id, _)| {
+                    id.operation_id == request.identity.operation_id
+                        || id.attempt_id == request.identity.attempt_id
+                }) {
+                    Some((old, id, result)) if *old == digest && *id == request.identity => {
+                        RemoteWorkLookup::Resolved(
+                            result
+                                .clone()
+                                .unwrap_or(RemoteWorkResult::ObservationUnknown),
+                        )
+                    }
+                    Some(_) => RemoteWorkLookup::Conflict,
+                    None => RemoteWorkLookup::Unknown,
+                },
+            )
+        }
         fn claim(&self, r: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim> {
             let digest = r.digest()?;
             let mut rows = self.0.lock().unwrap();
@@ -724,6 +758,74 @@ mod tests {
             profile_id: c.profiles[0].id.clone(),
             initial_prompt: Some("controlled fixture only".into()),
         }
+    }
+    #[test]
+    fn remote_compute_readonly_launch_query_cannot_claim_or_replay_missing_work() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-query-launch-{}", uuid::Uuid::new_v4()));
+        let journal = Arc::new(Journal::default());
+        let (server, pin, control) = worker_with_control(&root, "query", journal.clone());
+        let token = control
+            .issue_scoped_token("query", &WorkspaceId("workspace-query".into()), 1)
+            .unwrap();
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), token.expose(), &pin).unwrap();
+        let events = client.subscribe();
+        let caps = inspect(&client, &events);
+        let original = request(&caps, "query-op");
+        let query = |request_id, work: RemoteWorkRequest| {
+            client
+                .send_command(RuntimeCommand::QueryRemoteWork {
+                    request_id,
+                    request: work,
+                })
+                .unwrap();
+            match wait_event(
+                &events,
+                |e| matches!(e, RuntimeEvent::RemoteWorkQueried { request_id: id, .. } if *id == request_id),
+            ) {
+                RuntimeEvent::RemoteWorkQueried { result, .. } => result,
+                _ => unreachable!(),
+            }
+        };
+        assert_eq!(
+            query(30, original.clone()),
+            RemoteWorkResult::ObservationUnknown
+        );
+        assert!(journal.0.lock().unwrap().is_empty());
+        assert!(!root.join("launches").exists());
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: original.clone(),
+            })
+            .unwrap();
+        let RuntimeEvent::RemoteWorkResolved {
+            result: launched @ RemoteWorkResult::Launched { .. },
+            ..
+        } = wait_event(&events, |e| {
+            matches!(e, RuntimeEvent::RemoteWorkResolved { .. })
+        })
+        else {
+            panic!("fixture launch missing")
+        };
+        assert_eq!(query(31, original.clone()), launched);
+        assert_eq!(query(32, original.clone()), launched);
+        let mut wrong = original;
+        wrong.initial_prompt = Some("different immutable payload".into());
+        assert_eq!(query(33, wrong), RemoteWorkResult::ObservationUnknown);
+        assert_eq!(journal.0.lock().unwrap().len(), 1);
+        let until = Instant::now() + Duration::from_secs(2);
+        while !root.join("launches").exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            std::fs::read_to_string(root.join("launches")).unwrap(),
+            "launch"
+        );
+        drop(client);
+        drop(server);
+        let _ = std::fs::remove_dir_all(root);
     }
     #[test]
     fn scoped_tls_token_filters_unrelated_events_and_denies_raw_commands() {
@@ -1811,6 +1913,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(4);
         let mut admitted = false;
         let mut accepted = 0;
+        let mut original_acceptance = None;
         while !admitted || accepted == 0 {
             for event in events.drain() {
                 match event {
@@ -1831,6 +1934,10 @@ mod tests {
                         assert!(at_micros > 0);
                         assert_eq!(sequence, 1);
                         accepted += 1;
+                        original_acceptance = Some(RemoteInputAcceptance {
+                            sequence,
+                            at_micros,
+                        });
                     }
                     _ => {}
                 }
@@ -1841,6 +1948,68 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+        // A distinct administrator input advances the real session sequence. Recovery
+        // must still return the original task operation's immutable acceptance.
+        let admin = RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &pin).unwrap();
+        let admin_events = admin.subscribe();
+        admin
+            .send_command(RuntimeCommand::WriteInput {
+                session,
+                bytes: b"z".to_vec(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&admin_events, |e| matches!(
+                e,
+                RuntimeEvent::SessionInputAccepted { sequence: 2, .. }
+            )),
+            RuntimeEvent::SessionInputAccepted { sequence: 2, .. }
+        ));
+        drop(admin);
+        // Read-only recovery must return the original acceptance, never today's sequence/time.
+        for query_id in [71, 72] {
+            client
+                .send_command(RuntimeCommand::RemoteTaskInput {
+                    request: RemoteTaskInputRequest::QueryInput {
+                        target: target.clone(),
+                        request_id: query_id,
+                        operation_id: operation.clone(),
+                        request_digest: input.digest().unwrap(),
+                    },
+                })
+                .unwrap();
+            assert!(
+                matches!(wait_event(&events, |e| matches!(e, RuntimeEvent::RemoteTaskInput { reply: RemoteTaskInputReply::InputQueried { request_id, .. }, .. } if *request_id == query_id)),
+                RuntimeEvent::RemoteTaskInput { reply: RemoteTaskInputReply::InputQueried { result: RemoteTaskInputResult::Admitted, accepted: receipt, .. }, .. } if receipt == original_acceptance)
+            );
+        }
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: RemoteTaskInputRequest::QueryInput {
+                    target: target.clone(),
+                    request_id: 73,
+                    operation_id: OperationId::new(),
+                    request_digest: input.digest().unwrap(),
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput {
+                    reply: RemoteTaskInputReply::InputQueried { request_id: 73, .. },
+                    ..
+                }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::InputQueried {
+                    result: RemoteTaskInputResult::ObservationUnknown,
+                    accepted: None,
+                    ..
+                },
+                ..
+            }
+        ));
         client
             .send_command(RuntimeCommand::RemoteTaskInput { request: input })
             .unwrap();

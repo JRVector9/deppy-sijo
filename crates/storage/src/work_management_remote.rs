@@ -31,6 +31,13 @@ pub enum RemoteOperationClaim {
     Existing(RemoteOperationResult),
     Conflict,
 }
+/// Read-only lookup never inserts, claims, or converts a missing record into permission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteOperationLookup {
+    Missing,
+    Existing(RemoteOperationResult),
+    Conflict,
+}
 fn validate_identity(id: &RemoteOperationIdentity) -> anyhow::Result<()> {
     for text in [
         &id.workspace_id.0,
@@ -95,6 +102,20 @@ fn read_operation(
     .transpose()
 }
 impl CommandCenterStore {
+    pub fn lookup_remote_operation(
+        &self,
+        identity: &RemoteOperationIdentity,
+    ) -> anyhow::Result<RemoteOperationLookup> {
+        validate_identity(identity)?;
+        Ok(match read_operation(&self.conn, identity)? {
+            None => RemoteOperationLookup::Missing,
+            Some((old, result)) if old == *identity => RemoteOperationLookup::Existing(
+                result.unwrap_or(RemoteOperationResult::ObservationUnknown),
+            ),
+            Some(_) => RemoteOperationLookup::Conflict,
+        })
+    }
+
     pub fn claim_remote_operation(
         &mut self,
         identity: &RemoteOperationIdentity,
@@ -156,6 +177,46 @@ impl CommandCenterStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readonly_remote_lookup_never_claims_and_returns_only_exact_immutable_receipts() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-query-journal-{}", uuid::Uuid::new_v4()));
+        let mut store = CommandCenterStore::open(&root).unwrap();
+        let id = identity();
+        assert_eq!(
+            store.lookup_remote_operation(&id).unwrap(),
+            RemoteOperationLookup::Missing
+        );
+        assert_eq!(
+            store.claim_remote_operation(&id).unwrap(),
+            RemoteOperationClaim::New
+        );
+        assert_eq!(
+            store.lookup_remote_operation(&id).unwrap(),
+            RemoteOperationLookup::Existing(RemoteOperationResult::ObservationUnknown)
+        );
+        let result = RemoteOperationResult::Launched {
+            session_id: 4,
+            execution_generation: 7,
+        };
+        store.resolve_remote_operation(&id, &result).unwrap();
+        assert_eq!(
+            store.lookup_remote_operation(&id).unwrap(),
+            RemoteOperationLookup::Existing(result.clone())
+        );
+        let mut wrong = id.clone();
+        wrong.request_digest = "b".repeat(64);
+        assert_eq!(
+            store.lookup_remote_operation(&wrong).unwrap(),
+            RemoteOperationLookup::Conflict
+        );
+        assert_eq!(
+            store.lookup_remote_operation(&id).unwrap(),
+            RemoteOperationLookup::Existing(result)
+        );
+        drop(store);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn identity() -> RemoteOperationIdentity {
         RemoteOperationIdentity {
             workspace_id: WorkspaceId("workspace-a".into()),

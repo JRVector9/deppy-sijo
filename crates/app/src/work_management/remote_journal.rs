@@ -1,18 +1,20 @@
 //! Runtime callbacks only enqueue/poll. SQLite runs on this lazy bounded worker.
 use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use runtime::remote_worker::{
-    RemoteWorkClaim, RemoteWorkJournal, RemoteWorkRequest, RemoteWorkResult,
+    RemoteWorkClaim, RemoteWorkJournal, RemoteWorkLookup, RemoteWorkRequest, RemoteWorkResult,
 };
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 use storage::work_management::{
-    CommandCenterStore, RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationResult,
+    CommandCenterStore, RemoteOperationClaim, RemoteOperationIdentity, RemoteOperationLookup,
+    RemoteOperationResult,
 };
 
 #[derive(Clone)]
 enum JobKind {
     Claim,
+    Lookup,
     Resolve(RemoteOperationResult),
 }
 
@@ -24,10 +26,12 @@ struct Job {
     kind: JobKind,
 }
 enum Reply {
+    Lookup(RemoteOperationLookup),
     Claim(RemoteOperationClaim),
     Resolved(RemoteOperationResult),
 }
 struct Outcome {
+    lookup: bool,
     identity: RemoteOperationIdentity,
     reply: Result<Reply, ()>,
 }
@@ -43,9 +47,14 @@ struct Record {
     identity: RemoteOperationIdentity,
     status: Status,
 }
+struct QueryRecord {
+    identity: RemoteOperationIdentity,
+    reply: Option<std::result::Result<RemoteWorkLookup, ()>>,
+}
 struct State {
     worker: LazyBoundedWorker<Job, Outcome>,
     records: Vec<Record>,
+    queries: Vec<QueryRecord>,
 }
 pub(crate) struct AsyncRemoteJournal {
     state: Mutex<State>,
@@ -67,11 +76,13 @@ impl AsyncRemoteJournal {
             state: Mutex::new(State {
                 worker,
                 records: vec![],
+                queries: vec![],
             }),
         }
     }
 }
 fn execute(data_dir: &Path, store: &mut Option<CommandCenterStore>, job: Job) -> Outcome {
+    let lookup = matches!(job.kind, JobKind::Lookup);
     let result = (|| -> anyhow::Result<Reply> {
         if store.is_none() {
             *store = Some(CommandCenterStore::open(data_dir)?);
@@ -81,6 +92,7 @@ fn execute(data_dir: &Path, store: &mut Option<CommandCenterStore>, job: Job) ->
             .ok_or_else(|| anyhow::anyhow!("journal unavailable"))?;
         match job.kind {
             JobKind::Claim => Ok(Reply::Claim(store.claim_remote_operation(&job.identity)?)),
+            JobKind::Lookup => Ok(Reply::Lookup(store.lookup_remote_operation(&job.identity)?)),
             JobKind::Resolve(result) => {
                 store.resolve_remote_operation(&job.identity, &result)?;
                 Ok(Reply::Resolved(result))
@@ -88,6 +100,7 @@ fn execute(data_dir: &Path, store: &mut Option<CommandCenterStore>, job: Job) ->
         }
     })();
     Outcome {
+        lookup,
         identity: job.identity,
         reply: result.map_err(|_| ()),
     }
@@ -143,6 +156,9 @@ impl State {
             };
             match outcome.into_result() {
                 Err(_) => {
+                    for query in &mut self.queries {
+                        query.reply = Some(Err(()));
+                    }
                     for record in &mut self.records {
                         if matches!(
                             record.status,
@@ -153,13 +169,36 @@ impl State {
                     }
                 }
                 Ok(outcome) => {
+                    if outcome.lookup {
+                        if let Some(query) = self
+                            .queries
+                            .iter_mut()
+                            .find(|q| q.identity == outcome.identity)
+                        {
+                            query.reply = Some(match outcome.reply {
+                                Ok(Reply::Lookup(RemoteOperationLookup::Missing)) => {
+                                    Ok(RemoteWorkLookup::Unknown)
+                                }
+                                Ok(Reply::Lookup(RemoteOperationLookup::Conflict)) => {
+                                    Ok(RemoteWorkLookup::Conflict)
+                                }
+                                Ok(Reply::Lookup(RemoteOperationLookup::Existing(result))) => {
+                                    from_stored(result)
+                                        .map(RemoteWorkLookup::Resolved)
+                                        .map_err(|_| ())
+                                }
+                                _ => Err(()),
+                            });
+                        }
+                        continue;
+                    }
                     if let Some(record) = self
                         .records
                         .iter_mut()
                         .find(|r| r.identity == outcome.identity)
                     {
                         record.status = match outcome.reply {
-                            Err(()) => Status::Failed,
+                            Err(()) | Ok(Reply::Lookup(_)) => Status::Failed,
                             Ok(Reply::Claim(claim)) => match claim {
                                 RemoteOperationClaim::New => Status::Claimed(RemoteWorkClaim::New),
                                 RemoteOperationClaim::Conflict => {
@@ -201,6 +240,33 @@ impl State {
     }
 }
 impl RemoteWorkJournal for AsyncRemoteJournal {
+    fn lookup(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkLookup> {
+        let identity = identity(request)?;
+        let mut state = match self.state.try_lock() {
+            Ok(state) => state,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(RemoteWorkLookup::Pending),
+            Err(_) => anyhow::bail!("remote journal state unavailable"),
+        };
+        state.poll();
+        if let Some(index) = state.queries.iter().position(|q| q.identity == identity) {
+            if let Some(reply) = state.queries[index].reply.take() {
+                state.queries.remove(index);
+                return reply.map_err(|_| anyhow::anyhow!("remote journal query unavailable"));
+            }
+            return Ok(RemoteWorkLookup::Pending);
+        }
+        anyhow::ensure!(state.queries.len() < 32, "remote journal queries full");
+        if state.submit(Job {
+            identity: identity.clone(),
+            kind: JobKind::Lookup,
+        })? {
+            state.queries.push(QueryRecord {
+                identity,
+                reply: None,
+            });
+        }
+        Ok(RemoteWorkLookup::Pending)
+    }
     fn claim(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim> {
         let identity = identity(request)?;
         let mut state = match self.state.try_lock() {
@@ -295,6 +361,43 @@ mod tests {
     use deppy_core::work_management::{AttemptId, OperationId, RuntimeIncarnationId};
     use runtime::remote_worker::RemoteWorkIdentity;
     use std::time::{Duration, Instant};
+    #[test]
+    fn readonly_lookup_cannot_claim_missing_and_survives_journal_restart() {
+        let root = std::env::temp_dir().join(format!("deppy-async-query-{}", uuid::Uuid::new_v4()));
+        let request = request();
+        let query = |journal: &AsyncRemoteJournal| {
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let result = journal.lookup(&request).unwrap();
+                if result != RemoteWorkLookup::Pending {
+                    break result;
+                }
+                assert!(Instant::now() < until);
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        };
+        let journal = AsyncRemoteJournal::new(root.clone(), || {});
+        assert_eq!(query(&journal), RemoteWorkLookup::Unknown);
+        assert_eq!(committed_claim(&journal, &request), RemoteWorkClaim::New);
+        let result = RemoteWorkResult::Launched {
+            session: deppy_core::SessionId(2),
+            execution_generation: 9,
+        };
+        let until = Instant::now() + Duration::from_secs(5);
+        while !journal.resolve(&request, &result).unwrap() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(journal);
+        let restarted = AsyncRemoteJournal::new(root.clone(), || {});
+        assert_eq!(query(&restarted), RemoteWorkLookup::Resolved(result));
+        assert!(
+            restarted.state.lock().unwrap().records.is_empty(),
+            "query must never issue a claim"
+        );
+        drop(restarted);
+        std::fs::remove_dir_all(root).unwrap();
+    }
     fn request() -> RemoteWorkRequest {
         RemoteWorkRequest {
             identity: RemoteWorkIdentity {

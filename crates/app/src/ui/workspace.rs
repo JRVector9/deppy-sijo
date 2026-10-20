@@ -5761,6 +5761,7 @@ impl WorkspaceUi {
                 | RuntimeEvent::TerminalHistoryResult { .. }
                 | RuntimeEvent::RemoteWorkerObserved { .. }
                 | RuntimeEvent::RemoteWorkResolved { .. }
+                | RuntimeEvent::RemoteWorkQueried { .. }
                 | RuntimeEvent::RemoteTaskInput { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,

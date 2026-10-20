@@ -152,6 +152,15 @@ pub(crate) enum RemoteDeviceJob {
         prompt: String,
         authority: RemoteSendAuthority,
     },
+    ReconcileLaunch {
+        request_id: u64,
+        lease: ExecutionLease,
+    },
+    ReconcileInput {
+        request_id: u64,
+        lease: ExecutionLease,
+        operation_id: OperationId,
+    },
     ReserveLaunch {
         request_id: u64,
         request: LeaseRequest,
@@ -346,6 +355,10 @@ impl RemoteDeviceWorker {
             }
             | RemoteDeviceJob::CloseSession {
                 request_id, lease, ..
+            }
+            | RemoteDeviceJob::ReconcileLaunch { request_id, lease }
+            | RemoteDeviceJob::ReconcileInput {
+                request_id, lease, ..
             } => RemoteDeviceCorrelation {
                 request_id: *request_id,
                 workspace_id: Some(lease.request.workspace_id.clone()),
@@ -353,7 +366,8 @@ impl RemoteDeviceWorker {
                 attempt_id: Some(lease.request.attempt_id.clone()),
                 operation_id: Some(match &job {
                     RemoteDeviceJob::DeliverInput { operation_id, .. }
-                    | RemoteDeviceJob::CloseSession { operation_id, .. } => operation_id.clone(),
+                    | RemoteDeviceJob::CloseSession { operation_id, .. }
+                    | RemoteDeviceJob::ReconcileInput { operation_id, .. } => operation_id.clone(),
                     _ => lease.request.operation_id.clone(),
                 }),
                 candidate_id: None,

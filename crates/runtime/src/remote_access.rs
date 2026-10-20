@@ -84,7 +84,10 @@ impl RemoteConnectionScope {
         self.is_current()
             && match command {
                 RuntimeCommand::InspectRemoteWorker { .. } => true,
-                RuntimeCommand::SpawnRemoteWork { request } => self.matches(&request.identity),
+                RuntimeCommand::SpawnRemoteWork { request }
+                | RuntimeCommand::QueryRemoteWork { request, .. } => {
+                    self.matches(&request.identity)
+                }
                 RuntimeCommand::RemoteTaskInput { request } => {
                     self.matches(&request.target().identity)
                 }
@@ -104,7 +107,8 @@ impl RemoteConnectionScope {
                     && c.workspace_id == self.workspace_id
                     && c.grant_epoch == self.grant_epoch
             }
-            RuntimeEvent::RemoteWorkResolved { identity, .. } => self.matches(identity),
+            RuntimeEvent::RemoteWorkResolved { identity, .. }
+            | RuntimeEvent::RemoteWorkQueried { identity, .. } => self.matches(identity),
             RuntimeEvent::RemoteTaskInput { target, .. } => self.matches(&target.identity),
             RuntimeEvent::SessionInputAccepted {
                 session,
@@ -138,8 +142,9 @@ impl RemoteConnectionScope {
             && host.executions.iter().any(|record| {
                 self.matches(&record.target.identity)
                     && record.target.session == session
-                    && operation
-                        .is_none_or(|op| record.inputs.iter().any(|(id, _, _)| id.as_str() == op))
+                    && operation.is_none_or(|op| {
+                        record.inputs.iter().any(|(id, _, _, _)| id.as_str() == op)
+                    })
             })
     }
 }

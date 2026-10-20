@@ -305,6 +305,11 @@ pub enum RuntimeEvent {
         target: crate::remote_input::RemoteTaskTarget,
         reply: crate::remote_input::RemoteTaskInputReply,
     },
+    RemoteWorkQueried {
+        request_id: u64,
+        identity: crate::remote_worker::RemoteWorkIdentity,
+        result: crate::remote_worker::RemoteWorkResult,
+    },
 }
 
 impl RuntimeEvent {
@@ -605,6 +610,7 @@ mod tests {
                 "RemoteWorkerObserved",
                 "RemoteWorkResolved",
                 "RemoteTaskInput",
+                "RemoteWorkQueried",
             ]
         );
     }

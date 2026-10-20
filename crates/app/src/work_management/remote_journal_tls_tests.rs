@@ -104,6 +104,16 @@ pub(crate) fn worker_for_workspace_with_launcher(
     launcher: Arc<dyn RemoteWorkLauncher>,
     agent: AgentSelection,
 ) -> (RemoteRuntimeServer, String) {
+    let (server, pin, _) = worker_for_workspace_scoped(root, id, workspace, launcher, agent);
+    (server, pin)
+}
+pub(crate) fn worker_for_workspace_scoped(
+    root: &Path,
+    id: &str,
+    workspace: &str,
+    launcher: Arc<dyn RemoteWorkLauncher>,
+    agent: AgentSelection,
+) -> (RemoteRuntimeServer, String, SecretString) {
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(root.join("metadata.sqlite3"), b"legacy untouched").unwrap();
     let backend = InProcessRuntimeClient::try_new_with_resolver(
@@ -142,6 +152,10 @@ pub(crate) fn worker_for_workspace_with_launcher(
             .unwrap(),
         ))
         .unwrap();
+    let token = backend
+        .remote_worker_control()
+        .issue_scoped_token(id, &WorkspaceId(workspace.into()), 1)
+        .unwrap();
     let identity = runtime::tls_identity::get_or_create_identity(
         &MemorySecrets::default(),
         &root.join("fixture-cert.der"),
@@ -152,6 +166,7 @@ pub(crate) fn worker_for_workspace_with_launcher(
         RemoteRuntimeServer::serve_tls(backend, "127.0.0.1:0".parse().unwrap(), identity, false)
             .unwrap(),
         pin,
+        token,
     )
 }
 fn event(rx: &RuntimeEventReceiver, accept: impl Fn(&RuntimeEvent) -> bool) -> RuntimeEvent {

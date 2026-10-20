@@ -400,7 +400,12 @@ fn amend(
     }
     task.assigned_agent = agent;
     task.execution_device = device;
-    project.confirmed.remove(&task.goal_id.0);
+    let goal = task.goal_id.clone();
+    project.confirmed.remove(&goal.0);
+    project
+        .snapshot
+        .plan_confirmations
+        .retain(|review| review.plan.goal_id != goal);
     project.dirty();
     Ok(())
 }
@@ -776,6 +781,74 @@ mod tests {
         );
         assert!(!p.ready_tasks().unwrap().contains(&first_id));
         assert!(p.ready_tasks().unwrap().contains(&second.id));
+    }
+    #[test]
+    fn explicit_unstarted_assignment_edit_discards_only_its_old_review_evidence() {
+        let mut p = planned();
+        let agent = work::AgentSelection {
+            provider: "claude".into(),
+            model: Some("actual-model".into()),
+            effort: None,
+        };
+        p.allowed_agents.push(agent.clone());
+        let goal = p.snapshot.goals[0].id.clone();
+        let task = p.snapshot.tasks[0].id.0.clone();
+        confirm(&mut p, &goal);
+        let mut state = p.state();
+        let other_goal = state
+            .submit_goal(
+                work::SubmissionId::new(),
+                "other goal".into(),
+                "actual other request".into(),
+            )
+            .unwrap();
+        let mut other = state.tasks[0].clone();
+        other.id = work::TaskId::new();
+        other.goal_id = other_goal.clone();
+        other.state = work::WorkState::PlanReview;
+        other.scope = "src/other".into();
+        state
+            .install_plan(work::WorkPlan {
+                workspace_id: state.workspace_id.clone(),
+                goal_id: other_goal.clone(),
+                tasks: vec![other.clone()],
+            })
+            .unwrap();
+        p.set_state(state);
+        confirm(&mut p, &other_goal);
+        let revision = p.snapshot.config.revision.0.to_string();
+        let original = p.snapshot.clone();
+        assert!(
+            amend(&mut p, &task, &revision, agent.clone(), None).is_err(),
+            "confirmed queued work cannot change assignment without review"
+        );
+        assert_eq!(p.snapshot, original);
+        // The reducer can re-open an entirely unstarted plan. Even if an older
+        // caller retained review evidence, an explicit assignment edit invalidates it.
+        let reviewed = p.reviewed_plan(&goal).unwrap();
+        let mut state = p.state();
+        state.install_plan(reviewed).unwrap();
+        p.set_state(state);
+        p.snapshot.validate().unwrap();
+        amend(&mut p, &task, &revision, agent, None).unwrap();
+        p.snapshot
+            .validate()
+            .expect("an allowed assignment edit must remain persistable");
+        assert!(
+            !p.snapshot
+                .plan_confirmations
+                .iter()
+                .any(|review| review.plan.goal_id == goal)
+        );
+        assert!(
+            p.snapshot
+                .plan_confirmations
+                .iter()
+                .any(|review| review.plan.goal_id == other_goal)
+        );
+        assert!(p.confirmed.contains_key(&other_goal.0));
+        p.confirm_goal(&goal, &[]).unwrap();
+        assert!(p.ready_tasks().unwrap().contains(&other.id));
     }
     #[test]
     fn assignment_changes_only_reviewed_definition_and_requires_current_revision() {

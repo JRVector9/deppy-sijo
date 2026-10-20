@@ -178,6 +178,7 @@ mod tests {
                 use_worktrees: true,
             },
             main_binding: None,
+            plan_confirmations: vec![],
             goals: vec![],
             tasks: vec![],
             attempts: vec![],

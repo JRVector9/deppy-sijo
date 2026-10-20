@@ -240,6 +240,31 @@ impl ConfirmedPlan {
             tasks,
         })
     }
+    /// Explicit review of durable definitions; never call while merely loading a snapshot.
+    pub(crate) fn confirm_remaining(
+        state: &ProjectWorkState,
+        reviewed: &WorkPlan,
+        config: &ProjectConfig,
+        policy: &ExecutionPolicy,
+    ) -> Result<Self, ValidationError> {
+        policy.validate_config(config)?;
+        reviewed.validate()?;
+        let token = Self {
+            config: config.clone(),
+            policy: policy.clone(),
+            goal_id: reviewed.goal_id.clone(),
+            tasks: reviewed.tasks.clone(),
+        };
+        token.validate_current(state, config, policy)?;
+        for task in state
+            .tasks
+            .iter()
+            .filter(|task| task.goal_id == reviewed.goal_id && needs_confirmation(task))
+        {
+            policy.validate_task(task)?;
+        }
+        Ok(token)
+    }
     pub fn goal_id(&self) -> &GoalId {
         &self.goal_id
     }
@@ -334,6 +359,15 @@ impl ExecutionPolicy {
         }
         Ok(())
     }
+}
+
+/// Work which can require a future launch. Active attempts retain their original config.
+pub(crate) fn needs_confirmation(task: &Task) -> bool {
+    task.current_attempt_id.is_none() && task.state == WorkState::Queued
+        || matches!(
+            task.state,
+            WorkState::Failed | WorkState::Cancelled | WorkState::VerificationFailed
+        )
 }
 
 pub(crate) fn same_task_definition(a: &Task, b: &Task) -> bool {

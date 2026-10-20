@@ -8,9 +8,9 @@ use std::path::Path;
 use anyhow::Context;
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::{
-    Attempt, AttemptId, EventId, Goal, OperationId, PersistentBinding, ProjectConfig, Task, TaskId,
-    WORK_DRAFT_MAX_BYTES, WORK_DRAFT_MAX_COUNT, WORK_DRAFT_TOTAL_MAX_BYTES, WORK_EVENT_MAX_BYTES,
-    WORK_PAGE_MAX_ROWS, WORK_PLAN_MAX_TASKS, WorkPlan,
+    Attempt, AttemptId, EventId, Goal, GoalId, OperationId, PersistentBinding, ProjectConfig, Task,
+    TaskId, WORK_DRAFT_MAX_BYTES, WORK_DRAFT_MAX_COUNT, WORK_DRAFT_TOTAL_MAX_BYTES,
+    WORK_EVENT_MAX_BYTES, WORK_PAGE_MAX_ROWS, WORK_PLAN_MAX_TASKS, WorkPlan,
 };
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -174,10 +174,39 @@ pub struct DispatchOutbox {
     pub state: DispatchOutboxState,
 }
 
+/// Durable evidence of a user-reviewed immutable plan. This is never a runtime permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanConfirmation {
+    pub version: u8,
+    pub config: ProjectConfig,
+    pub plan: WorkPlan,
+}
+impl PlanConfirmation {
+    pub fn matches(&self, workspace: &WorkspaceId, goal: &GoalId, tasks: &[Task]) -> bool {
+        self.version == 1
+            && &self.config.workspace_id == workspace
+            && &self.plan.workspace_id == workspace
+            && &self.plan.goal_id == goal
+            && self.plan.tasks.len() == tasks.iter().filter(|task| &task.goal_id == goal).count()
+            && self.plan.tasks.iter().all(|reviewed| {
+                tasks.iter().any(|task| {
+                    let mut current = task.clone();
+                    current.state = deppy_core::work_management::WorkState::PlanReview;
+                    current.current_attempt_id = None;
+                    current.result = None;
+                    reviewed == &current
+                })
+            })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandCenterSnapshot {
     pub config: ProjectConfig,
     pub main_binding: Option<PersistentBinding>,
+    #[serde(default, deserialize_with = "bounded_confirmations")]
+    pub plan_confirmations: Vec<PlanConfirmation>,
     #[serde(deserialize_with = "bounded_goals")]
     pub goals: Vec<Goal>,
     #[serde(deserialize_with = "bounded_tasks")]
@@ -227,6 +256,11 @@ macro_rules! bounded_records {
         }
     };
 }
+bounded_records!(
+    bounded_confirmations,
+    PlanConfirmation,
+    WORK_PROJECT_MAX_GOALS
+);
 bounded_records!(bounded_goals, Goal, WORK_PROJECT_MAX_GOALS);
 bounded_records!(bounded_tasks, Task, WORK_PLAN_MAX_TASKS);
 bounded_records!(bounded_attempts, Attempt, WORK_PROJECT_MAX_ATTEMPTS);
@@ -250,7 +284,8 @@ impl CommandCenterSnapshot {
             "config revision exceeds SQLite range"
         );
         anyhow::ensure!(
-            self.goals.len() <= WORK_PROJECT_MAX_GOALS
+            self.plan_confirmations.len() <= WORK_PROJECT_MAX_GOALS
+                && self.goals.len() <= WORK_PROJECT_MAX_GOALS
                 && self.tasks.len() <= WORK_PLAN_MAX_TASKS
                 && self.attempts.len() <= WORK_PROJECT_MAX_ATTEMPTS
                 && self.events.len() <= WORK_PAGE_MAX_ROWS
@@ -310,6 +345,26 @@ impl CommandCenterSnapshot {
                 }
                 .validate()?;
             }
+        }
+        let mut confirmed_goals = HashSet::new();
+        let mut confirmed_tasks = 0usize;
+        for review in &self.plan_confirmations {
+            review.config.validate()?;
+            review.plan.validate()?;
+            confirmed_tasks = confirmed_tasks
+                .checked_add(review.plan.tasks.len())
+                .context("confirmation task count overflow")?;
+            anyhow::ensure!(
+                review.version == 1
+                    && confirmed_goals.insert(&review.plan.goal_id)
+                    && goals.contains_key(&review.plan.goal_id)
+                    && review.config.revision <= self.config.revision
+                    && (review.config.revision != self.config.revision
+                        || review.config == self.config)
+                    && review.matches(workspace_id, &review.plan.goal_id, &self.tasks)
+                    && confirmed_tasks <= WORK_PLAN_MAX_TASKS,
+                "reviewed plan definition or configuration mismatch"
+            );
         }
         let mut attempts = HashMap::new();
         let mut numbers = HashSet::new();

@@ -203,6 +203,74 @@ impl RemoteConfirmedPlan {
         state.confirm_plan(goal)?;
         Ok(token)
     }
+    /// Explicitly review pending definitions against current live device proofs.
+    pub(crate) fn confirm_remaining(
+        state: &ProjectWorkState,
+        reviewed: &WorkPlan,
+        config: &ProjectConfig,
+        policy: &ExecutionPolicy,
+        devices: &[VerifiedExecutionDevice],
+    ) -> Result<Self, ValidationError> {
+        reviewed.validate()?;
+        if devices.len() > super::devices::EXECUTION_DEVICE_MAX {
+            return Err(error("too many execution device proofs"));
+        }
+        let confirmed = ConfirmedPlan {
+            config: config.clone(),
+            policy: policy.clone(),
+            goal_id: reviewed.goal_id.clone(),
+            tasks: reviewed.tasks.clone(),
+        };
+        confirmed.validate_current(state, config, policy)?;
+        // Historical and live attempts retain their original config and need no
+        // renewed launch grant. Every future launch uses a fresh exact device proof.
+        let mut approved = Vec::new();
+        for task in state
+            .tasks
+            .iter()
+            .filter(|task| task.goal_id == reviewed.goal_id && dispatch::needs_confirmation(task))
+        {
+            validate_scope_agent(task, policy)?;
+            if let Some(id) = &task.execution_device {
+                if config.use_worktrees {
+                    return Err(error("remote task worktree ownership is unsupported"));
+                }
+                let matching: Vec<_> = devices
+                    .iter()
+                    .filter(|device| &device.registration().id == id)
+                    .collect();
+                if matching.len() != 1 {
+                    return Err(error("task requires one registered execution device proof"));
+                }
+                let device = matching[0];
+                device
+                    .validate_fresh()
+                    .map_err(|_| error("execution device proof is stale or revoked"))?;
+                if device.registration().workspace_id != state.workspace_id
+                    || !device.registration().execution_granted
+                {
+                    return Err(error(
+                        "execution device belongs to another project or has no grant",
+                    ));
+                }
+                if !approved
+                    .iter()
+                    .any(|previous: &ApprovedDevice| previous.registration.id == *id)
+                {
+                    approved.push(ApprovedDevice {
+                        registration: device.registration().clone(),
+                        profiles: device.profiles().to_vec(),
+                    });
+                }
+            }
+        }
+        let token = Self {
+            confirmed,
+            devices: approved,
+        };
+        token.validate_current(state, config, policy)?;
+        Ok(token)
+    }
     pub(crate) fn goal_id(&self) -> &GoalId {
         self.confirmed.goal_id()
     }
@@ -213,7 +281,11 @@ impl RemoteConfirmedPlan {
         policy: &ExecutionPolicy,
     ) -> Result<(), ValidationError> {
         self.confirmed.validate_current(state, config, policy)?;
-        for task in &self.confirmed.tasks {
+        for task in state
+            .tasks
+            .iter()
+            .filter(|task| task.goal_id == *self.goal_id() && dispatch::needs_confirmation(task))
+        {
             self.validate_task(task, policy)?;
         }
         Ok(())
@@ -581,6 +653,73 @@ mod tests {
             PrepareOutcome::Ready(ready) => ready,
             _ => panic!("expected first dispatch"),
         }
+    }
+    #[test]
+    fn mixed_reconfirmation_requires_fresh_exact_device_proofs_without_replaying_attempts() {
+        let mut fixture = Fixture::new();
+        let initial = fixture.confirm();
+        let reviewed = WorkPlan {
+            workspace_id: fixture.state.workspace_id.clone(),
+            goal_id: fixture.goal.clone(),
+            tasks: initial.confirmed.tasks.clone(),
+        };
+        fixture.config.revision = fixture.config.revision.next().unwrap();
+        fixture.policy.config_revision = fixture.config.revision;
+        let before = format!("{:?}", fixture.state);
+        assert!(
+            RemoteConfirmedPlan::confirm_remaining(
+                &fixture.state,
+                &reviewed,
+                &fixture.config,
+                &fixture.policy,
+                &[]
+            )
+            .is_err()
+        );
+        let devices = fixture
+            .registry
+            .verified_devices(&fixture.state.workspace_id, 10);
+        let restored = RemoteConfirmedPlan::confirm_remaining(
+            &fixture.state,
+            &reviewed,
+            &fixture.config,
+            &fixture.policy,
+            &devices,
+        )
+        .unwrap();
+        assert_eq!(format!("{:?}", fixture.state), before);
+        let fresh_attempt = AttemptId::new();
+        let operation = OperationId::new();
+        let intent = prepare_remote_launch(
+            &fixture.state,
+            &DeliveryLedger::default(),
+            &restored,
+            &fixture.state.tasks[0].id,
+            fresh_attempt.clone(),
+            operation.clone(),
+            &fixture.config,
+            &fixture.policy,
+            &devices[0],
+        )
+        .unwrap();
+        assert_eq!(intent.request().attempt_id, fresh_attempt);
+        assert_eq!(intent.request().operation_id, operation);
+        assert!(
+            fixture.state.attempts.is_empty(),
+            "review and preparation must not launch or create an attempt"
+        );
+        let mut changed = reviewed.clone();
+        changed.tasks[0].instructions.push_str("changed");
+        assert!(
+            RemoteConfirmedPlan::confirm_remaining(
+                &fixture.state,
+                &changed,
+                &fixture.config,
+                &fixture.policy,
+                &devices
+            )
+            .is_err()
+        );
     }
     #[test]
     fn verified_mixed_plan_prepares_exact_remote_attempt_without_sending_or_mutating_source() {

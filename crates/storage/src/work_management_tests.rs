@@ -29,6 +29,7 @@ fn snapshot(workspace_id: &str) -> CommandCenterSnapshot {
         main_binding: Some(PersistentBinding::Pane {
             pane_id: deppy_core::MuxPaneId("main-pane".into()),
         }),
+        plan_confirmations: vec![],
         goals: vec![Goal {
             workspace_id: workspace_id.clone(),
             id: goal_id.clone(),
@@ -658,5 +659,85 @@ fn work_management_explicit_archival_requires_terminal_acknowledged_records() {
             revision,
             snapshot: project
         })
+    );
+}
+
+#[test]
+fn reviewed_plan_records_are_versioned_bounded_and_validate_immutable_definitions() {
+    let mut original = snapshot("review-record-workspace");
+    let mut task = original.tasks[0].clone();
+    task.state = WorkState::PlanReview;
+    task.current_attempt_id = None;
+    task.result = None;
+    original.plan_confirmations.push(PlanConfirmation {
+        version: 1,
+        config: original.config.clone(),
+        plan: WorkPlan {
+            workspace_id: original.config.workspace_id.clone(),
+            goal_id: original.goals[0].id.clone(),
+            tasks: vec![task],
+        },
+    });
+    original.validate().unwrap();
+    let encoded = serde_json::to_value(&original).unwrap();
+    let mut legacy = encoded.clone();
+    legacy.as_object_mut().unwrap().remove("plan_confirmations");
+    let decoded: CommandCenterSnapshot = serde_json::from_value(legacy).unwrap();
+    assert!(
+        decoded.plan_confirmations.is_empty(),
+        "legacy storage must not invent review evidence"
+    );
+    for change in 0..4 {
+        let mut invalid = original.clone();
+        match change {
+            0 => invalid.plan_confirmations[0].version = 2,
+            1 => invalid.plan_confirmations[0].plan.tasks[0]
+                .instructions
+                .push_str("changed"),
+            2 => {
+                invalid.plan_confirmations[0].plan.tasks[0].current_attempt_id =
+                    invalid.tasks[0].current_attempt_id.clone()
+            }
+            _ => invalid
+                .plan_confirmations
+                .push(invalid.plan_confirmations[0].clone()),
+        }
+        assert!(invalid.validate().is_err());
+    }
+    let mut oversized = encoded;
+    oversized["plan_confirmations"] =
+        serde_json::Value::Array(vec![
+            serde_json::to_value(&original.plan_confirmations[0])
+                .unwrap();
+            WORK_PROJECT_MAX_GOALS + 1
+        ]);
+    assert!(serde_json::from_value::<CommandCenterSnapshot>(oversized).is_err());
+}
+
+#[test]
+fn reviewed_plan_nested_tasks_are_bounded_during_decode() {
+    let mut original = snapshot("bounded-reviewed-plan");
+    let mut task = original.tasks[0].clone();
+    task.state = WorkState::PlanReview;
+    task.current_attempt_id = None;
+    task.result = None;
+    original.plan_confirmations.push(PlanConfirmation {
+        version: 1,
+        config: original.config.clone(),
+        plan: WorkPlan {
+            workspace_id: original.config.workspace_id.clone(),
+            goal_id: original.goals[0].id.clone(),
+            tasks: vec![task.clone()],
+        },
+    });
+    let mut value = serde_json::to_value(original).unwrap();
+    value["plan_confirmations"][0]["plan"]["tasks"] =
+        serde_json::Value::Array(vec![
+            serde_json::to_value(task).unwrap();
+            WORK_PLAN_MAX_TASKS + 1
+        ]);
+    assert!(
+        serde_json::from_value::<CommandCenterSnapshot>(value).is_err(),
+        "nested review definitions must reject excessive rows before full allocation"
     );
 }

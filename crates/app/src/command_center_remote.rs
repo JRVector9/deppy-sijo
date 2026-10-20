@@ -609,7 +609,8 @@ impl App {
                     && d.registration().workspace_id == task.workspace_id
             })
             .ok_or("현재 연결되어 실행이 허용된 기기를 확인할 수 없습니다.")?;
-        let Some(assignment::Confirmed::Mixed(confirmed)) = project.confirmed.as_ref() else {
+        let Some(assignment::Confirmed::Mixed(confirmed)) = project.confirmed_for_task(&task.id)
+        else {
             return Err("변경한 기기·프로필을 포함한 전체 배정안을 먼저 확인해 주세요.".into());
         };
         let attempt = work::AttemptId::new();
@@ -761,7 +762,7 @@ impl App {
                     Stage::AttemptSave => {
                         if pending.assignment.is_none() {
                             let Some(assignment::Confirmed::Mixed(confirmed)) =
-                                project.confirmed.as_ref()
+                                project.confirmed_for_task(&pending.record.task_id)
                             else {
                                 return Err("확인한 원격 배정안이 바뀌었습니다.".into());
                             };

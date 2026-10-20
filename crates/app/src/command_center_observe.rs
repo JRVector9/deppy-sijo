@@ -291,7 +291,10 @@ impl App {
                 .and_then(|input| host.route(&input.target))
                 .cloned()
                 .filter(|l| l.capture.prompt.as_ref() == Some(&delayed.target));
-            if current && input_current(&host, &id, &delayed.target) && let Some(live) = live {
+            if current
+                && input_current(&host, &id, &delayed.target)
+                && let Some(live) = live
+            {
                 if let (Some(native), Some(input), Some(p)) =
                     (native, host.inputs.get(&id), host.projects.get(&workspace))
                     && host
@@ -340,9 +343,10 @@ impl App {
         prompt: String,
         id: String,
     ) {
-        let authorized = self.command_center.as_ref().is_some_and(|host| {
-            input_current(host, &id, &target)
-        });
+        let authorized = self
+            .command_center
+            .as_ref()
+            .is_some_and(|host| input_current(host, &id, &target));
         if !authorized {
             self.command_center_input_outcome(&id, ui::composer::PromptAdmissionOutcome::Rejected);
             return;
@@ -580,9 +584,14 @@ impl App {
     }
 }
 fn input_current(host: &CommandCenterHost, id: &str, target: &FleetPromptTarget) -> bool {
-    let Some(input) = host.inputs.get(id) else { return false };
-    let Some(project) = host.projects.get(&input.target.workspace_id) else { return false };
-    project.loaded && !project.storage_blocked
+    let Some(input) = host.inputs.get(id) else {
+        return false;
+    };
+    let Some(project) = host.projects.get(&input.target.workspace_id) else {
+        return false;
+    };
+    project.loaded
+        && !project.storage_blocked
         && host.route(&input.target).is_some_and(|live| {
             live.capture.prompt.as_ref() == Some(target)
                 && input.dispatch.as_ref().is_none_or(|assignment| {
@@ -591,7 +600,10 @@ fn input_current(host: &CommandCenterHost, id: &str, target: &FleetPromptTarget)
                         && assignment.attempt.runtime_binding == live.runtime_binding
                 })
         })
-        && host.remote_permits.get(id).is_none_or(|permit| permit.is_current())
+        && host
+            .remote_permits
+            .get(id)
+            .is_none_or(|permit| permit.is_current())
 }
 fn reject_delayed(host: &mut CommandCenterHost, id: &str, message: &str) {
     if let Some(input) = host.inputs.remove(id)
@@ -707,7 +719,7 @@ fn install_turn(host: &mut CommandCenterHost, turn: ObservedTurn) {
         } else if let Some(request) = &p.request {
             let policy = p.policy();
             match wm::provider_adapter::accept_final_response(request,&turn.identity.binding,&text,wm::provider_adapter::PlannerSupport {structured_final_response:true,tool_execution_restricted:false},&p.snapshot.config,&policy) {
-                Ok(proposal)=>{let mut state=p.state();if wm::orchestrator::install_proposal(&mut state,&proposal,&p.snapshot.config,&policy).is_ok() {p.proposal=Some(proposal);p.set_state(state);host.status="메인의 정확한 최종 응답에서 배정안을 검증했습니다. 확인 후 실행해 주세요.".into();}},
+                Ok(proposal)=>{let mut state=p.state();if wm::orchestrator::install_proposal(&mut state,&proposal,&p.snapshot.config,&policy).is_ok() {p.confirmed.remove(&proposal.plan().goal_id.0);p.snapshot.plan_confirmations.retain(|review|review.plan.goal_id!=proposal.plan().goal_id);p.proposal=Some(proposal);p.set_state(state);host.status="메인의 정확한 최종 응답에서 배정안을 검증했습니다. 확인 후 실행해 주세요.".into();}},
                 Err(_)=>host.status="메인 응답의 배정 JSON이 스키마와 일치하지 않습니다. 계획 JSON 편집기에서 확인해 주세요.".into(),
             }
         }
@@ -797,18 +809,40 @@ mod tests {
         let (mut host, watch, assignment) = fixture();
         let id = assignment.attempt.operation_id.0.clone();
         let target = watch.capture.prompt.clone().unwrap();
-        host.inputs.insert(id.clone(), Input {
-            target: watch.route.clone(), draft: String::new(), dispatch: Some(assignment.clone()),
-        });
-        assert!(remote::handoff_pending(&host, &watch.route), "manual retirement must wait for local handoff");
+        host.inputs.insert(
+            id.clone(),
+            Input {
+                target: watch.route.clone(),
+                draft: String::new(),
+                dispatch: Some(assignment.clone()),
+            },
+        );
+        assert!(
+            remote::handoff_pending(&host, &watch.route),
+            "manual retirement must wait for local handoff"
+        );
         assert!(input_current(&host, &id, &target));
         let p = host.projects.get_mut("workspace-a").unwrap();
-        apply_user_work_event(p, &watch.route, &assignment.attempt.id.0,
-            work::WorkEventKind::ResultSubmitted { result: work::TaskResult {
-                revision: work::ResultRevision(1), summary: "actual result".into(),
-                source_revision: None, artifact_revision: None, verification: work::VerificationState::NotRun,
-            } }, "fixture retirement after save ACK".into()).unwrap();
-        assert!(!input_current(&host, &id, &target), "a saved prompt must not outlive its exact assignment");
+        apply_user_work_event(
+            p,
+            &watch.route,
+            &assignment.attempt.id.0,
+            work::WorkEventKind::ResultSubmitted {
+                result: work::TaskResult {
+                    revision: work::ResultRevision(1),
+                    summary: "actual result".into(),
+                    source_revision: None,
+                    artifact_revision: None,
+                    verification: work::VerificationState::NotRun,
+                },
+            },
+            "fixture retirement after save ACK".into(),
+        )
+        .unwrap();
+        assert!(
+            !input_current(&host, &id, &target),
+            "a saved prompt must not outlive its exact assignment"
+        );
     }
     #[test]
     fn owned_launch_fresh_observation_is_one_shot_and_exact_capture_bound() {

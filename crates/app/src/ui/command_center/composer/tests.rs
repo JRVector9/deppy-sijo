@@ -509,3 +509,70 @@ fn composer_text_editor_matches_approved_focus_heights() {
         assert_eq!(send.size(), egui::vec2(34.0, 34.0));
     }
 }
+
+#[test]
+fn composer_footer_paints_caption_at_left_edge_with_approved_type_and_vector_arrow() {
+    for width in [1200.0, 390.0] {
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 600.0))
+            .build_ui_state(
+                |ui, state: &mut ComposerState| {
+                    composer(
+                        ui,
+                        &mut state.ui,
+                        &Snapshot::default(),
+                        &state.project,
+                        &mut state.intents,
+                    );
+                },
+                unbound(),
+            );
+        harness.run();
+        let anchor = harness
+            .get_by_role_and_label(egui::accesskit::Role::Button, "메인 에이전트 선택")
+            .rect();
+        let caption = harness
+            .output()
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.job.text == "메인 에이전트 선택" => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .expect("painted target caption");
+        assert!(
+            (caption.pos.x - anchor.min.x).abs() <= 1.0,
+            "caption text must start at the footer anchor, painted x={} vs anchor x={}",
+            caption.pos.x,
+            anchor.min.x
+        );
+        assert!(
+            caption
+                .galley
+                .job
+                .sections
+                .iter()
+                .all(|s| s.format.font_id.size == 10.0)
+        );
+        let hint = text(&Snapshot::default(), "send_hint").to_owned();
+        for shape in &harness.output().shapes {
+            if let egui::Shape::Text(text) = &shape.shape {
+                assert_ne!(
+                    text.galley.job.text, "↑",
+                    "send arrow must be drawn as a vector"
+                );
+                if text.galley.job.text == hint {
+                    assert!(
+                        text.galley
+                            .job
+                            .sections
+                            .iter()
+                            .all(|s| s.format.font_id.size == 10.0)
+                    );
+                }
+            }
+        }
+    }
+}

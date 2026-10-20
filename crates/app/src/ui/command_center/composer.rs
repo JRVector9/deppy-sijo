@@ -295,16 +295,28 @@ pub(super) fn composer(
             send_ui.spacing_mut().interact_size = egui::vec2(34.0, 34.0);
             let send = send_ui.add_enabled(
                 can_attempt,
-                egui::Button::new(egui::RichText::new("↑").size(22.0).color(
-                    if snapshot.dark_mode {
-                        colors(snapshot).bg
-                    } else {
-                        egui::Color32::WHITE
-                    },
-                ))
-                .fill(colors(snapshot).accent)
-                .min_size(egui::vec2(34.0, 34.0)),
+                egui::Button::new("")
+                    .fill(colors(snapshot).accent)
+                    .min_size(egui::vec2(34.0, 34.0)),
             );
+            // Match the approved 17px SVG path, independent of the UI font.
+            let icon_ink = if snapshot.dark_mode {
+                colors(snapshot).bg
+            } else {
+                egui::Color32::WHITE
+            }
+            .gamma_multiply(if can_attempt { 1.0 } else { 0.45 });
+            let icon_stroke = egui::Stroke::new(1.6 * 17.0 / 24.0, icon_ink);
+            let point = |x: f32, y: f32| {
+                send.rect.center() + egui::vec2(x - 12.0, y - 12.0) * (17.0 / 24.0)
+            };
+            send_ui
+                .painter()
+                .line_segment([point(12.0, 19.0), point(12.0, 5.0)], icon_stroke);
+            send_ui.painter().add(egui::Shape::line(
+                vec![point(6.0, 11.0), point(12.0, 5.0), point(18.0, 11.0)],
+                icon_stroke,
+            ));
             send.widget_info(|| {
                 egui::WidgetInfo::labeled(
                     egui::WidgetType::Button,
@@ -337,22 +349,20 @@ pub(super) fn composer(
             .max(1.0);
             let anchor = label_ui.add_sized(
                 [caption_width, 34.0],
-                egui::Button::new(
-                    egui::RichText::new(caption)
-                        .size(if mobile { 10.0 } else { 11.0 })
-                        .color(if too_long {
-                            colors(snapshot).red
-                        } else {
-                            colors(snapshot).muted
-                        }),
-                )
-                .frame(false)
-                .truncate()
-                .sense(if is_main {
-                    egui::Sense::click()
-                } else {
-                    egui::Sense::hover()
-                }),
+                egui::Button::new(egui::Atom::grow())
+                    .left_text(egui::RichText::new(caption).size(10.0).color(if too_long {
+                        colors(snapshot).red
+                    } else {
+                        colors(snapshot).muted
+                    }))
+                    .frame(false)
+                    .gap(0.0)
+                    .truncate()
+                    .sense(if is_main {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    }),
             );
             if is_main {
                 state.composer_focused |= main_picker(
@@ -368,7 +378,7 @@ pub(super) fn composer(
                 label_ui.add(
                     egui::Label::new(
                         egui::RichText::new(text(snapshot, "send_hint"))
-                            .size(11.0)
+                            .size(10.0)
                             .color(colors(snapshot).muted),
                     )
                     .truncate(),

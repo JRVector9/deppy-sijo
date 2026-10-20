@@ -1,0 +1,31 @@
+{
+  "kind": "local signed development build, debug profile; not notarized production distribution",
+  "branch": "feat/agent-command-center-v2-20261020",
+  "source_commit": "318b89292cf5c1aebd33d14f154273a65e5b1ae6",
+  "version_change": {
+    "source_old": "0.13.0",
+    "last_shipped": "0.13.1",
+    "new": "0.14.0"
+  },
+  "source_delta": "Cargo.toml/Cargo.lock workspace version only",
+  "version_diff_sha256": "0f8a661fd1402464b9e95933d35740d48d8bf78c19db85415ea05c52f3845d90",
+  "reported_version": "Deppy Sijo 0.14.0",
+  "plist_versions": {
+    "CFBundleVersion": "0.14.0",
+    "CFBundleShortVersionString": "0.14.0"
+  },
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.14.0/Deppy Sijo.app",
+  "opt_in": "DEPPY_COMMAND_CENTER_V2=1",
+  "binary_sha256": {
+    "deppy-sijo": "bb8ae529f14da988088e86015abdcd8c8077d49b5cde0cdd67ab79bc45593793",
+    "deppy-cloudflared": "9fb1cd8182918d3b7bd98b4766a76320e6f6cde47594cfae5721d70d77064ec1",
+    "deppy-mcp-proxy": "9cfd5386df7c23fefe4470dea6be07008394fda717565e40c69792f572502671"
+  },
+  "launch": {
+    "pid": 45806,
+    "executable": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.14.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+    "opt_in_verified": true,
+    "old_pid_exited": true,
+    "ui_verified": "CUA exact app path: main/project sidebar/worker monitor visible; actual workspace nomorevibe, no main bound yet"
+  }
+}

@@ -1,3 +1,26 @@
+# Command Center v2 — 로컬 0.14.0 빌드·실행 완료
+
+2026-10-20 사용자가 현재 작업에서 해당 브랜치 빌드와 실행을 명시 요청했다. 아래는 실제 사용자용 로컬 개발 빌드의 전달 기록이며, 이전의 실행 금지 상태를 이번 1회 실행 요청이 대체한다.
+
+- 브랜치 `feat/agent-command-center-v2-20261020`, source commit `318b89292cf5c1aebd33d14f154273a65e5b1ae6` + `Cargo.toml`/`Cargo.lock` 버전 변경. 제품 동작 소스는 `d50160a6` 이후 그대로다. 리뷰에서 발견한 D01–D10을 수정했다고 주장하지 않는다.
+- 버전: 브랜치 source0.13.0 →0.14.0; 마지막 실행/배포0.13.1 →0.14.0. 모든 접근 가능한 worktree Cargo와 versioned bundle 중 최대0.13.1을 확인했다. 신규 기능이므로 minor를 올렸다. workspace27개 패키지의 상속과 lock27개 version-only 변경을 검증했다.
+- `CARGO_BUILD_JOBS=2 cargo build --offline -p deppy-sijo -p mcp-proxy`: exit0, **41.56초**, dev profile. cloudflared2026.9.1 pinned archive SHA 검증 후 준비했다.
+- 기존 Developer ID Application: VectorNine INC 인증서로 앱과 companion을 서명한 로컬 개발 bundle이다. 공증된 production 배포/ZIP 생성/외부 업로드는 하지 않았다.
+- 실행 파일 `--version`: **Deppy Sijo 0.14.0**. `CFBundleShortVersionString`과 `CFBundleVersion`: **둘 다0.14.0**. 두 version 값 및 arm64/앱·helper 서명 검증 script exit0.
+- bundle: `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.14.0/Deppy Sijo.app`. 이전0.13.1 앱 번들은 보존했다.
+- 기존 앱 PID39472를 정상 quit한 뒤 LaunchServices로 이 bundle을 `--env DEPPY_COMMAND_CENTER_V2=1`과 함께 열었다. 실행 PID45806의 정확한 executable 경로와 opt-in 환경 변수를 확인했고 앱 프로세스는 하나였다.
+- CUA에서 **정확한 새 bundle 경로**로 앱을 선택해 AX와 스크린샷을 확인했다. 프로젝트 좌측/메인/우측 작업자 새 화면이 표시됐다. bundle ID만으로 선택한 첫 조회는 다른 과거 버전들과 ambiguous라 정확 경로로 다시 선택했다.
+- 현재 nomorevibe 프로젝트는 메인/실행 공급자·허용 범위가 미설정인 `unbound` 상태여서 입력이 비활성이다. 이번 빌드·실행 요청 중 사용자 프로젝트 설정을 임의로 연결하거나 에이전트 작업을 실행하지 않았다. 이 상태를 실제 에이전트 E2E 통과로 세지 않는다.
+- 현재 단계에서 전체 회귀 테스트를 다시 실행하지 않았다. 이력의 이전 전체 검사와 이번 실제 build/sign/version/launch 확인을 구분한다. commit/push/main merge는 하지 않았다.
+
+실제 source/version-diff SHA/binary SHA/실행 상태는 [build-result.json](assets/command-center-v2-local-0.14.0-20261020/build-result.json), 빌드·검증 원문과 로컬 bundle 재현 코드는 같은 디렉터리에 있다. [디자인 리뷰](2026-10-20-command-center-v2-design-only-review.md)의10건은 계속 남아 있다.
+
+---
+
+## 이전 검사 전용 인수 기록 — 역사적 내용
+
+아래의 source0.13.0/실행 미수행 표기는 그 이전 단계의 기록이다. 현재 전달 상태는 위0.14.0 기록을 따른다.
+
 # Command Center v2 브랜치 인수 기록
 
 ## 범위

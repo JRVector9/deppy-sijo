@@ -1,0 +1,204 @@
+{
+  "source": "318b8929",
+  "kind": "design fidelity measurements only; isolated Chrome fixture, not running Deppy",
+  "cases": [
+    {
+      "kind": "approved",
+      "width": 1440,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "inputHeight": 62,
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "height": 32
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "height": 32
+          }
+        ],
+        "contextButtons": [
+          "전체 기록"
+        ],
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px"
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "inputHeight": 100,
+        "inputResize": "none",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "height": 32
+          },
+          {
+            "text": "◫",
+            "label": "작업자 패널 접기",
+            "height": 32
+          }
+        ],
+        "contextButtons": [
+          "전체 기록"
+        ],
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px"
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 1440,
+      "blur": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "inputHeight": 68,
+        "inputResize": "vertical",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "⚙",
+            "label": "프로젝트 설정",
+            "height": 34
+          }
+        ],
+        "contextButtons": [
+          "작업자 접기"
+        ],
+        "target": "메인 · Codex",
+        "ownerAlign": "right",
+        "ownerLeftBorder": "0px"
+      },
+      "focus": {
+        "width": 1440,
+        "documentWidth": 1440,
+        "inputHeight": 68,
+        "inputResize": "vertical",
+        "inputFont": "14px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "⚙",
+            "label": "프로젝트 설정",
+            "height": 34
+          }
+        ],
+        "contextButtons": [
+          "작업자 접기"
+        ],
+        "target": "메인 · Codex",
+        "ownerAlign": "right",
+        "ownerLeftBorder": "0px"
+      }
+    },
+    {
+      "kind": "approved",
+      "width": 390,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "inputHeight": 60,
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "height": 32
+          }
+        ],
+        "contextButtons": [
+          "",
+          "작업자 3"
+        ],
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px"
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "inputHeight": 88,
+        "inputResize": "none",
+        "inputFont": "16px",
+        "selectDisplay": "none",
+        "projectButtons": [
+          {
+            "text": "프로젝트 설정 ↗",
+            "label": null,
+            "height": 32
+          }
+        ],
+        "contextButtons": [
+          "",
+          "작업자 3"
+        ],
+        "target": "nomorevibe / 메인 Codex",
+        "ownerAlign": "start",
+        "ownerLeftBorder": "1px"
+      }
+    },
+    {
+      "kind": "shared",
+      "width": 390,
+      "blur": {
+        "width": 390,
+        "documentWidth": 390,
+        "inputHeight": 68,
+        "inputResize": "vertical",
+        "inputFont": "16px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "⚙",
+            "label": "프로젝트 설정",
+            "height": 34
+          }
+        ],
+        "contextButtons": [
+          "☰",
+          "작업자 3"
+        ],
+        "target": "메인 · Codex",
+        "ownerAlign": "right",
+        "ownerLeftBorder": "0px"
+      },
+      "focus": {
+        "width": 390,
+        "documentWidth": 390,
+        "inputHeight": 68,
+        "inputResize": "vertical",
+        "inputFont": "16px",
+        "selectDisplay": "block",
+        "projectButtons": [
+          {
+            "text": "⚙",
+            "label": "프로젝트 설정",
+            "height": 34
+          }
+        ],
+        "contextButtons": [
+          "☰",
+          "작업자 3"
+        ],
+        "target": "메인 · Codex",
+        "ownerAlign": "right",
+        "ownerLeftBorder": "0px"
+      }
+    }
+  ]
+}

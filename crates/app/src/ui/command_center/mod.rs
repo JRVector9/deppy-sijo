@@ -3,6 +3,7 @@
 //! Opaque session keys must identify one exact native pane or structured session.
 //! The host validates every returned target again before executing an intent.
 
+mod composer;
 mod devices;
 mod layout;
 mod main;

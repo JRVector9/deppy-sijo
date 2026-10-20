@@ -45,6 +45,52 @@ pub(crate) struct TaskWorktreeProof {
     branch: String,
 }
 
+/// A project-bound root validated on a background executor before planning is enabled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectWorktreeRootProof {
+    project_folder: String,
+    root: String,
+    git_common_dir: String,
+}
+
+impl ProjectWorktreeRootProof {
+    pub fn project_folder(&self) -> &str {
+        &self.project_folder
+    }
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+}
+
+/// Blocking Git/filesystem validation: call only from an existing background worker.
+/// Does not create task worktrees, reserve tasks, launch agents, or remove anything.
+pub(crate) fn prepare_project_worktree_root(
+    project_folder: &str,
+) -> Result<ProjectWorktreeRootProof, TaskWorktreeError> {
+    validate_folder_path(project_folder)?;
+    let project = canonical_folder(project_folder)?;
+    let git_root = crate::git_cli::repo_root(&project, GIT_TIMEOUT)
+        .map_err(|_| TaskWorktreeError::InvalidFolder)?;
+    // Subdirectory projects need an explicit scope mapping; never silently widen their root.
+    if git_root.to_str() != Some(project_folder) {
+        return Err(TaskWorktreeError::InvalidFolder);
+    }
+    let common = common_dir(&project)?;
+    let deppy = checked_directory(&project.join(".deppy"))?;
+    let root = checked_directory(&deppy.join("worktrees"))?;
+    Ok(ProjectWorktreeRootProof {
+        project_folder: project_folder.into(),
+        root: root
+            .to_str()
+            .ok_or(TaskWorktreeError::InvalidFolder)?
+            .into(),
+        git_common_dir: common
+            .to_str()
+            .ok_or(TaskWorktreeError::InvalidFolder)?
+            .into(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TaskWorktreeError {
     InvalidJob,
@@ -162,17 +208,11 @@ struct StoredOwner {
 
 fn ensure(job: &EnsureTaskWorktree) -> Result<OwnedTaskWorktree, TaskWorktreeError> {
     validate_job(job)?;
-    let project = canonical_folder(&job.project_folder)?;
-    let git_root = crate::git_cli::repo_root(&project, GIT_TIMEOUT)
-        .map_err(|_| TaskWorktreeError::InvalidFolder)?;
-    // Subdirectory projects need an explicit scope mapping; never silently widen their root.
-    if git_root.to_str() != Some(job.project_folder.as_str()) {
-        return Err(TaskWorktreeError::InvalidFolder);
-    }
-    let common = common_dir(&project)?;
-    let deppy = checked_directory(&project.join(".deppy"))?;
-    let root = checked_directory(&deppy.join("worktrees"))?;
-    let owners = checked_directory(&deppy.join("task-worktree-owners"))?;
+    let proof = prepare_project_worktree_root(&job.project_folder)?;
+    let project = PathBuf::from(&proof.project_folder);
+    let common = PathBuf::from(&proof.git_common_dir);
+    let root = PathBuf::from(&proof.root);
+    let owners = checked_directory(&project.join(".deppy/task-worktree-owners"))?;
     let record_path = owners.join(record_name(job));
     let (mut file, created) = open_record(&record_path)?;
     file.try_lock()
@@ -260,11 +300,15 @@ fn validate_job(job: &EnsureTaskWorktree) -> Result<(), TaskWorktreeError> {
     if job.config_revision.get() == 0 {
         return Err(TaskWorktreeError::InvalidJob);
     }
-    if job.project_folder.is_empty()
-        || job.project_folder.len() > 4096
-        || job.project_folder.chars().any(char::is_control)
-        || !Path::new(&job.project_folder).is_absolute()
-        || Path::new(&job.project_folder)
+    validate_folder_path(&job.project_folder)
+}
+
+fn validate_folder_path(project_folder: &str) -> Result<(), TaskWorktreeError> {
+    if project_folder.is_empty()
+        || project_folder.len() > 4096
+        || project_folder.chars().any(char::is_control)
+        || !Path::new(project_folder).is_absolute()
+        || Path::new(project_folder)
             .components()
             .any(|c| matches!(c, Component::ParentDir | Component::CurDir))
     {
@@ -619,5 +663,47 @@ mod tests {
         ));
         assert!(!worker.worker.has_live_worker());
         assert!(!fixture.0.join(".deppy").exists());
+    }
+
+    #[test]
+    fn project_root_proof_is_bound_before_planning_without_creating_a_task() {
+        let fixture = Fixture::new();
+        let folder = fixture.0.to_str().unwrap();
+        let before = git(&fixture.0, &["worktree", "list", "--porcelain"]);
+        let proof = prepare_project_worktree_root(folder).unwrap();
+        assert_eq!(proof.project_folder(), folder);
+        assert_eq!(Path::new(proof.root()), fixture.0.join(".deppy/worktrees"));
+        assert!(Path::new(proof.root()).is_dir());
+        assert_eq!(prepare_project_worktree_root(folder).unwrap(), proof);
+        assert_eq!(
+            git(&fixture.0, &["worktree", "list", "--porcelain"]),
+            before
+        );
+        assert!(!fixture.0.join(".deppy/task-worktree-owners").exists());
+    }
+
+    #[test]
+    fn project_root_proof_rejects_subdirectory_traversal_and_symlink_roots() {
+        let fixture = Fixture::new();
+        let subdirectory = fixture.0.join("source");
+        std::fs::create_dir(&subdirectory).unwrap();
+        assert_eq!(
+            prepare_project_worktree_root(subdirectory.to_str().unwrap()),
+            Err(TaskWorktreeError::InvalidFolder)
+        );
+        assert_eq!(
+            prepare_project_worktree_root(&format!("{}/../escape", fixture.0.display())),
+            Err(TaskWorktreeError::InvalidFolder)
+        );
+        assert!(!fixture.0.join(".deppy").exists());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&subdirectory, fixture.0.join(".deppy")).unwrap();
+            assert_eq!(
+                prepare_project_worktree_root(fixture.0.to_str().unwrap()),
+                Err(TaskWorktreeError::InvalidFolder)
+            );
+            assert!(!subdirectory.join("worktrees").exists());
+        }
     }
 }

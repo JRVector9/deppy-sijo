@@ -55,6 +55,13 @@ impl Observations {
     pub(super) fn has_pending(&self) -> bool {
         !self.watches.is_empty() || !self.delayed.is_empty() || !self.reads_inflight.is_empty()
     }
+    pub(super) fn workspace_pending(&self, workspace: &str) -> bool {
+        self.watches.values().any(|watch| watch.route.workspace_id == workspace)
+            || self.delayed.values().any(|input| input.target.workspace_id == workspace)
+            // Reads are bounded and short-lived. A retired watch may still own a reader;
+            // wait for reaping before evicting any project rather than lose that owner.
+            || !self.reads_inflight.is_empty()
+    }
     pub(super) fn register_first_input(&mut self, capture: Capture, binding: work::RuntimeBinding) {
         if self.first_inputs.len() < 256 {
             self.first_inputs.push((capture, binding));

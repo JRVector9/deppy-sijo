@@ -2020,25 +2020,52 @@ fn admit_project_load(
                 && p.loaded
                 && p.generation == p.saved_generation
                 && !p.storage_blocked
-                && p.request.is_none()
-                && p.proposal.is_none()
-                && p.confirmed.is_empty()
-                && !p.snapshot.tasks.iter().any(|t| {
-                    matches!(
-                        t.state,
-                        work::WorkState::Queued
-                            | work::WorkState::Running
-                            | work::WorkState::WaitingApproval
-                            | work::WorkState::WaitingInput
-                            | work::WorkState::ObservationUnknown
+                && p.snapshot
+                    .goals
+                    .iter()
+                    .all(|goal| goal.state == work::WorkState::Completed)
+                && p.snapshot
+                    .tasks
+                    .iter()
+                    .all(|task| task.state == work::WorkState::Completed)
+                && p.snapshot.outbox.iter().all(|entry| {
+                    !matches!(
+                        entry.state,
+                        stored::DispatchOutboxState::Pending
+                            | stored::DispatchOutboxState::Uncertain
                     )
                 })
-                && !host.inputs.values().any(|i| &i.target.workspace_id == *id)
+                && !p
+                    .snapshot
+                    .drafts
+                    .iter()
+                    .any(|draft| draft.delivery_uncertain)
                 && !remote::project_pending(host, id)
+                && !host.observations.workspace_pending(id)
+                && !host
+                    .launches
+                    .values()
+                    .any(|launch| launch.record.workspace.0 == **id && !launch.finished())
+                && !host.pending_configs.contains_key(*id)
+                && !host
+                    .pending
+                    .iter()
+                    .any(|(_, intent)| intent_workspace(intent) == Some(id.as_str()))
+                && !host.flight.as_ref().is_some_and(|flight| match flight {
+                    Flight::Load { workspace, .. } | Flight::Save { workspace, .. } => {
+                        workspace == *id
+                    }
+                })
         })
         .map(|(id, _)| id.clone());
     let id = evict.ok_or("작업 중이거나 저장되지 않은 프로젝트가 4개 열려 있습니다. 작업을 확인한 뒤 다른 프로젝트를 불러와 주세요.")?;
     let p = host.projects.get_mut(&id).unwrap();
+    p.effect_fence.revoke();
+    p.effect_fence = remote::EffectFence::new();
+    p.request = None;
+    p.proposal = None;
+    p.confirmed.clear();
+    p.snapshot.plan_confirmations.clear();
     p.snapshot.goals.clear();
     p.snapshot.tasks.clear();
     p.snapshot.attempts.clear();
@@ -2835,6 +2862,246 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(host.projects["workspace-a"].snapshot.config, original);
         assert_eq!(host.projects["workspace-a"].generation, 0);
+    }
+    fn completed_project(workspace: &str, store: &mut stored::CommandCenterStore) -> Project {
+        let (mut p, _) = attempted();
+        let workspace_id = WorkspaceId(workspace.into());
+        p.snapshot.config.workspace_id = workspace_id.clone();
+        for goal in &mut p.snapshot.goals {
+            goal.workspace_id = workspace_id.clone();
+        }
+        for task in &mut p.snapshot.tasks {
+            task.workspace_id = workspace_id.clone();
+        }
+        for attempt in &mut p.snapshot.attempts {
+            attempt.workspace_id = workspace_id.clone();
+            attempt.config.workspace_id = workspace_id.clone();
+        }
+        p.scopes = vec!["src".into()];
+        p.allowed_agents = vec![p.snapshot.config.worker_agent.clone()];
+        p.ledger = Default::default();
+        let assignment = wm::dispatch::DispatchAssignment {
+            task: p.snapshot.tasks[0].clone(),
+            attempt: p.snapshot.attempts[0].clone(),
+            source_results: vec![],
+            prompt: "actual dispatched instructions".into(),
+        };
+        p.ledger.record_durable(assignment.clone()).unwrap();
+        assert!(p.ledger.claim_send(&assignment.attempt.operation_id));
+        p.request = Some(
+            wm::plan::PlannerRequest::new(&p.snapshot.goals[0], &p.snapshot.config, &p.policy())
+                .unwrap(),
+        );
+        let mut reviewed_task = p.snapshot.tasks[0].clone();
+        reviewed_task.state = work::WorkState::PlanReview;
+        reviewed_task.current_attempt_id = None;
+        let reviewed = work::WorkPlan {
+            workspace_id,
+            goal_id: reviewed_task.goal_id.clone(),
+            tasks: vec![reviewed_task],
+        };
+        let token = wm::dispatch::ConfirmedPlan::confirm_remaining(
+            &p.state(),
+            &reviewed,
+            &p.snapshot.config,
+            &p.policy(),
+        )
+        .unwrap();
+        p.confirmed.insert(
+            token.goal_id().0.clone(),
+            assignment::Confirmed::Local(token),
+        );
+        p.snapshot
+            .plan_confirmations
+            .push(stored::PlanConfirmation {
+                version: 1,
+                config: p.snapshot.config.clone(),
+                plan: reviewed,
+            });
+        apply_delivery_outcome(
+            &mut p,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        let target = cc::RouteTarget {
+            workspace_id: workspace.into(),
+            session_id: None,
+            task_id: Some(assignment.task.id.0.clone()),
+        };
+        for kind in [
+            work::WorkEventKind::ResultSubmitted {
+                result: work::TaskResult {
+                    revision: work::ResultRevision(1),
+                    summary: "actual completed work".into(),
+                    source_revision: None,
+                    artifact_revision: None,
+                    verification: work::VerificationState::NotRun,
+                },
+            },
+            work::WorkEventKind::VerificationFinished {
+                result_revision: work::ResultRevision(1),
+                outcome: work::VerificationState::Passed,
+            },
+            work::WorkEventKind::UserConfirmed {
+                result_revision: work::ResultRevision(1),
+            },
+        ] {
+            apply_user_work_event(
+                &mut p,
+                &target,
+                &assignment.attempt.id.0,
+                kind,
+                "actual operator verification".into(),
+            )
+            .unwrap();
+        }
+        assert!(p.state().goal_is_complete(&p.snapshot.goals[0].id));
+        let stored::SaveOutcome::Saved { revision } =
+            store.save_workspace(&p.snapshot, None).unwrap()
+        else {
+            panic!("independent project must save")
+        };
+        p.ack_saved(revision, p.generation);
+        assert_eq!(
+            store
+                .load_workspace(&p.snapshot.config.workspace_id)
+                .unwrap()
+                .unwrap()
+                .snapshot,
+            p.snapshot
+        );
+        p
+    }
+    #[test]
+    fn four_independently_persisted_completed_projects_can_admit_a_fifth() {
+        let dir = std::env::temp_dir().join(format!("cc-eviction-{}", uuid::Uuid::new_v4()));
+        let mut store = stored::CommandCenterStore::open(&dir).unwrap();
+        let mut h = host();
+        for workspace in ["active", "completed-a", "completed-b", "completed-c"] {
+            h.projects
+                .insert(workspace.into(), completed_project(workspace, &mut store));
+        }
+        h.projects.insert(
+            "fifth".into(),
+            Project {
+                loaded: false,
+                ..project()
+            },
+        );
+        let durable = store
+            .load_workspace(&WorkspaceId("completed-a".into()))
+            .unwrap()
+            .unwrap();
+        admit_project_load(&mut h, "fifth", "active").unwrap();
+        assert!(!h.projects["completed-a"].loaded);
+        assert!(h.projects["active"].loaded);
+        assert!(h.projects["completed-a"].request.is_none());
+        assert!(h.projects["completed-a"].confirmed.is_empty());
+        assert_eq!(
+            store
+                .load_workspace(&WorkspaceId("completed-a".into()))
+                .unwrap()
+                .unwrap(),
+            durable,
+            "cache eviction cannot delete durable work"
+        );
+    }
+    #[test]
+    fn cache_eviction_preserves_retryable_work_and_every_pending_effect_owner() {
+        for blocker in 0..9 {
+            let dir = std::env::temp_dir().join(format!(
+                "cc-eviction-block-{blocker}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            let mut store = stored::CommandCenterStore::open(&dir).unwrap();
+            let mut h = host();
+            for workspace in ["active", "protected", "dirty-a", "dirty-b"] {
+                let mut p = completed_project(workspace, &mut store);
+                if workspace.starts_with("dirty") {
+                    p.dirty();
+                }
+                h.projects.insert(workspace.into(), p);
+            }
+            h.projects.insert(
+                "fifth".into(),
+                Project {
+                    loaded: false,
+                    ..project()
+                },
+            );
+            let task = h.projects["protected"].snapshot.tasks[0].id.0.clone();
+            let target = cc::RouteTarget {
+                workspace_id: "protected".into(),
+                task_id: Some(task),
+                session_id: None,
+            };
+            match blocker {
+                0 => {
+                    h.projects.get_mut("protected").unwrap().snapshot.tasks[0].state =
+                        work::WorkState::VerificationFailed
+                }
+                1 => {
+                    h.projects.get_mut("protected").unwrap().snapshot.tasks[0].state =
+                        work::WorkState::ResultSubmitted
+                }
+                2 => {
+                    h.projects.get_mut("protected").unwrap().snapshot.outbox[0].state =
+                        stored::DispatchOutboxState::Uncertain
+                }
+                3 => {
+                    h.inputs.insert(
+                        "pending-input".into(),
+                        Input {
+                            target,
+                            draft: "pending actual input".into(),
+                            dispatch: None,
+                        },
+                    );
+                }
+                4 => {
+                    h.pending_configs.insert(
+                        "protected".into(),
+                        ("prepare-root".into(), cc::ProjectConfig::default()),
+                    );
+                }
+                5 => {
+                    h.flight = Some(Flight::Save {
+                        workspace: "protected".into(),
+                        generation: 1,
+                        after: None,
+                        receipt: None,
+                    })
+                }
+                6 => h.pending.push_back((
+                    "pending-user-action".into(),
+                    cc::Intent::ReportResult {
+                        target,
+                        attempt_id: "pending-attempt".into(),
+                        text: "actual result".into(),
+                    },
+                )),
+                7 => h
+                    .projects
+                    .get_mut("protected")
+                    .unwrap()
+                    .snapshot
+                    .drafts
+                    .push(stored::WorkDraft {
+                        target_key: "operation:unknown".into(),
+                        text: "uncertain operation".into(),
+                        delivery_uncertain: true,
+                    }),
+                _ => {
+                    h.projects.get_mut("protected").unwrap().snapshot.tasks[0].state =
+                        work::WorkState::Cancelled
+                }
+            }
+            assert!(
+                admit_project_load(&mut h, "fifth", "active").is_err(),
+                "blocker {blocker} must retain its project"
+            );
+            assert!(h.projects["protected"].loaded);
+        }
     }
     #[test]
     fn bounded_project_load_evicts_only_clean_inactive_and_preserves_pending_work() {

@@ -731,11 +731,9 @@ fn reviewed_plan_nested_tasks_are_bounded_during_decode() {
         },
     });
     let mut value = serde_json::to_value(original).unwrap();
+    let excessive_tasks = vec![task; WORK_PLAN_MAX_TASKS + 1];
     value["plan_confirmations"][0]["plan"]["tasks"] =
-        serde_json::Value::Array(vec![
-            serde_json::to_value(task).unwrap();
-            WORK_PLAN_MAX_TASKS + 1
-        ]);
+        serde_json::to_value(excessive_tasks).unwrap();
     assert!(
         serde_json::from_value::<CommandCenterSnapshot>(value).is_err(),
         "nested review definitions must reject excessive rows before full allocation"

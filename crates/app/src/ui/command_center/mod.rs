@@ -123,6 +123,8 @@ pub struct Approval {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
     #[serde(default)]
+    pub create_worker: Capability,
+    #[serde(default)]
     pub attempt_id: Option<String>,
     #[serde(default)]
     pub result_report: Capability,
@@ -185,6 +187,8 @@ pub struct ProjectConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default)]
+    pub create_main: Capability,
     #[serde(default)]
     pub loaded: bool,
     #[serde(default)]
@@ -284,6 +288,12 @@ pub enum Intent {
     RevokeExecutionDevice {
         workspace_id: String,
         device_id: String,
+    },
+    CreateMain {
+        workspace_id: String,
+    },
+    CreateWorker {
+        target: RouteTarget,
     },
     LoadProject {
         workspace_id: String,

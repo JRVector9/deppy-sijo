@@ -175,6 +175,11 @@ fn home(
                 text(snapshot, "main_collects")
             },
         );
+        if p.create_main.enabled && action(ui, snapshot, "새 메인 만들기", &p.create_main) {
+            intents.push(Intent::CreateMain {
+                workspace_id: p.id.clone(),
+            });
+        }
         if !p.main_summary.is_empty() {
             ui.add(egui::Label::new(&p.main_summary).wrap());
         } else {
@@ -424,6 +429,13 @@ fn task_detail(
                     target.session_id = selected.clone();
                     intents.push(Intent::DispatchTask { target });
                 }
+            }
+            if t.create_worker.enabled
+                && action(ui, snapshot, "새 워커 생성 후 배정", &t.create_worker)
+            {
+                intents.push(Intent::CreateWorker {
+                    target: t.target.clone(),
+                });
             }
             for (key, value) in [
                 ("scope", &t.scope),

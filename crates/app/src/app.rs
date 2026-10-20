@@ -3610,6 +3610,7 @@ enum SettingsJobAction {
     DeleteAgent {
         agent_id: String,
     },
+    CommandCenter(command_center_host::launch::SettingsRequest),
     PrepareAgentLaunch {
         agent_id: String,
         profile_id: Option<String>,
@@ -3755,6 +3756,7 @@ enum SettingsOutcomeKind {
     CodexLlmApiKeyDeleted(Result<(), SettingsErrorCode>),
     AgentRegistered(Result<(), SettingsErrorCode>),
     AgentDeleted(Result<(), SettingsErrorCode>),
+    CommandCenter(command_center_host::launch::SettingsResult),
     AgentLaunchPrepared(Result<PreparedAgentLaunch, SettingsErrorCode>),
     QuickAgentLaunchPrepared {
         request_id: u64,
@@ -5162,7 +5164,10 @@ fn execute_settings_job_with_repair(
     secret_repair: &DeferredSecretRepair,
     job: SettingsJob,
 ) -> SettingsOutcome {
-    if matches!(&job.action, SettingsJobAction::EditCredential { credential } if credential.secret.is_some())
+    if matches!(
+        &job.action,
+        SettingsJobAction::CommandCenter(command_center_host::launch::SettingsRequest::Install(_))
+    ) || matches!(&job.action, SettingsJobAction::EditCredential { credential } if credential.secret.is_some())
         || matches!(
             job.action,
             SettingsJobAction::AddCredential { .. }
@@ -5306,6 +5311,9 @@ fn execute_settings_job_with_repair(
                 .map_err(|_| SettingsErrorCode::Delete);
             refresh = result.is_ok();
             SettingsOutcomeKind::AgentDeleted(result)
+        }
+        SettingsJobAction::CommandCenter(request) => {
+            SettingsOutcomeKind::CommandCenter(command_center_host::launch::execute(db, request))
         }
         SettingsJobAction::PrepareAgentLaunch {
             agent_id,
@@ -5600,6 +5608,9 @@ fn settings_open_failed_outcome(job: SettingsJob) -> SettingsOutcome {
         }
         SettingsJobAction::DeleteAgent { .. } => {
             SettingsOutcomeKind::AgentDeleted(Err(SettingsErrorCode::Delete))
+        }
+        SettingsJobAction::CommandCenter(request) => {
+            SettingsOutcomeKind::CommandCenter(request.failed())
         }
         SettingsJobAction::PrepareAgentLaunch { .. } => {
             SettingsOutcomeKind::AgentLaunchPrepared(Err(SettingsErrorCode::Launch))
@@ -31247,6 +31258,9 @@ impl App {
                             .report_error(ui::agents::AgentsUiErrorCode::DeleteFailed);
                     }
                 }
+                SettingsOutcomeKind::CommandCenter(result) => {
+                    self.command_center_settings_result(result)
+                }
                 SettingsOutcomeKind::AgentLaunchPrepared(result) => match result {
                     Ok(prepared) => {
                         if prepared.proxy.is_some() {
@@ -35237,9 +35251,28 @@ impl eframe::App for App {
                 (workspace_id.to_owned(), runtime_instance, correlation_id)
             },
         );
+        let command_center_observe_runtime =
+            self.command_center_layout.available && self.command_center.is_some();
+        let mut command_center_runtime_events = Vec::new();
         let mut warm_restore_outcome = None;
         for rt in self.warm.values_mut() {
             let events = rt.events.drain();
+            if command_center_observe_runtime {
+                command_center_runtime_events.extend(
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                runtime::RuntimeEvent::RemoteWorkerObserved { .. }
+                                    | runtime::RuntimeEvent::RemoteWorkResolved { .. }
+                                    | runtime::RuntimeEvent::SessionExited { .. }
+                            )
+                        })
+                        .cloned()
+                        .map(|event| (rt.id.clone(), rt.runtime_instance, event)),
+                );
+            }
             let completion_events_overflowed = rt.events.take_overflowed();
             self.cloud_agent.observe_input_with_integrity(
                 rt.runtime_instance,
@@ -35369,6 +35402,13 @@ impl eframe::App for App {
         for (runtime_instance, event) in prompt_admission_events {
             self.observe_prompt_admissions(runtime_instance, std::slice::from_ref(&event));
         }
+        for (workspace_id, runtime_instance, event) in command_center_runtime_events {
+            self.observe_command_center_runtime(
+                &workspace_id,
+                runtime_instance,
+                std::slice::from_ref(&event),
+            );
+        }
         for (workspace_id, event) in approval_runtime_events {
             self.observe_agent_launcher_runtime_events(&workspace_id, std::slice::from_ref(&event));
             self.observe_approval_runtime_events(&workspace_id, std::slice::from_ref(&event));
@@ -35390,6 +35430,11 @@ impl eframe::App for App {
         // ui()가 스킵돼도 승인/완료/실패 알림은 유지). worker의 wake가 숨겨진 UI를
         // 깨워 이 logic()을 돌린다. 렌더용으로는 pending_events에 쌓아 ui()가 소비한다.
         let new_events = self.active.events.drain();
+        self.observe_command_center_runtime(
+            &self.active.id.clone(),
+            self.active.runtime_instance,
+            &new_events,
+        );
         let completion_events_overflowed = self.active.events.take_overflowed();
         self.cloud_agent.observe_input_with_integrity(
             self.active.runtime_instance,

@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 use storage::work_management as stored;
 use unicode_normalization::UnicodeNormalization as _;
 use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
+#[path = "command_center_launch.rs"]
+pub(super) mod launch;
 #[path = "command_center_switch.rs"]
 pub(super) mod layout;
 #[path = "command_center_routes.rs"]
@@ -29,6 +31,7 @@ struct LiveRoute {
     state: cc::TaskState,
     cwd: Option<String>,
     watch: Option<String>,
+    runtime_binding: Option<work::RuntimeBinding>,
 }
 #[derive(Clone)]
 struct Project {
@@ -44,6 +47,9 @@ struct Project {
     proposal: Option<wm::plan::ValidatedPlan>,
     confirmed: Option<wm::dispatch::ConfirmedPlan>,
     ledger: wm::dispatch::DeliveryLedger,
+    catalog: Option<launch::Catalog>,
+    catalog_requested: bool,
+    worktree_root: Option<wm::task_worktree::ProjectWorktreeRootProof>,
 }
 impl Project {
     fn state(&self) -> ProjectWorkState {
@@ -71,7 +77,11 @@ impl Project {
             workspace_id: self.snapshot.config.workspace_id.clone(),
             config_revision: self.snapshot.config.revision,
             project_folder: self.snapshot.config.folder.clone(),
-            worktree_root: None,
+            worktree_root: self
+                .worktree_root
+                .as_ref()
+                .filter(|proof| same_folder(proof.project_folder(), &self.snapshot.config.folder))
+                .map(|proof| proof.root().to_owned()),
             allowed_agents: self.allowed_agents.clone(),
             allowed_scope_roots: self.scopes.clone(),
             max_workers: self.snapshot.config.max_workers,
@@ -111,6 +121,12 @@ pub(super) struct CommandCenterHost {
     flight: Option<Flight>,
     next_token: u64,
     requested_loads: BTreeMap<String, String>,
+    launches: BTreeMap<String, launch::Pending>,
+    worktrees: wm::task_worktree::TaskWorktreeWorker,
+    pending_configs: BTreeMap<String, (String, cc::ProjectConfig)>,
+    installed: BTreeMap<u64, launch::Installed>,
+    execution_bindings: Vec<(Capture, work::RuntimeBinding, work::AgentSelection)>,
+    next_grant_epoch: u64,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
@@ -138,6 +154,15 @@ impl CommandCenterHost {
             flight: None,
             next_token: 0,
             requested_loads: BTreeMap::new(),
+            launches: BTreeMap::new(),
+            worktrees: {
+                let ctx = ctx.clone();
+                wm::task_worktree::TaskWorktreeWorker::new(move || ctx.request_repaint())
+            },
+            pending_configs: BTreeMap::new(),
+            installed: BTreeMap::new(),
+            execution_bindings: vec![],
+            next_grant_epoch: 0,
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
             operations: BTreeMap::new(),
@@ -159,6 +184,19 @@ impl CommandCenterHost {
     }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
         self.remote_permits.remove(id);
+        if let Some(pending) = self.launches.get_mut(id) {
+            if matches!(pending.stage, launch::Stage::Input) {
+                pending.record.phase = match status {
+                    cc::ReceiptStatus::Acknowledged => launch::Phase::Completed,
+                    cc::ReceiptStatus::Rejected => launch::Phase::Rejected,
+                    cc::ReceiptStatus::Uncertain => launch::Phase::Unknown,
+                };
+                pending.stage = launch::Stage::Done;
+                if let Some(p) = self.projects.get_mut(&pending.record.workspace.0) {
+                    let _ = launch::save_record(p, &pending.record);
+                }
+            }
+        }
         let detail = bounded(&detail.into(), 512);
         self.publication_dirty = true;
         self.status = detail.clone();
@@ -205,6 +243,20 @@ impl CommandCenterHost {
                 workspace_id: ws.into(),
                 ..Default::default()
             })
+    }
+    fn request_project_load(&mut self, id: &str, workspace: &str) -> Result<(), String> {
+        if self.requested_loads.contains_key(workspace)
+            || matches!(&self.flight,Some(Flight::Load {workspace:inflight,..}) if inflight==workspace)
+        {
+            return Err(
+                "이 프로젝트는 이미 불러오는 중입니다. 현재 요청의 응답을 기다려 주세요.".into(),
+            );
+        }
+        if self.requested_loads.len() >= 64 {
+            return Err("프로젝트 불러오기 대기 한도입니다.".into());
+        }
+        self.requested_loads.insert(workspace.into(), id.into());
+        Ok(())
     }
     fn enqueue(&mut self, id: String, intent: cc::Intent) {
         if let cc::Intent::DraftChanged { target, .. } = &intent {
@@ -312,6 +364,11 @@ fn persistent(live: &LiveRoute) -> Option<work::PersistentBinding> {
     }
 }
 fn binding(live: &LiveRoute, key: &str) -> Option<work::RuntimeBinding> {
+    if let Some(binding) = &live.runtime_binding {
+        return Some(binding.clone());
+    }
+    // Legacy terminal captures use the route incarnation, which is retired for every
+    // exact inner execution change. Atomic launches instead carry actual runtime proof.
     let prompt = live.capture.prompt.as_ref()?;
     Some(work::RuntimeBinding {
         incarnation: work::RuntimeIncarnationId::from_string(key.into()).ok()?,
@@ -395,12 +452,19 @@ impl App {
                     V::Off => cc::TaskState::ObservationUnknown,
                     V::Idle | V::Complete => cc::TaskState::Queued,
                 };
+                let capture = Capture {
+                    workspace: session.workspace_id,
+                    target: session.target,
+                    prompt: session.prompt_target,
+                };
+                let bound = host
+                    .execution_bindings
+                    .iter()
+                    .find(|(owner, _, _)| owner == &capture);
+                let agent = bound.map(|(_, _, selection)| selection.clone()).or(agent);
                 LiveRoute {
-                    capture: Capture {
-                        workspace: session.workspace_id,
-                        target: session.target,
-                        prompt: session.prompt_target,
-                    },
+                    runtime_binding: bound.map(|(_, binding, _)| binding.clone()),
+                    capture,
                     title: session.title,
                     agent,
                     state,
@@ -434,6 +498,9 @@ impl App {
                     proposal: None,
                     confirmed: None,
                     ledger: Default::default(),
+                    catalog: None,
+                    catalog_requested: false,
+                    worktree_root: None,
                 });
         }
     }
@@ -563,6 +630,20 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
+                    create_worker: if ready
+                        && p.confirmed.is_some()
+                        && p.state().can_dispatch(&task.id)
+                        && (!config.use_worktrees || p.worktree_root.is_some())
+                        && !launch::workspace_uncertain(&host.launches, &ws.id)
+                        && !host
+                            .launches
+                            .values()
+                            .any(|l| l.record.task_id.as_ref() == Some(&task.id) && !l.finished())
+                    {
+                        yes()
+                    } else {
+                        no("배정안 확인과 현재 작업·폴더 상태를 먼저 확인해 주세요.")
+                    },
                     attempt_id: attempt.map(|a| a.id.0.clone()),
                     result_report: if ready && attempt.is_some() {
                         yes()
@@ -638,6 +719,13 @@ impl App {
                 .collect();
             agents.sort_by_key(|a| a.provider.clone());
             agents.dedup();
+            if let Some(catalog) = &p.catalog {
+                for agent in &catalog.choices {
+                    if !agents.contains(agent) {
+                        agents.push(agent.clone());
+                    }
+                }
+            }
             let providers = agents.iter().map(|a| a.provider.clone()).collect();
             let models = agents.iter().filter_map(|a| a.model.clone()).collect();
             let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
@@ -666,7 +754,7 @@ impl App {
                     structured_final_response: false,
                     tool_execution_restricted: false,
                 });
-            snapshot.projects.push(cc::Project { loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            snapshot.projects.push(cc::Project { create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.proposal.as_ref().map(|v| v.plan().goal_id.0.clone()), plan_confirmation: if ready && p.proposal.is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history: p.snapshot.events.iter().rev().take(100).map(|e| cc::HistoryEntry { id: e.id.0.clone(), text: bounded(&e.display_payload,2048), ..Default::default() }).collect(), config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),
@@ -748,19 +836,20 @@ impl App {
         }
         match intent {
             cc::Intent::ConnectExecutionDevice { .. } | cc::Intent::GrantExecutionDevice { .. } | cc::Intent::RevokeExecutionDevice { .. } => return Err("기기 실행 연결을 준비 중입니다. 기존 세션은 계속 사용할 수 있습니다.".into()),
+            cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
+            cc::Intent::CreateWorker {target} => return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref()),
             cc::Intent::LoadProject { workspace_id } => {
                 let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded {
-                    if host.requested_loads.len() >= 64 { return Err("프로젝트 불러오기 대기 한도입니다.".into()); }
-                    host.requested_loads.entry(workspace_id).or_insert_with(|| id.into());
+                    host.request_project_load(id,&workspace_id)?;
                     return Ok(());
                 }
             }
             cc::Intent::RetryStorage { workspace_id } => {
                 if host.flight.is_some() { return Err("저장 작업이 진행 중입니다.".into()); }
                 let p = host.projects.get_mut(&workspace_id).ok_or("프로젝트가 없습니다.")?;
-                p.storage_blocked = false; p.loaded = false;
-                host.requested_loads.insert(workspace_id,id.into());
+                p.storage_blocked = false; p.loaded = false; p.catalog_requested=false;
+                host.request_project_load(id,&workspace_id)?;
                 host.publication_dirty = true;
                 return Ok(());
             }
@@ -804,6 +893,13 @@ impl App {
                 if config.allowed_scope_roots.len() > 64 || config.allowed_scope_roots.iter().map(String::len).sum::<usize>() > 8192 { return Err("허용 범위는 합계 8KiB, 64개 이하로 지정해 주세요.".into()); }
                 let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded || host.flight.is_some() { return Err("저장 중에는 설정을 변경할 수 없습니다.".into()); }
+                if config.use_worktrees && p.worktree_root.is_none() {
+                    if host.pending_configs.contains_key(&workspace_id) {return Err("전용 워크트리 폴더를 이미 준비 중입니다.".into());}
+                    if !self.queue_global_settings_action(&workspace_id,SettingsJobAction::CommandCenter(launch::SettingsRequest::PrepareRoot {operation_id:id.into(),workspace:workspace_id.clone(),folder:p.snapshot.config.folder.clone(),revision:p.snapshot.config.revision})) {return Err("설정 워커가 사용 중입니다. 잠시 뒤 저장해 주세요.".into());}
+                    host.pending_configs.insert(workspace_id,(id.into(),config));
+                    host.status="소유가 검증되는 전용 워크트리 루트를 준비하고 있습니다.".into();
+                    return Ok(());
+                }
                 if config.revision != p.snapshot.config.revision.0.to_string() { return Err("설정이 변경되었습니다. 최신 설정을 다시 열어 주세요.".into()); }
                 // Folder resolution belongs to the existing workspace registration worker.
                 let actual_folder = self.workspaces.iter().find(|ws| ws.id == workspace_id).map(|ws| ws.path.as_str()).ok_or("프로젝트가 없습니다.")?;
@@ -815,6 +911,10 @@ impl App {
                 let main_binding = live.and_then(persistent);
                 if config.worker_providers.is_empty() { return Err("실제 워커 공급자를 하나 이상 선택해 주세요.".into()); }
                 let mut allowed_agents: Vec<_> = host.live.iter().filter(|l| l.capture.workspace == workspace_id).filter_map(|l| l.agent.as_ref()).filter(|a| config.worker_providers.contains(&a.provider)).cloned().collect();
+                if let Some(catalog)=&p.catalog {
+                    for agent in &catalog.defaults {if config.worker_providers.contains(&agent.provider) && !allowed_agents.contains(agent) {allowed_agents.push(agent.clone());}}
+                    if !catalog.choices.contains(&selection) && live.is_none() {return Err("설치된 공급자의 실제 모델·강도 설정을 선택해 주세요.".into());}
+                }
                 allowed_agents.dedup();
                 if config.worker_providers.iter().any(|provider| !allowed_agents.iter().any(|a| &a.provider == provider)) { return Err("선택한 워커 공급자의 실제 모델·강도 설정을 확인할 수 없습니다.".into()); }
                 let worker = allowed_agents.first().cloned().ok_or("현재 실행 중인 워커 공급자를 선택해 주세요.")?;
@@ -889,6 +989,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::DispatchTask { target } => {
+                if launch::workspace_uncertain(&host.launches,&target.workspace_id) {return Err("확인되지 않은 이전 실행이 있습니다. 실행 상태를 먼저 복구해 주세요.".into());}
                 let live = host.route(&target).ok_or("실행 세션을 명시적으로 선택해 주세요.")?.clone();
                 let p = host.projects.get_mut(&target.workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if live.state != cc::TaskState::Queued || !live.cwd.as_deref().is_some_and(|cwd| same_folder(cwd,&p.snapshot.config.folder)) || persistent(&live) == p.snapshot.main_binding { return Err("선택한 세션은 현재 프로젝트 폴더의 유휴 워커가 아닙니다.".into()); }
@@ -956,6 +1057,7 @@ impl App {
             && host.pending.is_empty()
             && host.requested_loads.is_empty()
             && host.inputs.is_empty()
+            && host.launches.values().all(|l| l.finished())
             && host
                 .projects
                 .values()
@@ -1083,6 +1185,7 @@ impl App {
                                 )
                                 .ok();
                             }
+                            launch::restore_records(&mut host, &workspace);
                             let target = host
                                 .main_target(&workspace, host.projects.get(&workspace).unwrap());
                             if let Some(draft) = host.projects[&workspace]
@@ -1244,6 +1347,7 @@ impl App {
                 }
             }
         }
+        self.pump_command_center_launches(&mut host);
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
             && let Some((id, intent)) = host.pending.pop_front()
@@ -1349,6 +1453,12 @@ impl App {
             let result = if let Some(core) = &self.session_core {
                 let mut remote = self.command_center_snapshot();
                 remote.font_scale = self.config.ui.ui_scale;
+                for project in &mut remote.projects {
+                    project.create_main = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
+                    for task in &mut project.tasks {
+                        task.create_worker = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
+                    }
+                }
                 serde_json::to_value(remote)
                     .map_err(|_| ())
                     .and_then(|value| core.publish_work_snapshot(value).map_err(|_| ()))
@@ -1734,12 +1844,14 @@ fn active_workspace_cwd(
 }
 fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
     match intent {
-        cc::Intent::LoadProject { workspace_id }
+        cc::Intent::CreateMain { workspace_id }
+        | cc::Intent::LoadProject { workspace_id }
         | cc::Intent::SaveProject { workspace_id, .. }
         | cc::Intent::InstallPlanJson { workspace_id, .. }
         | cc::Intent::ConfirmPlan { workspace_id, .. }
         | cc::Intent::RetryStorage { workspace_id } => Some(workspace_id),
-        cc::Intent::Submit { target, .. }
+        cc::Intent::CreateWorker { target }
+        | cc::Intent::Submit { target, .. }
         | cc::Intent::DraftChanged { target, .. }
         | cc::Intent::DispatchTask { target }
         | cc::Intent::ReportResult { target, .. }
@@ -2023,6 +2135,9 @@ mod tests {
             proposal: None,
             confirmed: None,
             ledger: Default::default(),
+            catalog: None,
+            catalog_requested: false,
+            worktree_root: None,
         }
     }
     #[test]
@@ -2461,5 +2576,62 @@ mod tests {
             },
         );
         assert!(admit_project_load(&mut h, "another", "requested").is_ok());
+    }
+    #[test]
+    fn restored_launch_before_attempt_commit_is_unknown_and_never_replayed() {
+        let mut h = host();
+        let mut p = project();
+        let record = launch::Record {
+            operation_id: work::OperationId::new(),
+            attempt_id: work::AttemptId::new(),
+            workspace: p.snapshot.config.workspace_id.clone(),
+            task_id: Some(work::TaskId::new()),
+            config_revision: p.snapshot.config.revision,
+            selection: p.snapshot.config.worker_agent.clone(),
+            folder: p.snapshot.config.folder.clone(),
+            phase: launch::Phase::SpawnRequested,
+        };
+        launch::save_record(&mut p, &record).unwrap();
+        let generation = p.generation;
+        launch::save_record(&mut p, &record).unwrap();
+        assert_eq!(
+            p.generation, generation,
+            "unchanged launch marker cannot keep autosave awake"
+        );
+        h.projects.insert("workspace-a".into(), p);
+        launch::restore_records(&mut h, "workspace-a");
+        assert!(launch::workspace_uncertain(&h.launches, "workspace-a"));
+        let pending = &h.launches[&record.operation_id.0];
+        assert!(matches!(pending.stage, launch::Stage::Done));
+        assert!(pending.request.is_none());
+        launch::restore_records(&mut h, "workspace-a");
+        assert_eq!(h.launches.len(), 1);
+        assert!(h.inputs.is_empty());
+        assert!(h.flight.is_none());
+    }
+    #[test]
+    fn corrupt_launch_marker_blocks_project_instead_of_losing_dedup_history() {
+        let mut h = host();
+        let mut p = project();
+        set_draft(&mut p, "launch:corrupt", "invalid json", true).unwrap();
+        h.projects.insert("workspace-a".into(), p);
+        launch::restore_records(&mut h, "workspace-a");
+        assert!(h.projects["workspace-a"].storage_blocked);
+        assert!(h.launches.is_empty());
+    }
+    #[test]
+    fn two_distinct_project_load_operations_never_leave_an_unreceipted_waiter() {
+        let mut h = host();
+        h.request_project_load("first-op", "workspace-a").unwrap();
+        assert!(h.request_project_load("second-op", "workspace-a").is_err());
+        assert_eq!(h.requested_loads["workspace-a"], "first-op");
+        h.requested_loads.clear();
+        h.flight = Some(Flight::Load {
+            workspace: "workspace-a".into(),
+            token: 1,
+            receipt: Some("first-op".into()),
+        });
+        assert!(h.request_project_load("third-op", "workspace-a").is_err());
+        assert!(h.requested_loads.is_empty());
     }
 }

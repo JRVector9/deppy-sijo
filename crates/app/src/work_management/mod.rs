@@ -6,6 +6,7 @@ pub mod queue;
 pub mod plan;
 pub mod provider_adapter;
 pub mod orchestrator;
+pub(crate) mod task_worktree;
 pub use reducer::{ApplyOutcome, ProjectWorkState};
 
 pub(crate) mod devices;

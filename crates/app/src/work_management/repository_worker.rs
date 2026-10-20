@@ -29,7 +29,7 @@ pub(crate) enum RepositoryResult {
     Loaded {
         workspace_id: WorkspaceId,
         token: u64,
-        result: Result<Option<StoredProject>, RepositoryError>,
+        result: Result<Option<Box<StoredProject>>, RepositoryError>,
     },
     Saved {
         workspace_id: WorkspaceId,
@@ -92,6 +92,7 @@ fn execute(
                 .and_then(|store| {
                     store
                         .load_workspace(&workspace_id)
+                        .map(|record| record.map(Box::new))
                         .map_err(|_| RepositoryError::Unavailable)
                 });
             RepositoryResult::Loaded {

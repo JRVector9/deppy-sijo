@@ -421,10 +421,10 @@ impl ProjectWorkState {
                 let task = &mut self.tasks[i];
                 task.result.as_mut().unwrap().verification = VerificationState::NotRun;
                 task.state = WorkState::VerificationFailed;
-                if let Some(id) = &task.current_attempt_id {
-                    if let Some(attempt) = self.attempts.iter_mut().find(|a| &a.id == id) {
-                        attempt.state = WorkState::VerificationFailed;
-                    }
+                if let Some(id) = &task.current_attempt_id
+                    && let Some(attempt) = self.attempts.iter_mut().find(|a| &a.id == id)
+                {
+                    attempt.state = WorkState::VerificationFailed;
                 }
             }
         }

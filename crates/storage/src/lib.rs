@@ -7,6 +7,7 @@ pub use db::{
     ProjectKeyWorkspaceIdentity,
 };
 mod task_prompt;
+pub mod work_management;
 pub use db::{
     AGENT_STATE_BINDING_ROWS_MAX, AGENT_STATE_EXACT_MUTATIONS_MAX, AGENT_STATE_JOB_BYTES_MAX,
     AGENT_STATE_SNAPSHOT_BYTES_MAX, AGENT_STATE_STRUCTURED_MUTATION_BYTES_MAX,

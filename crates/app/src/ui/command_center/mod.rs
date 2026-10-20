@@ -125,6 +125,14 @@ pub struct Approval {
     pub action: Capability,
 }
 
+/// Exact structured-session request; it does not imply a workflow task or PTY authority.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PendingApproval {
+    pub target: RouteTarget,
+    pub session_title: String,
+    pub approval: Approval,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct RemoteTerminal {
     pub text: String,
@@ -210,6 +218,8 @@ pub struct ProjectConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default)]
+    pub pending_approvals: Vec<PendingApproval>,
     #[serde(default)]
     pub create_main: Capability,
     #[serde(default)]

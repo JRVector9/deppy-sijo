@@ -3794,3 +3794,6 @@ mod tests {
         session.kill().unwrap();
     }
 }
+
+#[cfg(test)]
+mod directory_cwd_tests;

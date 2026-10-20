@@ -1,6 +1,8 @@
 //! Host-owned workflow state. No provider polling, filesystem access or dispatch.
 
 pub mod reducer;
+pub mod dispatch;
+pub mod queue;
 pub use reducer::{ApplyOutcome, ProjectWorkState};
 
 #[cfg(test)]

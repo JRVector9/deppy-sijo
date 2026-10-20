@@ -41,6 +41,7 @@ mod resize_control;
 pub mod session_core;
 pub mod static_srv;
 pub mod upload;
+pub mod work;
 pub mod ws_api;
 
 /// 정적 요청(비-WS) 동시 처리 상한. 초과 접속은 503으로 거부하지 않고 슬롯이 빌 때까지
@@ -761,6 +762,42 @@ mod tests {
         let reply =
             read_frame_of_type(&mut owner, "cloud_control_result", Duration::from_secs(2)).unwrap();
         assert!(reply.contains("queued"));
+        drop(owner);
+        drop(unauth);
+        server.shutdown();
+    }
+
+    #[test]
+    fn work_projection_and_exact_intent_use_authenticated_socket() {
+        let server = start(None);
+        server.core().publish_work_snapshot(serde_json::json!({"projects":[{"id":"workspace-a","main_target":{"workspace_id":"workspace-a","session_id":"incarnation:7","task_id":null}}],"devices":[]})).unwrap();
+        let (tx, rx) = std::sync::mpsc::sync_channel(2);
+        server.set_cloud_control_sink(Arc::new(move |request| tx.try_send(request).is_ok()));
+        let operation = uuid::Uuid::new_v4().to_string();
+        let message=serde_json::json!({"type":"cloud_control","request":1,"intent":{"action":"command_center","operation_id":operation,"intent":{"type":"submit","target":{"workspace_id":"workspace-a","session_id":"incarnation:7","task_id":null},"text":"한글 새 입력"}}}).to_string();
+        let mut unauth = ws_client(server.local_addr());
+        send_text(&mut unauth, &message);
+        assert!(read_frame_of_type(&mut unauth, "error", Duration::from_secs(2)).is_some());
+        assert!(rx.try_recv().is_err());
+        let mut owner = ws_client_authed(server.local_addr());
+        let frame =
+            read_frame_of_type(&mut owner, "work_snapshot", Duration::from_secs(2)).unwrap();
+        assert!(frame.contains("incarnation:7"));
+        send_text(&mut owner, &message);
+        let request = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let Some(cloud::CloudControlIntent::CommandCenter {
+            operation_id,
+            intent,
+        }) = server.core().authorize_cloud_control(request)
+        else {
+            panic!("authenticated exact intent missing")
+        };
+        assert_eq!(operation_id, operation);
+        assert_eq!(intent["target"]["session_id"], "incarnation:7");
+        assert_eq!(intent["text"], "한글 새 입력");
+        let receipt =
+            read_frame_of_type(&mut owner, "cloud_control_result", Duration::from_secs(2)).unwrap();
+        assert!(receipt.contains("queued") && !receipt.contains("acknowledged"));
         drop(owner);
         drop(unauth);
         server.shutdown();

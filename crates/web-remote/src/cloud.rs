@@ -307,6 +307,9 @@ impl CloudControlRequest {
         let required = match &self.intent {
             CloudControlIntent::Navigate { .. } => RelayAction::Switch,
             CloudControlIntent::ApproveConnection { .. } => RelayAction::Approval,
+            CloudControlIntent::CommandCenter { intent, .. } => {
+                crate::work::required_action(intent)
+            }
             _ => RelayAction::Input,
         };
         authority.core_id == core_id
@@ -332,6 +335,10 @@ fn cloud_unix_seconds() -> u64 {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CloudControlIntent {
+    CommandCenter {
+        operation_id: String,
+        intent: serde_json::Value,
+    },
     RevokeConnection {
         connection_id: String,
     },
@@ -356,6 +363,12 @@ pub enum CloudControlIntent {
 impl CloudControlIntent {
     pub fn validate(&self) -> bool {
         match self {
+            Self::CommandCenter {
+                operation_id,
+                intent,
+            } => {
+                uuid::Uuid::parse_str(operation_id).is_ok() && crate::work::validate_intent(intent)
+            }
             Self::RevokeConnection { connection_id } => valid_identity(connection_id),
             Self::TakeControl {
                 session_id,

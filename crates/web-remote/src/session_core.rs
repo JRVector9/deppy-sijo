@@ -84,6 +84,13 @@ impl SessionCore {
         self.dashboard.authorize_cloud_control(request)
     }
 
+    pub fn publish_work_snapshot(
+        &self,
+        snapshot: serde_json::Value,
+    ) -> Result<(), crate::work::WorkError> {
+        self.dashboard.publish_work_snapshot(snapshot)
+    }
+
     pub fn publish_cloud_snapshot(
         &self,
         snapshot: crate::cloud::CloudSnapshot,

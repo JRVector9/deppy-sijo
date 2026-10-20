@@ -329,6 +329,7 @@ fn stream_loop(
     let mut last_dash = 0u64;
     let mut last_appr = 0u64;
     let mut last_cloud = 0u64;
+    let mut last_work = 0u64;
     let mut last_ping = Instant::now();
     // 시청 화면 상태 (P5c) — 접속별 baseline. 없으면 다음 프레임은 keyframe.
     // watch 전환·RequestKeyframe에서 리셋한다 (remote.rs §4.4-5 관례).
@@ -374,6 +375,15 @@ fn stream_loop(
                 return;
             }
             last_appr = version;
+        }
+        if let Some((version, json)) = dashboard.work_snapshot_for_permissions(
+            last_work,
+            crate::relay::contract::RelayPermissions::new(true, true, true),
+        ) {
+            if ws.send(Message::Text(json.into())).is_err() {
+                return;
+            }
+            last_work = version;
         }
         if let Some((version, json)) = dashboard.cloud_snapshot_if_newer(last_cloud) {
             if ws.send(Message::Text(json.into())).is_err() {

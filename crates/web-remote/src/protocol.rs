@@ -274,20 +274,28 @@ pub struct LineView {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMsg {
+    WorkSnapshot {
+        snapshot: serde_json::Value,
+    },
     CloudSnapshot {
         snapshot: crate::cloud::CloudSnapshot,
         can_control: bool,
         can_approve: bool,
     },
     /// Receipt is mailbox admission, not successful execution or cancellation.
-    CloudControlResult { request: u32, status: &'static str },
+    CloudControlResult {
+        request: u32,
+        status: &'static str,
+    },
     /// App-observed final activation result, sent only to the requesting socket.
     CloudNavigationResult {
         request: u32,
         status: crate::cloud::CloudNavigationOutcome,
     },
     /// 인증 성공 직후 1회.
-    Welcome { v: u32 },
+    Welcome {
+        v: u32,
+    },
     /// 워크스페이스별 세션 목록 + 리소스 스냅샷. 활성 워크스페이스의 상태는 런타임
     /// 이벤트 유래(프레임 독립), 제목·비활성 워크스페이스는 앱 스냅샷 유래.
     Dashboard {
@@ -299,7 +307,9 @@ pub enum ServerMsg {
         notice: Option<String>,
     },
     /// 승인 대기 목록(DB 폴링 유래).
-    Approvals { pending: Vec<ApprovalView> },
+    Approvals {
+        pending: Vec<ApprovalView>,
+    },
     /// 시청 세션 화면 (P5c). keyframe=전체 행, delta=바뀐 행만(빈 lines면 커서만 갱신).
     /// 행 텍스트+스타일 run 인코딩 — 셀 단위 JSON 대비 수십 배 작다 (계획 §4 이식).
     Viewport {
@@ -326,7 +336,9 @@ pub enum ServerMsg {
         reason: &'static str,
     },
     /// 인증 실패 등 — 직후 close.
-    Error { message: String },
+    Error {
+        message: String,
+    },
     TerminalControl {
         session: String,
         request: u32,

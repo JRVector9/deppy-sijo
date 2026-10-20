@@ -92,11 +92,14 @@ impl RelayMessageAdapter {
     }
 
     /// 이 명령에 필요한 권한. `None`이면 이 전송에 올 수 없는 메시지다.
-    const fn required(message: &ClientMsg) -> Option<RelayAction> {
+    fn required(message: &ClientMsg) -> Option<RelayAction> {
         match message {
             ClientMsg::CloudControl { intent, .. } => Some(match intent {
                 crate::cloud::CloudControlIntent::ApproveConnection { .. } => RelayAction::Approval,
                 crate::cloud::CloudControlIntent::Navigate { .. } => RelayAction::Switch,
+                crate::cloud::CloudControlIntent::CommandCenter { intent, .. } => {
+                    crate::work::required_action(intent)
+                }
                 _ => RelayAction::Input,
             }),
             // protocol-v3 페어링 토큰은 loopback 전송의 것이다. Relay 채널에서 이 메시지를
@@ -151,6 +154,14 @@ impl RelayMessageAdapter {
             return false;
         }
         match message {
+            ServerMsg::WorkSnapshot { snapshot } => {
+                self.permissions.allows(RelayAction::View)
+                    && crate::work::projection_allowed(
+                        snapshot,
+                        self.permissions.allows(RelayAction::Input),
+                        self.permissions.allows(RelayAction::Approval),
+                    )
+            }
             ServerMsg::CloudSnapshot { snapshot, .. } => {
                 self.permissions.allows(RelayAction::View)
                     && (snapshot.approvals.is_empty()

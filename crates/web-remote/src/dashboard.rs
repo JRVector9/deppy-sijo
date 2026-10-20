@@ -538,6 +538,8 @@ struct Inner {
 /// 접속 스레드가 소켓으로 밀어낼 발행 스냅샷. 버전이 오르면 push 대상.
 #[derive(Default)]
 struct Published {
+    work_version: u64,
+    work_frames: [String; 4],
     cloud_version: u64,
     cloud_frames: [String; 4],
     dashboard_json: String,
@@ -701,6 +703,40 @@ impl DashboardHandle {
             published.cloud_version = published.cloud_version.saturating_add(1);
         }
         Ok(())
+    }
+
+    /// Public native view only; no DB reads, transcript polling or new worker.
+    pub fn publish_work_snapshot(
+        &self,
+        snapshot: serde_json::Value,
+    ) -> Result<(), crate::work::WorkError> {
+        let frames = [
+            crate::work::encode_frame(&snapshot, false, false)?,
+            crate::work::encode_frame(&snapshot, true, false)?,
+            crate::work::encode_frame(&snapshot, false, true)?,
+            crate::work::encode_frame(&snapshot, true, true)?,
+        ];
+        let mut published = self.shared.published.lock().expect("published lock");
+        if published.work_frames != frames {
+            published.work_frames = frames;
+            published.work_version = published.work_version.saturating_add(1);
+        }
+        Ok(())
+    }
+    pub fn work_snapshot_for_permissions(
+        &self,
+        last: u64,
+        permissions: crate::relay::contract::RelayPermissions,
+    ) -> Option<(u64, String)> {
+        use crate::relay::contract::RelayAction;
+        if !permissions.allows(RelayAction::View) {
+            return None;
+        }
+        let index = usize::from(permissions.allows(RelayAction::Input))
+            + 2 * usize::from(permissions.allows(RelayAction::Approval));
+        let published = self.shared.published.lock().expect("published lock");
+        (published.work_version > last)
+            .then(|| (published.work_version, published.work_frames[index].clone()))
     }
 
     pub fn cloud_snapshot_if_newer(&self, last: u64) -> Option<(u64, String)> {

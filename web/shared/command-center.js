@@ -280,7 +280,10 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       const actions = node('div', 'cc-actions'); for (const allow of [false, true]) actions.append(actionButton(allow ? label('allow_once', '허용') : label('deny', '거절'), approval.action, {type: 'approval', target: task.target, approval_id: approval.id, allow}, 'approval:' + routeKey(task.target) + ':' + approval.id, allow ? 'cc-button cc-primary' : 'cc-button')); box.append(actions); content.append(box);
     }
     const actions = node('div', 'cc-actions'), selectionKey = routeKey({...task.target, session_id: null});
-    const choices = list(task.eligible_sessions).filter(s => s.target?.workspace_id === p.id && s.target?.session_id);
+    const pool = Array.isArray(task.eligible_session_keys)
+      ? list(p.worker_sessions).filter(s => task.eligible_session_keys.includes(s.target?.session_id))
+      : list(task.eligible_sessions);
+    const choices = pool.filter(s => s.target?.workspace_id === p.id && s.target?.session_id);
     const select = node('select'); select.setAttribute('aria-label', '작업 실행 세션'); select.dataset.ccWorker = '';
     const placeholder = node('option', '', '실행 세션 선택'); placeholder.value = ''; select.append(placeholder);
     for (const session of choices) { const option = node('option', '', session.title); option.value = session.target.session_id; select.append(option); }

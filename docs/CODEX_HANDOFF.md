@@ -1,67 +1,61 @@
-# Command Center v2 — 병렬 구현 통합 진행, 2026-10-20
+# Command Center v2 — 병렬 구현·통합 진행, 2026-10-20
 
 ## Current objective / authorization
 
-사용자가 승인한9개 PR 계획을 GPT-6.1-Sol/xhigh 서브에이전트3개로 병렬 구현 중이다. 원안으로 즉시 화면·소스를 복구할 수 있어야 한다. main 병합/push/앱 종료·실행·재시작 권한 없음. 실제 하지 않았다. 아래 과거 기록은 현재 기능 검증 결과로 취급하지 않는다.
+승인한 1안 발전형 HTML과 9개 PR 계획을 독립 기능 브랜치에 구현한다. 사용자가 병렬 개발과 즉시 원안 복구를 요청했으며 최신 메시지에서도 병렬 진행을 재확인했다. GPT-6.1-Sol/xhigh 서브에이전트 3명과 root가 각 파일 경계를 나눠 작업 중이다. **전체 작업은 아직 완료되지 않았다.** main 병합/push/앱 stop·launch·restart 권한은 없으며 실제 하지 않았다.
 
-## Isolation / design decisions
+## Isolation / rollback / release
 
-- Root `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`.
-- 기준 f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679/source0.13.0. rollback branch `rollback/command-center-pre-v2-20261020`, annotated tag `command-center-pre-v2-20261020` 동일 source. 기존 dirty tree 보존.
-- 기본 기존 화면, `DEPPY_COMMAND_CENTER_V2=1` 명시 opt-in. 기존 화면 전환/재진입은 작업자 프로세스를 종료하지 않는다. `docs/command-center-rollback.md`.
-- metadata DB/migration 불변. 별도 `command-center-v2.sqlite3`, lazy bounded worker에서만 접근. 새 코드 출시 시 버전 증가 필수이며 현재는 개발/검사 source0.13.0, 배포 아님.
-- Core task/attempt/submission/operation/runtime identity 분리, 명시 계획 확인, durable 저장 후 입력, 실제 admission만 ACK. 종료/timeout을 성공으로 표시하지 않음. remoteCloudControlPermit 비직렬화 권한을 저장 대기 뒤 효과 직전까지 재검증.
-- 원격 atomic worker는 host-granted 열린 디렉터리 fd + 실제 profile로 spawn. macOS `/dev/fd/<dirfd>` chdir가 ENOTDIR인 사실을 실제 fixture로 확인해 repo-vendored portable-pty0.9.0에 child fchdir 추가. global cache 수정/경로 fallback 없음.
+- Root: `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`.
+- 원안 source `f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679`, rollback branch `rollback/command-center-pre-v2-20261020`와 annotated tag `command-center-pre-v2-20261020` 모두 같은 commit. 기존 nominal/settings dirty worktree를 변경하거나 정리하지 않는다.
+- 기본은 기존 화면. `DEPPY_COMMAND_CENTER_V2=1` 명시 opt-in 후에도 기존 화면 버튼/재진입으로 전환한다. 실행 중 세션은 종료하지 않는다. 소스 복원은 새 detached worktree로 수행한다. `docs/command-center-rollback.md` 참고.
+- 기존 metadata DB/schema 불변. 별도 lazy sidecar `command-center-v2.sqlite3`; schema3은 실행 기기 등록을 추가하며 keychain 참조만 저장한다. 원안 소스는 새 sidecar를 읽지 않는다.
+- 현재 source0.13.0은 개발·검사 빌드이며 사용자용 릴리스 아님. 새 제품 artifact를 전달하려면 다른 worktree의 마지막 shipped보다 높은 버전 및 CLI/plist 검증이 필요하다. 앱 재시작 권한을 대신하지 않는다.
 
-## Integrated / modified
+## Completed / integrated source
 
-- PR1 core38733f30/eb8c770b, reducer6afdcd8c/dc44fa4a; PR2 isolated sidecarc411be79; helper worker/routes/layout7a6e73a9.
-- PR3 nativeleafa60e6da+6d6dc1b7; PR4 guarded puredispatch0ff23a08; PR5 validatedplanner/provider/orchestrationea56da0f; PR7 bounded registry1548dd27+review569f2d29; reserved attempt identity9d432b5e.
-- PR8 web authenticated bounded projections8d46b74e/16d8dbc7 + deferred authority1e9212f4; i18n105keys29e098b1; shared PWAleafb04fa50f.
-- Native hostd0943fa6 (agent9f2e69f2): exact Fleet routes, explicitmain, savedproject policy, durable→trackedPTY input, no fabricated Running/result; actual existing terminal/Git/history render slots. Followup result/approval/auto-new-worker pending.
-- Vendored owned directorydad77127 (agentf2b8589c). Async runtime atomicspawn/journal still agent tree, not root integrated.
-- Root PWA b2ff5bda: shell loopback+Relay bundle imports, fullviewport parent, reachable original-shell/reopen toggle, terminal back restores Command Center+draft, updated4existing Chrome asset fixtures/new production-bundle test. New report/verify wire pending DTO.
+- PR1 identity/reducer, PR2 sidecar/CAS/bounded repository, PR3 native 3단 화면, PR4 pure dispatch/queue와 owned task worktree, PR5 validated planner/orchestration, PR6 결과·검증·실제 Git/이력 routes, PR7 scoped atomic runtime/journal/TLS helpers, PR8 shared PWA production/Relay shell이 기능 브랜치에 통합되어 있다. UI가 보이는 것과 실제 실행 연결은 아래 미완료 항목을 구분한다.
+- Root integration 최신: `53a9d1b5` 로컬 idle agent 생성, `0d9fe098` active preparation 한도/알려진 미전송 실패 처리, `27d8a0fd` 순수 exact Codex tracker, `3a1806a1` 실제 App 관측 연결, `1e3472b9` sidecar schema3, `3a67d685` native trusted TLS device controller, `039d93bb` deferred cloud origin effect fence.
+- 로컬 생성: 실제 설치 provider/profile·credentials를 기존 settings worker에서 준비한다. durable launch claim → preallocated attempt/operation → atomic idle CLI spawn → 실제 Capture/runtime binding → task/outbox 저장 ACK → guarded prompt 순서다. launch에 초기 prompt를 섞지 않는다. 임의 첫 세션/프로젝트 루트 fallback 없음. proxy/승인 설정이 필요한 profile은 기존 명시 설정이 필요하다고 거부한다.
+- actual Codex SessionStart UUID와 exact InputAdmitted/SessionInputAccepted/turn proof/rollout final response를 연결한다. host가 현재 Capture/binding/config/attempt를 다시 계산한다. 최종 응답은 NotRun 결과 또는 검증된 계획 제안이며 자동 테스트 통과·프로젝트 완료로 표시하지 않는다. Claude/Kimi/Grok 등 증명되지 않은 구조화 관측은 수동 보고 경로를 사용한다.
+- native 기기 form은 readonly endpoint/pin/folder 확인 후 profiles와 capacity를 명시 허용한다. raw token은 nonDebug/nonSerialize one-shot SecretString이고 snapshot/intent/PWA에 포함하지 않는다. form leaf `d82234f4`; host의 실제 device setup/dispatch 연결은 cc_ui 작업 중.
+- TLS controller는 실제 attach_tls/pin/폴더/profile/epoch 확인, keychain+sidecar CAS, durable idle launch, bounded polling, exact request correlation을 구현했다. 원격 compute를 기존 SSH/Relay viewer와 혼동하지 않는다. 원격 prompt 전달과 mixed plan host 연결은 아직 미완료.
+- CloudControlPermit는 nonClone/nonSerialize 원래 activation/principal/epoch/deadline을 보존한다. Arc로 보관 가능하며 `with_current`는 bounded callback 동안 origin revoke/drop을 직렬화한다. 외부 policy 변경은 원래 revalidator와 activation retirement를 함께 유지해야 한다. 실제 PTY admission과 연결하는 후속 host 수정은 cc_ui 담당.
+- Root 미커밋 PWA publication 개선: 4프로젝트×64작업×16세션 선택 스트레스에서 기존480KiB 제한 갱신 실패를 재현했다. 표시 텍스트만 요약하고 반복 세션 DTO를 project pool에 합친다. exact target/attempt/revision/config/planner JSON/승인 근거는 자르지 않는다. JS가 기존/compact 두 형식을 지원한다. readonly create_main/create_worker capability도 차단한다.
 
-## Actual checks / failed approaches
+## Actual tests and limitations
 
-- Core20PASS; sidecar20PASS/strictClippyPASS; pure reducer+dispatch+planner standalone32PASS; layout2PASS/routes3PASS/lazyrepository1PASS (metadata fixture unchanged).
-- Native leaf latest10PASS1ignored; offscreen1PASS/8PNGs (fixture egui, not liveApp). Initial App `cargo check --tests` PASS; host filter13PASS. Followup current App checking undercc_ui.
-- web priorfull398PASS1ignored beforelast2tests; work_8PASS actualWS auth/opaque Korean/revocation/read-only. strictwebClippyPASS beforelatestpermit/tests. Deferred permit1PASS policy/revocation/deadline/disconnect. First permit RED was missingAPI compile failure, not behavioral regression.
-- Root realChrome sharedPWA79PASS; RelayNode16PASS. Productionbundle Chrome1PASS (13checks exactroute/NFC/queue!=ACK/newer draft/terminalroundtrip/fullviewport/rollback+reopen). First test failed because wait condition observed disabled=false before firstsnapshot, corrected test wait for actual project row; no product gate weakened.
-- Relay artifact build+verify exit0 in `/private/tmp/deppy-cc-relay-build-20261020` reservedexample origins/test artifact only, deployment blocked. Root syntax Node/sh/diffcheck exit0.
-- cc_storage actual fixture ownedfd2PASS; real two-worker pinnedTLS1PASS (same sessionnumber/exactruntimeisolation/disconnectaftereffect/idempotentreconnect); async Pendingjournal runtime2PASS (RED earlyACK0PASS1FAIL ->GREEN) only agenttree, not wholefeature proof.
-- Logs `/private/tmp/deppy-cc-{authority-green,production-shell2,leaf-browser-root,relay-node,relay-build}-20261020.log`.
-- Full current App/workspace/strictClippy/boundary/deps/finalbrowsercohort/releasepackage NOT complete. No live provider request or user DB change.
+- Root 최신 web lib **404 PASS / 0 FAIL / 1 ignored**, `/private/tmp/deppy-cc-web-budget-authority-green-20261020.log`. strict web all-target Clippy **PASS**, `/private/tmp/deppy-cc-web-budget-clippy-20261020.log`.
+- 실제 behavior RED: readonly new-agent capability 누출1FAIL, effect-authority stub1FAIL, 큰 projection1FAIL. 수정 후 위 fullweb GREEN. compact rich fixture는 4×64 작업과 16세션 선택을 유지한다. 원래 source DTO를 변형하지 않는다.
+- Shared PWA Chrome 직전 **93 assertions PASS** (390/760/1280, dark/light, exact compact dispatch); 현재 재실행 `/private/tmp/deppy-cc-budget-browser-final-20261020.log` 진행 중. 과거 production/Relay/mobile Chrome7 tests PASS와 web402PASS1ignored는 해당 시점 증거이며 최종 source 전체 통과로 확대하지 않는다.
+- cc_ui 전용 target actual local launch/reviewfix27PASS, observer host30PASS, checkPASS. Root 현재 통합 host 재검사 `/private/tmp/deppy-cc-integrated-host-observation-20261020.log` 진행 중. stale observation/rollback 경계 review 지적은 후속 수정 중.
+- cc_storage 실제 runtime serial **416PASS / 0FAIL / 1ignored**, strict runtime/pty/session/storage all-target Clippy PASS. 최초 병렬 runtime407PASS9FAIL1ignored 중4 static/wire source test를 수정했고 나머지5 timing test는 serial에서 제품 수정 없이 통과했다. root 최종 workspace 검증은 별도다.
+- cc_storage actual App two-TLS+SQLite journal fixture3PASS, remote compute8PASS, sidecar schema3 **25PASS**, latest controller work_management **30PASS**. `/private/tmp/deppy-cc-pr07-controller-all-final-20261020.log`. native profile 명시허용/권한취소 후 no launch/재연결 no replay/동일 session number 기기 격리 포함. 후속 stale-close fence 회귀 발견되어 수정 중.
+- Root clean-cache actual host 이전18PASS, full i18n-check PASS (`/private/tmp/deppy-cc-i18n-clean-20261020.log`). 이전 i18n2/3 실패는 worktree간 Cargo target 공유로 다른 source artifact가 Fresh 재사용된 원인. root workspace artifact만 clean 후 target을 독점 분리했다. 이후 공유하지 않는다.
+- task worktree helper 최초 standalone 검사가 old sha2를 골라 production dev-only dependency 문제를 놓쳤다. production storage digest 재사용 `a2691f50` 수정. standalone test는 실제 App 빌드 증거를 대신하지 않는다.
+- root strict workspace Clippy/full workspace/boundary/deps/final i18n/offscreen 최종 source gate **아직 미실행**. 실제 provider 유료 요청/실앱 launch/사용자 DB 변경/제품 배포/idle CPU 실측은 하지 않았다.
 
-## Latest verified integration
+## Ownership / remaining work
 
-- 후속 사용자 `이어서 진행해` 및 병렬 진행 재확인. GPT-6.1-Sol/xhigh3명 계속 병렬, 원안 tag/branch/기본기존화면/별도DB 유지. 앱 stop/launch/restart 없음.
-- 4194e3b7→1adbfe39: native Report/Verify typedbridge, webfontscale, explicit LoadProject/View, active-only autoload, clean inactive4project cache. 6010410c→e2fc778d: trusted host-only exactattempt pinnedfoldergrant32, active/pending host replacement 차단. 8e3ad05b→a966d15d: previous sameworker incarnation Unknown/no replay. 00226788→12c1b8b8 +2408c810→5e2893ca +26e9c320→a2691f50: lazy independentGitworktree/ownedproof/rootvalidation, production digest 재사용.
-- Root PWA explicit projectread +viewonlyauthority regression 추가. 실제Chrome leaf **91 assertionsPASS**, 390/760/1280·dark/light (`/private/tmp/deppy-cc-leaf-load-browser-20261020.log`). 새viewload는Relayoutbound를늘리지않고Relayreadonly는Mac에서열기설명만표시.
-- 실제 i18n interim2/3 **실패**: root dependency storage rlib가다른worktree에서생긴옛sourceartifact로Fresh재사용되어remotejournalexports없음. .d의상대경로+새remote파일누락으로확인. Root/cc_ui/performance target독점분리, rootworkspacepackageartifactclean후재검증. 이전fullcohort는그시점실제실행결과이지만최종통합source증거로확대하지않음.
-- 같은 actualAppcompile에서 worktreehelper sha2가dev-only이고0.11digestLowerHex미지원발견. 26e9c320실제수정; standalone원래sha2old0.10선택한검증한계기록. actualworkspace최종compile아직pending.
-- Root i18n5catalog title누락추가, full i18n-check PASS아직주장금지. root boundary/deps interimPASS. cc_storage serialruntime416PASS0FAIL1ignored보고(4개wire/staticmaintenance미통합), initialparallel407PASS9FAIL1ignored도기록; root최종실행별도.
+1. cc_ui `/Users/jr/Desktop/projects/deppy-sijo-cc-ui-20261020`: host/app.rs/native DTO/observation/device bridge/PlanReview UI. 자체 target/jobs2만 사용. 실제 PTY authority fence, 원안 전환 후 active observation 유지, 현재 attempt의 관측 소실 상태 보강, native device setup/remote dispatch 연결 중.
+2. cc_storage `/Users/jr/Desktop/projects/deppy-sijo-cc-devices-20261020`: runtime/protocol/TLS controller/device registry/sidecar. `/Users/jr/Desktop/projects/deppy-sijo-performance/target` 독점/jobs2. stale disconnect가 새 connection proof를 무효화하는 결함과 controller drop proof 회수 수정, exact guarded remote input 추가 중. host/app.rs 변경하지 않는다.
+3. cc_contracts `/Users/jr/Desktop/projects/deppy-sijo-cc-pwa-20261020`: pure policy/ownedworktree/observation helper. 별도 mixed RemoteConfirmedPlan 개발 중. controller가 발급한 private live device/lease proof만 사용하며 UI/planner JSON으로 권한을 만들지 않는다. native PlanReview에서 exact 기기/profile 선택 후 immutable mixed plan 확인. remote use_worktrees=true는 서버 소유 worktree proof가 없으면 명시 거부한다.
+4. Root: sequential cherry-pick/review, PWA wire/browser/budget, 권한 API, 문서·최종 게이트. 현재 cherry-pick conflict는 모두 해결했다. main 병합/push/restart 없이 완성까지 진행한다.
 
-- PR8b2ff5bda actual fullweb402PASS1ignored, 7realChrome testsPASS (newproductionbundle/Relay/기존mobile4targets), strictweballtargetsClippyPASS. Sharedleaf86assertionsPASS including exactresultattempt/revision/manualforms newerACKdraft/fontscale/read-only. Fixture first font expected desktop21px while mobile19px corrected responsive expectation, productCSS unchanged.
-- Native followupf87c4565→23f89353 integrated: actual host17PASS, native11PASS1ignored, transactionrollback/ignoredconfirmationreject/warmcwdscope/reviewstaterestore/deferredpermit. New report/verify remote nativeallowlist followscc_ui nextcommit; rootworkwire+PWAformsready.
-- Runtime reviewae304a74 integrated (revoked Pending Resolve retained; currentincarnationstalegrant Unknown; absbinaryrequired). Actual agentruntime4PASS incl revoke-during-result-journalcommit. Sidecarjournal/schema2 adapter + host launch integration pending.
-
-## Ownership / remaining / exact next commands
-
-- cc_ui `/Users/jr/Desktop/projects/deppy-sijo-cc-ui-20261020`: Apphost/app.rs/nativeDTO; automaticlocalworker/profile/exactbinding/worktree/actualproviderhooks. **独自target/jobs2**、root target共有禁止。LoadProject重複op silentlyqueued指摘済、distinctpending/inflightreject回帰を追加予定。
-- cc_storage `/Users/jr/Desktop/projects/deppy-sijo-cc-devices-20261020`: remoteatomic/journal/twoTLSfixtures/wiremaintenance、次にnewremote_controller.rs productiontrustedTLS registry/dispatch bridge。performance target独占/jobs2。host/app.rs直接変更禁止。
-- cc_contracts `/Users/jr/Desktop/projects/deppy-sijo-cc-pwa-20261020`: ownedtaskworktree完了、次にnewobservation.rs exactCodexTracker/rolloutfinaltext/approvalproofoffframe。host/app.rs変更禁止、cc_uiとAPI調整。
-- Root: PWA production/Relay tests+wireallowlist afterDTO, reviewedsequentialcherrypick, docs/version/finalgates. Do not mark entireplancomplete until automaticlocal/remote execution, correctresultsource, approvals/recovery and actual checks match requirements.
+## Exact next commands
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020
+cat AGENTS.md
+sed -n '1,110p' docs/CODEX_HANDOFF.md
 git status --short
 git diff --check
-cat AGENTS.md
-cat docs/superpowers/plans/2026-10-20-command-center-v2-implementation.md
-# Only after agent Cargo slot is released and all integration is frozen:
+# 먼저 running test logs와 agent messages 확인. 세 agent의 target을 공유하지 않는다.
+tail -n 30 /private/tmp/deppy-cc-integrated-host-observation-20261020.log
+tail -n 10 /private/tmp/deppy-cc-budget-browser-final-20261020.log
+# 모든 기능 소스가 통합·freeze된 뒤에만 최종 gate:
 python3 /private/tmp/deppy-cc-final-gates-20261020.py
-# Current task does not authorize dev-run.sh or App launch.
+# scripts/dev-run.sh 또는 App launch를 실행하지 않는다.
 ```
 
 ---

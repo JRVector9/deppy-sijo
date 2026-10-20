@@ -29,17 +29,24 @@ fn text(v: &Value, max: usize) -> bool {
     })
 }
 fn bounded(v: &Value, depth: usize, nodes: &mut usize) -> bool {
+    bounded_with_limit(v, depth, nodes, 32768)
+}
+fn bounded_with_limit(v: &Value, depth: usize, nodes: &mut usize, limit: usize) -> bool {
     *nodes += 1;
-    if depth > 10 || *nodes > 32768 {
+    if depth > 10 || *nodes > limit {
         return false;
     }
     match v {
         Value::String(s) => s.len() <= 32 * 1024,
-        Value::Array(a) => a.len() <= 256 && a.iter().all(|v| bounded(v, depth + 1, nodes)),
+        Value::Array(a) => {
+            a.len() <= 256
+                && a.iter()
+                    .all(|v| bounded_with_limit(v, depth + 1, nodes, limit))
+        }
         Value::Object(m) => {
             m.len() <= 256
                 && m.iter()
-                    .all(|(k, v)| k.len() <= 128 && bounded(v, depth + 1, nodes))
+                    .all(|(k, v)| k.len() <= 128 && bounded_with_limit(v, depth + 1, nodes, limit))
         }
         _ => true,
     }
@@ -170,7 +177,7 @@ pub fn encode_frame(v: &Value, input: bool, approval: bool) -> Result<String, Wo
                 "status",
                 "receipts",
             ],
-        ) || !bounded(v, 0, &mut 0))
+        ) || !bounded_with_limit(v, 0, &mut 0, 131072))
     {
         return Err(WorkError);
     }
@@ -178,14 +185,114 @@ pub fn encode_frame(v: &Value, input: bool, approval: bool) -> Result<String, Wo
     if !input || !approval {
         filter(&mut projection, input, approval);
     }
-    let encoded =
+    let frame = |projection: &Value| {
         serde_json::to_string(&serde_json::json!({"type":"work_snapshot","snapshot":projection}))
-            .map_err(|_| WorkError)?;
-    if encoded.len() > MAX_WORK_SNAPSHOT_BYTES {
-        Err(WorkError)
-    } else {
-        Ok(encoded)
+            .map_err(|_| WorkError)
+    };
+    let encoded = frame(&projection)?;
+    if encoded.len() <= MAX_WORK_SNAPSHOT_BYTES && bounded(&projection, 0, &mut 0) {
+        return Ok(encoded);
     }
+    compact_projection(&mut projection)?;
+    let encoded = frame(&projection)?;
+    if encoded.len() > MAX_WORK_SNAPSHOT_BYTES || !bounded(&projection, 0, &mut 0) {
+        return Err(WorkError);
+    }
+    Ok(encoded)
+}
+/// Summarize display text only. Exact targets, permissions, attempts, revisions, planner JSON,
+/// project configuration and approval evidence remain intact. Session choices are interned once
+/// per project instead of repeating a full DTO for every task. Never truncate executable data.
+fn compact_projection(projection: &mut Value) -> Result<(), WorkError> {
+    fn short(value: &mut Value, limit: usize) {
+        if let Some(text) = value.as_str()
+            && text.len() > limit
+        {
+            let mut end = limit.saturating_sub(3);
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            *value = Value::String(format!("{}…", &text[..end]));
+        }
+    }
+    let Some(projects) = projection.get_mut("projects").and_then(Value::as_array_mut) else {
+        return Err(WorkError);
+    };
+    for project in projects {
+        for key in ["goal", "main_summary"] {
+            if let Some(value) = project.get_mut(key) {
+                short(value, 512);
+            }
+        }
+        if let Some(history) = project.get_mut("history").and_then(Value::as_array_mut) {
+            history.truncate(20);
+            for event in history {
+                for key in ["text", "detail"] {
+                    if let Some(value) = event.get_mut(key) {
+                        short(value, 256);
+                    }
+                }
+            }
+        }
+        let mut workers = serde_json::Map::new();
+        if let Some(tasks) = project.get_mut("tasks").and_then(Value::as_array_mut) {
+            for task in tasks {
+                for (key, limit) in [
+                    ("title", 128),
+                    ("role", 64),
+                    ("scope", 128),
+                    ("acceptance_criteria", 192),
+                    ("result", 320),
+                    ("directory", 256),
+                    ("activity", 128),
+                ] {
+                    if let Some(value) = task.get_mut(key) {
+                        short(value, limit);
+                    }
+                }
+                if let Some(choices) = task
+                    .as_object_mut()
+                    .and_then(|t| t.remove("eligible_sessions"))
+                    .and_then(|v| v.as_array().cloned())
+                {
+                    let mut keys = Vec::with_capacity(choices.len());
+                    for mut worker in choices {
+                        let key = worker["target"]["session_id"]
+                            .as_str()
+                            .filter(|id| !id.is_empty())
+                            .ok_or(WorkError)?
+                            .to_owned();
+                        if let Some(value) = worker.get_mut("title") {
+                            short(value, 128);
+                        }
+                        if let Some(existing) = workers.get(&key) {
+                            if existing != &worker {
+                                return Err(WorkError);
+                            }
+                        } else {
+                            workers.insert(key.clone(), worker);
+                        }
+                        keys.push(Value::String(key));
+                    }
+                    task["eligible_session_keys"] = Value::Array(keys);
+                }
+            }
+        }
+        if workers.len() > 256 {
+            return Err(WorkError);
+        }
+        if !workers.is_empty() {
+            project["worker_sessions"] = Value::Array(workers.into_values().collect());
+        }
+    }
+    let existing = projection
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    projection["status"] = Value::String(format!(
+        "{existing} · 긴 설명과 이력은 요약 표시합니다. 원문은 앱과 터미널에서 확인해 주세요."
+    ));
+    Ok(())
 }
 /// Second outbound gate for callers that already hold a typed ServerMsg.
 pub fn projection_allowed(value: &Value, input: bool, approval: bool) -> bool {
@@ -219,6 +326,8 @@ fn filter(value: &mut Value, input: bool, approval: bool) {
                         "result_report",
                         "verify_result",
                         "launch",
+                        "create_main",
+                        "create_worker",
                         "save_settings",
                         "add_project",
                         "manage_devices",
@@ -302,7 +411,7 @@ mod tests {
     }
     #[test]
     fn work_read_only_projection_strips_controls_and_approval_command() {
-        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"manual_plan":{"enabled":true},"storage_retry":{"enabled":true},"tasks":[{"approval":{"command":"private command"},"dispatch":{"enabled":true},"result_report":{"enabled":true},"verify_result":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[]});
+        let value = json!({"projects":[{"id":"w","main_input":{"enabled":true,"reason":""},"create_main":{"enabled":true},"manual_plan":{"enabled":true},"storage_retry":{"enabled":true},"tasks":[{"create_worker":{"enabled":true},"approval":{"command":"private command"},"dispatch":{"enabled":true},"result_report":{"enabled":true},"verify_result":{"enabled":true},"confirm_result":{"enabled":true},"input":{"enabled":true}}]}],"devices":[]});
         let frame: Value =
             serde_json::from_str(&encode_frame(&value, false, false).unwrap()).unwrap();
         assert_eq!(frame["type"], "work_snapshot");
@@ -310,10 +419,10 @@ mod tests {
             frame["snapshot"]["projects"][0]["main_input"]["enabled"],
             false
         );
-        for key in ["manual_plan", "storage_retry"] {
+        for key in ["manual_plan", "storage_retry", "create_main"] {
             assert_eq!(frame["snapshot"]["projects"][0][key]["enabled"], false);
         }
-        for key in ["result_report", "verify_result"] {
+        for key in ["result_report", "verify_result", "create_worker"] {
             assert_eq!(
                 frame["snapshot"]["projects"][0]["tasks"][0][key]["enabled"],
                 false
@@ -333,6 +442,49 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn work_large_valid_projects_publish_compact_read_models_without_losing_task_identity() {
+        let mut task = json!({"target":{"workspace_id":"workspace-a","session_id":"exact-session","task_id":"task-a"},"attempt_id":"attempt-a","title":"한글".repeat(80),"role":"implementation","scope":"src/".repeat(200),"acceptance_criteria":"검증 근거 ".repeat(100),"result":"실제 응답 ".repeat(180),"result_revision":"7","directory":"/project/".repeat(200),"approval":{"id":"approval-a","command":"cargo test --locked","action":{"enabled":true}},"eligible_sessions":[]});
+        task["eligible_sessions"]=json!((0..16).map(|i|json!({"target":{"workspace_id":"workspace-a","session_id":format!("opaque-worker-{i}"),"task_id":null},"title":"실행 세션 ".repeat(40),"provider":"codex","device":"local","state":"queued","input":{"enabled":true}})).collect::<Vec<_>>());
+        let projects: Vec<_> = (0..4).map(|p| {
+            let tasks:Vec<_>=(0..64).map(|t| { let mut task=task.clone();task["target"]["workspace_id"]=json!(format!("workspace-{p}"));task["target"]["task_id"]=json!(format!("task-{p}-{t}"));for worker in task["eligible_sessions"].as_array_mut().unwrap(){worker["target"]["workspace_id"]=json!(format!("workspace-{p}"));}task }).collect();
+            json!({"id":format!("workspace-{p}"),"tasks":tasks,"history":(0..100).map(|i|json!({"id":format!("e-{i}"),"text":"이력 응답 ".repeat(150)})).collect::<Vec<_>>()})
+        }).collect();
+        let source = json!({"projects":projects,"devices":[],"status":"Observed"});
+        let encoded = encode_frame(&source, true, true)
+            .expect("valid bounded projects should keep publishing");
+        assert!(encoded.len() <= MAX_WORK_SNAPSHOT_BYTES);
+        let frame: Value = serde_json::from_str(&encoded).unwrap();
+        for p in 0..4 {
+            let tasks = frame["snapshot"]["projects"][p]["tasks"]
+                .as_array()
+                .unwrap();
+            assert_eq!(tasks.len(), 64);
+            assert_eq!(
+                frame["snapshot"]["projects"][p]["worker_sessions"]
+                    .as_array()
+                    .unwrap()
+                    .len(),
+                16
+            );
+            for (t, task) in tasks.iter().enumerate() {
+                assert_eq!(task["target"]["task_id"], format!("task-{p}-{t}"));
+                assert_eq!(task["attempt_id"], "attempt-a");
+                assert_eq!(task["result_revision"], "7");
+                assert_eq!(task["approval"]["command"], "cargo test --locked");
+            }
+        }
+        assert!(
+            frame["snapshot"]["status"]
+                .as_str()
+                .unwrap()
+                .contains("요약")
+        );
+        assert_eq!(
+            source["projects"][0]["history"].as_array().unwrap().len(),
+            100
         );
     }
     #[test]
@@ -419,7 +571,7 @@ mod tests {
             intent: json!({"type":"load_project","workspace_id":"workspace-b"}),
         };
         assert!(core.dashboard().request_cloud_control(&origin, load));
-        let (_, mut permit) = core
+        let (_, permit) = core
             .authorize_cloud_control_deferred(rx.try_recv().unwrap())
             .expect("view-only project read is authorized");
         assert!(permit.is_current());
@@ -431,7 +583,7 @@ mod tests {
         use crate::relay::contract::RelayPermissions;
         use crate::relay_client::RelayMessageAdapter;
         let readonly = RelayMessageAdapter::new(RelayPermissions::default());
-        let unsafe_view = json!({"projects":[{"tasks":[{"approval":{"command":"private command"},"input":{"enabled":true}}]}]});
+        let unsafe_view = json!({"projects":[{"tasks":[{"create_worker":{"enabled":true},"approval":{"command":"private command"},"input":{"enabled":true}}]}]});
         assert!(
             !readonly.may_emit(&crate::protocol::ServerMsg::WorkSnapshot {
                 snapshot: unsafe_view.clone()

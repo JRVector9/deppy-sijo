@@ -8,6 +8,7 @@ pub mod approvals;
 pub mod aux_search;
 pub mod clipboard_image;
 pub(crate) mod cloud_answer;
+pub mod command_center;
 pub mod composer;
 pub(crate) mod context_menu;
 #[cfg(test)]

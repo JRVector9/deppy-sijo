@@ -484,6 +484,49 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                 .is_none_or(|token| token.is_valid() && token.owner_epoch == stamp.owner_epoch)
     };
     match event {
+        RuntimeEvent::RemoteTaskInput { target, reply } => {
+            use crate::remote_input::RemoteTaskInputReply as R;
+            if !target.identity.is_valid()
+                || target.session.0 == 0
+                || target.execution_generation == 0
+            {
+                return Err("invalid remote execution target");
+            }
+            match reply {
+                R::Observed {
+                    request_id,
+                    execution,
+                } => {
+                    if *request_id == 0
+                        || execution.as_ref().is_some_and(|e| {
+                            e.target != *target
+                                || e.profile.validate().is_err()
+                                || uuid::Uuid::parse_str(&e.execution_handle).is_err()
+                        })
+                    {
+                        return Err("invalid remote execution proof");
+                    }
+                }
+                R::SessionObserved {
+                    request_id,
+                    snapshot,
+                } => {
+                    if *request_id == 0
+                        || snapshot
+                            .as_ref()
+                            .and_then(|s| s.terminal.as_ref())
+                            .is_some_and(|s| !crate::remote_input::valid_session_snapshot(s))
+                    {
+                        return Err("invalid remote session snapshot");
+                    }
+                }
+                R::Delivered { operation_id, .. } | R::SessionClosed { operation_id, .. } => {
+                    if uuid::Uuid::parse_str(operation_id.as_str()).is_err() {
+                        return Err("invalid remote input operation");
+                    }
+                }
+            }
+        }
         RuntimeEvent::RemoteWorkerObserved {
             request_id,
             capabilities,
@@ -3075,9 +3118,9 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        assert_eq!(PROTO_VERSION, 33);
+        assert_eq!(PROTO_VERSION, 34);
         for version in [
-            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32,
+            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33,
         ] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,

@@ -7,8 +7,8 @@ use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::{AttemptId, OperationId, RuntimeIncarnationId};
 use runtime::remote_input::{
-    RemoteExecutionProof, RemoteTaskInputReply, RemoteTaskInputRequest, RemoteTaskInputResult,
-    RemoteTaskTarget,
+    RemoteExecutionProof, RemoteSessionCloseResult, RemoteTaskInputReply, RemoteTaskInputRequest,
+    RemoteTaskInputResult, RemoteTaskTarget,
 };
 use runtime::remote_worker::{
     RemoteWorkIdentity, RemoteWorkRequest, RemoteWorkResult, RemoteWorkerCapabilities,
@@ -125,6 +125,19 @@ pub(crate) enum RemoteDeviceJob {
         workspace_id: WorkspaceId,
         device_id: String,
     },
+    CloseSession {
+        request_id: u64,
+        lease: ExecutionLease,
+        execution: Box<RemoteExecutionProof>,
+        operation_id: OperationId,
+        authority: RemoteSendAuthority,
+    },
+    ObserveSession {
+        request_id: u64,
+        lease: ExecutionLease,
+        session: deppy_core::SessionId,
+        execution_generation: u64,
+    },
     ObserveExecution {
         request_id: u64,
         lease: ExecutionLease,
@@ -184,6 +197,7 @@ pub(crate) enum RemoteDeviceOutcome {
         receipts: Vec<RemoteLaunchReceipt>,
         policies: Vec<VerifiedExecutionDevice>,
         inputs: Vec<RemoteInputReceipt>,
+        sessions: Vec<RemoteSessionObservation>,
     },
     Revoked {
         request_id: u64,
@@ -195,6 +209,11 @@ pub(crate) enum RemoteDeviceOutcome {
         verified: VerifiedExecutionLease,
     },
     LaunchReceipt(RemoteLaunchReceipt),
+    CloseReceipt(RemoteCloseReceipt),
+    SessionObserved {
+        request_id: u64,
+        observation: Box<RemoteSessionObservation>,
+    },
     ExecutionObserved {
         request_id: u64,
         lease: ExecutionLease,
@@ -212,11 +231,29 @@ pub(crate) enum RemoteDeviceOutcome {
         code: RemoteDeviceError,
     },
 }
+/// Read-only evidence from one exact trusted remote execution; status never proves task success.
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSessionObservation {
+    pub lease: ExecutionLease,
+    pub session: deppy_core::SessionId,
+    pub execution_generation: u64,
+    pub terminal: Option<Arc<terminal::TerminalViewportSnapshot>>,
+    pub detected_status: Option<runtime::SessionStatus>,
+    pub exit_code: Option<Option<u32>>,
+    pub connected: bool,
+}
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteLaunchReceipt {
     pub request_id: u64,
     pub lease: ExecutionLease,
     pub result: RemoteWorkResult,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteCloseReceipt {
+    pub request_id: u64,
+    pub lease: ExecutionLease,
+    pub operation_id: OperationId,
+    pub result: RemoteSessionCloseResult,
 }
 #[derive(Debug, Clone)]
 pub(crate) struct RemoteInputAcceptance {
@@ -298,10 +335,16 @@ impl RemoteDeviceWorker {
                 operation_id: None,
                 candidate_id: Some(candidate_id.clone()),
             },
-            RemoteDeviceJob::ObserveExecution {
+            RemoteDeviceJob::ObserveSession {
+                request_id, lease, ..
+            }
+            | RemoteDeviceJob::ObserveExecution {
                 request_id, lease, ..
             }
             | RemoteDeviceJob::DeliverInput {
+                request_id, lease, ..
+            }
+            | RemoteDeviceJob::CloseSession {
                 request_id, lease, ..
             } => RemoteDeviceCorrelation {
                 request_id: *request_id,
@@ -309,7 +352,8 @@ impl RemoteDeviceWorker {
                 device_id: Some(lease.request.device_id.clone()),
                 attempt_id: Some(lease.request.attempt_id.clone()),
                 operation_id: Some(match &job {
-                    RemoteDeviceJob::DeliverInput { operation_id, .. } => operation_id.clone(),
+                    RemoteDeviceJob::DeliverInput { operation_id, .. }
+                    | RemoteDeviceJob::CloseSession { operation_id, .. } => operation_id.clone(),
                     _ => lease.request.operation_id.clone(),
                 }),
                 candidate_id: None,
@@ -796,6 +840,30 @@ mod tests {
             assert!(Instant::now() < until);
             std::thread::sleep(Duration::from_millis(5));
         };
+        worker
+            .try_submit(RemoteDeviceJob::ObserveSession {
+                request_id: 41,
+                lease: lease.clone(),
+                session,
+                execution_generation,
+            })
+            .unwrap();
+        let RemoteDeviceOutcome::SessionObserved {
+            request_id: 41,
+            observation,
+        } = outcome(&mut worker)
+        else {
+            panic!("no exact read-only session observation");
+        };
+        assert_eq!(observation.lease, lease);
+        assert_eq!(observation.session, session);
+        assert_eq!(observation.execution_generation, execution_generation);
+        assert!(observation.connected);
+        let terminal = observation
+            .terminal
+            .expect("real TLS worker must return its actual terminal");
+        assert!(terminal.history.is_some_and(|h| h.generation > 0));
+        assert!(terminal.visible_cells.iter().any(|cell| cell.c == '❯'));
         let input_operation = OperationId::new();
         worker
             .try_submit(RemoteDeviceJob::DeliverInput {
@@ -834,7 +902,7 @@ mod tests {
             .try_submit(RemoteDeviceJob::DeliverInput {
                 request_id: 6,
                 lease: lease.clone(),
-                execution,
+                execution: execution.clone(),
                 operation_id: input_operation.clone(),
                 prompt: "bounded task".into(),
                 authority: native_authority(&input_operation),
@@ -850,6 +918,44 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join("worker/accepted")).unwrap(),
             b"\x1b[200~bounded task\x1b[201~\r"
+        );
+        let close_operation = OperationId::new();
+        worker
+            .try_submit(RemoteDeviceJob::CloseSession {
+                request_id: 6,
+                lease: lease.clone(),
+                execution: execution.clone(),
+                operation_id: close_operation.clone(),
+                authority: native_authority(&close_operation),
+            })
+            .unwrap();
+        assert!(matches!(
+            outcome(&mut worker),
+            RemoteDeviceOutcome::CloseReceipt(RemoteCloseReceipt {
+                result: RemoteSessionCloseResult::Closed,
+                ..
+            })
+        ));
+        worker
+            .try_submit(RemoteDeviceJob::Poll {
+                workspace_id: workspace.clone(),
+            })
+            .unwrap();
+        let RemoteDeviceOutcome::Snapshot {
+            devices, sessions, ..
+        } = outcome(&mut worker)
+        else {
+            panic!("no closed snapshot");
+        };
+        assert!(
+            devices
+                .iter()
+                .any(|d| d.id == lease.request.device_id && d.can_execute)
+        );
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.lease == lease && s.exit_code == Some(None))
         );
         drop(worker);
         let until = Instant::now() + Duration::from_secs(2);

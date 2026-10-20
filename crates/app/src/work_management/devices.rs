@@ -245,34 +245,7 @@ impl DeviceRegistry {
             false
         }
     }
-    pub fn register_viewer(
-        &mut self,
-        id: String,
-        name: String,
-        workspace: WorkspaceId,
-        connected: bool,
-    ) -> Result<(), DeviceUnavailable> {
-        if !valid_id(&id)
-            || name.is_empty()
-            || name.len() > 256
-            || name.chars().any(char::is_control)
-            || !valid_id(&workspace.0)
-        {
-            return Err(DeviceUnavailable::Invalid);
-        }
-        if self.entries.iter().any(|e| e.registration.id == id) {
-            return Err(DeviceUnavailable::Conflict);
-        }
-        if let Some(viewer) = self.viewers.iter_mut().find(|v| v.0 == id) {
-            *viewer = (id, name, workspace, connected);
-            return Ok(());
-        }
-        if self.entries.len() + self.viewers.len() >= EXECUTION_DEVICE_MAX {
-            return Err(DeviceUnavailable::Full);
-        }
-        self.viewers.push((id, name, workspace, connected));
-        Ok(())
-    }
+
     pub fn disconnect(&mut self, device: &str, connection_epoch: u64) {
         if let Some(entry) = self
             .entries
@@ -885,77 +858,7 @@ mod tests {
             Err(DeviceUnavailable::Stale)
         );
     }
-    #[test]
-    fn viewer_reconnect_and_revocation_do_not_grant_or_replay_compute() {
-        let mut registry = DeviceRegistry::default();
-        let mut device = registration();
-        registry
-            .register_viewer(
-                "relay".into(),
-                "Phone viewer".into(),
-                device.workspace_id.clone(),
-                true,
-            )
-            .unwrap();
-        assert_eq!(
-            registry.snapshot(&device.workspace_id, 10)[0].unavailable,
-            Some(DeviceUnavailable::ViewerOnly)
-        );
-        let mut viewer_request = request(&device);
-        viewer_request.device_id = "relay".into();
-        assert_eq!(
-            registry.reserve(viewer_request, 10),
-            Err(DeviceUnavailable::ViewerOnly)
-        );
-        registry.register(device.clone()).unwrap();
-        registry.observe(proof(&device), 10).unwrap();
-        let lease = registry.reserve(request(&device), 10).unwrap();
-        registry.disconnect(&device.id, 1);
-        assert_eq!(
-            registry.validate_lease(&lease, 11),
-            Err(DeviceUnavailable::Disconnected)
-        );
-        assert_eq!(
-            registry.observe(proof(&device), 11),
-            Err(DeviceUnavailable::Conflict)
-        );
-        let mut fresh = proof(&device);
-        fresh.connection_epoch = 2;
-        fresh.lease_epoch = 2;
-        registry.observe(fresh, 12).unwrap();
-        assert_eq!(
-            registry.validate_lease(&lease, 12),
-            Err(DeviceUnavailable::Conflict)
-        );
-        assert_eq!(registry.reserve(request(&device), 12).unwrap(), lease);
-        registry.disconnect(&device.id, 1); // A late close cannot disarm the new connection.
-        assert!(
-            registry
-                .snapshot(&device.workspace_id, 12)
-                .iter()
-                .find(|d| d.id == device.id)
-                .unwrap()
-                .connected
-        );
-        device.grant_epoch = 2;
-        device.execution_granted = false;
-        registry.register(device.clone()).unwrap();
-        assert_eq!(
-            registry.validate_lease(&lease, 13),
-            Err(DeviceUnavailable::Revoked)
-        );
-        assert!(registry.complete(&lease));
-        assert!(!registry.complete(&lease));
-        assert_eq!(
-            registry
-                .snapshot(&device.workspace_id, 13)
-                .iter()
-                .find(|d| d.id == device.id)
-                .unwrap()
-                .unavailable,
-            Some(DeviceUnavailable::Revoked)
-        );
-    }
+
     #[test]
     fn malformed_registrations_and_cross_worker_aliases_are_rejected() {
         let mut registry = DeviceRegistry::default();

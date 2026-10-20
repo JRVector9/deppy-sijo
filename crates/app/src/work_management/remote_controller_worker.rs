@@ -25,6 +25,7 @@ struct Flight {
     result: Option<RemoteWorkResult>,
     pending_result: Option<RemoteWorkResult>,
     execution: Option<RemoteExecutionProof>,
+    observation: Option<RemoteSessionObservation>,
 }
 struct InputFlight {
     request_id: u64,
@@ -47,6 +48,7 @@ pub(super) struct ControllerState {
     candidates: Vec<Candidate>,
     flights: Vec<Flight>,
     inputs: Vec<InputFlight>,
+    closes: Vec<RemoteCloseReceipt>,
     epoch: u64,
     query: u64,
     start: Instant,
@@ -70,6 +72,7 @@ impl ControllerState {
             candidates: vec![],
             flights: vec![],
             inputs: vec![],
+            closes: vec![],
             epoch: 0,
             query: 1,
             start: Instant::now(),
@@ -114,6 +117,8 @@ impl ControllerState {
             RemoteDeviceJob::Grant { request_id, .. }
             | RemoteDeviceJob::Revoke { request_id, .. }
             | RemoteDeviceJob::ReserveLaunch { request_id, .. }
+            | RemoteDeviceJob::ObserveSession { request_id, .. }
+            | RemoteDeviceJob::CloseSession { request_id, .. }
             | RemoteDeviceJob::ObserveExecution { request_id, .. }
             | RemoteDeviceJob::DeliverInput { request_id, .. } => *request_id,
             _ => 0,
@@ -141,6 +146,19 @@ impl ControllerState {
                 workspace_id,
                 device_id,
             } => self.revoke(request_id, &workspace_id, &device_id),
+            RemoteDeviceJob::CloseSession {
+                request_id,
+                lease,
+                execution,
+                operation_id,
+                authority,
+            } => self.close_session(request_id, lease, *execution, operation_id, authority),
+            RemoteDeviceJob::ObserveSession {
+                request_id,
+                lease,
+                session,
+                execution_generation,
+            } => self.observe_session(request_id, lease, session, execution_generation),
             RemoteDeviceJob::ObserveExecution {
                 request_id,
                 lease,
@@ -535,6 +553,7 @@ impl ControllerState {
             result: result.clone(),
             pending_result: None,
             execution: None,
+            observation: None,
         });
         Ok(match result {
             Some(result) => RemoteDeviceOutcome::LaunchReceipt(RemoteLaunchReceipt {
@@ -579,6 +598,219 @@ impl ControllerState {
             identity: flight.request.identity.clone(),
             session,
             execution_generation,
+        })
+    }
+    fn close_session(
+        &mut self,
+        request_id: u64,
+        lease: ExecutionLease,
+        execution: RemoteExecutionProof,
+        operation_id: OperationId,
+        authority: RemoteSendAuthority,
+    ) -> Result<RemoteDeviceOutcome> {
+        let target = self.launched_target(&lease)?;
+        if request_id == 0
+            || execution.target != target
+            || !self
+                .flights
+                .iter()
+                .any(|f| f.lease == lease && f.execution.as_ref() == Some(&execution))
+        {
+            return Err(RemoteDeviceError::WrongTarget);
+        }
+        if let Some(receipt) = self.closes.iter().find(|r| r.operation_id == operation_id) {
+            return if receipt.lease == lease {
+                Ok(RemoteDeviceOutcome::CloseReceipt(receipt.clone()))
+            } else {
+                Err(RemoteDeviceError::Conflict)
+            };
+        }
+        if self.closes.len() >= 256 {
+            return Err(RemoteDeviceError::Full);
+        }
+        if self.inputs.iter().any(|i| i.operation_id == operation_id) {
+            return Err(RemoteDeviceError::Conflict);
+        }
+        let index = self.exact_connection(&lease)?;
+        let inspect_query = self.next_query()?;
+        let request = RemoteTaskInputRequest::CloseSession {
+            target: target.clone(),
+            execution_handle: execution.execution_handle,
+            operation_id: operation_id.clone(),
+            deadline_unix_ms: authority
+                .deadline_unix_ms()
+                .ok_or(RemoteDeviceError::Stale)?,
+        };
+        if !request.is_valid() {
+            return Err(RemoteDeviceError::Invalid);
+        }
+        let mut connection = self.connections.remove(index);
+        let result = match authority.admit(&operation_id, || {
+            connection
+                .client
+                .send_command(RuntimeCommand::RemoteTaskInput { request })
+        }) {
+            None => RemoteSessionCloseResult::Rejected,
+            Some(Err(_)) => RemoteSessionCloseResult::ObservationUnknown,
+            Some(Ok(())) => {
+                let until = Instant::now() + Duration::from_secs(5);
+                'wait: loop {
+                    let mut events = connection.events.drain().into_iter();
+                    while let Some(event) = events.next() {
+                        if let RuntimeEvent::RemoteTaskInput {
+                            target: observed,
+                            reply:
+                                RemoteTaskInputReply::SessionClosed {
+                                    operation_id: operation,
+                                    result,
+                                },
+                        } = &event
+                            && *observed == target
+                            && *operation == operation_id
+                        {
+                            let remaining: Vec<_> = events.collect();
+                            if connection.deferred.len() + remaining.len() > 256 {
+                                break 'wait RemoteSessionCloseResult::ObservationUnknown;
+                            }
+                            connection.deferred.extend(remaining);
+                            break 'wait result.clone();
+                        }
+                        if connection.deferred.len() >= 256 {
+                            break 'wait RemoteSessionCloseResult::ObservationUnknown;
+                        }
+                        connection.deferred.push(event);
+                    }
+                    if connection.events.is_disconnected()
+                        || connection.events.take_overflowed()
+                        || Instant::now() >= until
+                    {
+                        break RemoteSessionCloseResult::ObservationUnknown;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        };
+        if result == RemoteSessionCloseResult::Closed {
+            self.registry.complete(&lease);
+            if let Some(observation) = self
+                .flights
+                .iter_mut()
+                .find(|f| f.lease == lease)
+                .and_then(|f| f.observation.as_mut())
+            {
+                observation.exit_code = Some(None);
+            }
+            if let Ok(caps) = inspect_exact(&mut connection, inspect_query) {
+                let _ = self
+                    .registry
+                    .observe(observation(&connection, caps), self.now());
+                connection.last_observed = Instant::now();
+            }
+        }
+        self.connections.insert(index, connection);
+        let receipt = RemoteCloseReceipt {
+            request_id,
+            lease,
+            operation_id,
+            result,
+        };
+        self.closes.push(receipt.clone());
+        Ok(RemoteDeviceOutcome::CloseReceipt(receipt))
+    }
+    fn observe_session(
+        &mut self,
+        request_id: u64,
+        lease: ExecutionLease,
+        session: deppy_core::SessionId,
+        execution_generation: u64,
+    ) -> Result<RemoteDeviceOutcome> {
+        let target = self.launched_target(&lease)?;
+        if request_id == 0
+            || target.session != session
+            || target.execution_generation != execution_generation
+        {
+            return Err(RemoteDeviceError::WrongTarget);
+        }
+        let flight_index = self
+            .flights
+            .iter()
+            .position(|f| f.lease == lease)
+            .ok_or(RemoteDeviceError::WrongTarget)?;
+        if self.flights[flight_index].observation.is_none()
+            && self
+                .flights
+                .iter()
+                .filter(|f| f.observation.is_some())
+                .count()
+                >= 32
+        {
+            return Err(RemoteDeviceError::Full);
+        }
+        let index = self.exact_connection(&lease)?;
+        let query = self.next_query()?;
+        let mut connection = self.connections.remove(index);
+        let result = (|| {
+            connection
+                .client
+                .send_command(RuntimeCommand::RemoteTaskInput {
+                    request: RemoteTaskInputRequest::ObserveSession {
+                        target: target.clone(),
+                        request_id: query,
+                    },
+                })
+                .map_err(|_| RemoteDeviceError::Transport)?;
+            let until = Instant::now() + Duration::from_secs(5);
+            loop {
+                let mut events = connection.events.drain().into_iter();
+                while let Some(event) = events.next() {
+                    match event {
+                        RuntimeEvent::RemoteTaskInput {
+                            target: observed,
+                            reply:
+                                RemoteTaskInputReply::SessionObserved {
+                                    request_id,
+                                    snapshot,
+                                },
+                        } if observed == target && request_id == query => {
+                            let remaining: Vec<_> = events.collect();
+                            if connection.deferred.len() + remaining.len() > 256 {
+                                return Err(RemoteDeviceError::Full);
+                            }
+                            connection.deferred.extend(remaining);
+                            return snapshot.ok_or(RemoteDeviceError::WrongTarget);
+                        }
+                        other => {
+                            if connection.deferred.len() >= 256 {
+                                return Err(RemoteDeviceError::Full);
+                            }
+                            connection.deferred.push(other);
+                        }
+                    }
+                }
+                if connection.events.is_disconnected()
+                    || connection.events.take_overflowed()
+                    || Instant::now() >= until
+                {
+                    return Err(RemoteDeviceError::Disconnected);
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        })();
+        self.connections.insert(index, connection);
+        let snapshot = result?;
+        let observation = RemoteSessionObservation {
+            lease,
+            session,
+            execution_generation,
+            terminal: snapshot.terminal,
+            detected_status: snapshot.detected_status,
+            exit_code: snapshot.exit_code,
+            connected: true,
+        };
+        self.flights[flight_index].observation = Some(observation.clone());
+        Ok(RemoteDeviceOutcome::SessionObserved {
+            request_id,
+            observation: Box::new(observation),
         })
     }
     fn observe_execution(
@@ -782,6 +1014,9 @@ impl ControllerState {
             {
                 flight.pending_result = None;
                 flight.result = Some(RemoteWorkResult::ObservationUnknown);
+                if let Some(observation) = &mut flight.observation {
+                    observation.connected = false;
+                }
             }
         }
     }
@@ -879,6 +1114,28 @@ impl ControllerState {
                             });
                         }
                     }
+                    RuntimeEvent::SessionStatusChanged { session, status } => {
+                        for flight in &mut self.flights {
+                            if flight.lease.request.device_id == connection.device_id
+                                && flight.lease.connection_epoch == connection.epoch
+                                && let Some(observation) = &mut flight.observation
+                                && observation.session == session
+                            {
+                                observation.detected_status = Some(status);
+                            }
+                        }
+                    }
+                    RuntimeEvent::SessionExited { session, exit_code } => {
+                        for flight in &mut self.flights {
+                            if flight.lease.request.device_id == connection.device_id
+                                && flight.lease.connection_epoch == connection.epoch
+                                && let Some(observation) = &mut flight.observation
+                                && observation.session == session
+                            {
+                                observation.exit_code = Some(exit_code);
+                            }
+                        }
+                    }
                     RuntimeEvent::RemoteWorkResolved { identity, result } => {
                         if let Some(flight) = self.flights.iter_mut().find(|f| {
                             f.request.identity == identity
@@ -966,9 +1223,16 @@ impl ControllerState {
         Ok(RemoteDeviceOutcome::Snapshot {
             devices: self.registry.snapshot(&workspace, self.now()),
             policies: self.registry.verified_devices(&workspace, self.now()),
-            workspace_id: workspace,
+            workspace_id: workspace.clone(),
             receipts,
             inputs,
+            sessions: self
+                .flights
+                .iter()
+                .filter_map(|f| f.observation.as_ref())
+                .filter(|o| o.lease.request.workspace_id == workspace)
+                .cloned()
+                .collect(),
         })
     }
 }

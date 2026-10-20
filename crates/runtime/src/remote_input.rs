@@ -24,6 +24,16 @@ pub enum RemoteTaskInputRequest {
         prompt: String,
         deadline_unix_ms: u64,
     },
+    ObserveSession {
+        target: RemoteTaskTarget,
+        request_id: u64,
+    },
+    CloseSession {
+        target: RemoteTaskTarget,
+        execution_handle: String,
+        operation_id: OperationId,
+        deadline_unix_ms: u64,
+    },
 }
 impl std::fmt::Debug for RemoteTaskInputRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -46,7 +56,19 @@ pub enum RemoteTaskInputResult {
     Rejected { reason: PtyInputRejectReason },
     ObservationUnknown,
 }
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RemoteSessionSnapshot {
+    pub terminal: Option<std::sync::Arc<terminal::TerminalViewportSnapshot>>,
+    pub detected_status: Option<crate::SessionStatus>,
+    pub exit_code: Option<Option<u32>>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteSessionCloseResult {
+    Closed,
+    Rejected,
+    ObservationUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum RemoteTaskInputReply {
     Observed {
         request_id: u64,
@@ -56,11 +78,22 @@ pub enum RemoteTaskInputReply {
         operation_id: OperationId,
         result: RemoteTaskInputResult,
     },
+    SessionObserved {
+        request_id: u64,
+        snapshot: Option<Box<RemoteSessionSnapshot>>,
+    },
+    SessionClosed {
+        operation_id: OperationId,
+        result: RemoteSessionCloseResult,
+    },
 }
 impl RemoteTaskInputRequest {
     pub fn target(&self) -> &RemoteTaskTarget {
         match self {
-            Self::Observe { target, .. } | Self::Deliver { target, .. } => target,
+            Self::Observe { target, .. }
+            | Self::ObserveSession { target, .. }
+            | Self::Deliver { target, .. }
+            | Self::CloseSession { target, .. } => target,
         }
     }
     pub fn is_valid(&self) -> bool {
@@ -69,7 +102,19 @@ impl RemoteTaskInputRequest {
             return false;
         }
         match self {
-            Self::Observe { request_id, .. } => *request_id > 0,
+            Self::Observe { request_id, .. } | Self::ObserveSession { request_id, .. } => {
+                *request_id > 0
+            }
+            Self::CloseSession {
+                execution_handle,
+                operation_id,
+                deadline_unix_ms,
+                ..
+            } => {
+                *deadline_unix_ms > 0
+                    && uuid::Uuid::parse_str(execution_handle).is_ok()
+                    && uuid::Uuid::parse_str(operation_id.as_str()).is_ok()
+            }
             Self::Deliver {
                 execution_handle,
                 operation_id,
@@ -102,24 +147,41 @@ impl RemoteTaskInputRequest {
             + i.operation_id.0.capacity()
             + i.incarnation.0.capacity();
         base + match self {
-            Self::Observe { .. } => 0,
+            Self::Observe { .. } | Self::ObserveSession { .. } => 0,
             Self::Deliver {
                 execution_handle,
                 operation_id,
                 prompt,
                 ..
             } => execution_handle.capacity() + operation_id.0.capacity() + prompt.capacity(),
+            Self::CloseSession {
+                execution_handle,
+                operation_id,
+                ..
+            } => execution_handle.capacity() + operation_id.0.capacity(),
         }
     }
     pub(crate) fn canonicalize(&mut self) {
         let t = match self {
-            Self::Observe { target, .. } | Self::Deliver { target, .. } => target,
+            Self::Observe { target, .. }
+            | Self::ObserveSession { target, .. }
+            | Self::Deliver { target, .. }
+            | Self::CloseSession { target, .. } => target,
         };
         t.identity.device_id.shrink_to_fit();
         t.identity.workspace_id.0.shrink_to_fit();
         t.identity.attempt_id.0.shrink_to_fit();
         t.identity.operation_id.0.shrink_to_fit();
         t.identity.incarnation.0.shrink_to_fit();
+        if let Self::CloseSession {
+            execution_handle,
+            operation_id,
+            ..
+        } = self
+        {
+            execution_handle.shrink_to_fit();
+            operation_id.0.shrink_to_fit();
+        }
         if let Self::Deliver {
             execution_handle,
             operation_id,
@@ -148,8 +210,21 @@ pub(crate) struct ExecutionRecord {
     pub profile: AgentSelection,
     pub proof: Option<RemoteExecutionProof>,
     pub inputs: Vec<(OperationId, String, RemoteTaskInputResult)>,
+    pub closes: Vec<(OperationId, String, RemoteSessionCloseResult)>,
 }
 
+impl ExecutionRecord {
+    pub(crate) fn close_pending(&self) -> bool {
+        self.closes
+            .iter()
+            .any(|(_, _, r)| *r == RemoteSessionCloseResult::ObservationUnknown)
+            && (self.owner.is_some_and(|o| o.is_current())
+                || self
+                    .proof
+                    .as_ref()
+                    .is_some_and(|p| p.execution.is_current() || p.foreground.is_current()))
+    }
+}
 /// Bounded kernel identity checks only; no process enumeration or executable-name guessing.
 pub(crate) fn owns_foreground(owner: ProcessIdentity, foreground: ProcessIdentity) -> bool {
     if !owner.is_current() || !foreground.is_current() {
@@ -259,4 +334,35 @@ fn only_child(owner: ProcessIdentity) -> Option<ProcessIdentity> {
         (deppy_core::process_identity::pid_parent(pid) == Some(owner.pid) && owner.is_current())
             .then_some(child)
     }
+}
+
+/// At most 160x80 cells plus 64KiB sparse graphemes; no full scrollback retention.
+pub fn valid_session_snapshot(snapshot: &terminal::TerminalViewportSnapshot) -> bool {
+    let cells = usize::from(snapshot.cols) * usize::from(snapshot.rows);
+    snapshot.cols > 0
+        && snapshot.cols <= 160
+        && snapshot.rows > 0
+        && snapshot.rows <= 80
+        && snapshot.visible_cells.len() == cells
+        && snapshot.history.is_some_and(|h| {
+            h.generation > 0
+                && h.total_lines >= u32::from(snapshot.rows)
+                && snapshot.scroll_offset >= 0
+                && snapshot.scroll_offset as u32 <= h.total_lines - u32::from(snapshot.rows)
+                && h.first_line
+                    .checked_add(snapshot.scroll_offset as u64)
+                    .is_some()
+        })
+        && snapshot.title.as_ref().is_none_or(|t| t.len() <= 4096)
+        && snapshot.dirty_ranges.len() <= 80
+        && snapshot
+            .dirty_ranges
+            .iter()
+            .all(|r| r.start <= r.end && r.end <= cells)
+        && snapshot
+            .graphemes
+            .iter()
+            .try_fold(0usize, |n, g| n.checked_add(g.text.len()))
+            .is_some_and(|n| n <= 64 * 1024)
+        && terminal::validate_cell_graphemes(&snapshot.visible_cells, &snapshot.graphemes).is_ok()
 }

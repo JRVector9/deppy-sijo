@@ -2928,12 +2928,24 @@ impl Worker {
                 self.sessions
                     .get(id)
                     .is_some_and(|session| session.lifecycle().is_running())
+                    || host
+                        .executions
+                        .iter()
+                        .any(|r| r.target.session == *id && r.close_pending())
             });
             let active_workers = self
                 .sessions
                 .values()
                 .filter(|s| s.kind() == session::SessionKind::Agent && s.lifecycle().is_running())
                 .count()
+                .saturating_add(
+                    host.executions
+                        .iter()
+                        .filter(|r| {
+                            !self.sessions.contains_key(&r.target.session) && r.close_pending()
+                        })
+                        .count(),
+                )
                 .min(usize::from(host.config.max_workers)) as u8;
             let now = std::time::Instant::now();
             host.leases.retain(|(_, until)| *until > now);
@@ -3142,7 +3154,15 @@ impl Worker {
                 .sessions
                 .values()
                 .filter(|s| s.kind() == session::SessionKind::Agent && s.lifecycle().is_running())
-                .count();
+                .count()
+                .saturating_add(
+                    host.executions
+                        .iter()
+                        .filter(|r| {
+                            !self.sessions.contains_key(&r.target.session) && r.close_pending()
+                        })
+                        .count(),
+                );
             if active >= usize::from(host.config.max_workers)
                 || self.suspended
                 || !self.session_capacity_available()
@@ -3171,7 +3191,7 @@ impl Worker {
             Err(code) => reject(code),
             Ok(command) => {
                 let session = SessionId(self.next_id);
-                let wrapped=matches!(&command,RuntimeCommand::SpawnAgent{command,args,..}
+                let wrapped = matches!(&command,RuntimeCommand::SpawnAgent{command,args,..}
                     if command=="/bin/sh" && args.first().is_some_and(|a|a=="-c")
                     && args.get(2).is_some_and(|a|a==crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME));
                 self.handle_command_inner_with_cwd(
@@ -3205,6 +3225,7 @@ impl Worker {
                                     profile: profile.agent.clone(),
                                     proof: None,
                                     inputs: vec![],
+                                    closes: vec![],
                                 });
                             }
                             R::Launched {
@@ -3270,7 +3291,8 @@ impl Worker {
                     if !crate::remote_input::owns_foreground(owner, foreground) {
                         return None;
                     }
-                    let execution=crate::remote_input::inner_execution(owner,foreground,record.wrapped)?;
+                    let execution =
+                        crate::remote_input::inner_execution(owner, foreground, record.wrapped)?;
                     let guard = crate::AgentInputGuard {
                         foreground_process_group: foreground.pid,
                         provider: kind,
@@ -3280,7 +3302,7 @@ impl Worker {
                         return None;
                     }
                     if let Some(proof) = &record.proof {
-                        if proof.foreground != foreground || proof.execution!=execution {
+                        if proof.foreground != foreground || proof.execution != execution {
                             return None;
                         }
                     } else {
@@ -3295,6 +3317,125 @@ impl Worker {
                     Some(R::Observed {
                         request_id: *request_id,
                         execution: record.proof.clone().map(Box::new),
+                    })
+                }
+                Q::CloseSession {
+                    execution_handle,
+                    operation_id,
+                    deadline_unix_ms,
+                    ..
+                } => {
+                    use crate::remote_input::RemoteSessionCloseResult as C;
+                    let proof = record.proof.as_ref()?.clone();
+                    let reject = || {
+                        Some(R::SessionClosed {
+                            operation_id: operation_id.clone(),
+                            result: C::Rejected,
+                        })
+                    };
+                    if proof.execution_handle != *execution_handle {
+                        return reject();
+                    }
+                    let digest = request.digest().ok()?;
+                    if let Some((_, previous, result)) =
+                        record.closes.iter().find(|(op, _, _)| op == operation_id)
+                    {
+                        return Some(R::SessionClosed {
+                            operation_id: operation_id.clone(),
+                            result: if *previous == digest {
+                                result.clone()
+                            } else {
+                                C::Rejected
+                            },
+                        });
+                    }
+                    let now = crate::remote_input::unix_millis()?;
+                    if !deadline_unix_ms
+                        .checked_sub(now)
+                        .is_some_and(|ms| ms > 0 && ms <= 30_000)
+                    {
+                        return reject();
+                    }
+                    let owner = record.owner?;
+                    if let Some(active) = self.sessions.get(&target.session)
+                        && (active.process_identity().pid != Some(owner.pid)
+                            || (active.lifecycle().is_running() && !owner.is_current()))
+                    {
+                        return reject();
+                    }
+                    if host
+                        .executions
+                        .iter()
+                        .map(|r| r.closes.len())
+                        .sum::<usize>()
+                        >= 256
+                        || host.executions.iter().any(|r| {
+                            r.closes.iter().any(|(op, _, _)| op == operation_id)
+                                || r.inputs.iter().any(|(op, _, _)| op == operation_id)
+                        })
+                    {
+                        return reject();
+                    }
+                    host.executions[index].closes.push((
+                        operation_id.clone(),
+                        digest,
+                        C::ObservationUnknown,
+                    ));
+                    if self.sessions.contains_key(&target.session) {
+                        // Existing PTY teardown captures and signals only its owned workload identities.
+                        self.kill_session_owned(target.session, true);
+                    }
+                    let result = if !self.sessions.contains_key(&target.session)
+                        && !owner.is_current()
+                        && !proof.foreground.is_current()
+                        && !proof.execution.is_current()
+                    {
+                        C::Closed
+                    } else {
+                        C::ObservationUnknown
+                    };
+                    host.executions[index].closes.last_mut()?.2 = result.clone();
+                    Some(R::SessionClosed {
+                        operation_id: operation_id.clone(),
+                        result,
+                    })
+                }
+                Q::ObserveSession { request_id, .. } => {
+                    let effects = self.collect_session_pump_effects(&[target.session], false, true);
+                    self.finish_session_pump_effects(effects);
+                    let active = self.sessions.get(&target.session)?;
+                    let owner = record.owner?;
+                    // Session numbers alone do not authorize even read-only execution data.
+                    // A running replacement under the same session can never inherit this target.
+                    if active.process_identity().pid != Some(owner.pid)
+                        || (active.lifecycle().is_running() && !owner.is_current())
+                    {
+                        return None;
+                    }
+                    let mut query = terminal::TerminalHistoryQuery::live();
+                    query.rows = Some(80);
+                    let terminal = active
+                        .history_snapshot(query)
+                        .filter(|result| {
+                            !result.expired
+                                && crate::remote_input::valid_session_snapshot(&result.snapshot)
+                        })
+                        .map(|result| Arc::new(result.snapshot));
+                    let exit_code = match active.lifecycle() {
+                        session::SessionLifecycle::Running => None,
+                        session::SessionLifecycle::Exited { exit_code } => Some(exit_code),
+                    };
+                    let detected_status = self
+                        .detectors
+                        .get(&target.session)
+                        .map(|d| d.status_view(None).detected_status);
+                    Some(R::SessionObserved {
+                        request_id: *request_id,
+                        snapshot: Some(Box::new(crate::remote_input::RemoteSessionSnapshot {
+                            terminal,
+                            detected_status,
+                            exit_code,
+                        })),
                     })
                 }
                 Q::Deliver {
@@ -3336,7 +3477,7 @@ impl Worker {
                     };
                     let owner = record.owner?;
                     let foreground = proof.foreground;
-                    let execution=proof.execution;
+                    let execution = proof.execution;
                     // Release the record borrow before consulting the bounded per-host ledger.
                     if host
                         .executions
@@ -3344,10 +3485,10 @@ impl Worker {
                         .map(|r| r.inputs.len())
                         .sum::<usize>()
                         >= 256
-                        || host
-                            .executions
-                            .iter()
-                            .any(|r| r.inputs.iter().any(|(op, _, _)| op == operation_id))
+                        || host.executions.iter().any(|r| {
+                            r.inputs.iter().any(|(op, _, _)| op == operation_id)
+                                || r.closes.iter().any(|(op, _, _)| op == operation_id)
+                        })
                     {
                         return Some(R::Delivered {
                             operation_id: operation_id.clone(),
@@ -3364,7 +3505,9 @@ impl Worker {
                         crate::InputPermit::new(),
                         Instant::now() + Duration::from_millis(remaining.min(1000)),
                         move |action| {
-                            if crate::remote_input::execution_is_current(owner, foreground,execution) {
+                            if crate::remote_input::execution_is_current(
+                                owner, foreground, execution,
+                            ) {
                                 action();
                             }
                         },
@@ -3405,6 +3548,14 @@ impl Worker {
             Q::Observe { request_id, .. } => R::Observed {
                 request_id,
                 execution: None,
+            },
+            Q::CloseSession { operation_id, .. } => R::SessionClosed {
+                operation_id,
+                result: crate::remote_input::RemoteSessionCloseResult::ObservationUnknown,
+            },
+            Q::ObserveSession { request_id, .. } => R::SessionObserved {
+                request_id,
+                snapshot: None,
             },
             Q::Deliver { operation_id, .. } => R::Delivered {
                 operation_id,

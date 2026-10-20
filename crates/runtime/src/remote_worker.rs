@@ -1389,12 +1389,15 @@ mod tests {
         let mut b_work = request(&b_caps, "other-input-launch");
         b_work.initial_prompt = None;
         b_client
-            .send_command(RuntimeCommand::SpawnRemoteWork { request: b_work })
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: b_work.clone(),
+            })
             .unwrap();
         let RuntimeEvent::RemoteWorkResolved {
             result:
                 RemoteWorkResult::Launched {
-                    session: b_session, ..
+                    session: b_session,
+                    execution_generation: b_generation,
                 },
             ..
         } = wait_event(&b_events, |e| {
@@ -1457,7 +1460,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert!(proof.foreground.is_current());
-        assert_ne!(proof.execution,proof.foreground,"a known launcher wrapper must pin the inner CLI process, not its persistent shell");
+        assert_ne!(
+            proof.execution, proof.foreground,
+            "a known launcher wrapper must pin the inner CLI process, not its persistent shell"
+        );
+        for (destination, receiver, observed) in [
+            (&b_client, &b_events, target.clone()),
+            (
+                &client,
+                &events,
+                RemoteTaskTarget {
+                    execution_generation: target.execution_generation + 1,
+                    ..target.clone()
+                },
+            ),
+        ] {
+            destination
+                .send_command(RuntimeCommand::RemoteTaskInput {
+                    request: RemoteTaskInputRequest::ObserveSession {
+                        target: observed,
+                        request_id: 9,
+                    },
+                })
+                .unwrap();
+            assert!(matches!(
+                wait_event(receiver, |e| matches!(
+                    e,
+                    RuntimeEvent::RemoteTaskInput { .. }
+                )),
+                RuntimeEvent::RemoteTaskInput {
+                    reply: RemoteTaskInputReply::SessionObserved { snapshot: None, .. },
+                    ..
+                }
+            ));
+        }
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: RemoteTaskInputRequest::ObserveSession {
+                    target: target.clone(),
+                    request_id: 10,
+                },
+            })
+            .unwrap();
+        let RuntimeEvent::RemoteTaskInput {
+            reply:
+                RemoteTaskInputReply::SessionObserved {
+                    snapshot: Some(snapshot),
+                    ..
+                },
+            ..
+        } = wait_event(&events, |e| {
+            matches!(e, RuntimeEvent::RemoteTaskInput { .. })
+        })
+        else {
+            panic!("no scoped native terminal");
+        };
+        let terminal = snapshot.terminal.unwrap();
+        assert!(terminal.history.is_some_and(|h| h.generation > 0));
+        assert!(terminal.visible_cells.iter().any(|c| c.c == '❯'));
         let operation = OperationId::new();
         let input = RemoteTaskInputRequest::Deliver {
             target: target.clone(),
@@ -1590,6 +1650,137 @@ mod tests {
         assert_eq!(
             std::fs::read(root.join("a/accepted")).unwrap(),
             b"\x1b[200~bounded task\x1b[201~\r"
+        );
+        let close = RemoteTaskInputRequest::CloseSession {
+            target: target.clone(),
+            execution_handle: proof.execution_handle.clone(),
+            operation_id: OperationId::new(),
+            deadline_unix_ms: unix_millis().unwrap() + 10_000,
+        };
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: close.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::SessionClosed {
+                    result: RemoteSessionCloseResult::Closed,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(!proof.foreground.is_current());
+        let after_close = inspect(&client, &events);
+        assert_eq!(after_close.active_workers, 0);
+        let mut next = request(&after_close, "after-explicit-close");
+        next.initial_prompt = None;
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork { request: next })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched { .. },
+                ..
+            }
+        ));
+        // An exact duplicate close cannot touch this new worker.
+        client
+            .send_command(RuntimeCommand::RemoteTaskInput { request: close })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::SessionClosed {
+                    result: RemoteSessionCloseResult::Closed,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert_eq!(inspect(&client, &events).active_workers, 1);
+        let b_target = RemoteTaskTarget {
+            identity: b_work.identity,
+            session: b_session,
+            execution_generation: b_generation,
+        };
+        let until = Instant::now() + Duration::from_secs(4);
+        let b_proof = loop {
+            b_client
+                .send_command(RuntimeCommand::RemoteTaskInput {
+                    request: RemoteTaskInputRequest::Observe {
+                        target: b_target.clone(),
+                        request_id: 11,
+                    },
+                })
+                .unwrap();
+            if let RuntimeEvent::RemoteTaskInput {
+                reply:
+                    RemoteTaskInputReply::Observed {
+                        execution: Some(proof),
+                        ..
+                    },
+                ..
+            } = wait_event(&b_events, |e| {
+                matches!(e, RuntimeEvent::RemoteTaskInput { .. })
+            }) {
+                break proof;
+            }
+            assert!(Instant::now() < until);
+        };
+        assert_ne!(b_proof.execution, b_proof.foreground);
+        assert_eq!(
+            unsafe { libc::kill(b_proof.execution.pid as i32, libc::SIGKILL) },
+            0
+        );
+        while b_proof.execution.is_current() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            b_proof.foreground.is_current(),
+            "persistent wrapper is still alive"
+        );
+        b_client
+            .send_command(RuntimeCommand::RemoteTaskInput {
+                request: RemoteTaskInputRequest::Deliver {
+                    target: b_target,
+                    execution_handle: b_proof.execution_handle.clone(),
+                    operation_id: OperationId::new(),
+                    prompt: "bounded task".into(),
+                    deadline_unix_ms: unix_millis().unwrap() + 10_000,
+                },
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&b_events, |e| matches!(
+                e,
+                RuntimeEvent::RemoteTaskInput { .. }
+            )),
+            RuntimeEvent::RemoteTaskInput {
+                reply: RemoteTaskInputReply::Delivered {
+                    result: RemoteTaskInputResult::Rejected { .. },
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            std::fs::read(root.join("b/accepted"))
+                .unwrap_or_default()
+                .is_empty()
         );
         drop(b_client);
         b.shutdown();

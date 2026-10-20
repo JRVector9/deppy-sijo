@@ -150,6 +150,8 @@ pub(super) struct CommandCenterHost {
     devices: devices::Devices,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
+    /// Local draft edit identity captured when a Submit enters the host queue.
+    input_draft_versions: BTreeMap<String, u64>,
     // IDs are never evicted during a host lifetime. Full capacity rejects new operations.
     operations: BTreeMap<String, cc::Intent>,
     remote_permits: BTreeMap<String, Arc<web_remote::cloud::CloudControlPermit>>,
@@ -193,6 +195,7 @@ impl CommandCenterHost {
             devices: devices::Devices::new(data_dir.clone(), ctx),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
+            input_draft_versions: BTreeMap::new(),
             operations: BTreeMap::new(),
             remote_permits: BTreeMap::new(),
             receipts: VecDeque::new(),
@@ -213,6 +216,9 @@ impl CommandCenterHost {
     }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
         self.remote_permits.remove(id);
+        if status != cc::ReceiptStatus::Uncertain {
+            self.input_draft_versions.remove(id);
+        }
         if let Some(pending) = self.launches.get_mut(id)
             && matches!(pending.stage, launch::Stage::Input)
         {
@@ -332,6 +338,10 @@ impl CommandCenterHost {
                 "요청 기록 한도에 도달했습니다. 미확인 입력을 재전송하지 않았습니다.",
             );
             return;
+        }
+        if let cc::Intent::Submit { target, .. } = &intent {
+            self.input_draft_versions
+                .insert(id.clone(), self.ui.draft_version(target));
         }
         self.operations.insert(id.clone(), intent.clone());
         self.pending.push_back((id, intent));
@@ -474,6 +484,107 @@ fn preserve_known_delivery_receipts(
     }
     merged
 }
+fn finish_project_load(
+    host: &mut CommandCenterHost,
+    workspace: &str,
+    receipt: Option<String>,
+    result: Result<Option<Box<stored::StoredProject>>, wm::repository_worker::RepositoryError>,
+) {
+    let previous_main = host.main_target(workspace, &host.projects[workspace]);
+    let result = result.map_err(|_| "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".to_owned())
+        .and_then(|mut record| {
+            if let Some(record) = &mut record {
+                let current = &host.projects[workspace];
+                // Validate the entire merge before replacing any project state. In
+                // particular, authoring while loading must not silently lose a
+                // local main draft when the stored draft collection is full.
+                for draft in current.snapshot.drafts.iter().filter(|d| !d.target_key.starts_with("settings:")) {
+                    if let Some(existing) = record.snapshot.drafts.iter_mut().find(|d| d.target_key == draft.target_key) {
+                        *existing = draft.clone();
+                    } else {
+                        record.snapshot.drafts.push(draft.clone());
+                    }
+                }
+                if record.snapshot.drafts.len() > work::WORK_DRAFT_MAX_COUNT
+                    || record.snapshot.drafts.iter().any(|d| d.text.len() > work::WORK_DRAFT_MAX_BYTES)
+                    || record.snapshot.drafts.iter().map(|d| d.text.len()).sum::<usize>() > work::WORK_DRAFT_TOTAL_MAX_BYTES
+                {
+                    return Err("초안 저장 한도로 불러오기를 완료하지 못했습니다. 현재 초안은 이 화면에 보존됩니다. 저장된 초안의 공간을 확보한 뒤 저장 상태를 다시 확인해 주세요.".into());
+                }
+                preserve_known_delivery_receipts(&mut record.snapshot, current);
+            }
+            Ok(record)
+        });
+    let succeeded = result.is_ok();
+    match result {
+        Ok(record) => {
+            let p = host.projects.get_mut(workspace).unwrap();
+            if let Some(record) = record {
+                p.revision = Some(record.revision);
+                p.snapshot = record.snapshot;
+                p.scopes = p
+                    .snapshot
+                    .drafts
+                    .iter()
+                    .find(|d| d.target_key == "settings:scopes")
+                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                    .unwrap_or_default();
+                p.allowed_agents = p
+                    .snapshot
+                    .drafts
+                    .iter()
+                    .find(|d| d.target_key == "settings:agents")
+                    .and_then(|d| serde_json::from_str(&d.text).ok())
+                    .unwrap_or_else(|| vec![p.snapshot.config.worker_agent.clone()]);
+                recover_observation(&mut p.snapshot);
+                p.dirty();
+            }
+            p.loaded = true;
+            p.storage_blocked = false;
+            if let Some(goal) = p
+                .snapshot
+                .goals
+                .iter()
+                .rev()
+                .find(|g| g.state == work::WorkState::PlanReview)
+            {
+                p.request =
+                    wm::plan::PlannerRequest::new(goal, &p.snapshot.config, &p.policy()).ok();
+            }
+            launch::restore_records(host, workspace);
+            remote::restore(host, workspace);
+            let target = host.main_target(workspace, host.projects.get(workspace).unwrap());
+            if !host.ui.has_draft(&target)
+                && !host.ui.has_draft(&previous_main)
+                && let Some(draft) = host.projects[workspace]
+                    .snapshot
+                    .drafts
+                    .iter()
+                    .find(|d| d.target_key == "main")
+            {
+                host.ui.set_draft(target, draft.text.clone());
+            }
+        }
+        Err(error) => {
+            if let Some(p) = host.projects.get_mut(workspace) {
+                p.storage_blocked = true;
+            }
+            host.status = error;
+        }
+    }
+    if let Some(id) = receipt {
+        if succeeded {
+            host.finish(
+                &id,
+                cc::ReceiptStatus::Acknowledged,
+                "프로젝트 상태를 불러왔습니다.",
+            );
+        } else {
+            host.reject(&id, host.status.clone());
+        }
+    }
+}
+
 fn yes() -> cc::Capability {
     cc::Capability {
         enabled: true,
@@ -1909,99 +2020,7 @@ impl App {
                         result,
                     }),
                 ) if workspace_id.0 == workspace && found == token => {
-                    let succeeded = result.is_ok();
-                    match result {
-                        Ok(record) => {
-                            let p = host.projects.get_mut(&workspace).unwrap();
-                            if let Some(mut record) = record {
-                                let preserved: Vec<_> = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .filter(|d| !d.target_key.starts_with("settings:"))
-                                    .cloned()
-                                    .collect();
-                                preserve_known_delivery_receipts(&mut record.snapshot, p);
-                                p.revision = Some(record.revision);
-                                p.snapshot = record.snapshot;
-                                for draft in preserved {
-                                    if let Some(existing) = p
-                                        .snapshot
-                                        .drafts
-                                        .iter_mut()
-                                        .find(|d| d.target_key == draft.target_key)
-                                    {
-                                        *existing = draft;
-                                    } else if p.snapshot.drafts.len() < work::WORK_DRAFT_MAX_COUNT {
-                                        p.snapshot.drafts.push(draft);
-                                    }
-                                }
-                                p.scopes = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .find(|d| d.target_key == "settings:scopes")
-                                    .and_then(|d| serde_json::from_str(&d.text).ok())
-                                    .unwrap_or_default();
-                                p.allowed_agents = p
-                                    .snapshot
-                                    .drafts
-                                    .iter()
-                                    .find(|d| d.target_key == "settings:agents")
-                                    .and_then(|d| serde_json::from_str(&d.text).ok())
-                                    .unwrap_or_else(|| {
-                                        vec![p.snapshot.config.worker_agent.clone()]
-                                    });
-                                recover_observation(&mut p.snapshot);
-                                p.dirty();
-                            }
-                            p.loaded = true;
-                            p.storage_blocked = false;
-                            if let Some(goal) = p
-                                .snapshot
-                                .goals
-                                .iter()
-                                .rev()
-                                .find(|g| g.state == work::WorkState::PlanReview)
-                            {
-                                p.request = wm::plan::PlannerRequest::new(
-                                    goal,
-                                    &p.snapshot.config,
-                                    &p.policy(),
-                                )
-                                .ok();
-                            }
-                            launch::restore_records(&mut host, &workspace);
-                            remote::restore(&mut host, &workspace);
-                            let target = host
-                                .main_target(&workspace, host.projects.get(&workspace).unwrap());
-                            if let Some(draft) = host.projects[&workspace]
-                                .snapshot
-                                .drafts
-                                .iter()
-                                .find(|d| d.target_key == "main")
-                            {
-                                host.ui.set_draft(target, draft.text.clone());
-                            }
-                        }
-                        Err(_) => {
-                            if let Some(p) = host.projects.get_mut(&workspace) {
-                                p.storage_blocked = true;
-                            }
-                            host.status = "저장된 작업 상태를 읽지 못했습니다. 원래 화면은 계속 사용할 수 있습니다.".into();
-                        }
-                    }
-                    if let Some(id) = receipt {
-                        if succeeded {
-                            host.finish(
-                                &id,
-                                cc::ReceiptStatus::Acknowledged,
-                                "프로젝트 상태를 불러왔습니다.",
-                            );
-                        } else {
-                            host.reject(&id, "프로젝트 상태를 불러오지 못했습니다.");
-                        }
-                    }
+                    finish_project_load(&mut host, &workspace, receipt, result);
                 }
                 (
                     Some(Flight::Save {
@@ -2284,54 +2303,7 @@ impl App {
         let Some(mut host) = self.command_center.take() else {
             return;
         };
-        let Some(input) = host.inputs.remove(id) else {
-            self.command_center = Some(host);
-            return;
-        };
-        let accepted = outcome == ui::composer::PromptAdmissionOutcome::Accepted;
-        let unknown = outcome == ui::composer::PromptAdmissionOutcome::Unknown;
-        if let Some(p) = host.projects.get_mut(&input.target.workspace_id) {
-            if let Some(marker) = p
-                .snapshot
-                .drafts
-                .iter_mut()
-                .find(|d| d.target_key == format!("operation:{id}"))
-            {
-                marker.delivery_uncertain = unknown;
-                p.dirty();
-            }
-            if let Some(assignment) = &input.dispatch {
-                apply_delivery_outcome(p, assignment, outcome);
-            }
-        }
-        let key = draft_key(&host, &input.target).ok();
-        if accepted
-            && clear_admitted_draft(&mut host.ui, &input.target, &input.draft)
-            && let (Some(key), Some(p)) = (key, host.projects.get_mut(&input.target.workspace_id))
-        {
-            let _ = set_draft(p, &key, "", false);
-        }
-        host.finish(
-            id,
-            if accepted {
-                cc::ReceiptStatus::Acknowledged
-            } else if unknown {
-                cc::ReceiptStatus::Uncertain
-            } else {
-                cc::ReceiptStatus::Rejected
-            },
-            if accepted {
-                "현재 실행의 입력 승인을 확인했습니다."
-            } else if unknown {
-                "입력 승인 여부를 확인할 수 없습니다. 자동 재전송하지 않습니다."
-            } else {
-                "현재 실행이 입력을 거부했습니다. 초안은 보존됩니다."
-            },
-        );
-        // Keep unknown operations live for a correlated late ACK and block implicit retry.
-        if unknown {
-            host.inputs.insert(id.into(), input);
-        }
+        finish_input_outcome(&mut host, id, outcome);
         self.command_center = Some(host);
         self.egui_ctx.request_repaint();
     }
@@ -2889,6 +2861,61 @@ fn apply_delivery_outcome(
     }
 }
 
+fn finish_input_outcome(
+    host: &mut CommandCenterHost,
+    id: &str,
+    outcome: ui::composer::PromptAdmissionOutcome,
+) {
+    let Some(input) = host.inputs.remove(id) else {
+        return;
+    };
+    let accepted = outcome == ui::composer::PromptAdmissionOutcome::Accepted;
+    let unknown = outcome == ui::composer::PromptAdmissionOutcome::Unknown;
+    if let Some(p) = host.projects.get_mut(&input.target.workspace_id) {
+        if let Some(marker) = p
+            .snapshot
+            .drafts
+            .iter_mut()
+            .find(|d| d.target_key == format!("operation:{id}"))
+        {
+            marker.delivery_uncertain = unknown;
+            p.dirty();
+        }
+        if let Some(assignment) = &input.dispatch {
+            apply_delivery_outcome(p, assignment, outcome);
+        }
+    }
+    let key = draft_key(host, &input.target).ok();
+    if accepted
+        && host.input_draft_versions.get(id) == Some(&host.ui.draft_version(&input.target))
+        && clear_admitted_draft(&mut host.ui, &input.target, &input.draft)
+        && let (Some(key), Some(p)) = (key, host.projects.get_mut(&input.target.workspace_id))
+    {
+        let _ = set_draft(p, &key, "", false);
+    }
+    host.finish(
+        id,
+        if accepted {
+            cc::ReceiptStatus::Acknowledged
+        } else if unknown {
+            cc::ReceiptStatus::Uncertain
+        } else {
+            cc::ReceiptStatus::Rejected
+        },
+        if accepted {
+            "현재 실행의 입력 승인을 확인했습니다."
+        } else if unknown {
+            "입력 승인 여부를 확인할 수 없습니다. 자동 재전송하지 않습니다."
+        } else {
+            "현재 실행이 입력을 거부했습니다. 초안은 보존됩니다."
+        },
+    );
+    // Keep unknown operations live for a correlated late ACK and block implicit retry.
+    if unknown {
+        host.inputs.insert(id.into(), input);
+    }
+}
+
 fn clear_admitted_draft(ui: &mut cc::UiState, target: &cc::RouteTarget, submitted: &str) -> bool {
     if submitted.is_empty() || !ui.draft(target).nfc().eq(submitted.nfc()) {
         return false;
@@ -3232,6 +3259,197 @@ mod tests {
         assert!(store_composer_draft(&mut h, target.clone(), "가".repeat(6000)).is_err());
         assert_eq!(h.ui.draft(&target), "  \n가");
     }
+    #[test]
+    fn composer_load_capacity_conflict_preserves_local_draft_and_blocks_storage_until_retry() {
+        let mut h = host();
+        let mut current = project();
+        current.loaded = false;
+        let mut loaded = stored::StoredProject {
+            revision: stored::ProjectRevision::new(1).unwrap(),
+            snapshot: current.snapshot.clone(),
+        };
+        loaded.snapshot.drafts = (0..work::WORK_DRAFT_MAX_COUNT)
+            .map(|n| stored::WorkDraft {
+                target_key: format!("stored-session-{n}"),
+                text: format!("independent stored draft {n}"),
+                delivery_uncertain: false,
+            })
+            .collect();
+        let loaded_before = loaded.clone();
+        h.projects.insert("workspace-a".into(), current);
+        let target = cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            ..Default::default()
+        };
+        store_composer_draft(&mut h, target.clone(), "typed while loading".into()).unwrap();
+        finish_project_load(
+            &mut h,
+            "workspace-a",
+            None,
+            Ok(Some(Box::new(loaded.clone()))),
+        );
+        assert!(h.projects["workspace-a"].storage_blocked);
+        assert!(!h.projects["workspace-a"].loaded);
+        assert_eq!(h.ui.draft(&target), "typed while loading");
+        assert_eq!(
+            h.projects["workspace-a"].snapshot.drafts[0].text,
+            "typed while loading"
+        );
+        assert!(h.status.contains("초안"));
+        assert!(h.save("workspace-a", None, None).is_err());
+        assert!(h.flight.is_none());
+        assert_eq!(
+            loaded, loaded_before,
+            "the stored record must remain recoverable"
+        );
+        // Retry can install a snapshot with room without dropping either retained owner.
+        loaded.snapshot.drafts.pop();
+        finish_project_load(&mut h, "workspace-a", None, Ok(Some(Box::new(loaded))));
+        assert!(!h.projects["workspace-a"].storage_blocked);
+        assert!(h.projects["workspace-a"].loaded);
+        assert_eq!(
+            h.projects["workspace-a"].snapshot.drafts.len(),
+            work::WORK_DRAFT_MAX_COUNT
+        );
+        assert_eq!(h.ui.draft(&target), "typed while loading");
+        assert_eq!(
+            h.projects["workspace-a"]
+                .snapshot
+                .drafts
+                .iter()
+                .find(|d| d.target_key == "main")
+                .unwrap()
+                .text,
+            "typed while loading"
+        );
+        assert!(h.inputs.is_empty());
+    }
+
+    #[test]
+    fn composer_load_does_not_overwrite_a_newer_ui_edit_waiting_for_host_processing() {
+        let mut h = host();
+        let mut p = project();
+        p.loaded = false;
+        let loaded = stored::StoredProject {
+            revision: stored::ProjectRevision::new(1).unwrap(),
+            snapshot: p.snapshot.clone(),
+        };
+        h.projects.insert("workspace-a".into(), p);
+        let target = cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            ..Default::default()
+        };
+        store_composer_draft(&mut h, target.clone(), "processed local text".into()).unwrap();
+        h.ui.set_draft(target.clone(), "new edit awaiting DraftChanged".into());
+        finish_project_load(&mut h, "workspace-a", None, Ok(Some(Box::new(loaded))));
+        assert_eq!(h.ui.draft(&target), "new edit awaiting DraftChanged");
+        assert!(h.inputs.is_empty());
+    }
+
+    #[test]
+    fn composer_late_ack_preserves_same_text_after_new_edits() {
+        let mut h = host();
+        let mut p = project();
+        let live = LiveRoute {
+            capture: Capture {
+                workspace: "workspace-a".into(),
+                target: FleetTarget::Pty {
+                    session: runtime::SessionId(1),
+                    tab: runtime::MuxTabId::new(),
+                    pane: runtime::MuxPaneId::new(),
+                },
+                prompt: None,
+            },
+            title: "Actual bound main".into(),
+            agent: None,
+            state: cc::TaskState::Queued,
+            cwd: None,
+            watch: None,
+            runtime_binding: None,
+        };
+        p.snapshot.main_binding = persistent(&live);
+        h.routes.refresh(vec![live.capture.clone()]);
+        h.live.push(live);
+        h.projects.insert("workspace-a".into(), p);
+        let target = h.main_target("workspace-a", &h.projects["workspace-a"]);
+        assert!(target.session_id.is_some() && h.route(&target).is_some());
+        store_composer_draft(&mut h, target.clone(), "가 submitted".into()).unwrap();
+        h.enqueue(
+            "actual-pending-input".into(),
+            cc::Intent::Submit {
+                target: target.clone(),
+                text: "가 submitted".into(),
+            },
+        );
+        assert!(matches!(
+            h.pending.pop_front(),
+            Some((_, cc::Intent::Submit { .. }))
+        ));
+        h.inputs.insert(
+            "actual-pending-input".into(),
+            Input {
+                target: target.clone(),
+                draft: "가 submitted".into(),
+                dispatch: None,
+            },
+        );
+        finish_input_outcome(
+            &mut h,
+            "actual-pending-input",
+            ui::composer::PromptAdmissionOutcome::Unknown,
+        );
+        assert!(h.inputs.contains_key("actual-pending-input"));
+        store_composer_draft(&mut h, target.clone(), "B new edit".into()).unwrap();
+        store_composer_draft(&mut h, target.clone(), "가 submitted".into()).unwrap();
+        finish_input_outcome(
+            &mut h,
+            "actual-pending-input",
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert_eq!(h.ui.draft(&target), "가 submitted");
+        assert_eq!(
+            h.projects["workspace-a"]
+                .snapshot
+                .drafts
+                .iter()
+                .find(|d| d.target_key == "main")
+                .unwrap()
+                .text,
+            "가 submitted"
+        );
+        assert!(!h.inputs.contains_key("actual-pending-input"));
+        assert_eq!(
+            h.receipts.back().unwrap().status,
+            cc::ReceiptStatus::Acknowledged
+        );
+        assert!(!h.input_draft_versions.contains_key("actual-pending-input"));
+        h.enqueue(
+            "next-explicit-input".into(),
+            cc::Intent::Submit {
+                target: target.clone(),
+                text: "가 submitted".into(),
+            },
+        );
+        h.inputs.insert(
+            "next-explicit-input".into(),
+            Input {
+                target: target.clone(),
+                draft: "가 submitted".into(),
+                dispatch: None,
+            },
+        );
+        finish_input_outcome(
+            &mut h,
+            "next-explicit-input",
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        assert_eq!(
+            h.ui.draft(&target),
+            "",
+            "an unchanged canonically equivalent draft should clear"
+        );
+    }
+
     #[test]
     fn admission_only_clears_the_same_target_and_unchanged_draft() {
         let mut state = cc::UiState::default();

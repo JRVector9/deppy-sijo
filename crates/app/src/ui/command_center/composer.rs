@@ -60,8 +60,11 @@ fn preserve_main_draft(ctx: &egui::Context, state: &mut UiState, p: &Project) ->
         && previous.as_ref().is_none_or(|old| old.target == unbound)
         && let Some(text) = state.drafts.remove(&unbound)
     {
-        if let Some(existing) = state.drafts.insert(p.main_target.clone(), text)
+        state.note_draft_edit(&unbound);
+        state.note_draft_edit(&p.main_target);
+        if let Some(existing) = state.drafts.insert(p.main_target.clone(), text.clone())
             && !existing.is_empty()
+            && !existing.nfc().eq(text.nfc())
         {
             state.drafts.insert(unbound, existing);
             alternate = true;
@@ -146,14 +149,13 @@ pub(super) fn composer(
     } else {
         24.0
     };
-    let available = (ui.available_width() - horizontal * 2.0)
-        .min(1000.0)
-        .max(1.0);
+    let available = (ui.available_width() - horizontal * 2.0).clamp(1.0, 1000.0);
     let inset = ((ui.available_width() - available) * 0.5).max(0.0);
     let origin = egui::pos2(
         ui.max_rect().left() + inset,
         ui.cursor().top() + if mobile { 9.0 } else { 12.0 },
     );
+    let previously_focused = state.composer_focused;
     let scale = snapshot.font_scale.clamp(1.0, 2.0);
     let text_height = (if mobile {
         if state.composer_focused { 88.0 } else { 60.0 }
@@ -205,6 +207,12 @@ pub(super) fn composer(
                     }
                 }
             });
+            let editor_font = egui::FontId::proportional(if mobile { 16.0 } else { 14.0 } * scale);
+            let row_height = ui.fonts_mut(|fonts| fonts.row_height(&editor_font));
+            let rows = ((text_height - 24.0) / row_height).floor().max(1.0) as usize;
+            let bottom_padding = (text_height - 12.0 - row_height * rows as f32)
+                .round()
+                .max(0.0) as i8;
             let draft = state.drafts.entry(target.clone()).or_default();
             let editor = egui::ScrollArea::vertical()
                 .id_salt(composer_id(&target).with("scroll"))
@@ -216,12 +224,15 @@ pub(super) fn composer(
                         editable,
                         egui::TextEdit::multiline(draft)
                             .id(composer_id(&target))
-                            .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(14, 12)))
+                            .frame(egui::Frame::NONE.inner_margin(egui::Margin {
+                                left: 14,
+                                right: 14,
+                                top: 12,
+                                bottom: bottom_padding,
+                            }))
                             .desired_width(f32::INFINITY)
-                            .desired_rows(2)
-                            .font(egui::FontId::proportional(
-                                if mobile { 16.0 } else { 14.0 } * scale,
-                            ))
+                            .desired_rows(rows)
+                            .font(editor_font)
                             .hint_text(text(
                                 snapshot,
                                 if task.is_some() {
@@ -244,19 +255,21 @@ pub(super) fn composer(
                     format!("{target_label} · {}", text(snapshot, "send")),
                 )
             });
+            let too_long = draft.nfc().collect::<String>().len() > 16 * 1024;
+            let nonblank = !draft.trim().is_empty();
             if editor.changed() {
+                let text = draft.clone();
+                state.note_draft_edit(&target);
                 intents.push(Intent::DraftChanged {
                     target: target.clone(),
-                    text: draft.clone(),
+                    text,
                 });
             }
             state.composer_focused = editor.has_focus();
             if !editor.has_focus() {
                 state.ime_composing = false;
             }
-            let too_long = draft.nfc().collect::<String>().len() > 16 * 1024;
-            let can_attempt =
-                editable && !draft.trim().is_empty() && !too_long && (enabled || unbound);
+            let can_attempt = editable && nonblank && !too_long && (enabled || unbound);
             let enter_key = editor.has_focus()
                 && ui.input_mut(|i| {
                     !i.modifiers.shift && i.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
@@ -371,6 +384,8 @@ pub(super) fn composer(
                         .drafts
                         .insert(target.clone(), other.clone())
                         .unwrap_or_default();
+                    state.note_draft_edit(&target);
+                    state.note_draft_edit(&unbound);
                     state.drafts.insert(unbound, current);
                     intents.push(Intent::DraftChanged {
                         target: target.clone(),
@@ -386,4 +401,7 @@ pub(super) fn composer(
                 intents.push(intent);
             }
         });
+    if state.composer_focused != previously_focused {
+        ui.ctx().request_repaint();
+    }
 }

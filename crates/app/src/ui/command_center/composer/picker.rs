@@ -6,7 +6,7 @@ use super::*;
 struct PickerState {
     config: ProjectConfig,
     error: Option<String>,
-    saved_revision: Option<String>,
+    saved_config: Option<ProjectConfig>,
 }
 
 fn same_config(desired: &ProjectConfig, current: &ProjectConfig) -> bool {
@@ -24,6 +24,17 @@ fn agent_matches(option: &AgentOption, config: &ProjectConfig) -> bool {
     option.provider == config.provider
         && option.model == config.model
         && option.effort == config.effort
+}
+
+fn eligible_main_session(p: &Project, session: &Session) -> bool {
+    session.target.workspace_id == p.id
+        && session.target.task_id.is_none()
+        && session
+            .target
+            .session_id
+            .as_deref()
+            .is_some_and(|id| !id.starts_with("remote:"))
+        && session.input.enabled
 }
 
 fn choose_session(config: &mut ProjectConfig, session: &Session) {
@@ -90,13 +101,27 @@ pub(super) fn main_picker(
         picker = Some(PickerState {
             config: p.config.clone(),
             error: None,
-            saved_revision: None,
+            saved_config: None,
         });
     }
     let Some(mut picker) = picker else {
         return false;
     };
+    // An acknowledged own save advances the CAS revision even if the user has
+    // edited more fields while it was pending. Preserve those newer fields.
+    if picker
+        .saved_config
+        .as_ref()
+        .is_some_and(|saved| saved.revision != p.config.revision && same_config(saved, &p.config))
+    {
+        picker.config.revision = p.config.revision.clone();
+        picker.saved_config = None;
+    }
     let child_menu_open = ui.ctx().any_popup_open();
+    // Capture the parent's Escape before egui's Popup consumes it. An open
+    // child ComboBox retains first refusal of Escape.
+    let escape = !child_menu_open
+        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     let mut close = false;
     let response = egui::Popup::from_response(anchor)
         .id(key)
@@ -122,7 +147,7 @@ pub(super) fn main_picker(
                                 .sessions
                                 .iter()
                                 .find(|s| {
-                                    s.target.workspace_id == p.id
+                                    eligible_main_session(p, s)
                                         && s.target.session_id == config.main_session_id
                                 })
                                 .map(|s| s.title.as_str())
@@ -134,12 +159,9 @@ pub(super) fn main_picker(
                                         None,
                                         "새 메인 에이전트",
                                     );
-                                    for session in p.sessions.iter().filter(|s| {
-                                        s.target.workspace_id == p.id
-                                            && s.target.task_id.is_none()
-                                            && s.target.session_id.is_some()
-                                            && s.input.enabled
-                                    }) {
+                                    for session in
+                                        p.sessions.iter().filter(|s| eligible_main_session(p, s))
+                                    {
                                         if ui
                                             .selectable_label(
                                                 config.main_session_id == session.target.session_id,
@@ -274,7 +296,7 @@ pub(super) fn main_picker(
                         if let Some(error) = &picker.error {
                             popup::notice(ui, error, popup::NoticeTone::Error);
                         }
-                        if picker.saved_revision.is_some() && !snapshot.status.is_empty() {
+                        if picker.saved_config.is_some() && !snapshot.status.is_empty() {
                             popup::notice(ui, &snapshot.status, popup::NoticeTone::Info);
                         }
                         if !p.save_settings.enabled {
@@ -295,7 +317,7 @@ pub(super) fn main_picker(
                             let binding_valid =
                                 picker.config.main_session_id.as_ref().is_some_and(|id| {
                                     p.sessions.iter().any(|s| {
-                                        s.target.workspace_id == p.id
+                                        eligible_main_session(p, s)
                                             && s.target.session_id.as_ref() == Some(id)
                                             && s.provider == picker.config.provider
                                             && s.model.as_deref().unwrap_or_default()
@@ -326,7 +348,7 @@ pub(super) fn main_picker(
                                     workspace_id: p.id.clone(),
                                     config: picker.config.clone(),
                                 });
-                                picker.saved_revision = Some(picker.config.revision.clone());
+                                picker.saved_config = Some(picker.config.clone());
                                 picker.error = None;
                             }
                         }
@@ -362,22 +384,12 @@ pub(super) fn main_picker(
                         .is_some_and(|response| !response.response.rect.contains(point))
                 })
         });
-    let escape = !nested_open
-        && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     if outside || escape || close {
         ui.ctx().data_mut(|data| data.remove::<PickerState>(key));
+        ui.ctx().request_repaint();
         ui.ctx()
             .memory_mut(|memory| memory.request_focus(composer_id(&p.main_target)));
     } else {
-        if picker
-            .saved_revision
-            .as_ref()
-            .is_some_and(|old| old != &p.config.revision)
-            && same_config(&picker.config, &p.config)
-        {
-            picker.config.revision = p.config.revision.clone();
-            picker.saved_revision = None;
-        }
         ui.ctx().data_mut(|data| data.insert_temp(key, picker));
     }
     true

@@ -5,3 +5,4 @@ pub use reducer::{ApplyOutcome, ProjectWorkState};
 
 #[cfg(test)]
 mod tests;
+pub(crate) mod repository_worker;

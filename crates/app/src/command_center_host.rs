@@ -747,6 +747,7 @@ impl App {
             );
         }
         match intent {
+            cc::Intent::ConnectExecutionDevice { .. } | cc::Intent::GrantExecutionDevice { .. } | cc::Intent::RevokeExecutionDevice { .. } => return Err("기기 실행 연결을 준비 중입니다. 기존 세션은 계속 사용할 수 있습니다.".into()),
             cc::Intent::LoadProject { workspace_id } => {
                 let p = host.projects.get(&workspace_id).ok_or("프로젝트가 없습니다.")?;
                 if !p.loaded {

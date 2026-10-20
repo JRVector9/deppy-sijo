@@ -3,6 +3,7 @@
 //! Opaque session keys must identify one exact native pane or structured session.
 //! The host validates every returned target again before executing an intent.
 
+mod devices;
 mod layout;
 mod main;
 mod settings;
@@ -11,6 +12,7 @@ mod workers;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use devices::{ExecutionCandidate, ExecutionProfile, ExecutionSetup, NativeDeviceSetupRequest};
 pub use layout::LayoutRects;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -228,6 +230,9 @@ pub struct Device {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Pairing and execution grants are trusted native-computer actions. Never publish this form.
+    #[serde(skip)]
+    pub execution_setup: ExecutionSetup,
     #[serde(default)]
     pub receipts: Vec<RemoteReceipt>,
     pub projects: Vec<Project>,
@@ -245,6 +250,7 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            execution_setup: ExecutionSetup::default(),
             receipts: Vec::new(),
             projects: Vec::new(),
             selected_workspace_id: None,
@@ -262,6 +268,23 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    #[serde(skip)]
+    ConnectExecutionDevice {
+        workspace_id: String,
+        request_id: u64,
+    },
+    #[serde(skip)]
+    GrantExecutionDevice {
+        workspace_id: String,
+        candidate_id: String,
+        profile_ids: Vec<String>,
+        max_workers: u8,
+    },
+    #[serde(skip)]
+    RevokeExecutionDevice {
+        workspace_id: String,
+        device_id: String,
+    },
     LoadProject {
         workspace_id: String,
     },
@@ -343,6 +366,7 @@ pub enum ReceiptStatus {
 }
 #[derive(Default)]
 pub struct UiState {
+    device_setup: devices::DeviceSetupState,
     pub view: View,
     pub detail_tab: DetailTab,
     pub selected_task_id: Option<String>,

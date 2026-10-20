@@ -48,7 +48,7 @@ pub(super) fn body(
                             View::Tasks => task_list(ui, state, snapshot, p),
                             View::Task => task_detail(ui, state, snapshot, p, intents),
                             View::Settings => settings::show(ui, state, snapshot, p, intents),
-                            View::Devices => devices(ui, snapshot, p, intents),
+                            View::Devices => devices::show(ui, state, snapshot, p, intents),
                             View::History => history(ui, snapshot, p, None, intents),
                             View::Terminal => terminal(ui, state, snapshot, p, intents),
                         }
@@ -594,43 +594,6 @@ fn history(
                 intents.push(Intent::OpenHistory(target.clone()));
             }
             rule(ui, snapshot);
-        });
-    }
-}
-
-fn devices(ui: &mut egui::Ui, snapshot: &Snapshot, p: &Project, intents: &mut Vec<Intent>) {
-    ui.heading(text(snapshot, "devices"));
-    if snapshot.devices.is_empty() {
-        weak(ui, snapshot, text(snapshot, "no_devices"));
-    }
-    for d in &snapshot.devices {
-        rule(ui, snapshot);
-        title(ui, snapshot, &d.name);
-        weak(ui, snapshot, &d.description);
-        weak(
-            ui,
-            snapshot,
-            if d.can_execute {
-                &d.capabilities
-            } else {
-                text(snapshot, "viewer_only")
-            },
-        );
-        ui.label(egui::RichText::new(&d.connection).color(if d.connected {
-            colors(snapshot).green
-        } else {
-            colors(snapshot).red
-        }));
-    }
-    rule(ui, snapshot);
-    if action(
-        ui,
-        snapshot,
-        text(snapshot, "manage_devices"),
-        &snapshot.manage_devices,
-    ) {
-        intents.push(Intent::ManageDevices {
-            workspace_id: Some(p.id.clone()),
         });
     }
 }

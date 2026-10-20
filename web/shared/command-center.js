@@ -160,7 +160,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
         }
         if (item.agentVersion !== undefined) {
           const draft = agentDrafts.get(item.workspace), saved = list(snapshot.projects).find(p => p.id === item.workspace)?.config;
-          if (draft && saved) { if (draft.version === item.agentVersion) draft.config = copy(saved); else draft.config.revision = saved.revision; }
+          if (draft && saved) { if (draft === item.agentDraft && draft.version === item.agentVersion) draft.config = copy(saved); else draft.config.revision = saved.revision; }
         }
         if (item.planVersion !== undefined && plans.get(item.workspace)?.version === item.planVersion) plans.delete(item.workspace);
         if (item.resultKey && resultDrafts.get(item.resultKey)?.version === item.resultVersion) resultDrafts.delete(item.resultKey);
@@ -281,7 +281,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const saved = comparable(config) === comparable(p.config), actions = node('div', 'cc-actions');
     const save = button('설정 저장', () => {
       if (!valid || !enabled(p.save_settings) || !connected || isPending('save:' + p.id)) return;
-      emit({type: 'save_project', workspace_id: p.id, config: copy(config)}, 'save:' + p.id, {workspace: p.id, agentVersion: draft.version});
+      emit({type: 'save_project', workspace_id: p.id, config: copy(config)}, 'save:' + p.id, {workspace: p.id, agentVersion: draft.version, agentDraft: draft});
     }, 'cc-button cc-primary'); save.dataset.ccAgentSave = ''; save.disabled = !valid || !connected || !enabled(p.save_settings) || isPending('save:' + p.id); save.title = str(p.save_settings?.reason);
     const create = button('새 메인 만들기', () => {
       if (!saved || config.main_session_id || !valid || !connected || !enabled(p.create_main)) return;

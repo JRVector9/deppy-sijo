@@ -193,6 +193,8 @@ pub struct Task {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct HistoryEntry {
     pub id: String,
+    #[serde(default)]
+    pub kind: String,
     pub target: Option<RouteTarget>,
     pub time: String,
     pub text: String,
@@ -462,6 +464,7 @@ pub struct UiState {
     pub detail_tab: DetailTab,
     pub selected_task_id: Option<String>,
     pub monitor_filter: MonitorFilter,
+    pub history_filter: String,
     pub left_drawer: bool,
     pub right_drawer: bool,
     pub monitor_collapsed: bool,

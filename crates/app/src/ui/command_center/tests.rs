@@ -1487,6 +1487,7 @@ fn approved_visual_fixture() -> Snapshot {
         time: time.into(),
         text: text.into(),
         detail: String::new(),
+        ..Default::default()
     })
     .collect();
     snapshot.devices = ["이 Mac", "gpu3090", "휴대폰"]

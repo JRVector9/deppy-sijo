@@ -383,14 +383,13 @@ impl App {
                             p.registration().id != device.registration.id
                                 || p.registration().workspace_id.0 != request.workspace
                         });
-                        if let Some(views) = host.devices.views.get_mut(&request.workspace) {
-                            if let Some(view) =
+                        if let Some(views) = host.devices.views.get_mut(&request.workspace)
+                            && let Some(view) =
                                 views.iter_mut().find(|d| d.id == device.registration.id)
-                            {
-                                view.can_execute = false;
-                                view.connected = false;
-                                view.unavailable = Some(wm::devices::DeviceUnavailable::Revoked);
-                            }
+                        {
+                            view.can_execute = false;
+                            view.connected = false;
+                            view.unavailable = Some(wm::devices::DeviceUnavailable::Revoked);
                         }
                         host.finish(&request.id,cc::ReceiptStatus::Acknowledged,"기기의 실행 허용을 회수하고 저장했습니다. 이전 미확인 실행은 재전송하지 않습니다.");
                     }
@@ -523,18 +522,16 @@ impl App {
         if (visible || host.remotes.values().any(|p| p.pending())) && connected {
             if host.devices.last_poll.elapsed() >= std::time::Duration::from_millis(500)
                 && let Some(workspace) = host.devices.next_connected_workspace()
-            {
-                if host
+                && host
                     .devices
                     .worker
                     .try_submit(RemoteDeviceJob::Poll {
                         workspace_id: WorkspaceId(workspace.clone()),
                     })
                     .is_ok()
-                {
-                    host.devices.poll_workspace = Some(workspace);
-                    host.devices.last_poll = std::time::Instant::now();
-                }
+            {
+                host.devices.poll_workspace = Some(workspace);
+                host.devices.last_poll = std::time::Instant::now();
             }
             self.egui_ctx
                 .request_repaint_after(std::time::Duration::from_millis(500));

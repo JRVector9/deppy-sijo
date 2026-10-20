@@ -28,6 +28,16 @@ pub(super) struct Observations {
     reads_inflight: std::collections::BTreeSet<String>,
     first_inputs: Vec<(Capture, work::RuntimeBinding)>,
 }
+struct Begin<'a> {
+    host_input: &'a Input,
+    live: &'a LiveRoute,
+    id: &'a str,
+    prompt: &'a str,
+    runtime_token: &'a str,
+    native: &'a str,
+    config_revision: work::ConfigRevision,
+    attempt_id: Option<work::AttemptId>,
+}
 impl Observations {
     pub fn new(ctx: &egui::Context) -> Self {
         let wake = ctx.clone();
@@ -59,17 +69,17 @@ impl Observations {
         self.first_inputs.remove(index);
         true
     }
-    fn begin(
-        &mut self,
-        host_input: &Input,
-        live: &LiveRoute,
-        id: &str,
-        prompt: &str,
-        runtime_token: &str,
-        native: &str,
-        config_revision: work::ConfigRevision,
-        attempt_id: Option<work::AttemptId>,
-    ) -> Result<(), &'static str> {
+    fn begin(&mut self, begin: Begin<'_>) -> Result<(), &'static str> {
+        let Begin {
+            host_input,
+            live,
+            id,
+            prompt,
+            runtime_token,
+            native,
+            config_revision,
+            attempt_id,
+        } = begin;
         if self.watches.len() >= 64 {
             return Err("observation_capacity");
         }
@@ -221,33 +231,33 @@ impl App {
             .as_ref()
             .is_some_and(|l| l.agent.as_ref().is_some_and(|a| a.provider == "codex"));
         let mut delayed = false;
-        if codex && host.observations.delayed.len() < 64 {
-            if let Some(token) = runtime_token {
-                let request = launch::SettingsRequest::NativeIdentity {
-                    operation_id: id.clone(),
-                    workspace: target.workspace_id.clone(),
-                    session: target.session,
-                    runtime_instance: target.runtime_instance,
-                    runtime_token: token.clone(),
-                };
-                if self.queue_global_settings_action(
-                    &target.workspace_id,
-                    SettingsJobAction::CommandCenter(request),
-                ) {
-                    host.observations.delayed.insert(
-                        id.clone(),
-                        Delayed {
-                            target: target.clone(),
-                            prompt: prompt.clone(),
-                            runtime_token: token,
-                            deadline: std::time::Instant::now()
-                                + std::time::Duration::from_secs(20),
-                        },
-                    );
-                    self.egui_ctx
-                        .request_repaint_after(std::time::Duration::from_secs(20));
-                    delayed = true;
-                }
+        if codex
+            && host.observations.delayed.len() < 64
+            && let Some(token) = runtime_token
+        {
+            let request = launch::SettingsRequest::NativeIdentity {
+                operation_id: id.clone(),
+                workspace: target.workspace_id.clone(),
+                session: target.session,
+                runtime_instance: target.runtime_instance,
+                runtime_token: token.clone(),
+            };
+            if self.queue_global_settings_action(
+                &target.workspace_id,
+                SettingsJobAction::CommandCenter(request),
+            ) {
+                host.observations.delayed.insert(
+                    id.clone(),
+                    Delayed {
+                        target: target.clone(),
+                        prompt: prompt.clone(),
+                        runtime_token: token,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(20),
+                    },
+                );
+                self.egui_ctx
+                    .request_repaint_after(std::time::Duration::from_secs(20));
+                delayed = true;
             }
         }
         self.command_center = Some(host);
@@ -284,18 +294,17 @@ impl App {
             if current && let Some(live) = live {
                 if let (Some(native), Some(input), Some(p)) =
                     (native, host.inputs.get(&id), host.projects.get(&workspace))
-                {
-                    if host
+                    && host
                         .observations
-                        .begin(
-                            input,
-                            &live,
-                            &id,
-                            &delayed.prompt,
-                            &runtime_token,
-                            &native,
-                            p.snapshot.config.revision,
-                            input
+                        .begin(Begin {
+                            host_input: input,
+                            live: &live,
+                            id: &id,
+                            prompt: &delayed.prompt,
+                            runtime_token: &runtime_token,
+                            native: &native,
+                            config_revision: p.snapshot.config.revision,
+                            attempt_id: input
                                 .dispatch
                                 .as_ref()
                                 .map(|a| a.attempt.id.clone())
@@ -306,11 +315,10 @@ impl App {
                                         .find(|t| Some(&t.id.0) == input.target.task_id.as_ref())
                                         .and_then(|t| t.current_attempt_id.clone())
                                 }),
-                        )
+                        })
                         .is_err()
-                    {
-                        host.status="이 실행의 자동 턴 관측을 증명하지 못했습니다. 실제 대화와 수동 계획·결과 보고를 사용할 수 있습니다.".into();
-                    }
+                {
+                    host.status="이 실행의 자동 턴 관측을 증명하지 못했습니다. 실제 대화와 수동 계획·결과 보고를 사용할 수 있습니다.".into();
                 }
                 send = Some((delayed.target, delayed.prompt, id.clone()));
             } else {
@@ -410,12 +418,10 @@ impl App {
                         .watches
                         .get(operation_id)
                         .filter(|w| w.target.runtime == runtime && w.target.session == *session)
-                    {
-                        if let Some(turn) =
+                        && let Some(turn) =
                             host.observations.tracker.admit(&watch.identity, *result)
-                        {
-                            terminal.push(turn);
-                        }
+                    {
+                        terminal.push(turn);
                     }
                 }
                 _ => {}
@@ -470,23 +476,21 @@ impl App {
             if let Some(watch) = host.observations.watches.get_mut(&id) {
                 watch.reading = false;
             }
-            if let Some(watch) = host.observations.watches.get(&id) {
-                if let Some(proof) = host.observations.native.get(&format!(
+            if let Some(watch) = host.observations.watches.get(&id)
+                && let Some(proof) = host.observations.native.get(&format!(
                     "{}:{}",
                     watch.target.workspace, watch.target.session.0
-                )) {
-                    if let Some(current) = current_identity(host, watch)
-                        && let Some(turn) = host.observations.tracker.complete(
-                            response,
-                            &current,
-                            &watch.target,
-                            proof,
-                            now,
-                        )
-                    {
-                        install_turn(host, turn);
-                    }
-                }
+                ))
+                && let Some(current) = current_identity(host, watch)
+                && let Some(turn) = host.observations.tracker.complete(
+                    response,
+                    &current,
+                    &watch.target,
+                    proof,
+                    now,
+                )
+            {
+                install_turn(host, turn);
             }
         }
         let ids: Vec<_> = host.observations.watches.keys().cloned().collect();
@@ -527,32 +531,31 @@ impl App {
                     && !poll.waiting
                     && (!watch.started || was_waiting)
                 {
-                    if let Some(attempt) = &watch.identity.attempt_id {
-                        if let Some(p) = host.projects.get_mut(&watch.route.workspace_id) {
-                            let _ = apply_user_work_event(
-                                p,
-                                &watch.route,
-                                &attempt.0,
-                                work::WorkEventKind::Started,
-                                "정확한 입력 승인과 새 공급자 턴 시작을 확인했습니다.".into(),
-                            );
-                        }
+                    if let Some(attempt) = &watch.identity.attempt_id
+                        && let Some(p) = host.projects.get_mut(&watch.route.workspace_id)
+                    {
+                        let _ = apply_user_work_event(
+                            p,
+                            &watch.route,
+                            &attempt.0,
+                            work::WorkEventKind::Started,
+                            "정확한 입력 승인과 새 공급자 턴 시작을 확인했습니다.".into(),
+                        );
                     }
                     watch.started = true;
                 }
                 if poll.waiting
                     && let Some(attempt) = &watch.identity.attempt_id
+                    && let Some(p) = host.projects.get_mut(&watch.route.workspace_id)
                 {
-                    if let Some(p) = host.projects.get_mut(&watch.route.workspace_id) {
-                        let current = p
-                            .snapshot
-                            .tasks
-                            .iter()
-                            .find(|t| Some(&t.id.0) == watch.route.task_id.as_ref())
-                            .map(|t| t.state);
-                        if current != Some(work::WorkState::WaitingInput) {
-                            let _=apply_user_work_event(p,&watch.route,&attempt.0,work::WorkEventKind::WaitingInput,"정확한 공급자 턴이 입력을 기다립니다. 승인 요청의 소유권은 별도로 확인합니다.".into());
-                        }
+                    let current = p
+                        .snapshot
+                        .tasks
+                        .iter()
+                        .find(|t| Some(&t.id.0) == watch.route.task_id.as_ref())
+                        .map(|t| t.state);
+                    if current != Some(work::WorkState::WaitingInput) {
+                        let _=apply_user_work_event(p,&watch.route,&attempt.0,work::WorkEventKind::WaitingInput,"정확한 공급자 턴이 입력을 기다립니다. 승인 요청의 소유권은 별도로 확인합니다.".into());
                     }
                 }
                 if !watch.reading
@@ -581,24 +584,24 @@ impl App {
     }
 }
 fn reject_delayed(host: &mut CommandCenterHost, id: &str, message: &str) {
-    if let Some(input) = host.inputs.remove(id) {
-        if let Some(p) = host.projects.get_mut(&input.target.workspace_id) {
-            if let Some(assignment) = &input.dispatch {
-                apply_delivery_outcome(
-                    p,
-                    assignment,
-                    ui::composer::PromptAdmissionOutcome::Rejected,
-                );
-            }
-            if let Some(marker) = p
-                .snapshot
-                .drafts
-                .iter_mut()
-                .find(|d| d.target_key == format!("operation:{id}"))
-            {
-                marker.delivery_uncertain = false;
-                p.dirty();
-            }
+    if let Some(input) = host.inputs.remove(id)
+        && let Some(p) = host.projects.get_mut(&input.target.workspace_id)
+    {
+        if let Some(assignment) = &input.dispatch {
+            apply_delivery_outcome(
+                p,
+                assignment,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+        }
+        if let Some(marker) = p
+            .snapshot
+            .drafts
+            .iter_mut()
+            .find(|d| d.target_key == format!("operation:{id}"))
+        {
+            marker.delivery_uncertain = false;
+            p.dirty();
         }
     }
     host.reject(id, message);
@@ -650,18 +653,18 @@ fn install_turn(host: &mut CommandCenterHost, turn: ObservedTurn) {
     let exact = current_identity(host, &watch).as_ref() == Some(&turn.identity)
         && watch.identity == turn.identity;
     if !exact {
-        if let Some(attempt) = &watch.identity.attempt_id {
-            if let Some(p) = host.projects.get_mut(&watch.route.workspace_id) {
-                // The old completed payload is discarded; only the still-current exact attempt
-                // loses observation. A replacement attempt is never changed by this response.
-                let _ = apply_user_work_event(
-                    p,
-                    &watch.route,
-                    &attempt.0,
-                    work::WorkEventKind::ObservationLost,
-                    "실행 캡처나 설정이 바뀌어 이전 턴의 관측을 종료했습니다.".into(),
-                );
-            }
+        if let Some(attempt) = &watch.identity.attempt_id
+            && let Some(p) = host.projects.get_mut(&watch.route.workspace_id)
+        {
+            // The old completed payload is discarded; only the still-current exact attempt
+            // loses observation. A replacement attempt is never changed by this response.
+            let _ = apply_user_work_event(
+                p,
+                &watch.route,
+                &attempt.0,
+                work::WorkEventKind::ObservationLost,
+                "실행 캡처나 설정이 바뀌어 이전 턴의 관측을 종료했습니다.".into(),
+            );
         }
         host.publication_dirty = true;
         host.status = "이전 실행의 턴 응답을 현재 작업에 적용하지 않았습니다.".into();

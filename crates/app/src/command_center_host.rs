@@ -117,7 +117,7 @@ enum Flight {
     Save {
         workspace: String,
         generation: u64,
-        after: Option<AfterSave>,
+        after: Option<Box<AfterSave>>,
         receipt: Option<String>,
     },
 }
@@ -199,17 +199,17 @@ impl CommandCenterHost {
     }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
         self.remote_permits.remove(id);
-        if let Some(pending) = self.launches.get_mut(id) {
-            if matches!(pending.stage, launch::Stage::Input) {
-                pending.record.phase = match status {
-                    cc::ReceiptStatus::Acknowledged => launch::Phase::Completed,
-                    cc::ReceiptStatus::Rejected => launch::Phase::Rejected,
-                    cc::ReceiptStatus::Uncertain => launch::Phase::Unknown,
-                };
-                pending.stage = launch::Stage::Done;
-                if let Some(p) = self.projects.get_mut(&pending.record.workspace.0) {
-                    let _ = launch::save_record(p, &pending.record);
-                }
+        if let Some(pending) = self.launches.get_mut(id)
+            && matches!(pending.stage, launch::Stage::Input)
+        {
+            pending.record.phase = match status {
+                cc::ReceiptStatus::Acknowledged => launch::Phase::Completed,
+                cc::ReceiptStatus::Rejected => launch::Phase::Rejected,
+                cc::ReceiptStatus::Uncertain => launch::Phase::Unknown,
+            };
+            pending.stage = launch::Stage::Done;
+            if let Some(p) = self.projects.get_mut(&pending.record.workspace.0) {
+                let _ = launch::save_record(p, &pending.record);
             }
         }
         let detail = bounded(&detail.into(), 512);
@@ -345,7 +345,7 @@ impl CommandCenterHost {
         self.flight = Some(Flight::Save {
             workspace: ws.into(),
             generation,
-            after,
+            after: after.map(Box::new),
             receipt,
         });
         Ok(())
@@ -1061,7 +1061,7 @@ impl App {
                 let confirmed = p.confirmed.as_ref().ok_or("먼저 현재 배정안을 확인해 주세요.")?;
                 if confirmed.goal_id() != &task.goal_id { return Err("확인한 배정안과 다른 목표의 작업입니다.".into()); }
                 let request = wm::dispatch::DispatchRequest { task_id: task.id.clone(), operation_id: work::OperationId::from_string(id.into()).map_err(|e| e.to_string())?, folder: wm::dispatch::DispatchFolder { path: p.snapshot.config.folder.clone(), worktree_owner: None }, persistent_binding: persistent(&live), runtime_binding: binding(&live,target.session_id.as_deref().unwrap()).ok_or("실행 세대가 확인되지 않습니다.")? };
-                let prepared=p.prepare_local(request,work::AttemptId::new())?;
+                let prepared=p.prepare_existing(request)?;
                 let prepared = match prepared { wm::dispatch::PrepareOutcome::Ready(prepared) => prepared, wm::dispatch::PrepareOutcome::Existing { attempt_id,delivery } => return Err(format!("이미 처리한 시도 {} ({delivery:?})입니다. 재전송하지 않았습니다.",attempt_id.0)) };
                 let assignment = prepared.assignment;
                 p.set_state(prepared.next_state);
@@ -1132,50 +1132,49 @@ impl App {
                 .values()
                 .all(|p| p.generation == p.saved_generation)
         {
-            if host.published && !host.publication_failed {
-                if let Some(core) = &self.session_core {
-                    if core.publish_work_snapshot(serde_json::Value::Null).is_ok() {
-                        host.published = false;
-                    } else {
-                        host.publication_failed = true;
-                        host.status =
-                            "원격 작업 화면 지우기에 실패했습니다. 다시 열어 갱신할 수 있습니다."
-                                .into();
-                    }
+            if host.published
+                && !host.publication_failed
+                && let Some(core) = &self.session_core
+            {
+                if core.publish_work_snapshot(serde_json::Value::Null).is_ok() {
+                    host.published = false;
+                } else {
+                    host.publication_failed = true;
+                    host.status =
+                        "원격 작업 화면 지우기에 실패했습니다. 다시 열어 갱신할 수 있습니다."
+                            .into();
                 }
             }
             self.command_center = Some(host);
             return;
         }
         self.refresh_command_center_routes(&mut host);
-        if let Some((target, action)) = host.pending_git.take() {
-            if host
+        if let Some((target, action)) = host.pending_git.take()
+            && host
                 .route(&target)
                 .is_some_and(|route| self.command_center_route_focused(route))
-            {
-                self.apply_command_center_git_action(ctx, action);
-            }
+        {
+            self.apply_command_center_git_action(ctx, action);
         }
-        if let Some((target, tab)) = host.aux_loading.clone() {
-            if let Some(route) = host
+        if let Some((target, tab)) = host.aux_loading.clone()
+            && let Some(route) = host
                 .route(&target)
                 .filter(|route| self.command_center_route_focused(route))
                 .cloned()
-            {
-                self.sync_session_aux_scope();
-                if tab == cc::DetailTab::Git {
-                    self.request_git_panel_io_at(
-                        ctx,
-                        route.cwd.map(PathBuf::from),
-                        ui::git_panel::GitPanelIoRequest::Snapshot,
-                    );
-                }
-                if tab == cc::DetailTab::History {
-                    self.enter_work_history_tab();
-                }
-                host.aux_ready = Some(target);
-                host.aux_loading = None;
+        {
+            self.sync_session_aux_scope();
+            if tab == cc::DetailTab::Git {
+                self.request_git_panel_io_at(
+                    ctx,
+                    route.cwd.map(PathBuf::from),
+                    ui::git_panel::GitPanelIoRequest::Snapshot,
+                );
             }
+            if tab == cc::DetailTab::History {
+                self.enter_work_history_tab();
+            }
+            host.aux_ready = Some(target);
+            host.aux_loading = None;
         }
         let mut send: Option<(FleetPromptTarget, String, String)> = None;
         if let Some(result) = host.repository.try_recv() {
@@ -1355,14 +1354,14 @@ impl App {
                             p.storage_blocked = true;
                         }
                         if let Some(after) = after {
-                            if let Some(assignment) = &after.input.dispatch {
-                                if let Some(p) = host.projects.get_mut(&workspace) {
-                                    apply_delivery_outcome(
-                                        p,
-                                        assignment,
-                                        ui::composer::PromptAdmissionOutcome::Rejected,
-                                    );
-                                }
+                            if let Some(assignment) = &after.input.dispatch
+                                && let Some(p) = host.projects.get_mut(&workspace)
+                            {
+                                apply_delivery_outcome(
+                                    p,
+                                    assignment,
+                                    ui::composer::PromptAdmissionOutcome::Rejected,
+                                );
                             }
                             host.reject(
                                 &after.id,
@@ -1400,14 +1399,14 @@ impl App {
                             p.storage_blocked = true;
                         }
                         if let Some(after) = after {
-                            if let Some(assignment) = &after.input.dispatch {
-                                if let Some(p) = host.projects.get_mut(&workspace) {
-                                    apply_delivery_outcome(
-                                        p,
-                                        assignment,
-                                        ui::composer::PromptAdmissionOutcome::Rejected,
-                                    );
-                                }
+                            if let Some(assignment) = &after.input.dispatch
+                                && let Some(p) = host.projects.get_mut(&workspace)
+                            {
+                                apply_delivery_outcome(
+                                    p,
+                                    assignment,
+                                    ui::composer::PromptAdmissionOutcome::Rejected,
+                                );
                             }
                             host.reject(
                                 &after.id,
@@ -1429,10 +1428,9 @@ impl App {
         // Mutations are staged by render and run here, through the same guarded host pipeline.
         if host.flight.is_none()
             && let Some((id, intent)) = host.pending.pop_front()
+            && let Err(error) = self.command_center_intent(&mut host, &id, intent)
         {
-            if let Err(error) = self.command_center_intent(&mut host, &id, intent) {
-                host.reject(&id, error);
-            }
+            host.reject(&id, error);
         }
         if host.flight.is_none() && send.is_none() {
             let next_load = host.requested_loads.keys().next().cloned().or_else(|| {
@@ -1533,12 +1531,12 @@ impl App {
                     }
                 }
             }
-        } else if !visible && self.command_center.as_ref().is_some_and(|h| h.published) {
-            if let Some(core) = &self.session_core {
-                if core.publish_work_snapshot(serde_json::Value::Null).is_ok() {
-                    self.command_center.as_mut().unwrap().published = false;
-                }
-            }
+        } else if !visible
+            && self.command_center.as_ref().is_some_and(|h| h.published)
+            && let Some(core) = &self.session_core
+            && core.publish_work_snapshot(serde_json::Value::Null).is_ok()
+        {
+            self.command_center.as_mut().unwrap().published = false;
         }
     }
     pub(super) fn command_center_input_outcome(
@@ -1570,10 +1568,11 @@ impl App {
             }
         }
         let key = draft_key(&host, &input.target).ok();
-        if accepted && clear_admitted_draft(&mut host.ui, &input.target, &input.draft) {
-            if let (Some(key), Some(p)) = (key, host.projects.get_mut(&input.target.workspace_id)) {
-                let _ = set_draft(p, &key, "", false);
-            }
+        if accepted
+            && clear_admitted_draft(&mut host.ui, &input.target, &input.draft)
+            && let (Some(key), Some(p)) = (key, host.projects.get_mut(&input.target.workspace_id))
+        {
+            let _ = set_draft(p, &key, "", false);
         }
         host.finish(
             id,
@@ -1753,60 +1752,57 @@ impl App {
             }
         }
         if !rendered {
-            if let Some(target) = host.ui.terminal_target.clone() {
-                if host.route(&target).is_some()
-                    && !host
-                        .pending
-                        .iter()
-                        .any(|(_, i)| matches!(i,cc::Intent::OpenSession(t) if t == &target))
-                {
-                    host.enqueue(
-                        uuid::Uuid::new_v4().to_string(),
-                        cc::Intent::OpenSession(target),
-                    );
-                }
+            if let Some(target) = host.ui.terminal_target.clone()
+                && host.route(&target).is_some()
+                && !host
+                    .pending
+                    .iter()
+                    .any(|(_, i)| matches!(i,cc::Intent::OpenSession(t) if t == &target))
+            {
+                host.enqueue(
+                    uuid::Uuid::new_v4().to_string(),
+                    cc::Intent::OpenSession(target),
+                );
             }
             self.active
                 .workspace_ui
                 .update_hidden(ui.ctx(), &events, &text);
             self.frame_terminal_owner = FrameTerminalOwner::None;
         }
-        if let Some((rect, target)) = host.ui.aux_rect.zip(host.ui.aux_target.clone()) {
-            if host.aux_ready.as_ref() == Some(&target)
-                && host
-                    .route(&target)
-                    .is_some_and(|route| self.command_center_route_focused(route))
-            {
-                let mut aux = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(rect)
-                        .id_salt("command-center-native-aux"),
-                );
-                aux.set_clip_rect(rect.intersect(ui.clip_rect()));
-                aux.painter()
-                    .rect_filled(rect, 0.0, aux.visuals().panel_fill);
-                match host.ui.aux_tab {
-                    Some(cc::DetailTab::Git) => {
-                        if let Some(action) = self.render_git_tab_body(&mut aux, rect, &text, false)
-                        {
-                            host.pending_git = Some((target, action));
-                        }
+        if let Some((rect, target)) = host.ui.aux_rect.zip(host.ui.aux_target.clone())
+            && host.aux_ready.as_ref() == Some(&target)
+            && host
+                .route(&target)
+                .is_some_and(|route| self.command_center_route_focused(route))
+        {
+            let mut aux = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .id_salt("command-center-native-aux"),
+            );
+            aux.set_clip_rect(rect.intersect(ui.clip_rect()));
+            aux.painter()
+                .rect_filled(rect, 0.0, aux.visuals().panel_fill);
+            match host.ui.aux_tab {
+                Some(cc::DetailTab::Git) => {
+                    if let Some(action) = self.render_git_tab_body(&mut aux, rect, &text, false) {
+                        host.pending_git = Some((target, action));
                     }
-                    Some(cc::DetailTab::History) => {
-                        let name = self
-                            .workspaces
-                            .iter()
-                            .find(|ws| ws.id == self.active.id)
-                            .map(Self::workspace_display_name)
-                            .unwrap_or_default();
-                        if let Some(action) =
-                            self.render_work_history_tab_body(&mut aux, rect, &name, None, &text)
-                        {
-                            self.pending_work_history_action = Some(action);
-                        }
-                    }
-                    _ => {}
                 }
+                Some(cc::DetailTab::History) => {
+                    let name = self
+                        .workspaces
+                        .iter()
+                        .find(|ws| ws.id == self.active.id)
+                        .map(Self::workspace_display_name)
+                        .unwrap_or_default();
+                    if let Some(action) =
+                        self.render_work_history_tab_body(&mut aux, rect, &name, None, &text)
+                    {
+                        self.pending_work_history_action = Some(action);
+                    }
+                }
+                _ => {}
             }
         }
         self.command_center = Some(host);
@@ -2041,6 +2037,12 @@ fn apply_delivery_outcome(
     assignment: &wm::dispatch::DispatchAssignment,
     outcome: ui::composer::PromptAdmissionOutcome,
 ) {
+    if matches!(
+        p.ledger.stage(&assignment.attempt.operation_id),
+        Some(wm::dispatch::DeliveryState::Admitted | wm::dispatch::DeliveryState::Rejected)
+    ) {
+        return;
+    }
     let Some(binding) = assignment.attempt.runtime_binding.as_ref() else {
         return;
     };
@@ -2436,6 +2438,29 @@ mod tests {
         project.snapshot.tasks[0].state = work::WorkState::Queued;
         project.snapshot.tasks[0].current_attempt_id = Some(work::AttemptId::new());
         assert!(!assignment_current(&project, &assignment));
+    }
+    #[test]
+    fn terminal_admission_receipt_cannot_be_downgraded_by_a_late_rejection() {
+        let (mut project, assignment) = attempted();
+        apply_delivery_outcome(
+            &mut project,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Accepted,
+        );
+        apply_delivery_outcome(
+            &mut project,
+            &assignment,
+            ui::composer::PromptAdmissionOutcome::Rejected,
+        );
+        assert_eq!(project.snapshot.tasks[0].state, work::WorkState::Queued);
+        assert_eq!(
+            project.snapshot.outbox[0].state,
+            stored::DispatchOutboxState::Admitted
+        );
+        assert_eq!(
+            project.ledger.stage(&assignment.attempt.operation_id),
+            Some(wm::dispatch::DeliveryState::Admitted)
+        );
     }
     #[test]
     fn known_rejection_frees_attempt_capacity_while_unknown_never_retries() {

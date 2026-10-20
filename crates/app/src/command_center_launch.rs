@@ -760,21 +760,20 @@ impl App {
                                 p.worktree_root = catalog.root.clone();
                             }
                             p.catalog = Some(catalog);
-                            if p.request.is_none() {
-                                if let Some(goal) = p
+                            if p.request.is_none()
+                                && let Some(goal) = p
                                     .snapshot
                                     .goals
                                     .iter()
                                     .rev()
                                     .find(|g| g.state == work::WorkState::PlanReview)
-                                {
-                                    p.request = wm::plan::PlannerRequest::new(
-                                        goal,
-                                        &p.snapshot.config,
-                                        &p.policy(),
-                                    )
-                                    .ok();
-                                }
+                            {
+                                p.request = wm::plan::PlannerRequest::new(
+                                    goal,
+                                    &p.snapshot.config,
+                                    &p.policy(),
+                                )
+                                .ok();
                             }
                         }
                         Err(error) => host.status = error,
@@ -919,8 +918,7 @@ impl App {
             .projects
             .get_mut(&self.active.id)
             .filter(|p| p.loaded && !p.catalog_requested)
-        {
-            if self.queue_global_settings_action(
+            && self.queue_global_settings_action(
                 &self.active.id.clone(),
                 SettingsJobAction::CommandCenter(SettingsRequest::Catalog {
                     workspace: self.active.id.clone(),
@@ -928,9 +926,9 @@ impl App {
                     revision: p.snapshot.config.revision,
                     prepare_root: p.snapshot.config.use_worktrees,
                 }),
-            ) {
-                p.catalog_requested = true;
-            }
+            )
+        {
+            p.catalog_requested = true;
         }
         let ids: Vec<_> = host.launches.keys().cloned().collect();
         for id in ids {
@@ -1000,6 +998,7 @@ impl App {
                                 match host.worktrees.try_request(job) {
                                     Ok(()) => pending.stage = Stage::Worktree,
                                     Err(error) => {
+                                        let reason=match &error {wm::task_worktree::TaskWorktreeSubmitError::Invalid {error,..}=>error.as_str(),wm::task_worktree::TaskWorktreeSubmitError::Full(_)=>"worktree_queue_full",wm::task_worktree::TaskWorktreeSubmitError::Unavailable(_)=>"worktree_worker_unavailable"};
                                         let job = error.into_job();
                                         debug_assert_eq!(
                                             job.operation_id,
@@ -1007,7 +1006,7 @@ impl App {
                                         );
                                         pending.record.phase = Phase::Rejected;
                                         pending.stage = Stage::Done;
-                                        host.reject(&id,"워크트리 준비 워커가 사용 중입니다. 실행은 시작하지 않았습니다.");
+                                        host.reject(&id,format!("워크트리 준비 요청을 접수하지 못했습니다: {reason}. 실행은 시작하지 않았습니다."));
                                     }
                                 }
                             } else if let Some(owned) =
@@ -1202,16 +1201,16 @@ impl App {
                         }
                     }
                 }
-            } else if let Stage::MainSave(generation) = pending.stage {
-                if host.projects[&workspace].saved_generation >= generation {
-                    pending.record.phase = Phase::Completed;
-                    pending.stage = Stage::Done;
-                    host.finish(
-                        &id,
-                        cc::ReceiptStatus::Acknowledged,
-                        "새 메인 세션을 만들고 정확한 바인딩을 저장했습니다.",
-                    );
-                }
+            } else if let Stage::MainSave(generation) = pending.stage
+                && host.projects[&workspace].saved_generation >= generation
+            {
+                pending.record.phase = Phase::Completed;
+                pending.stage = Stage::Done;
+                host.finish(
+                    &id,
+                    cc::ReceiptStatus::Acknowledged,
+                    "새 메인 세션을 만들고 정확한 바인딩을 저장했습니다.",
+                );
             }
             if let Some(p) = host.projects.get_mut(&workspace) {
                 let _ = save_record(p, &pending.record);
@@ -1332,23 +1331,27 @@ impl App {
                 }
                 runtime::RuntimeEvent::RemoteWorkResolved { identity, result } => {
                     let id = identity.operation_id.0.clone();
-                    if let Some(pending) = host.launches.get_mut(&id) {
-                        if accept_spawn_result(
+                    if let Some(pending) = host.launches.get_mut(&id)
+                        && accept_spawn_result(
                             pending,
                             workspace,
                             runtime_instance,
                             identity,
                             result,
-                        ) {
-                            let phase = pending.record.phase;
-                            if phase == Phase::Rejected {
-                                host.reject(
-                                    &id,
-                                    "런타임이 실행을 거부했습니다. 세션은 시작하지 않았습니다.",
-                                );
-                            } else if phase == Phase::Unknown {
-                                host.finish(&id,cc::ReceiptStatus::Uncertain,"세션 생성 여부를 확인하지 못했습니다. 자동 재실행하지 않습니다.");
-                            }
+                        )
+                    {
+                        let phase = pending.record.phase;
+                        if phase == Phase::Rejected {
+                            host.reject(
+                                &id,
+                                "런타임이 실행을 거부했습니다. 세션은 시작하지 않았습니다.",
+                            );
+                        } else if phase == Phase::Unknown {
+                            host.finish(
+                                &id,
+                                cc::ReceiptStatus::Uncertain,
+                                "세션 생성 여부를 확인하지 못했습니다. 자동 재실행하지 않습니다.",
+                            );
                         }
                     }
                 }

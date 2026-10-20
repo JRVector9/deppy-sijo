@@ -38,6 +38,35 @@ impl Project {
         }
         .map_err(|e| e.to_string())
     }
+    pub(super) fn prepare_existing(
+        &self,
+        request: wm::dispatch::DispatchRequest,
+    ) -> Result<wm::dispatch::PrepareOutcome, String> {
+        let token = self
+            .confirmed
+            .as_ref()
+            .ok_or("현재 배정안을 먼저 확인해 주세요.")?;
+        match token {
+            Confirmed::Local(t) => wm::dispatch::prepare_dispatch(
+                &self.state(),
+                &self.ledger,
+                t,
+                request,
+                &self.snapshot.config,
+                &self.policy(),
+            ),
+            Confirmed::Mixed(t) => wm::remote_dispatch::prepare_mixed_local_dispatch(
+                &self.state(),
+                &self.ledger,
+                t,
+                request,
+                work::AttemptId::new(),
+                &self.snapshot.config,
+                &self.policy(),
+            ),
+        }
+        .map_err(|e| e.to_string())
+    }
     pub(super) fn prepare_local(
         &self,
         request: wm::dispatch::DispatchRequest,

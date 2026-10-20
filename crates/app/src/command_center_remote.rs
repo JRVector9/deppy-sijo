@@ -667,12 +667,11 @@ impl App {
                 if pending.assignment.is_some() && !current_attempt(project, &pending) {
                     return Err("현재 작업 시도·실행 또는 검토 상태가 바뀌어 지연된 입력을 보내지 않았습니다.".into());
                 }
-                if matches!(pending.stage, Stage::MarkerSave)
-                    || (pending.stage == Stage::LaunchWait && pending.request_id == 0)
+                if (matches!(pending.stage, Stage::MarkerSave)
+                    || (pending.stage == Stage::LaunchWait && pending.request_id == 0))
+                    && !project.ready_tasks()?.contains(&pending.record.task_id)
                 {
-                    if !project.ready_tasks()?.contains(&pending.record.task_id) {
-                        return Err("원격 작업의 의존 관계·용량·검토 상태가 바뀌었습니다.".into());
-                    }
+                    return Err("원격 작업의 의존 관계·용량·검토 상태가 바뀌었습니다.".into());
                 }
                 if host.flight.is_some() {
                     return Ok(());

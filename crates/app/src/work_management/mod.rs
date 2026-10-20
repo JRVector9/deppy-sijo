@@ -3,6 +3,9 @@
 pub mod reducer;
 pub mod dispatch;
 pub mod queue;
+pub mod plan;
+pub mod provider_adapter;
+pub mod orchestrator;
 pub use reducer::{ApplyOutcome, ProjectWorkState};
 
 #[cfg(test)]

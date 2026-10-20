@@ -1,0 +1,24 @@
+   Compiling deppy-sijo v0.15.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 15.89s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-52a8f599c1bd5525)
+
+running 1 test
+test ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending ... FAILED
+
+failures:
+
+---- ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending stdout ----
+
+thread 'ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending' (181855342) panicked at crates/app/src/ui/command_center/tests.rs:713:5:
+assertion `left == right` failed
+  left: 2
+ right: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3545 filtered out; finished in 0.18s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

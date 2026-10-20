@@ -1,0 +1,33 @@
+{
+  "base_commit": "93bcc52f",
+  "branch": "feat/agent-command-center-v2-20261020",
+  "source_sha256": {
+    "crates/app/src/command_center_host.rs": "d7f0ff03069e342ad9c85a2cffd26905dc0649eba43c66aa877cb75a34808c39",
+    "crates/app/src/ui/command_center/settings.rs": "b37e997876b19a7f8ad1a31901e3a53aeb2c56b65babe6bff904999a4c626ecd",
+    "crates/app/src/ui/command_center/tests.rs": "4686c9875821b80d722986d90e27f24b144221bb09c2767a4a7c2220aaadb197"
+  },
+  "release_status": "source fix only; signed running 0.15.0 remains unchanged",
+  "native_ui_red": {
+    "exit": 101,
+    "cause": "duplicate menu option count 2 instead of 1"
+  },
+  "host_red": {
+    "exit": 101,
+    "cause": "flat provider list repeats per model/effort tuple"
+  },
+  "affected_green": {
+    "exit": 0,
+    "passed": 146,
+    "ignored": 1
+  },
+  "web_green": {
+    "exit": 0,
+    "checks": 237
+  },
+  "clippy": {
+    "exit": 0
+  },
+  "fmt_and_diff_check": {
+    "exit": 0
+  }
+}

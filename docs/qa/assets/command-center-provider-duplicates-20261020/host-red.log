@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.17s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-52a8f599c1bd5525)
+
+running 1 test
+test app::command_center_host::tests::agent_choice_lists_show_each_provider_once_without_losing_model_effort_options ... FAILED
+
+failures:
+
+---- app::command_center_host::tests::agent_choice_lists_show_each_provider_once_without_losing_model_effort_options stdout ----
+
+thread 'app::command_center_host::tests::agent_choice_lists_show_each_provider_once_without_losing_model_effort_options' (181858017) panicked at crates/app/src/command_center_host.rs:3146:9:
+assertion `left == right` failed
+  left: ["claude", "claude", "claude", "codex", "codex"]
+ right: ["claude", "codex"]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    app::command_center_host::tests::agent_choice_lists_show_each_provider_once_without_losing_model_effort_options
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3545 filtered out; finished in 0.01s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

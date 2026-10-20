@@ -1,0 +1,14 @@
+{
+  "ok": true,
+  "checks": 237,
+  "widths": [
+    390,
+    760,
+    1280,
+    1440
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ]
+}

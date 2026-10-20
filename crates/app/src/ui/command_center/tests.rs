@@ -667,7 +667,13 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
             ..Default::default()
         });
     }
-    p.available_providers = vec!["Codex".into(), "Claude".into()];
+    // Real catalogs repeat a provider for every model/effort tuple.
+    p.available_providers = vec![
+        "Codex".into(),
+        "Codex".into(),
+        "Claude".into(),
+        "Claude".into(),
+    ];
     p.available_agents = vec![
         AgentOption {
             provider: "Codex".into(),
@@ -704,6 +710,8 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
         .unwrap()
         .click();
     harness.run();
+    assert_eq!(harness.query_all_by_label("Codex").count(), 1);
+    assert_eq!(harness.query_all_by_label("Claude").count(), 1);
     harness.get_by_label("Claude").click();
     harness.run();
     let config = &harness.state().ui.settings_draft.as_ref().unwrap().1;
@@ -717,6 +725,15 @@ fn settings_agent_change_releases_binding_without_executing_or_sending() {
         .get_by_label(text(&snapshot, "execution_rules"))
         .click();
     harness.run();
+    for provider in ["Codex", "Claude"] {
+        assert_eq!(
+            harness
+                .query_all_by_label(provider)
+                .filter(|n| n.accesskit_node().role() == egui::accesskit::Role::CheckBox)
+                .count(),
+            1
+        );
+    }
     harness
         .get_all_by_value(text(&snapshot, "unbound"))
         .find(|n| n.accesskit_node().role() == egui::accesskit::Role::ComboBox)

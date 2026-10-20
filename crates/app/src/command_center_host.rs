@@ -6,7 +6,7 @@ use crate::work_management::{self as wm, ProjectWorkState};
 use crate::workspace_add::WorkspaceAddPurpose;
 use deppy_core::WorkspaceId;
 use deppy_core::work_management as work;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use storage::work_management as stored;
 use unicode_normalization::UnicodeNormalization as _;
 use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
@@ -618,6 +618,28 @@ fn binding(live: &LiveRoute, key: &str) -> Option<work::RuntimeBinding> {
         execution_generation: 1,
     })
 }
+fn agent_choice_lists(agents: &[work::AgentSelection]) -> (Vec<String>, Vec<String>, Vec<String>) {
+    // The catalog contains one tuple per model/effort; each choice axis is a set.
+    // Keep the complete tuple catalog intact for provider-specific validation.
+    let providers = agents
+        .iter()
+        .map(|a| a.provider.clone())
+        .collect::<BTreeSet<_>>();
+    let models = agents
+        .iter()
+        .filter_map(|a| a.model.clone())
+        .collect::<BTreeSet<_>>();
+    let efforts = agents
+        .iter()
+        .filter_map(|a| a.effort.clone())
+        .collect::<BTreeSet<_>>();
+    (
+        providers.into_iter().collect(),
+        models.into_iter().collect(),
+        efforts.into_iter().collect(),
+    )
+}
+
 fn project_snapshot(ws: &storage::WorkspaceRow) -> stored::CommandCenterSnapshot {
     let agent = work::AgentSelection {
         provider: "unbound".into(),
@@ -1010,9 +1032,7 @@ impl App {
                     }
                 }
             }
-            let providers = agents.iter().map(|a| a.provider.clone()).collect();
-            let models = agents.iter().filter_map(|a| a.model.clone()).collect();
-            let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
+            let (providers, models, efforts) = agent_choice_lists(&agents);
             let main_summary = if !p.loaded {
                 "저장된 작업 상태를 불러오는 중입니다.".into()
             } else if let Some(goal) = p.display_goal() {
@@ -3108,6 +3128,42 @@ mod tests {
             effect_fence: remote::EffectFence::new(),
         }
     }
+    #[test]
+    fn agent_choice_lists_show_each_provider_once_without_losing_model_effort_options() {
+        let agents = vec![
+            work::AgentSelection {
+                provider: "claude".into(),
+                model: Some("opus".into()),
+                effort: Some("high".into()),
+            },
+            work::AgentSelection {
+                provider: "claude".into(),
+                model: Some("opus".into()),
+                effort: Some("xhigh".into()),
+            },
+            work::AgentSelection {
+                provider: "claude".into(),
+                model: Some("sonnet".into()),
+                effort: Some("high".into()),
+            },
+            work::AgentSelection {
+                provider: "codex".into(),
+                model: None,
+                effort: None,
+            },
+            work::AgentSelection {
+                provider: "codex".into(),
+                model: Some("gpt".into()),
+                effort: Some("xhigh".into()),
+            },
+        ];
+        let (providers, models, efforts) = agent_choice_lists(&agents);
+        assert_eq!(providers, ["claude", "codex"]);
+        assert_eq!(models, ["gpt", "opus", "sonnet"]);
+        assert_eq!(efforts, ["high", "xhigh"]);
+        assert_eq!(agent_choice_lists(&[]), (vec![], vec![], vec![]));
+    }
+
     #[test]
     fn operation_payload_and_unknown_receipt_cannot_be_replayed_after_receipt_eviction() {
         let mut h = host();

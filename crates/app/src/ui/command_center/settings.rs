@@ -181,7 +181,7 @@ fn form(
             });
             field(ui, snapshot, "worker_providers", |ui| {
                 ui.horizontal_wrapped(|ui| {
-                    for provider in &p.available_providers {
+                    for provider in unique_choices(&p.available_providers) {
                         let mut allowed = draft.worker_providers.contains(provider);
                         if ui.checkbox(&mut allowed, provider).changed() {
                             if allowed {
@@ -404,6 +404,13 @@ fn inline(ui: &mut egui::Ui, mut draw: impl FnMut(&mut egui::Ui, usize)) {
     }
 }
 
+// Snapshots from older hosts may still repeat providers or fallback choices.
+// Preserve the catalog's display order while rendering each value only once.
+fn unique_choices(choices: &[String]) -> impl Iterator<Item = &String> {
+    let mut seen = std::collections::BTreeSet::new();
+    choices.iter().filter(move |choice| seen.insert(*choice))
+}
+
 fn choices(
     ui: &mut egui::Ui,
     snapshot: &Snapshot,
@@ -425,7 +432,7 @@ fn choices(
                 )
                 .width(ui.available_width())
                 .show_ui(ui, |ui| {
-                    for choice in choices {
+                    for choice in unique_choices(choices) {
                         ui.selectable_value(value, choice.clone(), choice);
                     }
                 });

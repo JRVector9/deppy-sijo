@@ -1,0 +1,9 @@
+   Compiling deppy-sijo v0.15.0 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.10s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-52a8f599c1bd5525)
+
+running 1 test
+test ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3545 filtered out; finished in 0.24s
+

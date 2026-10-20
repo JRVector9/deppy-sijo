@@ -291,7 +291,7 @@ impl App {
                 .and_then(|input| host.route(&input.target))
                 .cloned()
                 .filter(|l| l.capture.prompt.as_ref() == Some(&delayed.target));
-            if current && let Some(live) = live {
+            if current && input_current(&host, &id, &delayed.target) && let Some(live) = live {
                 if let (Some(native), Some(input), Some(p)) =
                     (native, host.inputs.get(&id), host.projects.get(&workspace))
                     && host
@@ -341,11 +341,7 @@ impl App {
         id: String,
     ) {
         let authorized = self.command_center.as_ref().is_some_and(|host| {
-            host.inputs.contains_key(&id)
-                && host
-                    .remote_permits
-                    .get(&id)
-                    .is_none_or(|permit| permit.is_current())
+            input_current(host, &id, &target)
         });
         if !authorized {
             self.command_center_input_outcome(&id, ui::composer::PromptAdmissionOutcome::Rejected);
@@ -583,6 +579,20 @@ impl App {
         }
     }
 }
+fn input_current(host: &CommandCenterHost, id: &str, target: &FleetPromptTarget) -> bool {
+    let Some(input) = host.inputs.get(id) else { return false };
+    let Some(project) = host.projects.get(&input.target.workspace_id) else { return false };
+    project.loaded && !project.storage_blocked
+        && host.route(&input.target).is_some_and(|live| {
+            live.capture.prompt.as_ref() == Some(target)
+                && input.dispatch.as_ref().is_none_or(|assignment| {
+                    assignment_current(project, assignment)
+                        && assignment.attempt.config == project.snapshot.config
+                        && assignment.attempt.runtime_binding == live.runtime_binding
+                })
+        })
+        && host.remote_permits.get(id).is_none_or(|permit| permit.is_current())
+}
 fn reject_delayed(host: &mut CommandCenterHost, id: &str, message: &str) {
     if let Some(input) = host.inputs.remove(id)
         && let Some(p) = host.projects.get_mut(&input.target.workspace_id)
@@ -781,6 +791,24 @@ mod tests {
         };
         host.projects.insert("workspace-a".into(), p);
         (host, watch, assignment)
+    }
+    #[test]
+    fn deferred_local_input_rechecks_attempt_before_actual_send() {
+        let (mut host, watch, assignment) = fixture();
+        let id = assignment.attempt.operation_id.0.clone();
+        let target = watch.capture.prompt.clone().unwrap();
+        host.inputs.insert(id.clone(), Input {
+            target: watch.route.clone(), draft: String::new(), dispatch: Some(assignment.clone()),
+        });
+        assert!(remote::handoff_pending(&host, &watch.route), "manual retirement must wait for local handoff");
+        assert!(input_current(&host, &id, &target));
+        let p = host.projects.get_mut("workspace-a").unwrap();
+        apply_user_work_event(p, &watch.route, &assignment.attempt.id.0,
+            work::WorkEventKind::ResultSubmitted { result: work::TaskResult {
+                revision: work::ResultRevision(1), summary: "actual result".into(),
+                source_revision: None, artifact_revision: None, verification: work::VerificationState::NotRun,
+            } }, "fixture retirement after save ACK".into()).unwrap();
+        assert!(!input_current(&host, &id, &target), "a saved prompt must not outlive its exact assignment");
     }
     #[test]
     fn owned_launch_fresh_observation_is_one_shot_and_exact_capture_bound() {

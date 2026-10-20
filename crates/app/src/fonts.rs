@@ -154,12 +154,17 @@ static CJK_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> = std::sync::O
 /// 워크스페이스·세션·파일 트리·하단 내비게이션이 공유하는 좌측 사이드바 전용 가족.
 /// 전역 UI 폰트 설정은 유지하고 이 named family를 사이드바 scope에만 적용한다.
 pub const SIDEBAR_FONT_FAMILY: &str = "sidebar_apple_sd_gothic";
+/// Command Center headings need a real weight600 face; RichText::strong only changes color.
+pub const CC_SEMIBOLD_FONT_FAMILY: &str = "command_center_semibold";
 
 #[cfg(target_os = "macos")]
 const SIDEBAR_FONT_PATH: &str = "/System/Library/Fonts/AppleSDGothicNeo.ttc";
 
 #[cfg(target_os = "macos")]
 static SIDEBAR_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> = std::sync::OnceLock::new();
+#[cfg(target_os = "macos")]
+static CC_SEMIBOLD_FONT_DATA: std::sync::OnceLock<Option<CachedFontData>> =
+    std::sync::OnceLock::new();
 
 fn cjk_font_data() -> Option<CachedFontData> {
     CJK_FONT_DATA
@@ -230,12 +235,86 @@ fn sidebar_font_data() -> Option<CachedFontData> {
             read_font_file_bounded(Path::new(SIDEBAR_FONT_PATH), FONT_FILE_BYTES_MAX)
                 .ok()
                 .map(|bytes| {
-                    let mut data = egui::FontData::from_owned(bytes);
+                    // Both faces borrow this one process-lifetime buffer. Cloning an owned
+                    // FontData for another TTC index would copy the entire55MiB file.
+                    let mut data = egui::FontData::from_static(Box::leak(bytes.into_boxed_slice()));
                     data.index = 0;
                     (SIDEBAR_FONT_PATH, std::sync::Arc::new(data))
                 })
         })
         .clone()
+}
+
+#[cfg(target_os = "macos")]
+fn sfnt_face_with_weight(bytes: &[u8], weight: u16) -> Option<u32> {
+    let u16_at = |offset: usize| -> Option<u16> {
+        Some(u16::from_be_bytes(
+            bytes.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+        ))
+    };
+    let u32_at = |offset: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(
+            bytes.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    };
+    let collection = bytes.get(..4)? == b"ttcf";
+    let count = if collection { u32_at(8)? } else { 1 };
+    if count > 64 {
+        return None;
+    }
+    for index in 0..count {
+        let start = if collection {
+            u32_at(12 + index as usize * 4)? as usize
+        } else {
+            0
+        };
+        let count = u16_at(start.checked_add(4)?)?;
+        if count > 256 {
+            return None;
+        }
+        for table in 0..count as usize {
+            let record = start.checked_add(12)?.checked_add(table * 16)?;
+            if bytes.get(record..record.checked_add(4)?)? != b"OS/2" {
+                continue;
+            }
+            let offset = u32_at(record.checked_add(8)?)? as usize;
+            if u32_at(record.checked_add(12)?)? < 6 {
+                return None;
+            }
+            if u16_at(offset.checked_add(4)?)? == weight {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+#[cfg(target_os = "macos")]
+fn command_center_semibold_data() -> Option<CachedFontData> {
+    CC_SEMIBOLD_FONT_DATA
+        .get_or_init(|| {
+            let (_, regular) = sidebar_font_data()?;
+            let index = sfnt_face_with_weight(&regular.font, 600)?;
+            let mut semibold = (*regular).clone();
+            semibold.index = index;
+            Some((CC_SEMIBOLD_FONT_FAMILY, std::sync::Arc::new(semibold)))
+        })
+        .clone()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn command_center_semibold_data() -> Option<CachedFontData> {
+    None
+}
+
+/// Resolve outside Context lock closures, just like sidebar_font_family.
+pub fn command_center_semibold_family(ctx: &egui::Context) -> egui::FontFamily {
+    let family = egui::FontFamily::Name(CC_SEMIBOLD_FONT_FAMILY.into());
+    if ctx.fonts(|fonts| fonts.definitions().families.contains_key(&family)) {
+        family
+    } else {
+        egui::FontFamily::Proportional
+    }
 }
 
 /// 사이드바 named family가 아직 `ctx`에 등록되지 않았으면(예: `install_cjk_fallback`
@@ -449,6 +528,16 @@ fn build_font_definitions(
     }
     fonts.families.insert(sidebar_family, sidebar_fallback);
 
+    let mut semibold_fallback = fonts.families[&egui::FontFamily::Proportional].clone();
+    if let Some((name, data)) = command_center_semibold_data() {
+        fonts.font_data.insert(name.to_owned(), data);
+        semibold_fallback.insert(0, name.to_owned());
+    }
+    fonts.families.insert(
+        egui::FontFamily::Name(CC_SEMIBOLD_FONT_FAMILY.into()),
+        semibold_fallback,
+    );
+
     fonts
 }
 
@@ -559,6 +648,36 @@ pub fn effective_ui_font_name(selected_path: Option<&str>, options: &[(String, S
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ui_semibold_from_shared_ttc_uses_real_face_without_duplicating_font_bytes() {
+        let defs = super::build_font_definitions(
+            None,
+            super::DEFAULT_MONO_FONT,
+            super::DEFAULT_MONO_WEIGHT,
+        );
+        let family = egui::FontFamily::Name("command_center_semibold".into());
+        let key = defs
+            .families
+            .get(&family)
+            .and_then(|keys| keys.first())
+            .expect("Command Center semibold family");
+        let face = &defs.font_data[key];
+        assert_eq!(face.index, 4, "installed Apple SD Gothic Neo SemiBold face");
+        let regular = &defs.font_data[super::SIDEBAR_FONT_FAMILY];
+        assert_eq!(
+            face.font.as_ptr(),
+            regular.font.as_ptr(),
+            "share the same large TTC bytes"
+        );
+        assert_ne!(face.index, regular.index);
+        let rebuilt = super::build_font_definitions(
+            None,
+            super::DEFAULT_MONO_FONT,
+            super::DEFAULT_MONO_WEIGHT,
+        );
+        assert!(std::sync::Arc::ptr_eq(face, &rebuilt.font_data[key]));
+    }
     use super::{DEFAULT_UI_FONT_NAME, effective_ui_font_name};
 
     fn temp_path(tag: &str) -> std::path::PathBuf {

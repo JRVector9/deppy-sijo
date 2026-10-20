@@ -462,6 +462,8 @@ async function flow() {
   await waitFor(() => !workHost.hidden, "encrypted Command Center projection");
   ok(workHost.querySelector("[data-cc-composer]").disabled, "paired viewer never gains Command Center input from offered capabilities");
   ok(workHost.getBoundingClientRect().height === innerHeight, "Relay Command Center fills actual viewport");
+  eq([...workHost.querySelectorAll('[data-cc-nav]')].map(button => button.dataset.ccNav).join(','), 'main,tasks,terminal,devices,history', 'Relay preserves approved semantic navigation');
+  eq(workHost.querySelectorAll('[data-cc-monitor-filter]').length, 3, 'Relay preserves read-only monitor filters');
   const clearWorkFrame = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "work_snapshot", snapshot: null})));
   deliver(C.FRAME_TYPE.CIPHERTEXT, connection, clearWorkFrame.ciphertext, clearWorkFrame.sequence);
   await waitFor(() => workHost.hidden && !home.hidden, "rollback to Relay home");

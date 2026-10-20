@@ -47,7 +47,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   let snapshot = null, workspaceId = null, screen = 'main', taskId = null, detailTab = 'work';
   let connected = false, opened = false, initialized = false, destroyed = false, composing = false;
   let currentKey = '', currentTarget = null, currentCapability = null, draftTotal = 0, draftSerial = 0, compositionEndedAt = -Infinity;
-  let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null;
+  let themeOverride = null, drawer = null, drawerReturn = null, lastVisibility = null, monitorFilter = 'all', monitorCollapsed = false;
   let remoteWatchTimer = null;
   const drafts = new Map(), pending = new Map(), settings = new Map(), plans = new Map(), resultDrafts = new Map(), workerSelections = new Map(), remotePositions = new Map();
   const element = node('section', 'cc-shell'); element.hidden = true;
@@ -58,10 +58,12 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   const nav = node('nav', 'cc-nav'); nav.setAttribute('aria-label', '주요 화면');
   const headActions = node('div', 'cc-head-actions');
   const theme = button('라이트', () => { themeOverride = !app.classList.contains('cc-light'); applyTheme(); }, 'cc-button cc-ghost');
-  headActions.append(theme, button('터미널로', () => setOpen(false), 'cc-button cc-ghost'));
+  const currentTerminal = button('터미널로', openCurrentTerminal, 'cc-button cc-ghost'); currentTerminal.dataset.ccCurrentTerminal = '';
+  const close = button('×', () => setOpen(false), 'cc-button cc-ghost'); close.dataset.ccClose = ''; close.setAttribute('aria-label', '지휘 화면 접기');
+  headActions.append(theme, currentTerminal, close);
   header.append(brand, nav, headActions);
   const layout = node('div', 'cc-layout');
-  const backdrop = button('패널 닫기', closeDrawers, 'cc-backdrop'); backdrop.tabIndex = -1;
+  const backdrop = button('', closeDrawers, 'cc-backdrop'); backdrop.tabIndex = -1; backdrop.setAttribute('aria-label', '패널 닫기');
   const left = node('aside', 'cc-sidebar'); left.setAttribute('aria-label', '프로젝트와 독립 세션');
   const workspace = node('div', 'cc-workspace'), projectbar = node('header', 'cc-projectbar');
   const workbody = node('div', 'cc-workbody'), main = node('main', 'cc-work');
@@ -188,7 +190,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     if (!rememberDraft()) return; screen = next; taskId = selected; detailTab = 'work'; closeDrawers(); render(); content.scrollTop = 0;
   }
   function chooseProject(id) {
-    if (!rememberDraft()) return; workspaceId = id; screen = 'main'; taskId = null; closeDrawers(); render(); content.scrollTop = 0;
+    if (!rememberDraft()) return; workspaceId = id; screen = 'main'; taskId = null; monitorFilter = 'all'; closeDrawers(); render(); content.scrollTop = 0;
     if (project()?.loaded === false) {
       if (readOnly) say('Mac에서 이 프로젝트를 열면 저장된 작업 화면이 표시됩니다.');
       else emit({type: 'load_project', workspace_id: id}, 'load:' + id);
@@ -217,6 +219,29 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     control.title = control.disabled ? str(task?.terminal?.reason) || '이 세션의 터미널 연결을 제공하지 않습니다' : '이 세션의 실제 터미널 열기'; return control;
   }
   function isRemoteTask(task) { return !!task?.target?.task_id && str(task?.target?.session_id).startsWith('remote:'); }
+  function openCurrentTerminal() {
+    if (screen === 'task') {
+      const control = terminalButton(selectedTask());
+      if (control.disabled) say(control.title); else control.click();
+      return;
+    }
+    const p = project(), session = list(p?.sessions).find(s => s.target?.workspace_id === p.id && routeKey(s.target) === routeKey(p.main_target));
+    const control = terminalButton(session);
+    if (control.disabled) say(control.title); else control.click();
+  }
+  function openTaskDetail(task, tab = 'work') {
+    if (!rememberDraft()) return;
+    screen = 'task'; taskId = task.target?.task_id; detailTab = tab; closeDrawers(); render(); content.scrollTop = 0;
+  }
+  const needsAttention = task => ['waiting_approval', 'waiting_input', 'result_submitted', 'verification_failed', 'awaiting_user_confirmation', 'failed', 'observation_unknown'].includes(task.state);
+  const hasResult = task => ['result_submitted', 'verification_failed', 'awaiting_user_confirmation', 'completed'].includes(task.state);
+  function taskShortcut(task, className = 'cc-button') {
+    const result = hasResult(task), caption = result ? '결과 확인' : task.state === 'waiting_approval' ? '승인 확인' : needsAttention(task) ? '상태 확인' : '작업 상세';
+    const control = button(caption, () => openTaskDetail(task, result ? 'result' : 'work'), className);
+    control.dataset.ccTaskAction = task.target?.task_id || '';
+    control.dataset.ccDrawerFocus = 'action:' + routeKey(task.target);
+    return control;
+  }
   function remoteViewTask() { const task = selectedTask(); return screen === 'task' && detailTab === 'terminal' && isRemoteTask(task) && task.terminal?.enabled !== false ? task : null; }
   function requestRemoteView(task) { return emit({type: 'observe_remote_session', target: task.target}, 'observe:' + routeKey(task.target)); }
   function syncRemoteWatch() {
@@ -251,35 +276,104 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
         entry.append(node('strong', '', session.title), node('small', '', [session.provider, session.model, session.effort, session.device].filter(Boolean).join(' · ')), stateTag(session.state, label)); left.append(entry);
       }
     }
-    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); foot.querySelector('button').dataset.ccDrawerFocus = 'settings'; left.append(foot);
+    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); foot.querySelector('button').dataset.ccDrawerFocus = 'settings'; foot.querySelector('button').dataset.ccSettings = ''; left.append(foot);
   }
-  function taskRow(task, compact = false) {
-    const row = button('', () => navigate('task', task.target?.task_id), compact ? 'cc-worker-row' : 'cc-task-row'); row.dataset.ccTask = task.target?.task_id || ''; row.dataset.ccDrawerFocus = 'task:' + routeKey(task.target);
-    const title = node('div', 'cc-task-title'); title.append(node('strong', '', task.title), node('small', '', compact ? task.activity : task.scope));
+  function taskRow(task) {
+    const row = button('', () => navigate('task', task.target?.task_id), 'cc-task-row'); row.dataset.ccTask = task.target?.task_id || '';
+    const title = node('div', 'cc-task-title'); title.append(node('strong', '', task.title), node('small', '', task.scope));
     row.append(title, node('span', 'cc-owner', [task.provider, task.device].filter(Boolean).join(' · ')), stateTag(task.state, label));
-    if (compact) row.append(node('small', 'cc-worker-time', task.observed_at || '관측 시각 없음')); return row;
+    return row;
   }
   function renderRight(p) {
-    const heading = node('div', 'cc-monitor-title'); heading.append(node('h2', '', label('workers', '작업자') + ' ' + list(p?.tasks).length), button(label('close', '닫기'), closeDrawers, 'cc-button cc-ghost cc-drawer-close')); right.replaceChildren(heading); heading.querySelector('button').dataset.ccDrawerFocus = 'close';
-    if (!list(p?.tasks).length) right.append(node('p', 'cc-empty', label('no_tasks', '배정된 작업자가 없습니다.')));
-    for (const task of list(p?.tasks).slice(0, 64)) right.append(taskRow(task, true));
-    right.append(node('p', 'cc-monitor-note', '관측된 실행·승인·결과 상태를 표시합니다. 결과 제출과 검증 완료는 구분됩니다.'));
+    const previousScroll = right.querySelector('.cc-monitor-scroll')?.scrollTop || 0;
+    const tasks = list(p?.tasks), running = tasks.filter(t => t.state === 'running').length;
+    const heading = node('header', 'cc-monitor-title'); heading.append(node('h2', '', label('workers', '작업자')), node('small', 'cc-muted', '실행 ' + running + (p?.config ? ' / 최대 ' + p.config.parallel_limit : '')), button(label('close', '닫기'), closeDrawers, 'cc-button cc-ghost cc-drawer-close')); right.replaceChildren(heading); heading.querySelector('button').dataset.ccDrawerFocus = 'close';
+    const scroll = node('div', 'cc-monitor-scroll'), filters = node('div', 'cc-monitor-filter'); filters.setAttribute('aria-label', '작업자 필터');
+    for (const [key, caption] of [['all', '전체'], ['attention', '확인 필요'], ['running', '실행 중']]) {
+      const control = button(caption, () => { monitorFilter = key; render(); }, 'cc-button cc-ghost');
+      control.dataset.ccMonitorFilter = key; control.dataset.ccDrawerFocus = 'filter:' + key; control.setAttribute('aria-pressed', String(monitorFilter === key)); filters.append(control);
+    }
+    scroll.append(filters);
+    const visible = tasks.filter(task => monitorFilter === 'all' || monitorFilter === 'running' && task.state === 'running' || monitorFilter === 'attention' && needsAttention(task));
+    if (!visible.length) scroll.append(node('p', 'cc-empty', tasks.length ? '해당 상태의 작업자가 없습니다.' : label('no_tasks', '배정된 작업자가 없습니다.')));
+    for (const task of visible.slice(0, 64)) {
+      const row = node('article', 'cc-worker-row' + (screen === 'task' && task.target?.task_id === taskId ? ' cc-selected' : ''));
+      row.dataset.ccWorkerTask = task.target?.task_id || '';
+      const top = node('div', 'cc-worker-heading'); top.append(node('span', 'cc-worker-role', [task.provider, task.role].filter(Boolean).join(' · ')), stateTag(task.state, label));
+      const title = button(task.title, () => openTaskDetail(task), 'cc-worker-title'); title.dataset.ccTask = task.target?.task_id || ''; title.dataset.ccDrawerFocus = 'task:' + routeKey(task.target);
+      const meta = node('div', 'cc-worker-meta'); meta.append(node('span', '', task.device || '—'), node('time', '', task.observed_at || '관측 시각 없음'));
+      const actions = node('div', 'cc-worker-actions'), terminal = terminalButton(task); terminal.dataset.ccDrawerFocus = 'terminal:' + routeKey(task.target);
+      terminal.classList.remove('cc-ghost'); terminal.append(' ↗'); actions.append(taskShortcut(task), terminal);
+      row.append(top, title, node('small', 'cc-worker-scope', task.scope), node('p', 'cc-worker-activity', task.activity), meta, actions); scroll.append(row);
+    }
+    if (p) {
+      const rules = node('section', 'cc-worker-rules'), config = p.config;
+      rules.append(node('h3', '', '이 프로젝트의 실행 규칙'));
+      if (config) rules.append(node('p', '', ['메인 ' + p.main_provider + ' → ' + list(config.worker_providers).join(' · '), config.use_worktrees ? '작업별 독립 worktree' : '공유 경로 · 수정 범위 확인', config.automation + ' · 최대 ' + config.parallel_limit + '개 병렬'].join('\n')));
+      const settings = button('실행 규칙 설정 ↗', () => navigate('settings'), 'cc-button cc-ghost'); settings.dataset.ccSettings = ''; settings.dataset.ccDrawerFocus = 'settings'; rules.append(settings); scroll.append(rules);
+    }
+    const foot = node('footer', 'cc-monitor-foot'), devices = button('기기 관리 ↗', () => navigate('devices'), 'cc-button cc-ghost'); devices.dataset.ccDrawerFocus = 'devices';
+    foot.append(node('small', 'cc-muted', '기기 ' + list(snapshot.devices).filter(device => device.connected).length + '대 연결'), devices); right.append(scroll, foot); scroll.scrollTop = previousScroll;
   }
   function title(caption, description) {
     const intro = node('div', 'cc-intro'); intro.append(node('h1', '', caption)); if (description) intro.append(node('p', 'cc-muted', description)); content.append(intro);
   }
-  function renderHistory(entries) {
-    if (!entries.length) { content.append(node('p', 'cc-empty', label('no_history', '아직 기록이 없습니다.'))); return; }
+  function renderHistory(entries, destination = content) {
+    if (!entries.length) { destination.append(node('p', 'cc-empty', label('no_history', '아직 기록이 없습니다.'))); return; }
     for (const entry of entries.slice(-100).reverse()) {
       const row = node('div', 'cc-history-row'), body = node('div'); body.append(node('p', '', entry.text), node('small', 'cc-muted', entry.detail)); row.append(node('time', '', entry.time), body);
-      if (entry.target?.task_id) row.append(button('작업 보기', () => navigate('task', entry.target.task_id), 'cc-button cc-ghost')); content.append(row);
+      if (entry.target?.workspace_id === workspaceId && entry.target?.task_id) row.append(button('작업 보기', () => navigate('task', entry.target.task_id), 'cc-button cc-ghost')); destination.append(row);
     }
   }
-  function renderPlan(p) {
-    if (p.pending_goal_id) {
+  function renderMain(p) {
+    const tasks = list(p.tasks), goal = node('section', 'cc-goal');
+    goal.append(node('p', 'cc-section-label', '프로젝트 목표 · ' + p.name), node('p', 'cc-instruction', p.goal || '이 프로젝트에서 어떤 작업을 진행할까요?'));
+    const flow = node('div', 'cc-main-flow');
+    for (const caption of ['목표', '계획·배정', '독립 실행 ' + tasks.filter(t => t.state === 'running').length, '결과 취합', '검증']) flow.append(node('span', '', caption));
+    goal.append(flow); content.append(goal);
+    const thread = (key, caption) => {
+      const section = node('section', 'cc-thread-entry'), body = node('div', 'cc-thread-body'); section.dataset.ccThread = key;
+      section.append(node('span', 'cc-thread-label', key.toUpperCase()), body); body.append(node('h2', '', caption)); content.append(section); return body;
+    };
+    const mainBody = thread('main', tasks.length ? '구현과 독립 리뷰를 나누고, 결과를 모아 검증합니다.' : '첫 목표를 메인 에이전트에게 맡겨 주세요.');
+    mainBody.append(node('p', 'cc-main-summary', p.main_summary || (tasks.length ? '메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 계속 확인할 수 있습니다.' : '아래 입력창에 목표를 쓰면 배정안을 확인할 수 있습니다.')));
+    const outline = node('div', 'cc-assignment-outline');
+    tasks.slice(0, 3).forEach((task, index) => {
+      const row = button('', () => openTaskDetail(task), 'cc-outline-row'); row.dataset.ccTask = task.target?.task_id || '';
+      const body = node('span', 'cc-outline-title'), owner = node('span', 'cc-owner');
+      body.append(node('strong', '', [task.role, task.title].filter(Boolean).join(' · ')), node('small', '', task.scope)); owner.append(node('span', '', task.provider), node('small', '', task.device));
+      row.append(node('span', 'cc-outline-number', String(index + 1).padStart(2, '0')), body, owner); outline.append(row);
+    }); mainBody.append(outline);
+    if (tasks.length > 3) mainBody.append(button('전체 작업 ' + tasks.length + '개 보기 ↗', () => navigate('tasks'), 'cc-button cc-ghost'));
+    if (p.config) {
+      const foot = node('div', 'cc-main-summary-foot'); foot.append(node('span', '', p.config.use_worktrees ? '작업별 독립 worktree' : '공유 경로 · 수정 범위 확인'), node('span', '', '동시 실행 최대 ' + p.config.parallel_limit + ' · ' + p.config.automation)); mainBody.append(foot);
+    }
+    renderPlan(p, {manual: false});
+    const attention = tasks.filter(needsAttention), approvals = readOnly ? [] : list(p.pending_approvals).filter(request => request.target?.workspace_id === p.id && request.approval && !tasks.some(task => routeKey(task.target) === routeKey(request.target) && task.approval?.id === request.approval.id));
+    if (attention.length || approvals.length) {
+      const checks = thread('check', '지금 확인할 작업 ' + (attention.length + approvals.length) + '건');
+      checks.append(node('p', '', '명령 승인은 실행 전에, 결과 확인은 제출된 근거를 본 뒤 진행합니다.'));
+      const actions = node('div', 'cc-check-actions');
+      for (const task of attention) { const control = taskShortcut(task); control.append(node('span', '', ' · ' + [task.provider, task.role].filter(Boolean).join(' / '))); actions.append(control); } checks.append(actions);
+      for (const request of approvals) {
+        const approval = request.approval, box = node('section', 'cc-approval'); box.dataset.ccApproval = approval.id;
+        box.append(node('h3', '', '실행 승인 요청 · ' + request.session_title), node('pre', 'cc-log', approval.command), facts([['폴더', approval.directory], ['범위', approval.scope]]));
+        const actions = node('div', 'cc-actions');
+        for (const allow of [false, true]) actions.append(actionButton(allow ? label('allow_once', '한 번 허용') : label('deny', '거절'), approval.action, {type: 'approval', target: request.target, approval_id: approval.id, allow}, 'approval:' + routeKey(request.target) + ':' + approval.id, allow ? 'cc-button cc-primary' : 'cc-button'));
+        box.append(actions); checks.append(box);
+      }
+    }
+    if (list(p.history).length) {
+      const live = thread('live', '메인이 작업자 진행과 결과를 모읍니다.'); renderHistory(list(p.history).slice(-3), live);
+      const all = button('프로젝트 전체 기록 ↗', () => navigate('history'), 'cc-button cc-ghost'); all.dataset.ccAllHistory = ''; live.append(all);
+    }
+    renderPlan(p, {review: false});
+  }
+  function renderPlan(p, {review = true, manual = true} = {}) {
+    if (review && p.pending_goal_id) {
       const review = node('div', 'cc-review'); review.append(node('span', 'cc-grow', '작업 범위와 담당자를 검토한 뒤 계획을 확정해 주세요.'), actionButton(label('confirm_plan', '계획 확정'), p.plan_confirmation, {type: 'confirm_plan', workspace_id: p.id, goal_id: p.pending_goal_id}, 'plan:' + p.id)); content.append(review);
     }
-    if (!p.manual_plan) return;
+    if (!manual || !p.manual_plan || !enabled(p.manual_plan) && !p.planner_prompt && !plans.has(p.id)) return;
     const details = node('details', 'cc-manual-plan'); details.append(node('summary', '', '계획 JSON 직접 검토·입력'), node('p', 'cc-muted', '메인 응답의 구조화된 계획을 붙여 넣으세요. 설치 후에도 계획 확정이 필요합니다.'));
     if (p.planner_prompt) { const prompt = node('details'); prompt.append(node('summary', '', '메인에게 전달할 계획 요청'), node('pre', 'cc-log', p.planner_prompt)); details.append(prompt); }
     const area = node('textarea', 'cc-plan-input'); area.dataset.ccFocus = 'plan-json'; area.setAttribute('aria-label', '작업 계획 JSON'); area.rows = 8; area.spellcheck = false; area.value = plans.get(p.id)?.text || ''; area.disabled = !enabled(p.manual_plan) || !connected;
@@ -416,12 +510,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     else if (screen === 'settings') renderSettings(p);
     else if (screen === 'history') { title('프로젝트 기록'); renderHistory(list(p.history)); }
     else if (screen === 'tasks') { title('작업', '현재 프로젝트에 배정된 독립 작업입니다.'); if (!list(p.tasks).length) content.append(node('p', 'cc-empty', '아직 배정된 작업이 없습니다.')); for (const task of list(p.tasks).slice(0, 64)) content.append(taskRow(task)); }
-    else {
-      title('메인에게 작업 맡기기', [p.main_provider, p.main_model, p.main_effort].filter(Boolean).join(' · '));
-      const goal = node('section', 'cc-goal'); goal.append(node('p', 'cc-section-label', '현재 목표'), node('p', 'cc-instruction', p.goal || '아직 제출한 목표가 없습니다.')); content.append(goal);
-      if (p.main_summary) { const summary = node('section', 'cc-main-summary'); summary.append(node('h2', '', '메인'), node('p', '', p.main_summary)); content.append(summary); }
-      const tasks = node('section', 'cc-task-table'); tasks.append(node('h2', 'cc-section-label', '배정된 작업')); if (!list(p.tasks).length) tasks.append(node('p', 'cc-empty', '메인과 목표를 논의한 뒤 검토할 계획을 등록해 주세요.')); for (const task of list(p.tasks).slice(0, 64)) tasks.append(taskRow(task)); content.append(tasks); renderPlan(p);
-    }
+    else renderMain(p);
     content.scrollTop = scroll;
     [...content.querySelectorAll('details')].forEach((detail, index) => { detail.open = expanded[index] || false; });
     if (focusKey) {
@@ -451,17 +540,22 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const activePanel = drawer === 'left' ? left : drawer === 'right' ? right : null;
     const drawerFocus = activePanel?.contains(document.activeElement) ? document.activeElement.dataset.ccDrawerFocus : null;
     rememberRemotePosition();
-    for (const [key, fallback] of [['main', '메인'], ['tasks', '작업'], ['devices', '기기'], ['history', '기록'], ['settings', '설정']]) {
-      const tab = button(label(key, fallback), () => navigate(key), 'cc-nav-button' + ((screen === key || (screen === 'task' && key === 'tasks')) ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', screen === key ? 'page' : 'false'); nav.append(tab);
+    app.classList.toggle('cc-monitor-collapsed', monitorCollapsed);
+    for (const [key, fallback] of [['main', '메인 에이전트'], ['tasks', '작업'], ['terminal', '터미널'], ['devices', '에이전트·기기'], ['history', '이력']]) {
+      const active = screen === key || screen === 'task' && key === (detailTab === 'terminal' ? 'terminal' : 'tasks');
+      const tab = button(label('nav_' + key, fallback), () => key === 'terminal' ? openCurrentTerminal() : navigate(key), 'cc-nav-button' + (active ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', active ? 'page' : 'false'); nav.append(tab);
     }
     const p = project(); renderLeft(); renderRight(p); projectbar.replaceChildren();
     const heading = node('div', 'cc-grow'); heading.append(node('h2', '', p?.name || '프로젝트 없음'), node('small', 'cc-path', p?.directory || ''));
-    const select = node('select', 'cc-project-select'); select.setAttribute('aria-label', '작업할 프로젝트'); for (const available of list(snapshot.projects).slice(0, 64)) { const option = node('option', '', available.name); option.value = available.id; select.append(option); } select.value = p?.id || ''; select.addEventListener('change', () => chooseProject(select.value)); projectbar.append(heading, select);
+    const select = node('select', 'cc-project-select'); select.setAttribute('aria-label', '작업할 프로젝트'); for (const available of list(snapshot.projects).slice(0, 64)) { const option = node('option', '', available.name); option.value = available.id; select.append(option); } select.value = p?.id || ''; select.addEventListener('change', () => chooseProject(select.value));
+    const settings = button('⚙', () => navigate('settings'), 'cc-button cc-ghost'); settings.dataset.ccSettings = ''; settings.setAttribute('aria-label', '프로젝트 설정'); projectbar.append(heading, select, settings);
     context.replaceChildren();
     const openLeft = button('☰', () => openDrawer('left', openLeft), 'cc-button cc-ghost cc-open-left'); openLeft.dataset.ccOpenLeft = ''; openLeft.setAttribute('aria-label', '프로젝트 목록 열기');
-    const caption = node('div', 'cc-grow', screen === 'task' ? selectedTask()?.title || '작업' : screen === 'main' ? '메인 지휘' : label(screen, {tasks: '프로젝트 작업', devices: '기기', history: '기록', settings: '설정'}[screen]));
+    const caption = node('div', 'cc-grow', screen === 'task' ? selectedTask()?.title || '작업' : screen === 'main' ? '메인 에이전트' : label(screen, {tasks: '프로젝트 작업', devices: '기기', history: '기록', settings: '설정'}[screen]));
+    if (screen === 'main') caption.append(node('small', 'cc-context-model', [p?.main_provider, p?.main_model, p?.main_effort].filter(Boolean).join(' · ')));
     const openRight = button('작업자 ' + list(p?.tasks).length, () => openDrawer('right', openRight), 'cc-button cc-ghost cc-open-right'); openRight.dataset.ccOpenRight = ''; openRight.setAttribute('aria-label', '작업자 패널 열기');
-    context.append(openLeft, caption); if (screen === 'task') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight);
+    const toggle = button(monitorCollapsed ? '작업자 펼치기' : '작업자 접기', () => { monitorCollapsed = !monitorCollapsed; render(); }, 'cc-button cc-ghost cc-monitor-toggle'); toggle.dataset.ccMonitorToggle = ''; toggle.setAttribute('aria-label', monitorCollapsed ? '작업자 패널 펼치기' : '작업자 패널 접기'); toggle.setAttribute('aria-expanded', String(!monitorCollapsed));
+    context.append(openLeft, caption); if (screen === 'task') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight, toggle);
     renderContent(p); updateComposer(); status.textContent = connected ? str(snapshot.status) || '관측된 상태' : '연결 끊김 · 초안 보존 · 자동 재전송 없음';
     if (drawer) {
       drawerReturn = drawer === 'left' ? openLeft : openRight;

@@ -34,6 +34,11 @@
     await wait(() => input() && !input().disabled && host().querySelector('[data-cc-project]'), 'authenticated projection');
     check(document.getElementById('dashboard-shell').hidden && !host().hidden, 'new projection replaces dashboard');
     check(host().getBoundingClientRect().height === innerHeight, 'production host fills viewport height');
+    check([...host().querySelectorAll('[data-cc-nav]')].map(button => button.dataset.ccNav).join(',') === 'main,tasks,terminal,devices,history', 'approved semantic navigation crosses production bundle');
+    host().querySelector('[data-cc-settings]').click();
+    host().querySelector('[data-cc-focus="setting-use_worktrees"]').focus(); ccSocket.publish();
+    check(document.activeElement?.dataset.ccFocus === 'setting-use_worktrees', 'focused checkbox survives production snapshot');
+    host().querySelector('[data-cc-nav="main"]').click();
     const write = text => { input().value = text; input().dispatchEvent(new Event('input', {bubbles: true})); };
     write('한글 목표'); host().querySelector('[data-cc-send]').click();
     const request = ccSent.find(frame => frame.type === 'cloud_control');
@@ -41,7 +46,7 @@
     check(input().value.length > 0, 'transport queue does not clear draft');
     write('저장 중 새 초안'); ccSnapshot.receipts = [{operation_id: request.intent.operation_id, status: 'acknowledged', detail: '접수'}]; ccSocket.publish();
     check(input().value === '저장 중 새 초안', 'newer draft survives matching ACK');
-    host().querySelector('.cc-session').click();
+    host().querySelector('[data-cc-nav="terminal"]').click();
     await wait(() => !document.getElementById('viewer').hidden, 'terminal open');
     check(host().hidden, 'terminal and command center do not overlap');
     check(ccSent.find(frame => frame.type === 'watch').session === '11111111-1111-4111-8111-111111111111', 'actual UUID watch');
@@ -49,6 +54,11 @@
     await wait(() => !host().hidden && !host().querySelector('.cc-app').hidden, 'return to command center');
     check(input().value === '저장 중 새 초안', 'terminal roundtrip preserves target draft');
     [...host().querySelectorAll('.cc-head-actions button')].find(button => button.textContent === '터미널로').click();
+    await wait(() => !document.getElementById('viewer').hidden, 'header opens exact terminal');
+    check(host().hidden && !document.getElementById('viewer').hidden && ccSent.filter(frame => frame.type === 'watch').at(-1).session === '11111111-1111-4111-8111-111111111111', 'terminal header opens exact terminal instead of dashboard');
+    document.getElementById('viewer-back').click();
+    await wait(() => !host().hidden && !host().querySelector('.cc-app').hidden, 'return from header terminal');
+    host().querySelector('[data-cc-close]').click();
     check(!document.getElementById('dashboard-shell').hidden && !host().hidden, 'original shell and reopen control remain reachable');
     host().querySelector('[data-cc-open]').click();
     check(document.getElementById('dashboard-shell').hidden, 'reentry hides original shell');

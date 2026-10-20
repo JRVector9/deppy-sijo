@@ -1228,19 +1228,7 @@ impl App {
                 }
             }
             cc::Intent::DraftChanged { target, text } => {
-                work::validate_input(&text)
-                    .or_else(|e| if text.is_empty() { Ok(()) } else { Err(e) })
-                    .map_err(|e| e.to_string())?;
-                let key = draft_key(host, &target)?;
-                let p = host
-                    .projects
-                    .get_mut(&target.workspace_id)
-                    .ok_or("프로젝트가 없습니다.")?;
-                if !p.loaded {
-                    return Err("상태를 불러오는 중입니다.".into());
-                }
-                set_draft(p, &key, &text, false)?;
-                host.ui.set_draft(target, text);
+                store_composer_draft(host, target, text)?;
                 return Ok(());
             }
             cc::Intent::SaveProject {
@@ -1455,7 +1443,7 @@ impl App {
                     .projects
                     .get_mut(&target.workspace_id)
                     .ok_or("프로젝트가 없습니다.")?;
-                if !p.loaded || host.flight.is_some() {
+                if !p.loaded || p.storage_blocked || host.flight.is_some() {
                     return Err("저장 또는 불러오기가 완료된 뒤 입력해 주세요.".into());
                 }
                 if p.snapshot
@@ -2902,11 +2890,43 @@ fn apply_delivery_outcome(
 }
 
 fn clear_admitted_draft(ui: &mut cc::UiState, target: &cc::RouteTarget, submitted: &str) -> bool {
-    if submitted.is_empty() || ui.draft(target) != submitted {
+    if submitted.is_empty() || !ui.draft(target).nfc().eq(submitted.nfc()) {
         return false;
     }
     ui.clear_draft(target);
     true
+}
+
+fn store_composer_draft(
+    host: &mut CommandCenterHost,
+    target: cc::RouteTarget,
+    text: String,
+) -> Result<(), String> {
+    if text.len() > work::WORK_INPUT_MAX_BYTES {
+        return Err("입력은 16 KiB 이하여야 합니다. 초안은 보존됩니다.".into());
+    }
+    let key = draft_key(host, &target)?;
+    let mut target = target;
+    let mut text = text;
+    if key == "main" && target.session_id.is_none() {
+        let current = host.main_target(&target.workspace_id, &host.projects[&target.workspace_id]);
+        if current != target && host.ui.has_draft(&current) {
+            if !host.ui.draft(&current).nfc().eq(text.nfc()) {
+                return Err("연결 후 편집한 메인 초안을 보존했습니다. 이전 대상의 지연된 편집을 적용하지 않았습니다.".into());
+            }
+            text = host.ui.draft(&current).to_owned();
+            target = current;
+        }
+    }
+    let p = host
+        .projects
+        .get_mut(&target.workspace_id)
+        .ok_or("프로젝트가 없습니다.")?;
+    // Authoring survives loading and storage recovery; the load merge preserves
+    // these local edits, while host.save still waits for valid storage state.
+    set_draft(p, &key, &text, false)?;
+    host.ui.set_draft(target, text);
+    Ok(())
 }
 
 fn draft_key(host: &CommandCenterHost, target: &cc::RouteTarget) -> Result<String, String> {
@@ -2914,13 +2934,47 @@ fn draft_key(host: &CommandCenterHost, target: &cc::RouteTarget) -> Result<Strin
         .projects
         .get(&target.workspace_id)
         .ok_or("프로젝트가 없습니다.")?;
-    if let Some(task) = &target.task_id {
-        if !p.snapshot.tasks.iter().any(|t| &t.id.0 == task) {
-            return Err("현재 프로젝트의 작업이 아닙니다.".into());
+    if let Some(task_id) = &target.task_id {
+        let task = p
+            .snapshot
+            .tasks
+            .iter()
+            .find(|t| &t.id.0 == task_id && t.workspace_id.0 == target.workspace_id)
+            .ok_or("현재 프로젝트의 작업이 아닙니다.")?;
+        let expected = if let Some(remote) = remote::target_for(host, task) {
+            remote
+        } else {
+            let runtime = task
+                .current_attempt_id
+                .as_ref()
+                .and_then(|id| p.snapshot.attempts.iter().find(|a| &a.id == id))
+                .and_then(|a| a.runtime_binding.as_ref());
+            let live = runtime.and_then(|runtime| {
+                host.live.iter().find(|live| {
+                    live.capture.workspace == target.workspace_id
+                        && host
+                            .routes
+                            .key(&live.capture)
+                            .is_some_and(|key| binding(live, key).as_ref() == Some(runtime))
+                })
+            });
+            let mut expected =
+                live.map(|live| host.target(live))
+                    .unwrap_or_else(|| cc::RouteTarget {
+                        workspace_id: target.workspace_id.clone(),
+                        ..Default::default()
+                    });
+            expected.task_id = Some(task_id.clone());
+            expected
+        };
+        if expected != *target {
+            return Err("초안의 작업 실행 대상이 바뀌었습니다.".into());
         }
-        return Ok(format!("task:{task}"));
+        return Ok(format!("task:{task_id}"));
     }
-    if host.main_target(&target.workspace_id, p) == *target {
+    // The no-session route is the logical main draft before binding. Delayed
+    // local edits still address that draft after binding, never an execution.
+    if target.session_id.is_none() || host.main_target(&target.workspace_id, p) == *target {
         return Ok("main".into());
     }
     let live = host
@@ -3074,6 +3128,111 @@ mod tests {
         assert!(p.generation > p.saved_generation);
     }
     #[test]
+    fn composer_host_unbound_draft_remains_addressable_after_exact_main_binding() {
+        let mut h = host();
+        let mut p = project();
+        let live = LiveRoute {
+            capture: Capture {
+                workspace: "workspace-a".into(),
+                target: FleetTarget::Pty {
+                    session: runtime::SessionId(1),
+                    tab: runtime::MuxTabId::new(),
+                    pane: runtime::MuxPaneId::new(),
+                },
+                prompt: None,
+            },
+            title: "Actual main".into(),
+            agent: None,
+            state: cc::TaskState::Queued,
+            cwd: None,
+            watch: None,
+            runtime_binding: None,
+        };
+        let before = cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            ..Default::default()
+        };
+        set_draft(&mut p, "main", "same project draft", false).unwrap();
+        h.routes.refresh(vec![live.capture.clone()]);
+        h.live.push(live.clone());
+        p.snapshot.main_binding = persistent(&live);
+        h.projects.insert("workspace-a".into(), p);
+        let after = h.main_target("workspace-a", &h.projects["workspace-a"]);
+        assert!(after.session_id.is_some());
+        assert_eq!(draft_key(&h, &before).unwrap(), "main");
+        assert_eq!(draft_key(&h, &after).unwrap(), "main");
+        assert!(
+            h.route(&before).is_none(),
+            "draft compatibility must not authorize execution"
+        );
+        assert!(h.inputs.is_empty());
+        assert!(h.flight.is_none());
+        assert_eq!(
+            h.projects["workspace-a"].snapshot.drafts[0].text,
+            "same project draft"
+        );
+        h.ui.set_draft(after.clone(), "new bound edit".into());
+        set_draft(
+            h.projects.get_mut("workspace-a").unwrap(),
+            "main",
+            "new bound edit",
+            false,
+        )
+        .unwrap();
+        assert!(store_composer_draft(&mut h, before, "late prebind edit".into()).is_err());
+        assert_eq!(h.ui.draft(&after), "new bound edit");
+        assert_eq!(
+            h.projects["workspace-a"].snapshot.drafts[0].text,
+            "new bound edit"
+        );
+    }
+    #[test]
+    fn composer_host_stale_task_draft_cannot_overwrite_current_task_text() {
+        let (mut p, assignment) = attempted();
+        let key = format!("task:{}", assignment.task.id.0);
+        set_draft(&mut p, &key, "current task draft", false).unwrap();
+        let mut h = host();
+        h.projects.insert("workspace-a".into(), p);
+        let stale = cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            session_id: Some("retired-execution".into()),
+            task_id: Some(assignment.task.id.0),
+        };
+        assert!(store_composer_draft(&mut h, stale, "stale edit".into()).is_err());
+        assert_eq!(
+            h.projects["workspace-a"]
+                .snapshot
+                .drafts
+                .iter()
+                .find(|d| d.target_key == key)
+                .unwrap()
+                .text,
+            "current task draft"
+        );
+    }
+
+    #[test]
+    fn composer_host_preserves_local_draft_during_load_and_storage_recovery() {
+        let mut h = host();
+        let mut p = project();
+        p.loaded = false;
+        p.storage_blocked = true;
+        h.projects.insert("workspace-a".into(), p);
+        let target = cc::RouteTarget {
+            workspace_id: "workspace-a".into(),
+            ..Default::default()
+        };
+        store_composer_draft(&mut h, target.clone(), "  \n가".into()).unwrap();
+        assert_eq!(h.ui.draft(&target), "  \n가");
+        assert_eq!(h.projects["workspace-a"].snapshot.drafts[0].text, "  \n가");
+        assert!(h.projects["workspace-a"].generation > 0);
+        assert!(h.inputs.is_empty());
+        assert!(h.save("workspace-a", None, None).is_err());
+        assert!(h.flight.is_none());
+        assert!(store_composer_draft(&mut h, target.clone(), "가".repeat(6000)).is_err());
+        assert_eq!(h.ui.draft(&target), "  \n가");
+    }
+    #[test]
     fn admission_only_clears_the_same_target_and_unchanged_draft() {
         let mut state = cc::UiState::default();
         let target = target();
@@ -3083,6 +3242,9 @@ mod tests {
         assert_eq!(state.draft(&target), "edited after submit");
         state.set_draft(target.clone(), "submitted".into());
         assert!(clear_admitted_draft(&mut state, &target, "submitted"));
+        assert_eq!(state.draft(&target), "");
+        state.set_draft(target.clone(), "가 goal".into());
+        assert!(clear_admitted_draft(&mut state, &target, "가 goal"));
         assert_eq!(state.draft(&target), "");
     }
     #[test]

@@ -599,6 +599,39 @@ async function flow() {
   }
   ok(refused, "view-only shell cannot construct an input message");
 
+  // The production shared view requests its exact remote task through the paired channel.
+  const remoteTarget = {workspace_id: "ws-1", session_id: "remote:original-launch", task_id: "task-remote"};
+  workProjection.projects[0].tasks = [{target: remoteTarget, title: "원격 워커", provider: "Codex",
+    state: "running", input: {enabled: true}, terminal: {enabled: true}, terminal_session_id: "s1",
+    remote_terminal: {text: "실제 원격 화면", connected: true, closed: false, cols: 80, rows: 24, status: "관측됨"}}];
+  const remoteFrame = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "work_snapshot", snapshot: workProjection})));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, remoteFrame.ciphertext, remoteFrame.sequence);
+  await waitFor(() => workHost.querySelector('[data-cc-task="task-remote"]'), "remote task projection");
+  workHost.querySelector('[data-cc-task="task-remote"]').click();
+  const beforeObservation = sent.length;
+  workHost.querySelector('[data-cc-terminal="task-remote"]').click();
+  await waitFor(() => sent.length === beforeObservation + 1, "remote observation ciphertext");
+  const observation = JSON.parse(await openFromMac(beforeObservation));
+  eq(observation.type, "cloud_control", "remote view uses existing cloud envelope");
+  eq(observation.intent.action, "command_center", "remote view uses Command Center authority");
+  eq(observation.intent.intent.type, "observe_remote_session", "only read-only view requested");
+  eq(JSON.stringify(observation.intent.intent.target), JSON.stringify(remoteTarget), "original opaque remote route preserved");
+  eq(shell.state.watching, null, "remote target never aliases offered local watch UUID");
+  ok(workHost.querySelector('[data-cc-composer]').disabled, "remote viewer cannot gain input");
+  ok(workHost.querySelector('.cc-remote-terminal').textContent.includes("실제 원격 화면"), "real remote text displayed");
+  const refresh = () => [...workHost.querySelectorAll("button")].find(button => button.textContent === "화면 새로 고침");
+  const rejectedView = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "cloud_control_result", request: observation.request, status: "rejected", ok: false})));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, rejectedView.ciphertext, rejectedView.sequence);
+  await waitFor(() => !refresh().disabled, "matching readonly rejection reaches shared view");
+  refresh().click();
+  await waitFor(() => sent.length === beforeObservation + 2, "explicit readonly refresh ciphertext");
+  const refreshed = JSON.parse(await openFromMac(beforeObservation + 1));
+  eq(refreshed.intent.intent.type, "observe_remote_session", "refresh remains read-only");
+  ok(refreshed.intent.operation_id !== observation.intent.operation_id, "explicit fresh read has a distinct operation");
+  const clearRemote = await macChannel.seal(new TextEncoder().encode(JSON.stringify({type: "work_snapshot", snapshot: null})));
+  deliver(C.FRAME_TYPE.CIPHERTEXT, connection, clearRemote.ciphertext, clearRemote.sequence);
+  await waitFor(() => workHost.hidden, "remote view closes before idle heartbeat checks");
+
   // 생존 신호: 서버는 **마지막으로 받은 DRLY 프레임** 시각으로만 유휴를 판정한다(기본 60초).
   // 이 셸은 보기 전용이라 승인 대기 5분 동안 보낼 것이 없으므로, 20초 주기의 빈 HEARTBEAT가
   // 없으면 60초에 끊기고 그 뒤의 승인은 죽은 세션에 도착한다.

@@ -63,10 +63,28 @@ import { createCommandCenterView } from "../shared/command-center.js";
 export const MIN_PROTOCOL_VERSION = 1;
 
 /// 이 셸이 **만들 수 있는** 메시지의 전부. 보기 전용 권한 행렬 그대로다.
-export const OUTBOUND_MESSAGE_TYPES = Object.freeze(["watch", "unwatch", "request_keyframe"]);
+export const OUTBOUND_MESSAGE_TYPES = Object.freeze(["watch", "unwatch", "request_keyframe", "cloud_control"]);
 
 /// 이 셸이 해석하는 수신 메시지의 전부.
-export const INBOUND_MESSAGE_TYPES = Object.freeze(["dashboard", "viewport", "cloud_snapshot", "work_snapshot"]);
+export const INBOUND_MESSAGE_TYPES = Object.freeze(["dashboard", "viewport", "cloud_snapshot", "work_snapshot", "cloud_control_result"]);
+
+// The shared Command Center may request only a read-only view of its exact remote task.
+// The paired desktop independently rechecks current View authority and the opaque route.
+function isRemoteObservation(message) {
+  const keys = (value, names) => value && !Array.isArray(value) && typeof value === "object"
+    && Object.keys(value).length === names.length && Object.keys(value).every(key => names.includes(key));
+  const identity = value => typeof value === "string" && value.length > 0
+    && new TextEncoder().encode(value).length <= 256 && !/[\u0000-\u001f\u007f-\u009f]/.test(value);
+  const control = message?.intent, intent = control?.intent, target = intent?.target;
+  return keys(message, ["type", "request", "intent"]) && message.type === "cloud_control"
+    && Number.isInteger(message.request) && message.request > 0 && message.request <= 0xffffffff
+    && keys(control, ["action", "operation_id", "intent"]) && control.action === "command_center"
+    && typeof control.operation_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(control.operation_id)
+    && keys(intent, ["type", "target"]) && intent.type === "observe_remote_session"
+    && keys(target, ["workspace_id", "session_id", "task_id"])
+    && identity(target.workspace_id) && identity(target.session_id) && identity(target.task_id)
+    && target.session_id.startsWith("remote:") && target.session_id.length > "remote:".length;
+}
 
 export const SCREEN = Object.freeze({
   BOOT: "boot",
@@ -328,7 +346,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
   /// 보기 전용 허용 목록 밖의 메시지는 **만들어질 수 없다**.
   async function sendMessage(message) {
     const type = message?.type;
-    if (!OUTBOUND_MESSAGE_TYPES.includes(type)) {
+    if (!OUTBOUND_MESSAGE_TYPES.includes(type) || (type === "cloud_control" && !isRemoteObservation(message))) {
       throw new RangeError(`이 셸이 보낼 수 없는 메시지다: ${String(type)}`);
     }
     if (state.screen !== SCREEN.SESSION) return false;
@@ -409,7 +427,7 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
     commandCenterHost.hidden = true;
     session.append(commandCenterHost);
     state.commandCenter = createCommandCenterView({
-      host: commandCenterHost, send: () => false, readOnly: true,
+      host: commandCenterHost, send: sendMessage, readOnly: true,
       watchSession(id) {
         if (!state.workspaces.some(workspace => watchable(workspace).some(view => view.id === id))) {
           state.commandCenter.open(); return false;
@@ -994,6 +1012,10 @@ export function createShell({ endpoint, socketFactory, identityStore = {loadOrCr
       return;
     }
     if (!INBOUND_MESSAGE_TYPES.includes(message?.type)) return;
+    if (message.type === "cloud_control_result") {
+      state.commandCenter?.accept(message);
+      return;
+    }
     if (message.type === "work_snapshot") {
       state.commandCenter?.accept(message);
       const center = byId("relay-command-center"), home = byId("relay-home");

@@ -213,3 +213,42 @@ test("네트워크 재시도는 다섯 번으로 제한하고 이전 socket 이�
     delete globalThis.document; delete globalThis.history; delete globalThis.location;
   }
 });
+
+test("보기 전용 지휘 터미널은 정확한 원격 화면 조회만 암호 채널에 보낸다", async () => {
+  globalThis.document = {body: {dataset: {}}, getElementById: () => null};
+  const sent = [];
+  const shell = createShell({endpoint: "wss://relay.example.test"});
+  shell.state.screen = "session";
+  shell.state.routeId = bytes(3, 16);
+  shell.state.connectionId = bytes(6, 16);
+  shell.state.channel = {closed: false, close() {},
+    seal: async plaintext => ({sequence: 0n, ciphertext: plaintext})};
+  shell.state.socket = {readyState: 1, send: frame => sent.push(C.decodeFrame(frame).frame), close() {}};
+  const observe = {type: "cloud_control", request: 0x40000000, intent: {
+    action: "command_center", operation_id: "11111111-1111-4111-8111-111111111111",
+    intent: {type: "observe_remote_session", target: {
+      workspace_id: "workspace-a", session_id: "remote:original-launch", task_id: "task-a"}}}};
+  try {
+    assert.equal(await shell.sendMessage(observe), true);
+    assert.equal(sent.length, 1);
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(sent[0].payload)), observe);
+    const denied = [
+      {...observe, request: -1}, {...observe, request: 2 ** 32},
+      {...observe, token: "extra-authority"},
+      {...observe, intent: {...observe.intent, action: "take_control"}},
+      {...observe, intent: {...observe.intent, operation_id: "invalid-operation"}},
+      ...["submit", "approval", "confirm_result", "confirm_plan", "dispatch_task", "save_project", "install_plan_json", "close_worker", "load_project"].map(type => ({
+        ...observe, intent: {...observe.intent, intent: {...observe.intent.intent, type}}})),
+      ...[{session_id: "local-watch-uuid"}, {task_id: null}, {workspace_id: "wrong\nworkspace"}, {task_id: "x".repeat(257)}, {token: "extra-authority"}].map(change => ({
+        ...observe, intent: {...observe.intent, intent: {...observe.intent.intent, target: {...observe.intent.intent.target, ...change}}}})),
+    ];
+    for (const message of denied) await assert.rejects(shell.sendMessage(message), RangeError);
+    assert.equal(sent.length, 1, "거절된 명령은 암호 채널에 도달하지 않는다");
+    shell.state.screen = "recovery";
+    assert.equal(await shell.sendMessage(observe), false, "현재 페어링 세션이 없으면 전송하지 않는다");
+    assert.equal(sent.length, 1);
+  } finally {
+    shell.dispose();
+    delete globalThis.document;
+  }
+});

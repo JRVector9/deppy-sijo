@@ -8,7 +8,6 @@ use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::{AttemptId, ConfigRevision, OperationId, TaskId};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
@@ -363,12 +362,16 @@ fn git_scalar(path: &Path, args: &[&str]) -> Result<String, TaskWorktreeError> {
 }
 
 fn record_name(job: &EnsureTaskWorktree) -> String {
-    let mut digest = Sha256::new();
-    for value in [job.workspace_id.0.as_str(), job.task_id.as_str()] {
-        digest.update((value.len() as u64).to_be_bytes());
-        digest.update(value.as_bytes());
-    }
-    format!("{:x}.json", digest.finalize())
+    // These IDs are ASCII/control-free before this function is called, so the existing digest
+    // helper's CRLF normalization cannot alias two identities. Lengths make the tuple unambiguous.
+    let identity = format!(
+        "cc-task-worktree-owner-v1:{}:{}:{}:{}",
+        job.workspace_id.0.len(),
+        job.workspace_id.0,
+        job.task_id.as_str().len(),
+        job.task_id.as_str()
+    );
+    format!("{}.json", storage::native_prompt_digest(&identity))
 }
 
 fn open_record(path: &Path) -> Result<(File, bool), TaskWorktreeError> {

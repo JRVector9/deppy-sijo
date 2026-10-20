@@ -286,6 +286,50 @@ fn composing_enter_never_submits_and_overlimit_draft_is_preserved() {
 }
 
 #[test]
+fn project_settings_button_stays_inside_header_at_large_font_scale() {
+    for width in [1440.0, 1280.0, 1000.0, 760.0, 390.0] {
+        let snapshot = Snapshot {
+            font_scale: 1.25,
+            ..fixture()
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(width, 900.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                HarnessState::default(),
+            );
+        if let Ok(font) = std::fs::read("/System/Library/Fonts/AppleSDGothicNeo.ttc") {
+            let mut fonts = egui::FontDefinitions::default();
+            fonts
+                .font_data
+                .insert("cc-cjk".into(), egui::FontData::from_owned(font).into());
+            fonts
+                .families
+                .get_mut(&egui::FontFamily::Proportional)
+                .unwrap()
+                .insert(0, "cc-cjk".into());
+            harness.ctx.set_fonts(fonts);
+        }
+        harness.run();
+        let header = harness.state().ui.last_layout.unwrap().projectbar;
+        let button = harness
+            .get_all_by_label("프로젝트 설정")
+            .find(|button| header.y_range().contains(button.rect().center().y))
+            .expect("project header settings button");
+        assert!(
+            header.contains_rect(button.rect()),
+            "width={width} header={header:?} button={:?}",
+            button.rect()
+        );
+        button.click();
+        harness.run();
+        assert_eq!(harness.state().ui.view, View::Settings);
+    }
+}
+
+#[test]
 fn rollback_is_a_visible_native_button_at_mobile_width() {
     let snapshot = fixture();
     let mut harness = egui_kittest::Harness::builder()

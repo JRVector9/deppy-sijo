@@ -1164,16 +1164,48 @@ fn projectbar(
     egui::Frame::NONE
         .inner_margin(egui::Margin::symmetric(if l.mobile { 16 } else { 24 }, 12))
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let controls = if l.mobile { 94.0 } else { 320.0 };
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if !l.mobile
+                    && !l.monitor_is_drawer
+                    && ui
+                        .button("◫")
+                        .on_hover_text(text(snapshot, "collapse_workers"))
+                        .clicked()
+                {
+                    state.monitor_collapsed = !state.monitor_collapsed;
+                }
+                if ui.button(text(snapshot, "settings")).clicked() {
+                    state.view = View::Settings;
+                    state.settings_draft = None;
+                }
+                if !l.mobile {
+                    egui::ComboBox::from_id_salt("cc-project-select")
+                        .selected_text(
+                            p.map(|p| p.name.as_str())
+                                .unwrap_or(text(snapshot, "select_project")),
+                        )
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for p in &snapshot.projects {
+                                if ui
+                                    .selectable_label(
+                                        state.active_workspace.as_ref() == Some(&p.id),
+                                        &p.name,
+                                    )
+                                    .clicked()
+                                {
+                                    intents.push(Intent::SelectProject {
+                                        workspace_id: p.id.clone(),
+                                    });
+                                }
+                            }
+                        });
+                }
                 ui.allocate_ui_with_layout(
-                    egui::vec2(
-                        (ui.available_width() - controls).max(80.0),
-                        l.projectbar.height() - 24.0,
-                    ),
+                    egui::vec2(ui.available_width(), l.projectbar.height() - 24.0),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
-                        ui.set_min_width((ui.max_rect().width()).max(80.0));
+                        ui.set_min_width(ui.max_rect().width());
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(p.map(|p| p.name.as_str()).unwrap_or("Deppy"))
@@ -1199,42 +1231,6 @@ fn projectbar(
                         }
                     },
                 );
-                if !l.mobile {
-                    egui::ComboBox::from_id_salt("cc-project-select")
-                        .selected_text(
-                            p.map(|p| p.name.as_str())
-                                .unwrap_or(text(snapshot, "select_project")),
-                        )
-                        .width(130.0)
-                        .show_ui(ui, |ui| {
-                            for p in &snapshot.projects {
-                                if ui
-                                    .selectable_label(
-                                        state.active_workspace.as_ref() == Some(&p.id),
-                                        &p.name,
-                                    )
-                                    .clicked()
-                                {
-                                    intents.push(Intent::SelectProject {
-                                        workspace_id: p.id.clone(),
-                                    });
-                                }
-                            }
-                        });
-                }
-                if ui.button(text(snapshot, "settings")).clicked() {
-                    state.view = View::Settings;
-                    state.settings_draft = None;
-                }
-                if !l.mobile
-                    && !l.monitor_is_drawer
-                    && ui
-                        .button("◫")
-                        .on_hover_text(text(snapshot, "collapse_workers"))
-                        .clicked()
-                {
-                    state.monitor_collapsed = !state.monitor_collapsed;
-                }
             });
         });
 }

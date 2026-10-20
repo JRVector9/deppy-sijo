@@ -1,0 +1,3348 @@
+{
+  "kind": "Actual offscreen egui viewport and widget geometry; not live user app evidence",
+  "source_commit": "1dd0ba7afc46a347b2340566b965304b33682f7d",
+  "render_matrix": [
+    {
+      "assignment_title": [
+        303.375,
+        433.0,
+        402.6875,
+        447.0
+      ],
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1440-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1440-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1440-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1440-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1440-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": [
+        303.375,
+        433.0,
+        402.6875,
+        447.0
+      ],
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1440-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1440-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1440-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1440-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1440-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": [
+        312.1875,
+        457.0,
+        436.3125,
+        475.0
+      ],
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1440-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1440-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1440-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1440-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1440-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": [
+        312.1875,
+        457.0,
+        436.3125,
+        475.0
+      ],
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1440-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1440-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1440-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1440-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        1130.0,
+        48.0,
+        1440.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1440.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1440-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1440.0,
+        900.0
+      ],
+      "width": 1440.0
+    },
+    {
+      "assignment_title": [
+        303.375,
+        433.0,
+        402.6875,
+        447.0
+      ],
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1280-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1280-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1280-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1280-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1280-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": [
+        303.375,
+        433.0,
+        402.6875,
+        447.0
+      ],
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1280-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1280-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1280-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1280-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1280-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": [
+        312.1875,
+        478.0,
+        436.3125,
+        496.0
+      ],
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1280-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1280-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1280-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1280-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1280-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": [
+        312.1875,
+        478.0,
+        436.3125,
+        496.0
+      ],
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1280-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1280-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1280-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1280-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        970.0,
+        48.0,
+        1280.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1280.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1280-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1280.0,
+        900.0
+      ],
+      "width": 1280.0
+    },
+    {
+      "assignment_title": [
+        279.375,
+        427.0,
+        378.6875,
+        441.0
+      ],
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        279.375,
+        427.0,
+        378.6875,
+        441.0
+      ],
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "workers-1000-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        279.375,
+        427.0,
+        378.6875,
+        441.0
+      ],
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        279.375,
+        427.0,
+        378.6875,
+        441.0
+      ],
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "workers-1000-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        288.1875,
+        472.0,
+        412.3125,
+        490.0
+      ],
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        288.1875,
+        472.0,
+        412.3125,
+        490.0
+      ],
+      "dark": true,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "workers-1000-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        288.1875,
+        472.0,
+        412.3125,
+        490.0
+      ],
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "main-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "settings-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "empty-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "no-project-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "devices-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        288.1875,
+        472.0,
+        412.3125,
+        490.0
+      ],
+      "dark": false,
+      "drawer": [
+        690.0,
+        48.0,
+        1000.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        1000.0,
+        48.0
+      ],
+      "height": 900.0,
+      "name": "workers-1000-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        1000.0,
+        900.0
+      ],
+      "width": 1000.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "main-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "settings-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "empty-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "no-project-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "devices-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "workers-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "projects-760-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "main-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "settings-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "empty-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "no-project-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "devices-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "workers-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        66.375,
+        403.0,
+        165.6875,
+        417.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "projects-760-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "main-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "settings-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "empty-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "no-project-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "devices-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "workers-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": true,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "projects-760-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "main-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "settings-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "empty-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "no-project-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "devices-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "workers-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        75.1875,
+        448.0,
+        199.3125,
+        466.0
+      ],
+      "dark": false,
+      "drawer": [
+        430.0,
+        46.0,
+        760.0,
+        878.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        760.0,
+        46.0
+      ],
+      "height": 900.0,
+      "name": "projects-760-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        760.0,
+        900.0
+      ],
+      "width": 760.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "main-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "settings-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "empty-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "no-project-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "devices-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "workers-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "projects-390-dark-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "main-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "settings-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "empty-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "no-project-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "devices-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "workers-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        32.78125,
+        461.0,
+        132.09375,
+        475.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "projects-390-light-font100",
+      "scale": 1.0,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "main-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "settings-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "empty-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "no-project-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "devices-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "workers-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": true,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "projects-390-dark-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "main-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "settings-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "empty-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "no-project-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": null,
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "devices-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "workers-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    },
+    {
+      "assignment_title": [
+        35.21875,
+        537.0,
+        159.34375,
+        555.0
+      ],
+      "dark": false,
+      "drawer": [
+        60.0,
+        46.0,
+        390.0,
+        822.0
+      ],
+      "header": [
+        0.0,
+        0.0,
+        390.0,
+        46.0
+      ],
+      "height": 844.0,
+      "name": "projects-390-light-font125",
+      "scale": 1.25,
+      "screen": [
+        0.0,
+        0.0,
+        390.0,
+        844.0
+      ],
+      "width": 390.0
+    }
+  ],
+  "pixel_assignment_separators": {
+    "image": "main-1440-dark-font100.png",
+    "x_scan": [
+      282,
+      1086
+    ],
+    "separator_rgb": [
+      48,
+      52,
+      61
+    ],
+    "y": [
+      421,
+      483,
+      545,
+      623
+    ],
+    "first_two_row_pitch": [
+      62,
+      62
+    ]
+  }
+}

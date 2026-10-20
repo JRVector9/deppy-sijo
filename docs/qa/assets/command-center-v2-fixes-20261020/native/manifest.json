@@ -1,0 +1,58 @@
+{
+  "kind": "Native fixes evidence from real app Cargo tests, never app launch",
+  "source_commit": "1dd0ba7afc46a347b2340566b965304b33682f7d",
+  "source_sha256": {
+    "crates/app/src/ui/command_center/devices.rs": "1dd01048683384f2a7676d75cddc2a799e5456ba7de76db1610d1737e538574c",
+    "crates/app/src/ui/command_center/layout.rs": "72125b3fb5d84347336cf11d16ee1835ce2de51d988551efe36d5e6d213f010e",
+    "crates/app/src/ui/command_center/main.rs": "e99d3a196c2bcb4ebf5fe2b511f660ebb162d7127976d88346a140f563029b8b",
+    "crates/app/src/ui/command_center/mod.rs": "7018fd0e39cb9e68cb33d0eead0f53b28ca8ba9f3e52aec14e4b4172e5d38929",
+    "crates/app/src/ui/command_center/server.rs": "1811d4386f1e3d599469ddd6a44354405102f6e7bbbb1b92f2b37e09f2b2932d",
+    "crates/app/src/ui/command_center/settings.rs": "20730725c43ba495896a623241de6e6e572b3fbe60049f3cd6c6a2105389b27e",
+    "crates/app/src/ui/command_center/tests.rs": "1785719d9922f1978046ca1156058bff6fa8603dfd3168b04018d6e2851c9a30",
+    "crates/app/src/ui/command_center/workers.rs": "7f23dea55a7865e41efab2ee7a3d0fca595354a1a13e8511e8893cf0c8010608"
+  },
+  "png_sha256": {
+    "main-1440-dark-font100.png": "1ad4a1c0ac590d16c6b5e17e9f95c1ca89f8937bf98f11b7c78a5b46cce3fbfc",
+    "main-1280-dark-font125.png": "c35030d9eafcc9b41ec5858c45edd411029dc67cd9901d61be82c7a427769108",
+    "main-390-dark-font100.png": "9c72b3b39baa8cfa88f2cfd8230e911d8b748ffee83f4122866de847a0d184fc",
+    "workers-1000-light-font100.png": "1c8fcc974d935b2e3663826fbcaad28a9c160ca61e53d97b887ecb9111b2cf9e",
+    "workers-390-dark-font125.png": "4a10b1c6aeda1e908044c869bb73d5823456a184369d65563b8f2e550eb86c71",
+    "settings-1440-dark-font100.png": "120f6e013f0514d33532c7c05cfb426d6f13a100082b3b50caa463164f44a676",
+    "settings-390-light-font125.png": "c93ddf5310301720f7d79c0b632311ae696aca2af0a7e1fb0807601914080d1c",
+    "devices-390-light-font125.png": "40d81e7f2de0c230e9b9f29ce383a6d0758704634ee9d755b2305762b6640fd8",
+    "empty-390-light-font125.png": "8cfaa4ccc2a9407337062959f6e57a225a3442069c60c014e4797289bd85ed1f",
+    "no-project-390-light-font125.png": "063e3e17bcf34afcd84e327d889da6d3ad040f549d2f50a5817c07ec149a1a12"
+  },
+  "geometry_sha256": "9ebeef86f818b010964e3ed21bad6592b197fa06c8aae9002150f77b4e7f8ea9",
+  "tests": {
+    "focused_cargo": {
+      "passed": 24,
+      "failed": 0,
+      "ignored": 1,
+      "filtered": 3472
+    },
+    "offscreen_cargo": {
+      "passed": 1,
+      "failed": 0,
+      "filtered": 3496,
+      "png_count": 120
+    }
+  },
+  "rendered_at_widths": [
+    1440,
+    1280,
+    1000,
+    760,
+    390
+  ],
+  "font_scales": [
+    1,
+    1.25
+  ],
+  "themes": [
+    "dark",
+    "light"
+  ],
+  "full_private_evidence": "/private/tmp/deppy-cc-native-fix-20261020/screenshots-final",
+  "transient_standalone_host_change": "Uncommitted cc::Project initializer pending_approvals: vec![] only; root integration supplies actual exact request projection. No product host semantics claimed here."
+}

@@ -1,27 +1,16 @@
 //! Bounded compute registrations. A Relay viewer is never an execution grant.
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::{AgentSelection, AttemptId, OperationId, RuntimeIncarnationId};
-use std::net::SocketAddr;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+pub use storage::work_management::RegisteredExecutionDevice as RegisteredDevice;
 
 pub const EXECUTION_DEVICE_MAX: usize = 32;
 pub const EXECUTION_PROFILE_MAX: usize = 32;
 pub const EXECUTION_LEASE_MAX: usize = 256;
 pub const EXECUTION_FRESHNESS_MS: u64 = 30_000;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisteredDevice {
-    pub id: String,
-    pub name: String,
-    pub endpoint: SocketAddr,
-    pub pinned_fingerprint: String,
-    pub workspace_id: WorkspaceId,
-    pub folder: String,
-    pub folder_anchor: String,
-    pub allowed_agents: Vec<AgentSelection>,
-    pub max_workers: u8,
-    pub grant_epoch: u64,
-    pub execution_granted: bool,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerProfile {
@@ -65,6 +54,48 @@ pub struct ExecutionLease {
     pub lease_epoch: u64,
     pub connection_epoch: u64,
     pub incarnation: RuntimeIncarnationId,
+}
+
+/// Read-only proof minted from an exact trusted connection, never from UI fields.
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedExecutionDevice {
+    registration: RegisteredDevice,
+    profiles: Vec<WorkerProfile>,
+    observed_at: std::time::Instant,
+    fence: Arc<AtomicBool>,
+}
+impl VerifiedExecutionDevice {
+    pub(crate) fn registration(&self) -> &RegisteredDevice {
+        &self.registration
+    }
+    pub(crate) fn profiles(&self) -> &[WorkerProfile] {
+        &self.profiles
+    }
+    pub(crate) fn validate_fresh(&self) -> Result<(), DeviceUnavailable> {
+        (self.fence.load(Ordering::Acquire)
+            && self.observed_at.elapsed()
+                <= std::time::Duration::from_millis(EXECUTION_FRESHNESS_MS))
+        .then_some(())
+        .ok_or(DeviceUnavailable::Stale)
+    }
+}
+#[derive(Debug, Clone)]
+pub(crate) struct VerifiedExecutionLease {
+    lease: ExecutionLease,
+    observed_at: std::time::Instant,
+    fence: Arc<AtomicBool>,
+}
+impl VerifiedExecutionLease {
+    pub(crate) fn lease(&self) -> &ExecutionLease {
+        &self.lease
+    }
+    pub(crate) fn validate_fresh(&self) -> Result<(), DeviceUnavailable> {
+        (self.fence.load(Ordering::Acquire)
+            && self.observed_at.elapsed()
+                <= std::time::Duration::from_millis(EXECUTION_FRESHNESS_MS))
+        .then_some(())
+        .ok_or(DeviceUnavailable::Stale)
+    }
 }
 
 impl ExecutionLease {
@@ -114,13 +145,15 @@ pub struct DeviceView {
     pub profiles: Vec<WorkerProfile>,
 }
 
+#[derive(Clone)]
 struct DeviceEntry {
     registration: RegisteredDevice,
     observation: Option<(WorkerObservation, u64)>,
     disconnected_through: u64,
+    fence: Arc<AtomicBool>,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct DeviceRegistry {
     entries: Vec<DeviceEntry>,
     leases: Vec<ExecutionLease>,
@@ -128,6 +161,68 @@ pub struct DeviceRegistry {
 }
 
 impl DeviceRegistry {
+    pub(crate) fn verified_devices(
+        &self,
+        workspace: &WorkspaceId,
+        now_ms: u64,
+    ) -> Vec<VerifiedExecutionDevice> {
+        self.entries
+            .iter()
+            .filter(|e| e.registration.workspace_id == *workspace)
+            .filter_map(|e| {
+                let proof = fresh_observation(e, now_ms).ok()?;
+                let age = now_ms.checked_sub(e.observation.as_ref()?.1)?;
+                Some(VerifiedExecutionDevice {
+                    registration: e.registration.clone(),
+                    fence: Arc::clone(&e.fence),
+                    profiles: proof
+                        .profiles
+                        .iter()
+                        .filter(|p| e.registration.allowed_agents.contains(&p.agent))
+                        .cloned()
+                        .collect(),
+                    observed_at: std::time::Instant::now()
+                        .checked_sub(std::time::Duration::from_millis(age))?,
+                })
+            })
+            .collect()
+    }
+    pub(crate) fn verified_lease(
+        &self,
+        lease: &ExecutionLease,
+        now_ms: u64,
+    ) -> Result<VerifiedExecutionLease, DeviceUnavailable> {
+        self.validate_lease(lease, now_ms)?;
+        let entry = self
+            .entries
+            .iter()
+            .find(|e| e.registration.id == lease.request.device_id)
+            .ok_or(DeviceUnavailable::Missing)?;
+        let (_, observed) = entry
+            .observation
+            .as_ref()
+            .ok_or(DeviceUnavailable::Missing)?;
+        let age = now_ms
+            .checked_sub(*observed)
+            .ok_or(DeviceUnavailable::Stale)?;
+        Ok(VerifiedExecutionLease {
+            lease: lease.clone(),
+            fence: Arc::clone(&entry.fence),
+            observed_at: std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(age))
+                .ok_or(DeviceUnavailable::Stale)?,
+        })
+    }
+    pub fn revoke(&mut self, id: &str) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.registration.id == id) {
+            entry.fence.store(false, Ordering::Release);
+            entry.registration.execution_granted = false;
+            entry.observation = None;
+            true
+        } else {
+            false
+        }
+    }
     pub fn register_viewer(
         &mut self,
         id: String,
@@ -162,6 +257,7 @@ impl DeviceRegistry {
             .iter_mut()
             .find(|e| e.registration.id == device)
         {
+            entry.fence.store(false, Ordering::Release);
             entry.disconnected_through = entry.disconnected_through.max(connection_epoch);
             if entry
                 .observation
@@ -281,6 +377,7 @@ impl DeviceRegistry {
             if device.grant_epoch <= entry.registration.grant_epoch {
                 return Err(DeviceUnavailable::Conflict);
             }
+            entry.fence.store(false, Ordering::Release);
             entry.registration = device;
             entry.observation = None;
             return Ok(());
@@ -292,6 +389,7 @@ impl DeviceRegistry {
             registration: device,
             observation: None,
             disconnected_through: 0,
+            fence: Arc::new(AtomicBool::new(false)),
         });
         Ok(())
     }
@@ -358,6 +456,23 @@ impl DeviceRegistry {
             {
                 return Err(DeviceUnavailable::Conflict);
             }
+        }
+        let same_identity = entry.observation.as_ref().is_some_and(|(previous, _)| {
+            previous.device_id == proof.device_id
+                && previous.pinned_fingerprint == proof.pinned_fingerprint
+                && previous.connection_epoch == proof.connection_epoch
+                && previous.incarnation == proof.incarnation
+                && previous.workspace_id == proof.workspace_id
+                && previous.folder == proof.folder
+                && previous.folder_anchor == proof.folder_anchor
+                && previous.grant_epoch == proof.grant_epoch
+                && previous.lease_epoch == proof.lease_epoch
+                && previous.profiles == proof.profiles
+                && previous.max_workers == proof.max_workers
+        });
+        if !same_identity {
+            entry.fence.store(false, Ordering::Release);
+            entry.fence = Arc::new(AtomicBool::new(true));
         }
         entry.observation = Some((proof, now_ms));
         Ok(())
@@ -451,6 +566,9 @@ fn valid_folder(value: &str) -> bool {
 }
 
 fn validate_registration(device: &RegisteredDevice) -> Result<(), DeviceUnavailable> {
+    if device.validate().is_err() {
+        return Err(DeviceUnavailable::Invalid);
+    }
     let fingerprint = device.pinned_fingerprint.as_bytes();
     let valid_pin = fingerprint.len() == 95
         && fingerprint.iter().enumerate().all(|(i, b)| {
@@ -551,6 +669,44 @@ mod tests {
             folder: device.folder.clone(),
             agent: device.allowed_agents[0].clone(),
         }
+    }
+    #[test]
+    fn verified_device_and_lease_clones_are_revoked_by_live_registry_changes() {
+        let mut registry = DeviceRegistry::default();
+        let device = registration();
+        registry.register(device.clone()).unwrap();
+        registry.observe(proof(&device), 10).unwrap();
+        let policy = registry
+            .verified_devices(&device.workspace_id, 10)
+            .remove(0);
+        assert_eq!(policy.registration(), &device);
+        assert_eq!(policy.profiles()[0].agent, device.allowed_agents[0]);
+        let lease = registry.reserve(request(&device), 10).unwrap();
+        let verified = registry.verified_lease(&lease, 10).unwrap();
+        assert_eq!(verified.lease(), &lease);
+        let duplicate = verified.clone();
+        assert!(policy.validate_fresh().is_ok());
+        assert!(verified.validate_fresh().is_ok());
+        let mut heartbeat = proof(&device);
+        heartbeat.active_workers = 1;
+        heartbeat.active_operation_ids = vec![lease.request.operation_id.clone()];
+        registry.observe(heartbeat, 11).unwrap();
+        assert!(
+            policy.validate_fresh().is_ok(),
+            "capacity heartbeat cannot retire an unchanged identity"
+        );
+        assert!(duplicate.validate_fresh().is_ok());
+        registry.disconnect(&device.id, 1);
+        assert!(policy.validate_fresh().is_err());
+        assert!(duplicate.validate_fresh().is_err());
+        let mut observed = proof(&device);
+        observed.connection_epoch = 2;
+        registry.observe(observed, 20).unwrap();
+        let policy = registry
+            .verified_devices(&device.workspace_id, 20)
+            .remove(0);
+        registry.revoke(&device.id);
+        assert!(policy.validate_fresh().is_err());
     }
     #[test]
     fn registered_compute_requires_exact_fresh_proof_and_reserves_capacity() {

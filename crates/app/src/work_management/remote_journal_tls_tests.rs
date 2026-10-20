@@ -78,6 +78,13 @@ impl RemoteWorkLauncher for Launcher {
     }
 }
 fn worker(root: &Path, id: &str) -> (RemoteRuntimeServer, String) {
+    worker_for_workspace(root, id, &format!("workspace-{id}"))
+}
+pub(crate) fn worker_for_workspace(
+    root: &Path,
+    id: &str,
+    workspace: &str,
+) -> (RemoteRuntimeServer, String) {
     std::fs::create_dir_all(root).unwrap();
     std::fs::write(root.join("metadata.sqlite3"), b"legacy untouched").unwrap();
     let backend = InProcessRuntimeClient::try_new_with_resolver(
@@ -101,7 +108,7 @@ fn worker(root: &Path, id: &str) -> (RemoteRuntimeServer, String) {
             RemoteWorkerHost::new(
                 RemoteWorkerConfig {
                     device_id: id.into(),
-                    workspace_id: WorkspaceId(format!("workspace-{id}")),
+                    workspace_id: WorkspaceId(workspace.into()),
                     folder: root.to_path_buf(),
                     grant_epoch: 1,
                     max_workers: 2,

@@ -11,6 +11,7 @@ pub(crate) mod observation;
 pub use reducer::{ApplyOutcome, ProjectWorkState};
 
 pub(crate) mod devices;
+pub(crate) mod remote_controller;
 pub(crate) mod remote_execution;
 pub(crate) mod repository_worker;
 #[cfg(test)]

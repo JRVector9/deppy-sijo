@@ -185,27 +185,53 @@ mod tests {
     }
     #[test]
     fn work_devices_upgrade_verified_v2_and_reject_corrupt_rows() {
-        let root = std::env::temp_dir().join(format!("deppy-device-upgrade-{}", uuid::Uuid::new_v4()));
+        let root =
+            std::env::temp_dir().join(format!("deppy-device-upgrade-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let main = root.join("metadata.sqlite3");
         std::fs::write(&main, b"unchanged legacy bytes").unwrap();
-        let conn = rusqlite::Connection::open(root.join(super::super::COMMAND_CENTER_FILE_NAME)).unwrap();
+        let conn =
+            rusqlite::Connection::open(root.join(super::super::COMMAND_CENTER_FILE_NAME)).unwrap();
         conn.execute_batch(super::super::SCHEMA).unwrap();
         conn.execute_batch(super::super::REMOTE_SCHEMA).unwrap();
-        conn.execute("UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1", rusqlite::params![super::super::schema_digest(&conn).unwrap(),super::super::source_digest(2)]).unwrap();
-        conn.pragma_update(None,"application_id",super::super::APPLICATION_ID).unwrap();
-        conn.pragma_update(None,"user_version",2).unwrap();
+        conn.execute(
+            "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
+            rusqlite::params![
+                super::super::schema_digest(&conn).unwrap(),
+                super::super::source_digest(2)
+            ],
+        )
+        .unwrap();
+        conn.pragma_update(None, "application_id", super::super::APPLICATION_ID)
+            .unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
         drop(conn);
         let mut store = CommandCenterStore::open(&root).unwrap();
         let device = device();
-        store.save_execution_device(&device,"worker-secret",None).unwrap();
+        store
+            .save_execution_device(&device, "worker-secret", None)
+            .unwrap();
         let mut invalid = device.clone();
         invalid.allowed_agents = vec![];
-        assert!(store.save_execution_device(&invalid,"worker-secret",Some(1)).is_err());
-        assert!(store.save_execution_device(&device,"x".repeat(129).as_str(),Some(1)).is_err());
-        store.conn.execute("UPDATE work_execution_devices SET body=?1",[br#"{}"#.as_slice()]).unwrap();
+        assert!(
+            store
+                .save_execution_device(&invalid, "worker-secret", Some(1))
+                .is_err()
+        );
+        assert!(
+            store
+                .save_execution_device(&device, "x".repeat(129).as_str(), Some(1))
+                .is_err()
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE work_execution_devices SET body=?1",
+                [br#"{}"#.as_slice()],
+            )
+            .unwrap();
         assert!(store.load_execution_devices(&device.workspace_id).is_err());
-        assert_eq!(std::fs::read(main).unwrap(),b"unchanged legacy bytes");
+        assert_eq!(std::fs::read(main).unwrap(), b"unchanged legacy bytes");
         drop(store);
         std::fs::remove_dir_all(root).unwrap();
     }

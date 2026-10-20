@@ -18,7 +18,7 @@ enum JobKind {
 
 #[cfg(all(test, unix))]
 #[path = "remote_journal_tls_tests.rs"]
-mod tls_tests;
+pub(crate) mod tls_tests;
 struct Job {
     identity: RemoteOperationIdentity,
     kind: JobKind,

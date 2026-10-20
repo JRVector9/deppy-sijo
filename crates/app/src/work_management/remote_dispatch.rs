@@ -1069,7 +1069,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_connection_or_lease_epoch_invalidates_an_inflight_proof() {
+    fn changed_connection_or_grant_epoch_invalidates_an_inflight_proof() {
         for connection_change in [false, true] {
             let mut fixture = Fixture::new();
             let confirmed = fixture.confirm();
@@ -1083,9 +1083,18 @@ mod tests {
             if connection_change {
                 observation.connection_epoch += 1;
             } else {
-                observation.lease_epoch += 1;
+                fixture.device.grant_epoch += 1;
+                fixture.registry.register(fixture.device.clone()).unwrap();
+                observation.grant_epoch = fixture.device.grant_epoch;
             }
             fixture.registry.observe(observation, 11).unwrap();
+            assert!(lease.validate_fresh().is_err());
+            assert!(
+                fixture
+                    .registry
+                    .verified_execution_lease(lease.lease(), 11)
+                    .is_err()
+            );
             assert!(
                 prepare_remote_dispatch(
                     &fixture.state,
@@ -1100,6 +1109,64 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn capacity_epoch_expires_initial_launch_lease_but_preserves_exact_existing_execution() {
+        let mut fixture = Fixture::new();
+        let confirmed = fixture.confirm();
+        let lease = fixture.lease(0);
+        let (_, _, mut observation) = registry(
+            fixture.state.workspace_id.clone(),
+            "/remote/project",
+            1,
+            "approved-profile",
+        );
+        observation.lease_epoch += 1;
+        observation.active_workers = 1;
+        observation.active_operation_ids = vec![lease.lease().request.operation_id.clone()];
+        fixture.registry.observe(observation, 11).unwrap();
+
+        // A capacity update cannot authorize a new launch with the old reservation.
+        assert_eq!(
+            fixture.registry.validate_lease(lease.lease(), 11),
+            Err(super::super::devices::DeviceUnavailable::Conflict)
+        );
+        assert!(fixture.registry.verified_lease(lease.lease(), 11).is_err());
+        // The exact already-launched execution still owns its operation and input target.
+        let execution = fixture
+            .registry
+            .verified_execution_lease(lease.lease(), 11)
+            .unwrap();
+        assert_eq!(execution.lease(), lease.lease());
+        assert!(lease.validate_fresh().is_ok());
+        let before = format!("{:?}", fixture.state);
+        let prepared = ready(
+            prepare_remote_dispatch(
+                &fixture.state,
+                &DeliveryLedger::default(),
+                &confirmed,
+                fixture.request(&execution, 0),
+                execution.lease().request.attempt_id.clone(),
+                &fixture.config,
+                &fixture.policy,
+                &execution,
+            )
+            .unwrap(),
+        );
+        assert_eq!(format!("{:?}", fixture.state), before);
+        assert_eq!(
+            prepared.assignment.attempt.id,
+            lease.lease().request.attempt_id
+        );
+        assert_eq!(
+            prepared.assignment.attempt.operation_id,
+            lease.lease().request.operation_id
+        );
+        assert_eq!(
+            prepared.assignment.attempt.runtime_binding,
+            Some(fixture.request(&execution, 0).runtime_binding)
+        );
     }
 
     #[test]

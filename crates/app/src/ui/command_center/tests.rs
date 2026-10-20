@@ -1,5 +1,5 @@
 use super::*;
-use egui_kittest::kittest::Queryable;
+use egui_kittest::kittest::{NodeT, Queryable};
 
 #[test]
 fn approved_desktop_geometry_and_narrow_drawers() {
@@ -608,4 +608,44 @@ fn plan_review_assignment_picker_emits_exact_native_profile_and_revision() {
         serde_json::to_value(intent).is_err(),
         "native trust assignment cannot arrive as unauthenticated JSON"
     );
+}
+
+#[test]
+fn verification_failed_retry_uses_host_capability_and_exact_task() {
+    for enabled in [true, false] {
+        let mut snapshot = rich_fixture();
+        let task = &mut snapshot.projects[0].tasks[0];
+        task.state = TaskState::VerificationFailed;
+        task.device = "remote TLS worker".into();
+        task.eligible_sessions.clear();
+        task.create_worker = Capability {
+            enabled,
+            reason: "host admission reason".into(),
+        };
+        let target = task.target.clone();
+        let mut initial = HarnessState::default();
+        initial.ui.open_task(target.clone());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1000.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                initial,
+            );
+        harness.run();
+        let retry = harness.get_by_label("새 워커 생성 후 배정");
+        assert_eq!(!retry.accesskit_node().is_disabled(), enabled);
+        if enabled {
+            retry.click();
+        }
+        harness.run();
+        assert_eq!(
+            harness
+                .state()
+                .intents
+                .contains(&Intent::CreateWorker { target }),
+            enabled
+        );
+    }
 }

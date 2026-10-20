@@ -1,0 +1,41 @@
+{
+  "source_commit": "e93ab90297c19b6974459b94bceff2a3e4f02d97",
+  "shared_browser": {
+    "ok": true,
+    "checks": 150,
+    "widths": [
+      390,
+      760,
+      1280,
+      1440
+    ],
+    "themes": [
+      "dark",
+      "light"
+    ]
+  },
+  "shared_cdp_js_console_events": [],
+  "production_relay_cdp_js_console_events": [],
+  "production_window_errors": {
+    "captured": null,
+    "window": []
+  },
+  "production_drawer": {
+    "inside": true,
+    "dialog": "true",
+    "closed": true
+  },
+  "production_fixture": {
+    "status": "ok",
+    "marker": "COMMAND_CENTER_SHELL_OK:16"
+  },
+  "relay_fixture": {
+    "status": "ok",
+    "marker": "RELAY_SHELL_OK"
+  },
+  "captured_console_events": [
+    "Runtime.exceptionThrown",
+    "Runtime.consoleAPICalled error/assert/warning"
+  ],
+  "scope": "Installed isolated Chrome, actual production concatenation and encrypted Relay fixture; no user app/provider/physical device."
+}

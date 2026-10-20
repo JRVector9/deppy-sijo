@@ -1,0 +1,123 @@
+{
+  "source_commits": [
+    "995493fefad29925016bc2ce3617b8f6ea676a9f",
+    "e93ab90297c19b6974459b94bceff2a3e4f02d97"
+  ],
+  "approved_source": {
+    "path": "docs/mockups/multi-agent-command-center-v2-2026-10-20.html",
+    "sha256": "17025c009526c4926b5cabdc4e62ab071cf314bcda921b23a0edb38070dd1d54"
+  },
+  "capture_mapping": {
+    "approved-main-1440-dark.png": "approved-1440-dark-font1.png",
+    "shared-main-1440-dark.png": "shared-1440-dark-font1.png",
+    "approved-main-1440-light.png": "approved-1440-light-font1.png",
+    "shared-main-1440-light.png": "shared-1440-light-font1.png",
+    "approved-main-390-dark.png": "approved-390-dark-font1.png",
+    "shared-main-390-dark.png": "shared-390-dark-font1.png",
+    "approved-main-390-light.png": "approved-390-light-font1.png",
+    "shared-main-390-light.png": "shared-390-light-font1.png",
+    "approved-monitor-1280-dark.png": "approved-monitor-1280-dark-font1.png",
+    "shared-monitor-1280-dark.png": "monitor-1280-dark-font1.png",
+    "approved-drawer-760-light-font1.png": "approved-monitor-760-light-font1.png",
+    "shared-drawer-760-light-font1.25.png": "monitor-760-light-font1.25.png",
+    "production-main-390-dark-font1.25.png": "production-390-dark-font1.25.png",
+    "relay-main-1440-light-font1.25.png": "relay-1440-light-font1.25.png"
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "sha256": "f2807dbd790bac2704115b5e98f909ec0aaf1d684d9f5bb7281dc86d4512731d",
+      "bytes": 5969
+    },
+    {
+      "path": "approved-drawer-760-light-font1.png",
+      "sha256": "7bcd4cb11b031ebb7ea6deea4f628a5510c57fd9608606f81a7998df7d142617",
+      "bytes": 108148
+    },
+    {
+      "path": "approved-main-1440-dark.png",
+      "sha256": "d19a21b63f598cf8038103be21045b6f58c3cf5fc7ea69d62376bb3516bccb64",
+      "bytes": 169320
+    },
+    {
+      "path": "approved-main-1440-light.png",
+      "sha256": "6f464478e3c232ad6775efc4316a9a707286d5b2f7605eaceec4b287aa36ce83",
+      "bytes": 167678
+    },
+    {
+      "path": "approved-main-390-dark.png",
+      "sha256": "8bdbc5ebba4c3924aebaf0caad532b90e8f58159aeeb1c975a3d8fd1174c578b",
+      "bytes": 68100
+    },
+    {
+      "path": "approved-main-390-light.png",
+      "sha256": "7fe4649e83eb04d329d768adf523a9e926fc76b3f66b034d74ca1c0499357ed9",
+      "bytes": 66040
+    },
+    {
+      "path": "approved-monitor-1280-dark.png",
+      "sha256": "0c51647bc4c9d62ef4c6a21f9332d99d94de815fb4ee34d45f9811820d2a250e",
+      "bytes": 167049
+    },
+    {
+      "path": "browser-results.json",
+      "sha256": "2a252b91b781592fa6b0bca53d52611ad516273f3674939f318d309d3b8443b0",
+      "bytes": 929
+    },
+    {
+      "path": "matched-matrix.json",
+      "sha256": "ade61b88bf8e6407626eec12d848b593774b6674de6c1e7f394b8e2a7f930d24",
+      "bytes": 84550
+    },
+    {
+      "path": "matched-snapshot.json",
+      "sha256": "cd67012316013b61342df1d9bcc3d11380db9d27754a451e66619e48edc01ccd",
+      "bytes": 10709
+    },
+    {
+      "path": "production-main-390-dark-font1.25.png",
+      "sha256": "221cf29ffd9a4b1ce6405cebdda2d05118f7e4fd514edc971185de8977b23ac4",
+      "bytes": 74688
+    },
+    {
+      "path": "production-relay-matrices.json",
+      "sha256": "a046d8759db14b49bd58bbc5cc66e35c79e15c79f7a52be8b8580395d4a4e0aa",
+      "bytes": 21705
+    },
+    {
+      "path": "relay-main-1440-light-font1.25.png",
+      "sha256": "2d5a211d0296b1e0fbcf034b932dfbd087ea8da70c269e438ea7e3c8ac6b9130",
+      "bytes": 173171
+    },
+    {
+      "path": "shared-drawer-760-light-font1.25.png",
+      "sha256": "49b82efd396a36d0240b483fe816f5613c7768e24ea2368b55bf3633c83cd7f2",
+      "bytes": 122132
+    },
+    {
+      "path": "shared-main-1440-dark.png",
+      "sha256": "0caa515a63ddc9e417fb1902609de887cf641a240913044996d5642a3c20baa0",
+      "bytes": 148341
+    },
+    {
+      "path": "shared-main-1440-light.png",
+      "sha256": "eba3b1948791fb6ec9318d175de621e3b30117629b8d0399d52d283ef08dbc24",
+      "bytes": 146634
+    },
+    {
+      "path": "shared-main-390-dark.png",
+      "sha256": "174463f9a4001cb873d4b88d5be8690c2a28fc6546c28017a73230e495cbaac8",
+      "bytes": 63642
+    },
+    {
+      "path": "shared-main-390-light.png",
+      "sha256": "6c9e7f2b655e09f3f7cbdade16aa448ba60fd1b80b0e4c43d6dd62ab3c0ea4c1",
+      "bytes": 61798
+    },
+    {
+      "path": "shared-monitor-1280-dark.png",
+      "sha256": "70fecfa5fc6e33221772bba10f461927f587fa401635e6a6417fb926cb3c60b0",
+      "bytes": 146242
+    }
+  ]
+}

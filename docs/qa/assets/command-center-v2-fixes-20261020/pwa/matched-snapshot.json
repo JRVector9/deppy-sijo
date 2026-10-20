@@ -1,0 +1,382 @@
+{
+  "projects": [
+    {
+      "id": "nomorevibe",
+      "name": "nomorevibe",
+      "directory": "~/projects/nomorevibe",
+      "loaded": true,
+      "goal": "모바일 결제 화면을 개선하고, 리뷰와 동작 검증까지 진행해 줘.",
+      "main_summary": "메인이 구현·리뷰·검증으로 작업을 나눴습니다.\nClaude가 이 Mac에서 결제 화면을 수정하고 있습니다.\nCodex가 gpu3090에서 리뷰 결과를 보냈습니다.",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "nomorevibe",
+        "session_id": "main-nomorevibe",
+        "task_id": null
+      },
+      "main_provider": "Codex",
+      "main_model": "GPT-6.1-Sol",
+      "main_effort": "xhigh",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [
+        {
+          "title": "메인 Codex",
+          "provider": "Codex",
+          "model": "GPT-6.1-Sol",
+          "effort": "xhigh",
+          "device": "이 Mac",
+          "state": "running",
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "main-nomorevibe",
+            "task_id": null
+          },
+          "terminal_session_id": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "tasks": [
+        {
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-ui",
+            "task_id": "ui"
+          },
+          "title": "결제 화면 구현",
+          "role": "구현",
+          "scope": "결제 요약·버튼·좁은 화면",
+          "acceptance_criteria": "변경과 결과를 제출",
+          "provider": "Claude",
+          "device": "이 Mac",
+          "directory": ".worktrees/ui",
+          "state": "running",
+          "activity": "결제 요약과 버튼 간격을 수정하고 있습니다.",
+          "observed_at": "14:21",
+          "result": null,
+          "result_revision": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": "이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다."
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "approval": null,
+          "terminal_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        {
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-review",
+            "task_id": "review"
+          },
+          "title": "독립 코드 리뷰",
+          "role": "리뷰",
+          "scope": "변경 범위·예외 처리 검토",
+          "acceptance_criteria": "변경과 결과를 제출",
+          "provider": "Codex",
+          "device": "gpu3090",
+          "directory": ".worktrees/review",
+          "state": "awaiting_user_confirmation",
+          "activity": "중복 제출과 실패 응답 처리 검토를 마쳤습니다.",
+          "observed_at": "14:24",
+          "result": "중복 제출과 실패 응답 처리 검토를 마쳤습니다.",
+          "result_revision": "1",
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": "이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다."
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": true,
+            "reason": ""
+          },
+          "approval": null,
+          "terminal_session_id": "22222222-2222-4222-8222-222222222222"
+        },
+        {
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-test",
+            "task_id": "test"
+          },
+          "title": "모바일 동작 검증",
+          "role": "검증",
+          "scope": "구현 완료 후 시나리오 확인",
+          "acceptance_criteria": "변경과 결과를 제출",
+          "provider": "Codex",
+          "device": "gpu3090",
+          "directory": ".worktrees/test",
+          "state": "waiting_approval",
+          "activity": "모바일 mock 검증 명령의 범위 확인을 기다립니다. 구현·리뷰 결과 이후 실행합니다.",
+          "observed_at": "14:23",
+          "result": null,
+          "result_revision": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": "이 원격 화면에서는 Git 변경 작업을 제공하지 않습니다."
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "approval": {
+            "id": "approval-test",
+            "command": "npm test -- checkout.mobile",
+            "directory": ".worktrees/test",
+            "scope": "로컬 mock 테스트",
+            "action": {
+              "enabled": true,
+              "reason": ""
+            }
+          },
+          "terminal_session_id": "22222222-2222-4222-8222-222222222222"
+        }
+      ],
+      "history": [
+        {
+          "id": "example-review",
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-review",
+            "task_id": "review"
+          },
+          "time": "14:24",
+          "text": "리뷰 결과를 제출했습니다. 런타임 테스트는 실행하지 않았습니다.",
+          "detail": "work"
+        },
+        {
+          "id": "example-approval",
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-test",
+            "task_id": "test"
+          },
+          "time": "14:23",
+          "text": "모바일 mock 검증 명령의 승인을 요청했습니다.",
+          "detail": "approval"
+        },
+        {
+          "id": "example-ui",
+          "target": {
+            "workspace_id": "nomorevibe",
+            "session_id": "worker-ui",
+            "task_id": "ui"
+          },
+          "time": "14:21",
+          "text": "결제 화면 구현을 시작했습니다.",
+          "detail": "work"
+        }
+      ],
+      "config": {
+        "name": "nomorevibe",
+        "directory": "~/projects/nomorevibe",
+        "main_session_id": "main-nomorevibe",
+        "provider": "Codex",
+        "model": "GPT-6.1-Sol",
+        "effort": "xhigh",
+        "worker_providers": [
+          "Codex",
+          "Claude"
+        ],
+        "allowed_scope_roots": [
+          "src"
+        ],
+        "parallel_limit": 3,
+        "automation": "배정 전 확인",
+        "use_worktrees": true,
+        "revision": "1"
+      },
+      "save_settings": {
+        "enabled": true,
+        "reason": ""
+      },
+      "available_providers": [
+        "Codex",
+        "Claude"
+      ],
+      "available_models": [
+        "GPT-6.1-Sol",
+        "Opus"
+      ],
+      "available_efforts": [
+        "xhigh"
+      ],
+      "available_automation": [
+        "배정 전 확인"
+      ]
+    },
+    {
+      "id": "design",
+      "name": "Design",
+      "directory": "~/projects/Design",
+      "loaded": true,
+      "goal": "",
+      "main_summary": "",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "design",
+        "session_id": "main-design",
+        "task_id": null
+      },
+      "main_provider": "Claude",
+      "main_model": "Opus",
+      "main_effort": "xhigh",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [
+        {
+          "title": "메인 Claude",
+          "provider": "Claude",
+          "model": "Opus",
+          "effort": "xhigh",
+          "device": "이 Mac",
+          "state": "running",
+          "target": {
+            "workspace_id": "design",
+            "session_id": "main-design",
+            "task_id": null
+          },
+          "terminal_session_id": "11111111-1111-4111-8111-111111111111"
+        }
+      ],
+      "tasks": [],
+      "history": [],
+      "config": {
+        "name": "Design",
+        "directory": "~/projects/Design",
+        "main_session_id": "main-design",
+        "provider": "Claude",
+        "model": "Opus",
+        "effort": "xhigh",
+        "worker_providers": [
+          "Codex",
+          "Claude"
+        ],
+        "allowed_scope_roots": [
+          "src"
+        ],
+        "parallel_limit": 3,
+        "automation": "배정 전 확인",
+        "use_worktrees": true,
+        "revision": "1"
+      },
+      "save_settings": {
+        "enabled": true,
+        "reason": ""
+      },
+      "available_providers": [
+        "Codex",
+        "Claude"
+      ],
+      "available_models": [
+        "GPT-6.1-Sol",
+        "Opus"
+      ],
+      "available_efforts": [
+        "xhigh"
+      ],
+      "available_automation": [
+        "배정 전 확인"
+      ]
+    }
+  ],
+  "selected_workspace_id": "nomorevibe",
+  "devices": [
+    {
+      "id": "mac",
+      "name": "이 Mac",
+      "description": "Mac Studio · 현재 기기",
+      "capabilities": "Claude · Codex",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": true
+    },
+    {
+      "id": "gpu",
+      "name": "gpu3090",
+      "description": "Ubuntu · 작업 실행",
+      "capabilities": "Codex · Kimi",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": true
+    },
+    {
+      "id": "phone",
+      "name": "내 iPhone",
+      "description": "iPhone · 열람·입력",
+      "capabilities": "작업 실행 없음",
+      "connection": "연결됨",
+      "connected": true,
+      "can_execute": false
+    }
+  ],
+  "dark_mode": true,
+  "font_scale": 1,
+  "labels": {},
+  "add_project": {
+    "enabled": false,
+    "reason": ""
+  },
+  "manage_devices": {
+    "enabled": false,
+    "reason": ""
+  },
+  "status": "관측된 상태",
+  "receipts": []
+}

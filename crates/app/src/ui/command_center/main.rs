@@ -458,6 +458,7 @@ fn description(ui: &mut egui::Ui, snapshot: &Snapshot, value: &str) {
                 .line_height(Some(22.2 * snapshot.font_scale))
                 .color(colors(snapshot).muted),
         )
+        .halign(egui::Align::Min)
         .wrap(),
     );
 }

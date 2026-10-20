@@ -131,7 +131,14 @@ fn form(
         weak(ui, snapshot, text(snapshot, "unbound"));
     }
     ui.add_space(24.0);
-    let rules = egui::CollapsingHeader::new(text(snapshot, "execution_rules"))
+    let rules_top = ui.next_widget_position().y;
+    ui.painter().hline(
+        ui.max_rect().x_range(),
+        rules_top,
+        egui::Stroke::new(1.0, colors(snapshot).line),
+    );
+    ui.add_space(10.0);
+    egui::CollapsingHeader::new(text(snapshot, "execution_rules"))
         .id_salt("cc-rules")
         .show(ui, |ui| {
             weak(ui, snapshot, "이 프로젝트의 다음 배정부터 적용합니다.");
@@ -246,22 +253,26 @@ fn form(
                 }
             });
         });
+    ui.add_space(15.0);
+    let (rules_bottom, _) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
     ui.painter().hline(
-        ui.max_rect().x_range(),
-        rules.header_response.rect.top() - 12.0,
+        rules_bottom.x_range(),
+        rules_bottom.top(),
         egui::Stroke::new(1.0, colors(snapshot).line),
     );
-    ui.add_space(18.0);
+    ui.add_space(16.0);
     egui::Frame::NONE
         .fill(colors(snapshot).bg)
         .stroke(egui::Stroke::new(1.0, colors(snapshot).line))
         .inner_margin(egui::Margin::symmetric(13, 10))
         .show(ui, |ui| {
-            ui.set_width((ui.available_width() - 26.0).max(1.0));
+            ui.set_min_width(ui.available_width());
             ui.add(
                 egui::Label::new(
                     egui::RichText::new(text(snapshot, "settings_note"))
                         .size(12.0 * snapshot.font_scale)
+                        .line_height(Some(18.6 * snapshot.font_scale))
                         .color(colors(snapshot).muted),
                 )
                 .wrap(),

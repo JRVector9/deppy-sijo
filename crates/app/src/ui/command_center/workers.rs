@@ -744,4 +744,10 @@ pub(super) fn monitor(
         footer.top(),
         egui::Stroke::new(1.0, c.line),
     );
+    // Paint after the scroll background so the divider spans the complete monitor width.
+    ui.painter().hline(
+        header.x_range(),
+        header.bottom(),
+        egui::Stroke::new(1.0, c.line),
+    );
 }

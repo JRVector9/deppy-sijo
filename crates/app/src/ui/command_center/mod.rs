@@ -763,6 +763,8 @@ pub(super) fn setup_style(ui: &mut egui::Ui, snapshot: &Snapshot) {
         widget.corner_radius = egui::CornerRadius::same(4);
     }
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    // The approved reading surface clips overflow; fading it obscures text and controls.
+    style.spacing.scroll.fade.strength = 0.0;
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
     style.spacing.interact_size.y = 34.0_f32.max(22.0 * scale + 6.0);
     for (kind, size) in [

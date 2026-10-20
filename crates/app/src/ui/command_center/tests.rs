@@ -504,6 +504,40 @@ fn use_korean_font(harness: &mut egui_kittest::Harness<'_, impl Sized>) {
 }
 
 #[test]
+fn overflow_content_clips_without_covering_light_content_with_a_gradient() {
+    fn gradient(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Mesh(mesh) if mesh.vertices.len() == 4 => mesh
+                .vertices
+                .iter()
+                .any(|vertex| vertex.color != mesh.vertices[0].color),
+            egui::Shape::Vec(shapes) => shapes.iter().any(gradient),
+            _ => false,
+        }
+    }
+    let mut snapshot = approved_visual_fixture();
+    snapshot.dark_mode = false;
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 900.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            UiState::default(),
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    assert!(
+        !harness
+            .output()
+            .shapes
+            .iter()
+            .any(|shape| gradient(&shape.shape)),
+        "overflow must remain plainly clipped; a default gradient obscures content and action labels"
+    );
+}
+
+#[test]
 fn verification_failed_retry_uses_host_capability_and_exact_task() {
     for enabled in [true, false] {
         let mut snapshot = rich_fixture();

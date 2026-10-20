@@ -32,6 +32,22 @@ const message=async()=>{try{
  let snapshot=makeSnapshot();receive(snapshot);await tick();
  check(view.element.textContent.includes('실제 프로젝트 A'),'real snapshot project must render');
  check(view.element.querySelectorAll('[data-cc-nav]').length===5,'approved five navigation entries');
+ // Snapshot updates must preserve non-text controls and modal keyboard ownership.
+ const snapshotFailures=[];
+ click('[data-cc-nav="settings"]');
+ const checkbox=view.element.querySelector('[data-cc-focus="setting-use_worktrees"]');checkbox.focus();
+ try{receive(snapshot);}catch(error){snapshotFailures.push('checkbox snapshot throws '+error.name);}
+ if(document.activeElement?.dataset.ccFocus!=='setting-use_worktrees')snapshotFailures.push('checkbox focus lost');
+ click('[data-cc-nav="main"]');await tick();
+ for(const [side,selector]of [['left','[data-cc-open-left]'],['right','[data-cc-open-right]']]){
+   click(selector);receive(snapshot);
+   const panel=view.element.querySelector(side==='left'?'.cc-sidebar':'.cc-monitor');
+   if(!panel.contains(document.activeElement))snapshotFailures.push(side+' drawer snapshot loses focus');
+   document.activeElement.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true}));
+   if(view.element.querySelector('.cc-app').classList.contains('cc-'+side+'-open'))snapshotFailures.push(side+' drawer Escape stays open');
+   if(document.activeElement!==view.element.querySelector(selector))snapshotFailures.push(side+' drawer return focus disconnected');
+ }
+ check(!snapshotFailures.length,snapshotFailures.join('; '));
  write('한글 목표');click('[data-cc-send]');
  check(sent.length===1,'one submit');check(sent[0].intent.intent.text==='한글 목표','NFC at submission');
  check(sent[0].request===0x40000000,'reserved request namespace');

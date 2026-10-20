@@ -36,6 +36,10 @@ function facts(entries) {
   for (const [caption, value] of entries) result.append(node('dt', '', caption), node('dd', '', value || '—'));
   return result;
 }
+function textSelection(control) {
+  if (!control || !(control.tagName === 'TEXTAREA' || control.tagName === 'INPUT' && ['text', 'search', 'url', 'tel', 'password'].includes(control.type))) return null;
+  return Number.isInteger(control.selectionStart) && Number.isInteger(control.selectionEnd) ? [control.selectionStart, control.selectionEnd, control.selectionDirection] : null;
+}
 
 export function createCommandCenterView({host, send, watchSession, onVisibility, readOnly = false} = {}) {
   if (!host?.append) throw new TypeError('Command Center host element required');
@@ -236,25 +240,27 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function renderLeft() {
     left.replaceChildren(node('div', 'cc-side-label', label('workspaces', '워크스페이스')), button('닫기', closeDrawers, 'cc-button cc-ghost cc-drawer-close'));
+    left.querySelector('.cc-drawer-close').dataset.ccDrawerFocus = 'close';
     for (const p of list(snapshot.projects).slice(0, 64)) {
-      const row = button('', () => chooseProject(p.id), 'cc-project-row' + (p.id === workspaceId ? ' cc-active' : '')); row.dataset.ccProject = p.id;
+      const row = button('', () => chooseProject(p.id), 'cc-project-row' + (p.id === workspaceId ? ' cc-active' : '')); row.dataset.ccProject = p.id; row.dataset.ccDrawerFocus = 'project:' + p.id;
       row.append(node('span', 'cc-project-glyph', '▱'), node('span', 'cc-grow', p.name), node('span', 'cc-muted', list(p.tasks).length));
       row.setAttribute('aria-current', p.id === workspaceId ? 'true' : 'false'); left.append(row);
       if (p.id === workspaceId) for (const session of list(p.sessions).slice(0, 64)) {
         const entry = button('', () => { closeDrawers(); if (session.terminal_session_id && typeof watchSession === 'function') { setOpen(false); watchSession(session.terminal_session_id); } else say('이 세션의 터미널 연결을 제공하지 않습니다.'); }, 'cc-session');
+        entry.dataset.ccDrawerFocus = 'session:' + routeKey(session.target);
         entry.append(node('strong', '', session.title), node('small', '', [session.provider, session.model, session.effort, session.device].filter(Boolean).join(' · ')), stateTag(session.state, label)); left.append(entry);
       }
     }
-    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); left.append(foot);
+    const foot = node('div', 'cc-side-foot'); foot.append(button(label('settings', '프로젝트 설정'), () => navigate('settings'), 'cc-button cc-ghost'), node('p', '', label('project_independent', '프로젝트·작업·입력은 각각 독립적입니다.'))); foot.querySelector('button').dataset.ccDrawerFocus = 'settings'; left.append(foot);
   }
   function taskRow(task, compact = false) {
-    const row = button('', () => navigate('task', task.target?.task_id), compact ? 'cc-worker-row' : 'cc-task-row'); row.dataset.ccTask = task.target?.task_id || '';
+    const row = button('', () => navigate('task', task.target?.task_id), compact ? 'cc-worker-row' : 'cc-task-row'); row.dataset.ccTask = task.target?.task_id || ''; row.dataset.ccDrawerFocus = 'task:' + routeKey(task.target);
     const title = node('div', 'cc-task-title'); title.append(node('strong', '', task.title), node('small', '', compact ? task.activity : task.scope));
     row.append(title, node('span', 'cc-owner', [task.provider, task.device].filter(Boolean).join(' · ')), stateTag(task.state, label));
     if (compact) row.append(node('small', 'cc-worker-time', task.observed_at || '관측 시각 없음')); return row;
   }
   function renderRight(p) {
-    const heading = node('div', 'cc-monitor-title'); heading.append(node('h2', '', label('workers', '작업자') + ' ' + list(p?.tasks).length), button(label('close', '닫기'), closeDrawers, 'cc-button cc-ghost cc-drawer-close')); right.replaceChildren(heading);
+    const heading = node('div', 'cc-monitor-title'); heading.append(node('h2', '', label('workers', '작업자') + ' ' + list(p?.tasks).length), button(label('close', '닫기'), closeDrawers, 'cc-button cc-ghost cc-drawer-close')); right.replaceChildren(heading); heading.querySelector('button').dataset.ccDrawerFocus = 'close';
     if (!list(p?.tasks).length) right.append(node('p', 'cc-empty', label('no_tasks', '배정된 작업자가 없습니다.')));
     for (const task of list(p?.tasks).slice(0, 64)) right.append(taskRow(task, true));
     right.append(node('p', 'cc-monitor-note', '관측된 실행·승인·결과 상태를 표시합니다. 결과 제출과 검증 완료는 구분됩니다.'));
@@ -396,7 +402,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   }
   function renderContent(p) {
     const scroll = content.scrollTop, active = content.contains(document.activeElement) ? document.activeElement : null;
-    const focusKey = active?.dataset.ccFocus, selection = active && 'selectionStart' in active ? [active.selectionStart, active.selectionEnd] : null;
+    const focusKey = active?.dataset.ccFocus, selection = textSelection(active);
     const expanded = [...content.querySelectorAll('details')].map(detail => detail.open);
     content.replaceChildren();
     if (screen === 'devices') {
@@ -421,7 +427,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     if (focusKey) {
       const replacement = [...content.querySelectorAll('[data-cc-focus]')].find(control => control.dataset.ccFocus === focusKey);
       replacement?.focus({preventScroll: true});
-      if (replacement && selection && replacement.type !== 'number') replacement.setSelectionRange?.(...selection);
+      if (selection && textSelection(replacement)) replacement.setSelectionRange(...selection);
     }
   }
   function rememberRemotePosition() {
@@ -442,6 +448,8 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
   content.addEventListener('scroll', rememberRemotePosition, true);
   function render() {
     if (!snapshot || destroyed) return; applyTheme(); nav.replaceChildren();
+    const activePanel = drawer === 'left' ? left : drawer === 'right' ? right : null;
+    const drawerFocus = activePanel?.contains(document.activeElement) ? document.activeElement.dataset.ccDrawerFocus : null;
     rememberRemotePosition();
     for (const [key, fallback] of [['main', '메인'], ['tasks', '작업'], ['devices', '기기'], ['history', '기록'], ['settings', '설정']]) {
       const tab = button(label(key, fallback), () => navigate(key), 'cc-nav-button' + ((screen === key || (screen === 'task' && key === 'tasks')) ? ' cc-active' : '')); tab.dataset.ccNav = key; tab.setAttribute('aria-current', screen === key ? 'page' : 'false'); nav.append(tab);
@@ -455,6 +463,14 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const openRight = button('작업자 ' + list(p?.tasks).length, () => openDrawer('right', openRight), 'cc-button cc-ghost cc-open-right'); openRight.dataset.ccOpenRight = ''; openRight.setAttribute('aria-label', '작업자 패널 열기');
     context.append(openLeft, caption); if (screen === 'task') context.append(button('메인으로', () => navigate('main'), 'cc-button cc-ghost')); context.append(openRight);
     renderContent(p); updateComposer(); status.textContent = connected ? str(snapshot.status) || '관측된 상태' : '연결 끊김 · 초안 보존 · 자동 재전송 없음';
+    if (drawer) {
+      drawerReturn = drawer === 'left' ? openLeft : openRight;
+      const panel = drawer === 'left' ? left : right;
+      if (panel.hasAttribute('aria-modal')) {
+        const replacement = [...panel.querySelectorAll('[data-cc-drawer-focus]')].find(control => control.dataset.ccDrawerFocus === drawerFocus);
+        (replacement && !replacement.disabled ? replacement : panel.querySelector('button:not(:disabled)'))?.focus({preventScroll: true});
+      }
+    }
     restoreRemotePosition();
     syncRemoteWatch();
   }

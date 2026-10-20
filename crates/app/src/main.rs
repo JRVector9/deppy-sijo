@@ -75,6 +75,7 @@ mod test_dropped_file;
 mod theme;
 mod ui;
 mod workspace_add;
+mod work_management;
 mod worktree;
 
 use std::path::{Path, PathBuf};

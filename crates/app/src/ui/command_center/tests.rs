@@ -254,6 +254,8 @@ fn secondary_content_keeps_left_edges_compact_facts_and_full_width_task_routes()
             owner.pos.x, owner_heading.pos.x
         ));
     }
+    assert!((owner_heading.pos.y - painted(&harness, "나눈 작업").pos.y).abs() < 1.0);
+    assert!((owner_heading.pos.y - painted(&harness, "상태").pos.y).abs() < 1.0);
     let title = painted(&harness, "결제 화면 구현");
     let pos = egui::pos2(
         harness.state().last_layout.unwrap().content.right() - 40.0,

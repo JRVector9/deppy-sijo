@@ -546,7 +546,7 @@ fn task_list(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot, p: &Pr
                         .max(1.0);
                 ui.spacing_mut().interact_size.y = 0.0;
                 ui.spacing_mut().item_spacing.x = gap;
-                ui.horizontal(|ui| {
+                ui.horizontal_top(|ui| {
                     for (value, width) in [
                         ("나눈 작업", title_width),
                         (text(snapshot, "owner_device"), owner_width),

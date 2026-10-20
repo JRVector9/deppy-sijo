@@ -182,6 +182,7 @@ struct CloudControlAuthority {
     origin: CloudControlOrigin,
     policy: CloudControlPolicy,
     active: AtomicBool,
+    effect_fence: std::sync::Mutex<()>,
     core_alive: Arc<dyn Fn() -> bool + Send + Sync>,
     revalidate: CloudControlRevalidator,
 }
@@ -206,6 +207,7 @@ impl CloudControlOriginGuard {
                 origin,
                 policy,
                 active: AtomicBool::new(true),
+                effect_fence: std::sync::Mutex::new(()),
                 core_alive,
                 revalidate,
             }),
@@ -213,6 +215,9 @@ impl CloudControlOriginGuard {
     }
 
     pub fn revoke(&self) {
+        // Once this returns, an effect admitted under this activation has finished.
+        // A poisoned fence is still revoked; subsequent effect admission fails closed.
+        let _fence = self.authority.effect_fence.lock();
         self.authority.active.store(false, Ordering::SeqCst);
     }
 
@@ -258,6 +263,30 @@ pub struct CloudControlPermit {
 }
 
 impl CloudControlPermit {
+    /// Admit a bounded, nonblocking effect while excluding origin revocation.
+    /// The callback must not reenter this permit or revoke the originating guard.
+    /// The transport's principal/policy callback is rechecked before taking the fence;
+    /// policy changes must also retire their original transport activation.
+    pub fn with_current(&self, effect: &mut dyn FnMut()) -> bool {
+        // The trusted revalidator may itself revoke the origin. Do not call it while
+        // holding the lifecycle fence; recheck local fences once it returns.
+        if !self.is_current() {
+            return false;
+        }
+        let Ok(_fence) = self.request.authority.effect_fence.lock() else {
+            return false;
+        };
+        if !self.request.fence_valid(
+            &self.request.authority.core_id,
+            Instant::now(),
+            cloud_unix_seconds(),
+        ) {
+            return false;
+        }
+        effect();
+        true
+    }
+
     pub fn is_current(&self) -> bool {
         self.request.authorized_at(
             &self.request.authority.core_id,
@@ -641,6 +670,58 @@ mod tests {
             .unwrap();
         drop(guard);
         assert!(!permit.is_current(), "disconnect invalidates deferred work");
+    }
+
+    #[test]
+    fn deferred_control_effect_holds_origin_fence_and_rejects_revoked_policy() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<CloudControlPermit>();
+        let core = crate::session_core::SessionCore::spawn(None);
+        let policy = Arc::new(std::sync::Mutex::new(Some(control_policy())));
+        let current = policy.clone();
+        let guard = Arc::new(core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 103 },
+            control_policy(),
+            Arc::new(move || *current.lock().unwrap()),
+        ));
+        let (_, permit) = core
+            .authorize_cloud_control_deferred(queued_control(&core, &guard))
+            .unwrap();
+        let mut effects = 0;
+        assert!(permit.with_current(&mut || effects += 1));
+        assert_eq!(effects, 1);
+        *policy.lock().unwrap() = None;
+        assert!(!permit.with_current(&mut || effects += 1));
+        assert_eq!(effects, 1);
+        *policy.lock().unwrap() = Some(control_policy());
+        let (_, next_permit) = core
+            .authorize_cloud_control_deferred(queued_control(&core, &guard))
+            .unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let effect_thread = std::thread::spawn(move || {
+            permit.with_current(&mut || {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            })
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let revoke_guard = guard.clone();
+        let (revoked_tx, revoked_rx) = std::sync::mpsc::channel();
+        let revoke_thread = std::thread::spawn(move || {
+            revoke_guard.revoke();
+            revoked_tx.send(()).unwrap();
+        });
+        assert!(
+            revoked_rx.recv_timeout(Duration::from_millis(30)).is_err(),
+            "revocation returned while the admitted effect was running"
+        );
+        release_tx.send(()).unwrap();
+        assert!(effect_thread.join().unwrap());
+        revoked_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        revoke_thread.join().unwrap();
+        assert!(!next_permit.with_current(&mut || effects += 1));
+        assert_eq!(effects, 1);
     }
 
     #[test]

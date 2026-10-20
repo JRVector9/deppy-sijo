@@ -15,6 +15,10 @@ enum JobKind {
     Claim,
     Resolve(RemoteOperationResult),
 }
+
+#[cfg(all(test, unix))]
+#[path = "remote_journal_tls_tests.rs"]
+mod tls_tests;
 struct Job {
     identity: RemoteOperationIdentity,
     kind: JobKind,

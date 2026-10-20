@@ -34,7 +34,7 @@ impl LayoutRects {
             84.0
         };
         let worktop_h = if mobile { 44.0 } else { 48.0 };
-        let footer_h = 22.0;
+        let footer_h = if mobile { 22.0 } else { 24.0 };
         let left_w = if mobile {
             0.0
         } else if width <= 1250.0 {
@@ -52,10 +52,10 @@ impl LayoutRects {
         let composer_h = if has_composer {
             // Font growth gets more vertical space; the content's origin and scroll identity stay fixed.
             let extra = ((scale.clamp(1.0, 2.0) - 1.0) * 56.0).ceil();
-            if composer_focused {
-                158.0 + extra
+            if mobile {
+                (if composer_focused { 151.0 } else { 123.0 }) + extra
             } else {
-                114.0 + extra
+                (if composer_focused { 174.0 } else { 136.0 }) + extra
             }
         } else {
             0.0

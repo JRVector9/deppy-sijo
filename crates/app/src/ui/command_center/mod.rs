@@ -563,6 +563,10 @@ pub const LABELS: &[(&str, &str)] = &[
     ),
     ("main_collects", "메인이 작업자 진행과 결과를 모읍니다."),
     (
+        "main_plan",
+        "구현과 독립 리뷰를 나누고, 결과를 모아 검증합니다.",
+    ),
+    (
         "no_main_summary",
         "아직 메인 에이전트가 제출한 진행 내용이 없습니다.",
     ),
@@ -582,6 +586,8 @@ pub const LABELS: &[(&str, &str)] = &[
     ("dispatch_task", "작업 실행 · 재시도"),
     ("no_filtered", "이 필터에 해당하는 작업이 없습니다."),
     ("work", "작업"),
+    ("work_result", "작업과 결과"),
+    ("original_terminal", "원문 터미널"),
     ("result", "결과"),
     ("git", "Git 변경"),
     ("scope", "수정 범위"),
@@ -620,7 +626,7 @@ pub const LABELS: &[(&str, &str)] = &[
     ),
     ("name", "프로젝트 이름"),
     ("main_binding", "메인 세션"),
-    ("unbound", "연결 안 됨"),
+    ("unbound", "메인 에이전트 선택"),
     ("provider", "메인 에이전트"),
     ("model", "모델"),
     ("effort", "추론 강도"),
@@ -741,7 +747,7 @@ pub(super) fn setup_style(ui: &mut egui::Ui, snapshot: &Snapshot) {
     }
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(10.0, 6.0);
-    style.spacing.interact_size.y = 34.0_f32.max(22.0 * scale + 10.0);
+    style.spacing.interact_size.y = 34.0_f32.max(22.0 * scale + 6.0);
     for (kind, size) in [
         (egui::TextStyle::Body, 14.0),
         (egui::TextStyle::Button, 13.0),
@@ -823,6 +829,69 @@ pub(super) fn action(
             });
     }
     response.clicked()
+}
+
+pub(super) fn ghost_button(
+    ui: &mut egui::Ui,
+    snapshot: &Snapshot,
+    label: &str,
+    height: f32,
+    size: f32,
+) -> egui::Response {
+    let font = egui::FontId::proportional(size * snapshot.font_scale);
+    let width = ui
+        .painter()
+        .layout_no_wrap(label.into(), font, colors(snapshot).muted)
+        .size()
+        .x
+        + 16.0;
+    ui.add_sized(
+        [width, height.max(size * snapshot.font_scale + 12.0)],
+        egui::Button::new(
+            egui::RichText::new(label)
+                .size(size * snapshot.font_scale)
+                .color(colors(snapshot).muted),
+        )
+        .frame(false),
+    )
+}
+
+fn brand_mark(ui: &mut egui::Ui, snapshot: &Snapshot) {
+    let (r, _) = ui.allocate_exact_size(egui::vec2(23.0, 23.0), egui::Sense::hover());
+    ui.painter().rect_stroke(
+        r,
+        4.0,
+        egui::Stroke::new(1.0, colors(snapshot).muted),
+        egui::StrokeKind::Inside,
+    );
+    ui.painter().text(
+        r.center(),
+        egui::Align2::CENTER_CENTER,
+        "D",
+        egui::FontId::monospace(14.0),
+        colors(snapshot).accent,
+    );
+}
+
+fn fold_button(ui: &mut egui::Ui, snapshot: &Snapshot) -> egui::Response {
+    let (r, response) = ui.allocate_exact_size(egui::vec2(32.0, 32.0), egui::Sense::click());
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(
+            egui::WidgetType::Button,
+            ui.is_enabled(),
+            text(snapshot, "collapse_workers"),
+        )
+    });
+    if response.hovered() {
+        ui.painter().rect_filled(r, 3.0, colors(snapshot).raised);
+    }
+    let icon = egui::Rect::from_center_size(r.center(), egui::vec2(14.0, 12.0));
+    let stroke = egui::Stroke::new(1.0, colors(snapshot).muted);
+    ui.painter()
+        .rect_stroke(icon, 1.0, stroke, egui::StrokeKind::Inside);
+    ui.painter()
+        .vline(icon.center().x + 2.0, icon.y_range(), stroke);
+    response.on_hover_text(text(snapshot, "collapse_workers"))
 }
 
 pub(super) fn project<'a>(state: &UiState, snapshot: &'a Snapshot) -> Option<&'a Project> {
@@ -947,7 +1016,7 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot) -> Vec<
             header(ui, state, snapshot, p, &layout, &mut intents)
         });
         if let Some(sidebar) = layout.sidebar {
-            region(ui, sidebar, c.bg, "cc-projects", 12.0, |ui| {
+            region(ui, sidebar, c.bg, "cc-projects", 0.0, |ui| {
                 workers::projects(ui, state, snapshot, &mut intents)
             });
         }
@@ -962,41 +1031,49 @@ pub fn show(ui: &mut egui::Ui, state: &mut UiState, snapshot: &Snapshot) -> Vec<
         region(ui, layout.worktop, c.canvas, "cc-worktop", 0.0, |ui| {
             worktop(ui, state, snapshot, p, &layout, &mut intents)
         });
-        if state.terminal_rect.is_none() {
-            region(
-                ui,
-                layout.content,
-                c.canvas,
-                "cc-content",
-                if layout.mobile { 16.0 } else { 28.0 },
-                |ui| main::body(ui, state, snapshot, p, &mut intents),
-            );
+        if state.terminal_rect.is_none() || state.view == View::Task {
+            region(ui, layout.content, c.canvas, "cc-content", 0.0, |ui| {
+                let (x, y) = if layout.mobile {
+                    (16, 20)
+                } else if layout.screen.width() <= 1250.0 {
+                    (20, 22)
+                } else {
+                    (24, 24)
+                };
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(x, y))
+                    .show(ui, |ui| main::body(ui, state, snapshot, p, &mut intents));
+            });
         }
         if has_composer {
-            region(
-                ui,
-                layout.composer,
-                c.canvas,
-                "cc-composer",
-                if layout.mobile { 12.0 } else { 18.0 },
-                |ui| main::composer(ui, state, snapshot, p.unwrap(), &mut intents),
-            );
+            region(ui, layout.composer, c.canvas, "cc-composer", 0.0, |ui| {
+                main::composer(ui, state, snapshot, p.unwrap(), &mut intents)
+            });
         }
         if let Some(monitor) = layout.monitor {
             region(ui, monitor, c.bg, "cc-monitor", 0.0, |ui| {
                 workers::monitor(ui, state, snapshot, p, &mut intents)
             });
         }
-        region(ui, layout.footer, c.bg, "cc-footer", 3.0, |ui| {
-            weak(
-                ui,
-                snapshot,
-                if snapshot.status.is_empty() {
-                    text(snapshot, "project_independent")
-                } else {
-                    &snapshot.status
-                },
-            )
+        region(ui, layout.footer, c.bg, "cc-footer", 0.0, |ui| {
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add_space(if layout.mobile { 12.0 } else { 16.0 });
+                ui.label(
+                    egui::RichText::new("메인 → 독립 작업자 → 결과 취합 → 검증")
+                        .size((if layout.mobile { 9.0 } else { 10.0 }) * snapshot.font_scale)
+                        .color(c.accent),
+                );
+                if !layout.mobile && !snapshot.status.is_empty() {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.add_space(16.0);
+                        ui.label(
+                            egui::RichText::new(&snapshot.status)
+                                .size(10.0 * snapshot.font_scale)
+                                .color(c.muted),
+                        );
+                    });
+                }
+            });
         });
         for r in [layout.header, layout.projectbar, layout.worktop] {
             ui.painter()
@@ -1078,16 +1155,16 @@ fn header(
         }
         if !l.mobile {
             ui.add_space(76.0);
-            ui.label(
-                egui::RichText::new("D")
-                    .strong()
-                    .color(colors(snapshot).accent),
-            );
+            brand_mark(ui, snapshot);
             ui.label(egui::RichText::new("Deppy Sijo").strong());
-            ui.add_space(20.0);
+            ui.add_space(if l.screen.width() <= 1250.0 {
+                4.0
+            } else {
+                28.0
+            });
         } else {
             ui.add_space(10.0);
-            ui.label(egui::RichText::new("D").color(colors(snapshot).accent));
+            brand_mark(ui, snapshot);
         }
         let scale = snapshot.font_scale.clamp(0.75, 2.0);
         let actions_width = if l.mobile {
@@ -1104,40 +1181,21 @@ fn header(
             172.0 * scale
         };
         let nav_width = (ui.available_width() - actions_width).max(100.0);
-        let mut nav_font_size = if l.mobile { 11.0 } else { 13.0 } * scale;
-        if l.mobile {
-            let labels = [
-                text(snapshot, "main").to_owned(),
-                format!(
-                    "{} {}",
-                    text(snapshot, "tasks"),
-                    p.map_or(0, |p| p.tasks.len())
-                ),
-                text(snapshot, "terminal").into(),
-                text(snapshot, "devices").into(),
-                text(snapshot, "history").into(),
-            ];
-            let text_width: f32 = labels
-                .iter()
-                .map(|label| {
-                    ui.painter()
-                        .layout_no_wrap(
-                            label.clone(),
-                            egui::FontId::proportional(nav_font_size),
-                            colors(snapshot).text,
-                        )
-                        .size()
-                        .x
-                })
-                .sum();
-            nav_font_size *= ((nav_width - 36.0) / text_width).min(1.0);
-        }
+        let nav_font_size = if l.mobile { 11.0 } else { 13.0 } * scale;
         egui::ScrollArea::horizontal()
             .id_salt("cc-navigation")
             .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysHidden)
             .max_width(nav_width)
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = if l.mobile {
+                        14.0
+                    } else if l.screen.width() <= 1250.0 {
+                        16.0
+                    } else {
+                        20.0
+                    };
+                    ui.spacing_mut().button_padding = egui::vec2(2.0, 0.0);
                     for (view, key) in [
                         (View::Main, "main"),
                         (View::Tasks, "tasks"),
@@ -1204,30 +1262,45 @@ fn header(
                     }
                 });
             });
-        if !l.mobile
-            && ui
-                .small_button(text(
-                    snapshot,
-                    if snapshot.dark_mode { "light" } else { "dark" },
-                ))
-                .clicked()
-        {
-            intents.push(Intent::SetTheme {
-                dark_mode: !snapshot.dark_mode,
-            });
-        }
-        if ui
-            .small_button(
-                egui::RichText::new(text(snapshot, "original")).size(if l.mobile {
-                    10.0 * scale
-                } else {
-                    11.0 * scale
-                }),
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.add_space(if l.mobile { 8.0 } else { 16.0 });
+            if ghost_button(
+                ui,
+                snapshot,
+                text(snapshot, "original"),
+                28.0,
+                if l.mobile { 10.0 } else { 12.0 },
             )
             .clicked()
-        {
-            intents.push(Intent::UseOriginalLayout);
-        }
+            {
+                intents.push(Intent::UseOriginalLayout);
+            }
+            if !l.mobile {
+                if ghost_button(
+                    ui,
+                    snapshot,
+                    text(snapshot, if snapshot.dark_mode { "light" } else { "dark" }),
+                    28.0,
+                    12.0,
+                )
+                .clicked()
+                {
+                    intents.push(Intent::SetTheme {
+                        dark_mode: !snapshot.dark_mode,
+                    });
+                }
+                if l.screen.width() > 1250.0 {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "기기 {}",
+                            snapshot.devices.iter().filter(|d| d.connected).count()
+                        ))
+                        .size(11.0 * scale)
+                        .color(colors(snapshot).muted),
+                    );
+                }
+            }
+        });
     });
 }
 
@@ -1243,16 +1316,18 @@ fn projectbar(
         .inner_margin(egui::Margin::symmetric(if l.mobile { 16 } else { 24 }, 12))
         .show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !l.mobile
-                    && !l.monitor_is_drawer
-                    && ui
-                        .button("◫")
-                        .on_hover_text(text(snapshot, "collapse_workers"))
-                        .clicked()
-                {
+                if !l.mobile && !l.monitor_is_drawer && fold_button(ui, snapshot).clicked() {
                     state.monitor_collapsed = !state.monitor_collapsed;
                 }
-                if ui.button(text(snapshot, "settings")).clicked() {
+                if ghost_button(
+                    ui,
+                    snapshot,
+                    text(snapshot, "settings"),
+                    32.0,
+                    if l.mobile { 10.0 } else { 12.0 },
+                )
+                .clicked()
+                {
                     state.view = View::Settings;
                     state.settings_draft = None;
                 }
@@ -1278,6 +1353,13 @@ fn projectbar(
                                 }
                             }
                         });
+                    if !l.monitor_is_drawer {
+                        ui.label(
+                            egui::RichText::new("작업할 프로젝트")
+                                .size(10.0 * snapshot.font_scale)
+                                .color(colors(snapshot).muted),
+                        );
+                    }
                 }
                 ui.allocate_ui_with_layout(
                     egui::vec2(ui.available_width(), l.projectbar.height() - 24.0),
@@ -1287,25 +1369,41 @@ fn projectbar(
                         ui.add(
                             egui::Label::new(
                                 egui::RichText::new(p.map(|p| p.name.as_str()).unwrap_or("Deppy"))
-                                    .size(19.0 * snapshot.font_scale)
+                                    .size(
+                                        (if l.mobile { 17.0 } else { 19.0 }) * snapshot.font_scale,
+                                    )
                                     .strong(),
                             )
                             .truncate(),
                         );
                         if let Some(p) = p {
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "● {} · {}",
-                                        p.directory,
-                                        text(snapshot, "project_scope")
-                                    ))
-                                    .small()
-                                    .color(colors(snapshot).muted),
+                            ui.horizontal(|ui| {
+                                let (dot, _) = ui.allocate_exact_size(
+                                    egui::vec2(6.0, 12.0),
+                                    egui::Sense::hover(),
+                                );
+                                ui.painter().circle_filled(
+                                    dot.center(),
+                                    3.0,
+                                    colors(snapshot).accent,
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "{} · {}",
+                                            p.directory,
+                                            text(snapshot, "project_scope")
+                                        ))
+                                        .size(
+                                            (if l.mobile { 10.0 } else { 11.0 })
+                                                * snapshot.font_scale,
+                                        )
+                                        .color(colors(snapshot).muted),
+                                    )
+                                    .truncate(),
                                 )
-                                .truncate(),
-                            )
-                            .on_hover_text(&p.directory);
+                                .on_hover_text(&p.directory);
+                            });
                         }
                     },
                 );
@@ -1322,7 +1420,13 @@ fn worktop(
     intents: &mut Vec<Intent>,
 ) {
     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-        ui.add_space(if l.mobile { 10.0 } else { 24.0 });
+        ui.add_space(if l.mobile {
+            12.0
+        } else if l.screen.width() <= 1250.0 {
+            20.0
+        } else {
+            24.0
+        });
         if l.mobile
             && ui
                 .button("☰")
@@ -1340,8 +1444,12 @@ fn worktop(
             View::History => text(snapshot, "history"),
             View::Settings => text(snapshot, "settings"),
         };
-        ui.label(egui::RichText::new(title).strong());
-        if !l.mobile
+        ui.label(
+            egui::RichText::new(title)
+                .size((if l.mobile { 12.0 } else { 13.0 }) * snapshot.font_scale)
+                .strong(),
+        );
+        if l.screen.width() > 1250.0
             && state.view == View::Main
             && let Some(p) = p
         {
@@ -1374,7 +1482,9 @@ fn worktop(
                 if ui.small_button(text(snapshot, "back_main")).clicked() {
                     state.view = View::Main;
                 }
-            } else if !l.mobile && ui.small_button(text(snapshot, "all_history")).clicked() {
+            } else if !l.mobile
+                && ghost_button(ui, snapshot, text(snapshot, "all_history"), 28.0, 12.0).clicked()
+            {
                 state.view = View::History;
                 if let Some(p) = p {
                     intents.push(Intent::OpenHistory(p.main_target.clone()));

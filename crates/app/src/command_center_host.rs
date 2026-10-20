@@ -898,7 +898,7 @@ impl App {
             let efforts = agents.iter().filter_map(|a| a.effort.clone()).collect();
             let main_summary = if !p.loaded {
                 "저장된 작업 상태를 불러오는 중입니다.".into()
-            } else if let Some(goal) = p.snapshot.goals.last() {
+            } else if let Some(goal) = p.display_goal() {
                 let state = p.state();
                 let aggregate = wm::orchestrator::aggregate_goal(&state, &goal.id);
                 let completion = if state.goal_is_complete(&goal.id) {
@@ -906,8 +906,14 @@ impl App {
                 } else {
                     "진행 중"
                 };
+                let review = if p.pending_confirmation_goal().is_some() {
+                    "배정안 확인 필요 · "
+                } else {
+                    ""
+                };
                 format!(
-                    "{completion} · 작업 {} · 결과 제출 {} · 검증 통과 {} · 사용자 확인 {}\n메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.",
+                    "{review}목표: {}\n{completion} · 작업 {} · 결과 제출 {} · 검증 통과 {} · 사용자 확인 {}\n메인 응답은 실제 세션에서 확인합니다. 배정안 JSON을 검증한 뒤 실행을 확인해 주세요.",
+                    bounded(&goal.prompt, 4096),
                     aggregate.total,
                     aggregate.results_submitted,
                     aggregate.verification_passed,
@@ -922,7 +928,7 @@ impl App {
                     tool_execution_restricted: false,
                 });
             let history = approval::history(p, &tasks);
-            snapshot.projects.push(cc::Project { pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.snapshot.goals.last().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            snapshot.projects.push(cc::Project { pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.display_goal().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),

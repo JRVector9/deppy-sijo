@@ -15,6 +15,11 @@ impl Confirmed {
     }
 }
 impl Project {
+    pub(super) fn display_goal(&self) -> Option<&work::Goal> {
+        self.pending_confirmation_goal()
+            .and_then(|pending| self.snapshot.goals.iter().find(|goal| goal.id == pending))
+            .or_else(|| self.snapshot.goals.last())
+    }
     pub(super) fn pending_confirmation_goal(&self) -> Option<work::GoalId> {
         self.proposal
             .as_ref()
@@ -539,6 +544,13 @@ mod tests {
             "confirming a second goal must not retire an earlier plan"
         );
         assert!(ready.contains(&second.id));
+        p.confirmed.clear();
+        assert_eq!(p.pending_confirmation_goal(), Some(goal.clone()));
+        assert_eq!(
+            p.display_goal().map(|display| &display.id),
+            Some(&goal),
+            "review button must display its own goal rather than a newer goal"
+        );
     }
     #[test]
     fn sqlite_restored_queued_goal_offers_explicit_reconfirmation() {

@@ -16,8 +16,8 @@
 
 ## 단계별 실행·검증
 
-- [ ] 실제 현재 앱과 승인 HTML 최종 스타일을 대조해 아래 목록을 채운다.
-- [ ] root가 composer 모듈 분리 후 기존 컴파일/호출 경계를 확인한다.
+- [x] 실제 현재 앱을 CUA AX/스크린샷으로 직접 확인하고, 승인 HTML 최종 스타일과1200px 논리 너비로 대조해 C01–C26을 작성했다. 수정 전6case 기하 측정을 `docs/qa/assets/command-center-v2-exact-20261020/before/`에 저장했다.
+- [x] root가 composer 모듈 분리 후9da3417a 기준 기존 Command Center 회귀92PASS/0FAIL/1ignored를 직접 실행했다. 새 동작 테스트와 최종 통합 검증은 별도 진행한다.
 - [ ] 새 입력 동작은 unbound 작성, Enter 선택 진입, 연결 후 초안 유지, 프로젝트 격리, 자동 전송 없음, IME의 실제 회귀를 먼저 RED로 확인한다.
 - [ ] 네이티브/PWA/host 각 담당이 최소 변경으로 GREEN을 만든다.
 - [ ] root가 각 commit과 소유권·실제 동작을 리뷰하고 통합한다.

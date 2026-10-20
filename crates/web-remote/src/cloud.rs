@@ -251,6 +251,22 @@ pub struct CloudControlRequest {
     navigation_callback: Option<CloudNavigationCallback>,
 }
 
+/// Non-serializable authority for an effect deferred across a durable save.
+/// Keep it with the queued operation and recheck immediately before every effect.
+pub struct CloudControlPermit {
+    request: CloudControlRequest,
+}
+
+impl CloudControlPermit {
+    pub fn is_current(&self) -> bool {
+        self.request.authorized_at(
+            &self.request.authority.core_id,
+            Instant::now(),
+            cloud_unix_seconds(),
+        )
+    }
+}
+
 impl std::fmt::Debug for CloudControlRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CloudControlRequest")
@@ -288,6 +304,14 @@ impl CloudControlRequest {
     pub(crate) fn authorize(self, core_id: &str) -> Option<CloudControlIntent> {
         self.authorized_at(core_id, Instant::now(), cloud_unix_seconds())
             .then_some(self.intent)
+    }
+
+    pub(crate) fn authorize_deferred(
+        self,
+        core_id: &str,
+    ) -> Option<(CloudControlIntent, CloudControlPermit)> {
+        self.authorized_at(core_id, Instant::now(), cloud_unix_seconds())
+            .then(|| (self.intent.clone(), CloudControlPermit { request: self }))
     }
 
     fn authorized_at(&self, core_id: &str, now: Instant, unix_seconds: u64) -> bool {
@@ -587,6 +611,36 @@ mod tests {
                 .request_cloud_control(guard, control_intent())
         );
         rx.try_recv().unwrap()
+    }
+
+    #[test]
+    fn deferred_control_permit_rechecks_revocation_policy_and_deadline() {
+        let core = crate::session_core::SessionCore::spawn(None);
+        let current = Arc::new(std::sync::Mutex::new(Some(control_policy())));
+        let observed = current.clone();
+        let guard = core.dashboard().cloud_control_origin(
+            CloudControlOrigin::DirectWeb { connection_id: 97 },
+            control_policy(),
+            Arc::new(move || *observed.lock().unwrap()),
+        );
+        let request = queued_control(&core, &guard);
+        let (intent, mut permit) = core.authorize_cloud_control_deferred(request).unwrap();
+        assert_eq!(intent, control_intent());
+        assert!(permit.is_current());
+        *current.lock().unwrap() = None;
+        assert!(
+            !permit.is_current(),
+            "queued durable work cannot outlive its principal"
+        );
+        *current.lock().unwrap() = Some(control_policy());
+        assert!(permit.is_current());
+        permit.request.deadline = Instant::now();
+        assert!(!permit.is_current());
+        let (_, permit) = core
+            .authorize_cloud_control_deferred(queued_control(&core, &guard))
+            .unwrap();
+        drop(guard);
+        assert!(!permit.is_current(), "disconnect invalidates deferred work");
     }
 
     #[test]

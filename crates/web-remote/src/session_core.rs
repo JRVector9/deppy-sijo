@@ -84,6 +84,17 @@ impl SessionCore {
         self.dashboard.authorize_cloud_control(request)
     }
 
+    /// Retain the authority fence when the effect waits on storage or a worker.
+    pub fn authorize_cloud_control_deferred(
+        &self,
+        request: crate::cloud::CloudControlRequest,
+    ) -> Option<(
+        crate::cloud::CloudControlIntent,
+        crate::cloud::CloudControlPermit,
+    )> {
+        request.authorize_deferred(self.dashboard.cloud_control_core_id())
+    }
+
     pub fn publish_work_snapshot(
         &self,
         snapshot: serde_json::Value,

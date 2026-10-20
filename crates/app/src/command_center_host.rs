@@ -300,6 +300,7 @@ impl CommandCenterHost {
                 | cc::Intent::OpenHistory(_)
                 | cc::Intent::SetTheme { .. }
                 | cc::Intent::UseOriginalLayout
+                | cc::Intent::ObserveRemoteSession { .. }
         ) {
             if self.pending.len() < 64 {
                 self.pending.push_back((id, intent));
@@ -550,6 +551,7 @@ impl App {
                 },
             );
         }
+        let mut remote_terminal_budget = 128 * 1024;
         for ws in self
             .workspaces
             .iter()
@@ -657,6 +659,7 @@ impl App {
                     && !eligible.is_empty()
                     && p.state().can_dispatch(&task.id);
                 tasks.push(cc::Task {
+                    remote_terminal:remote::sessions::public_terminal(host,&target,&mut remote_terminal_budget),
                     close_worker: if remote_target {remote::sessions::close_cap(host,&target)} else {no("현재 소유한 원격 워커가 없습니다.")},
                     selected_assignment: assignment::selected(task, &assignment_choices),
                     create_worker: if task.execution_device.is_some() {
@@ -843,6 +846,7 @@ impl App {
         if !matches!(
             intent,
             cc::Intent::LoadProject { .. }
+                | cc::Intent::ObserveRemoteSession { .. }
                 | cc::Intent::Submit { .. }
                 | cc::Intent::Approval { .. }
                 | cc::Intent::ConfirmResult { .. }
@@ -924,6 +928,7 @@ impl App {
                 return Ok(());
             }
             cc::Intent::UseOriginalLayout => self.command_center_layout.use_original(),
+            cc::Intent::ObserveRemoteSession {target}=>return remote::sessions::request_view(host,id,&target),
             cc::Intent::SetTheme { dark_mode } => {
                 self.config.ui.theme = if dark_mode { crate::config::Theme::Dark } else { crate::config::Theme::Light };
                 self.pending_settings_config_apply = true;
@@ -1149,6 +1154,7 @@ impl App {
             && host.launches.values().all(|l| l.finished())
             && !host.remotes.values().any(|p| p.pending())
             && !remote::sessions::pending(&host)
+            && !remote::sessions::has_watches(&host)
             && host
                 .projects
                 .values()

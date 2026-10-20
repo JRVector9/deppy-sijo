@@ -55,8 +55,13 @@ struct Action {
 }
 struct View {
     observation: RemoteSessionObservation,
+    text: Option<String>,
     cache: terminal::renderer_egui::TerminalRenderCache,
     generation: u64,
+}
+struct Watch {
+    permit: Arc<web_remote::cloud::CloudControlPermit>,
+    expires: std::time::Instant,
 }
 #[derive(Default)]
 pub(in super::super) struct Sessions {
@@ -64,6 +69,67 @@ pub(in super::super) struct Sessions {
     views: BTreeMap<String, View>,
     observing: Option<(u64, String)>,
     next_view: Option<std::time::Instant>,
+    watches: BTreeMap<cc::RouteTarget, Watch>,
+    watch_cursor: usize,
+}
+pub(in super::super) fn has_watches(host: &CommandCenterHost) -> bool {
+    !host.remote_sessions.watches.is_empty()
+}
+pub(in super::super) fn request_view(
+    host: &mut CommandCenterHost,
+    id: &str,
+    target: &cc::RouteTarget,
+) -> Result<(), String> {
+    if !is_target(host, target) {
+        return Err("현재 원격 시도·실행 대상이 바뀌었습니다.".into());
+    }
+    let permit = host
+        .remote_permits
+        .get(id)
+        .cloned()
+        .ok_or("현재 원격 화면 읽기 권한을 확인할 수 없습니다.")?;
+    if !permit.is_current() {
+        return Err("원격 화면 읽기 권한이 만료되었습니다.".into());
+    }
+    if host.remote_sessions.watches.len() >= 8 && !host.remote_sessions.watches.contains_key(target)
+    {
+        return Err("동시에 조회할 수 있는 원격 화면 한도입니다.".into());
+    }
+    host.remote_sessions.watches.insert(
+        target.clone(),
+        Watch {
+            permit,
+            expires: std::time::Instant::now() + std::time::Duration::from_secs(5),
+        },
+    );
+    host.finish(
+        id,
+        cc::ReceiptStatus::Acknowledged,
+        "정확한 원격 실행의 읽기 전용 화면 조회를 요청했습니다.",
+    );
+    Ok(())
+}
+pub(in super::super) fn public_terminal(
+    host: &CommandCenterHost,
+    target: &cc::RouteTarget,
+    budget: &mut usize,
+) -> Option<cc::RemoteTerminal> {
+    let (key, _) = source(host, target)?;
+    let view = host.remote_sessions.views.get(key)?;
+    let snapshot = view.observation.terminal.as_ref()?;
+    let text = bounded(
+        view.text.as_deref().unwrap_or_default(),
+        (*budget).min(32 * 1024),
+    );
+    *budget = budget.saturating_sub(text.len());
+    Some(cc::RemoteTerminal {
+        text,
+        cols: snapshot.cols,
+        rows: snapshot.rows,
+        connected: view.observation.connected,
+        closed: closed(host, key),
+        status: status(host, target).unwrap_or_default(),
+    })
 }
 fn source<'a>(
     host: &'a CommandCenterHost,
@@ -606,6 +672,13 @@ pub(in super::super) fn session_observed(
     if let Some(view) = host.remote_sessions.views.get_mut(&key) {
         if view.observation.terminal != observation.terminal {
             view.generation = view.generation.saturating_add(1);
+            view.text = observation.terminal.as_ref().map(|s| {
+                bounded(
+                    &crate::cloud_agent::screen_text_with_truncation(s).0,
+                    32 * 1024,
+                )
+            });
+            host.publication_dirty = true;
         }
         view.observation = observation;
     } else {
@@ -617,6 +690,12 @@ pub(in super::super) fn session_observed(
         host.remote_sessions.views.insert(
             key,
             View {
+                text: observation.terminal.as_ref().map(|s| {
+                    bounded(
+                        &crate::cloud_agent::screen_text_with_truncation(s).0,
+                        32 * 1024,
+                    )
+                }),
                 observation,
                 cache: Default::default(),
                 generation: 1,
@@ -685,6 +764,14 @@ impl App {
         host: &mut CommandCenterHost,
         visible: bool,
     ) {
+        let now = std::time::Instant::now();
+        host.remote_sessions
+            .watches
+            .retain(|_, watch| now < watch.expires && watch.permit.is_current());
+        if !host.remote_sessions.watches.is_empty() {
+            self.egui_ctx
+                .request_repaint_after(std::time::Duration::from_millis(500));
+        }
         let ids: Vec<_> = host
             .remote_sessions
             .actions
@@ -819,7 +906,7 @@ impl App {
             self.egui_ctx
                 .request_repaint_after(std::time::Duration::from_millis(100));
         }
-        if !visible || host.devices.has_pending() {
+        if host.devices.has_pending() {
             return;
         }
         if host
@@ -829,7 +916,23 @@ impl App {
         {
             return;
         }
-        let Some(target) = host.ui.terminal_target.clone() else {
+        let mut targets: Vec<_> = host.remote_sessions.watches.keys().cloned().collect();
+        if let Some(native) = visible
+            .then(|| host.ui.terminal_target.clone())
+            .flatten()
+            .filter(|t| is_target(host, t))
+            && !targets.contains(&native)
+        {
+            targets.push(native);
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let target = targets
+            .get(host.remote_sessions.watch_cursor % targets.len())
+            .cloned();
+        host.remote_sessions.watch_cursor = (host.remote_sessions.watch_cursor + 1) % targets.len();
+        let Some(target) = target else {
             return;
         };
         let Some((key, pending)) = source(host, &target) else {
@@ -845,19 +948,30 @@ impl App {
         let binding = pending.record.binding.as_ref().unwrap().clone();
         host.next_token = host.next_token.saturating_add(1);
         let token = host.next_token;
-        if host
-            .devices
-            .queue_remote(
-                token,
-                RemoteDeviceJob::ObserveSession {
-                    request_id: token,
-                    lease,
-                    session: binding.session_id,
-                    execution_generation: binding.execution_generation,
-                },
-            )
-            .is_ok()
-        {
+        let job = RemoteDeviceJob::ObserveSession {
+            request_id: token,
+            lease,
+            session: binding.session_id,
+            execution_generation: binding.execution_generation,
+        };
+        let mut job = Some(job);
+        let mut admitted = false;
+        let permit = host
+            .remote_sessions
+            .watches
+            .get(&target)
+            .map(|w| w.permit.clone());
+        let mut queue = || {
+            if let Some(job) = job.take() {
+                admitted = host.devices.queue_remote(token, job).is_ok();
+            }
+        };
+        if let Some(permit) = permit {
+            permit.with_current(&mut queue);
+        } else {
+            queue();
+        }
+        if admitted {
             host.remote_sessions.observing = Some((token, key));
             host.remote_sessions.next_view =
                 Some(std::time::Instant::now() + std::time::Duration::from_millis(500));
@@ -1021,5 +1135,53 @@ mod tests {
         let mut input = record;
         input.kind = Kind::Input;
         assert!(!action_current(project, &input));
+    }
+    #[test]
+    fn public_remote_view_is_actual_scoped_text_and_utf8_budgeted() {
+        use terminal::TerminalBackend;
+        let (mut host, _, lease, target) = host_action(ActionStage::Done, Kind::Input);
+        let mut backend = terminal::AlacrittyBackend::new(40, 3, 10);
+        backend
+            .feed("실제 원격 한글 a\u{301}\u{308}".as_bytes())
+            .unwrap();
+        session_observed(
+            &mut host,
+            None,
+            RemoteSessionObservation {
+                lease,
+                session: runtime::SessionId(7),
+                execution_generation: 19,
+                terminal: Some(Arc::new(backend.viewport_snapshot().unwrap())),
+                detected_status: None,
+                exit_code: None,
+                connected: true,
+            },
+        );
+        let mut budget = 32 * 1024;
+        let view = public_terminal(&host, &target, &mut budget).unwrap();
+        assert!(view.text.contains("실제 원격 한글"));
+        assert!(view.text.contains("a\u{301}\u{308}"));
+        assert_eq!((view.cols, view.rows), (40, 3));
+        assert!(view.connected);
+        assert!(!view.closed);
+        let mut tiny = 4;
+        let view = public_terminal(&host, &target, &mut tiny).unwrap();
+        assert!(view.text.len() <= 4);
+        assert!(std::str::from_utf8(view.text.as_bytes()).is_ok());
+        let mut wrong = target;
+        wrong.workspace_id = "another-workspace".into();
+        assert!(public_terminal(&host, &wrong, &mut budget).is_none());
+    }
+    #[test]
+    fn readonly_watch_requires_original_view_permit_and_never_changes_native_navigation() {
+        let (mut host, _, _, target) = host_action(ActionStage::Done, Kind::Input);
+        let view = host.ui.view;
+        assert!(request_view(&mut host, &uuid::Uuid::new_v4().to_string(), &target).is_err());
+        assert!(host.remote_sessions.watches.is_empty());
+        assert_eq!(host.ui.view, view);
+        let intent = cc::Intent::ObserveRemoteSession { target };
+        let value = serde_json::to_value(&intent).unwrap();
+        assert_eq!(value["type"], "observe_remote_session");
+        assert_eq!(serde_json::from_value::<cc::Intent>(value).unwrap(), intent);
     }
 }

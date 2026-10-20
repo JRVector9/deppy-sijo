@@ -126,7 +126,19 @@ pub struct Approval {
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RemoteTerminal {
+    pub text: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub connected: bool,
+    pub closed: bool,
+    pub status: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub remote_terminal: Option<RemoteTerminal>,
     #[serde(default)]
     pub close_worker: Capability,
     #[serde(skip)]
@@ -286,6 +298,9 @@ impl Default for Snapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
+    ObserveRemoteSession {
+        target: RouteTarget,
+    },
     #[serde(skip)]
     CloseWorker {
         target: RouteTarget,

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — Command Center v2 development branch
+
+- Add an opt-in project/main-agent/worker layout with independent task attempts, drafts, approvals, results, Git and history routes; retain the original layout and source rollback point.
+- Persist work in a separate sidecar and admit local or explicitly granted remote workers through durable operation identities. Recover uncertain remote receipts by read-only lookup without replaying work.
+- Add pinned, project-scoped TLS worker connections, exact owned-worker termination, and read-only remote terminal views in the PWA and paired Relay shell.
+- Preserve mobile remote scroll positions and resume read-only observation after lost receipts while retaining mutating-operation fences.
+
+This branch has no distributed release artifact. See [usage and capability boundaries](docs/command-center-v2.md) and [verification evidence](docs/qa/2026-10-20-command-center-v2-implementation.md).
+
 ## [0.13.0] - 2026-10-15
 
 ### Added

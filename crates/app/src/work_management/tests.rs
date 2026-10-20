@@ -142,9 +142,19 @@ fn work_management_submission_retry_returns_original_without_rewriting() {
         .unwrap();
     assert_eq!(
         state
-            .submit_goal(submission, "Changed".into(), "Two".into())
+            .submit_goal(submission.clone(), "Original".into(), "One".into())
             .unwrap(),
         id
+    );
+    assert!(
+        state
+            .submit_goal(submission.clone(), "Changed".into(), "One".into())
+            .is_err()
+    );
+    assert!(
+        state
+            .submit_goal(submission, "Original".into(), "Two".into())
+            .is_err()
     );
     assert_eq!(state.goals.len(), 1);
     assert_eq!(state.goals[0].prompt, "One");
@@ -170,6 +180,7 @@ fn work_management_operation_retry_and_duplicate_ack_do_not_allocate() {
     let op = OperationId::new();
     let id = state.tasks[0].id.clone();
     let cfg = config(&state.workspace_id);
+    let binding = runtime();
     let first = state
         .begin_attempt(
             &id,
@@ -177,7 +188,7 @@ fn work_management_operation_retry_and_duplicate_ack_do_not_allocate() {
             cfg.clone(),
             cfg.folder.clone(),
             None,
-            runtime(),
+            binding.clone(),
         )
         .unwrap();
     let duplicate = state
@@ -187,7 +198,7 @@ fn work_management_operation_retry_and_duplicate_ack_do_not_allocate() {
             cfg.clone(),
             cfg.folder.clone(),
             None,
-            runtime(),
+            binding,
         )
         .unwrap();
     assert_eq!(first, duplicate);
@@ -553,4 +564,118 @@ fn work_management_upstream_rework_invalidates_completed_descendant_verification
         ),
         ApplyOutcome::Ignored
     );
+}
+
+#[test]
+fn work_management_verification_failed_retry_reuses_session_with_new_generation() {
+    let mut state = fixture(1);
+    let first = begin(&mut state, 0);
+    apply(
+        &mut state,
+        &first,
+        1,
+        WorkEventKind::ResultSubmitted { result: result(1) },
+    );
+    apply(
+        &mut state,
+        &first,
+        2,
+        WorkEventKind::VerificationFinished {
+            result_revision: ResultRevision(1),
+            outcome: VerificationState::Failed,
+        },
+    );
+    let mut binding = state.attempts[0].runtime_binding.clone().unwrap();
+    binding.execution_generation += 1;
+    let cfg = config(&state.workspace_id);
+    let next = state
+        .begin_attempt(
+            &state.tasks[0].id.clone(),
+            OperationId::new(),
+            cfg.clone(),
+            cfg.folder.clone(),
+            None,
+            binding,
+        )
+        .unwrap();
+    assert_ne!(first, next);
+    assert_eq!(state.attempts.len(), 2);
+    assert_eq!(state.tasks[0].state, WorkState::Queued);
+    assert_eq!(
+        apply(
+            &mut state,
+            &first,
+            3,
+            WorkEventKind::ResultSubmitted { result: result(2) }
+        ),
+        ApplyOutcome::Ignored
+    );
+}
+
+#[test]
+fn work_management_operation_retry_rejects_changed_assignment_snapshot() {
+    let mut state = fixture(1);
+    let first = begin(&mut state, 0);
+    let attempt = state.attempts[0].clone();
+    let task = attempt.task_id.clone();
+    let op = attempt.operation_id.clone();
+    let cfg = attempt.config.clone();
+    let binding = attempt.runtime_binding.clone().unwrap();
+    let mut changed_cfg = cfg.clone();
+    changed_cfg.revision = ConfigRevision(2);
+    assert!(
+        state
+            .begin_attempt(
+                &task,
+                op.clone(),
+                changed_cfg,
+                attempt.folder.clone(),
+                None,
+                binding.clone()
+            )
+            .is_err()
+    );
+    assert!(
+        state
+            .begin_attempt(
+                &task,
+                op.clone(),
+                cfg.clone(),
+                "/different".into(),
+                None,
+                binding.clone()
+            )
+            .is_err()
+    );
+    assert!(
+        state
+            .begin_attempt(
+                &task,
+                op.clone(),
+                cfg.clone(),
+                attempt.folder.clone(),
+                Some(PersistentBinding::ProviderThread {
+                    provider: "codex".into(),
+                    thread_id: "different".into()
+                }),
+                binding.clone()
+            )
+            .is_err()
+    );
+    let mut changed_runtime = binding;
+    changed_runtime.execution_generation += 1;
+    assert!(
+        state
+            .begin_attempt(
+                &task,
+                op,
+                cfg,
+                attempt.folder.clone(),
+                None,
+                changed_runtime
+            )
+            .is_err()
+    );
+    assert_eq!(state.attempts, vec![attempt]);
+    assert_eq!(state.tasks[0].current_attempt_id, Some(first));
 }

@@ -35,7 +35,13 @@ impl ProjectWorkState {
             .iter()
             .find(|goal| goal.submission_id == submission_id)
         {
-            return Ok(goal.id.clone());
+            return if goal.title == title && goal.prompt == prompt {
+                Ok(goal.id.clone())
+            } else {
+                Err(ValidationError(
+                    "submission payload conflicts with existing goal".into(),
+                ))
+            };
         }
         let goal = Goal {
             workspace_id: self.workspace_id.clone(),
@@ -132,10 +138,17 @@ impl ProjectWorkState {
             .iter()
             .find(|a| a.operation_id == operation_id)
         {
-            return if &attempt.task_id == task_id {
+            return if &attempt.task_id == task_id
+                && attempt.config == config
+                && attempt.folder == folder
+                && attempt.persistent_binding == persistent_binding
+                && attempt.runtime_binding.as_ref() == Some(&runtime_binding)
+            {
                 Ok(attempt.id.clone())
             } else {
-                Err(ValidationError("operation belongs to another task".into()))
+                Err(ValidationError(
+                    "operation payload conflicts with existing attempt".into(),
+                ))
             };
         }
         if !self.can_dispatch(task_id) {
@@ -144,11 +157,17 @@ impl ProjectWorkState {
             ));
         }
         if self.attempts.iter().any(|attempt| {
-            !attempt.state.is_terminal()
-                && attempt.runtime_binding.as_ref().is_some_and(|binding| {
-                    binding.incarnation == runtime_binding.incarnation
-                        && binding.session_id == runtime_binding.session_id
-                })
+            matches!(
+                attempt.state,
+                WorkState::Queued
+                    | WorkState::Running
+                    | WorkState::WaitingApproval
+                    | WorkState::WaitingInput
+                    | WorkState::ObservationUnknown
+            ) && attempt.runtime_binding.as_ref().is_some_and(|binding| {
+                binding.incarnation == runtime_binding.incarnation
+                    && binding.session_id == runtime_binding.session_id
+            })
         }) {
             return Err(ValidationError(
                 "runtime session already owns a live attempt".into(),

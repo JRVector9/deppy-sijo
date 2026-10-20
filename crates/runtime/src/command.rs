@@ -414,6 +414,10 @@ pub(crate) fn runtime_command_retained_bytes(
         retained_strings(&mut total, transient_args)?;
     }
     match command {
+        RuntimeCommand::InspectRemoteWorker { .. } => {}
+        RuntimeCommand::SpawnRemoteWork { request } => {
+            retained_add(&mut total, request.retained_bytes())?
+        }
         RuntimeCommand::SpawnAgent {
             agent_config_id,
             command,
@@ -618,6 +622,8 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
         canonicalize_mux_pane_id(pane);
     }
     match command {
+        RuntimeCommand::InspectRemoteWorker { .. } => {}
+        RuntimeCommand::SpawnRemoteWork { request } => request.canonicalize(),
         RuntimeCommand::SpawnAgent {
             agent_config_id,
             command,
@@ -828,6 +834,16 @@ pub(crate) fn validate_host_command(command: &RuntimeCommand) -> Result<(), Runt
         validate_args(&argv)?;
     }
     match command {
+        RuntimeCommand::InspectRemoteWorker { request_id } => {
+            if *request_id == 0 {
+                return Err(admission_error("remote_worker_request_invalid"));
+            }
+        }
+        RuntimeCommand::SpawnRemoteWork { request } => {
+            if !request.is_valid() {
+                return Err(admission_error("remote_work_invalid"));
+            }
+        }
         RuntimeCommand::SpawnShell {
             cols,
             rows,
@@ -1424,11 +1440,25 @@ pub enum RuntimeCommand {
         operation_id: u64,
         query: terminal::TerminalHistoryQuery,
     },
+    InspectRemoteWorker {
+        request_id: u64,
+    },
+    SpawnRemoteWork {
+        request: crate::remote_worker::RemoteWorkRequest,
+    },
 }
 
 impl std::fmt::Debug for RuntimeCommand {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            RuntimeCommand::InspectRemoteWorker { request_id } => f
+                .debug_struct("InspectRemoteWorker")
+                .field("request_id", request_id)
+                .finish(),
+            RuntimeCommand::SpawnRemoteWork { request } => f
+                .debug_struct("SpawnRemoteWork")
+                .field("identity", &request.identity)
+                .finish(),
             RuntimeCommand::QueryTerminalHistory {
                 session,
                 operation_id,

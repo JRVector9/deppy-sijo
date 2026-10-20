@@ -293,6 +293,14 @@ pub enum RuntimeEvent {
         operation_id: Option<String>,
         at_micros: i64,
     },
+    RemoteWorkerObserved {
+        request_id: u64,
+        capabilities: Option<crate::remote_worker::RemoteWorkerCapabilities>,
+    },
+    RemoteWorkResolved {
+        identity: crate::remote_worker::RemoteWorkIdentity,
+        result: crate::remote_worker::RemoteWorkResult,
+    },
 }
 
 impl RuntimeEvent {

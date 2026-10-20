@@ -154,9 +154,75 @@ impl Session {
         scrollback_lines: usize,
         output_wake: Option<PtyOutputWake>,
     ) -> anyhow::Result<Self> {
-        let mut pty = match output_wake {
-            Some(wake) => PortablePtyBackend.spawn_with_output_wake(spec, cols, rows, wake)?,
-            None => PortablePtyBackend.spawn(spec, cols, rows)?,
+        Self::spawn_with_spec_in_directory(
+            id,
+            kind,
+            spec,
+            cols,
+            rows,
+            scrollback_lines,
+            output_wake,
+            #[cfg(unix)]
+            None,
+        )
+    }
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_with_spec_and_output_wake_in_directory(
+        id: SessionId,
+        kind: SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        output_wake: PtyOutputWake,
+        directory: std::sync::Arc<std::os::fd::OwnedFd>,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_with_spec_in_directory(
+            id,
+            kind,
+            spec,
+            cols,
+            rows,
+            scrollback_lines,
+            Some(output_wake),
+            Some(directory),
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with_spec_in_directory(
+        id: SessionId,
+        kind: SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        output_wake: Option<PtyOutputWake>,
+        #[cfg(unix)] directory: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
+    ) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        let pinned = directory
+            .map(|directory| {
+                PortablePtyBackend.spawn_with_output_wake_in_directory(
+                    spec,
+                    cols,
+                    rows,
+                    output_wake
+                        .clone()
+                        .unwrap_or_else(|| std::sync::Arc::new(|| {})),
+                    directory,
+                )
+            })
+            .transpose()?;
+        #[cfg(not(unix))]
+        let pinned: Option<Box<dyn pty::PtySession>> = None;
+        let mut pty = if let Some(pinned) = pinned {
+            pinned
+        } else {
+            match output_wake {
+                Some(wake) => PortablePtyBackend.spawn_with_output_wake(spec, cols, rows, wake)?,
+                None => PortablePtyBackend.spawn(spec, cols, rows)?,
+            }
         };
         let process_identity = pty.process_identity();
         let output = pty.take_output().expect("새 세션의 output 채널");

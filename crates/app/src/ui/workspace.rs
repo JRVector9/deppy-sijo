@@ -5758,7 +5758,9 @@ impl WorkspaceUi {
                 RuntimeEvent::EnvironmentApplied { .. }
                 | RuntimeEvent::InputAdmitted { .. }
                 | RuntimeEvent::SessionInputAccepted { .. }
-                | RuntimeEvent::TerminalHistoryResult { .. } => {}
+                | RuntimeEvent::TerminalHistoryResult { .. }
+                | RuntimeEvent::RemoteWorkerObserved { .. }
+                | RuntimeEvent::RemoteWorkResolved { .. } => {}
                 RuntimeEvent::LastOutputExtracted {
                     session,
                     text,

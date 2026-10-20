@@ -439,9 +439,58 @@ impl PortablePtyBackend {
         #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
         #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
     ) -> anyhow::Result<Box<dyn PtySession>> {
+        self.spawn_impl_in_directory(
+            cmd,
+            cols,
+            rows,
+            output_wake,
+            #[cfg(unix)]
+            None,
+            #[cfg(test)]
+            worker_liveness,
+            #[cfg(test)]
+            worker_spawn_failure,
+        )
+    }
+    #[cfg(unix)]
+    pub fn spawn_with_output_wake_in_directory(
+        &self,
+        cmd: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        output_wake: PtyOutputWake,
+        directory: Arc<std::os::fd::OwnedFd>,
+    ) -> anyhow::Result<Box<dyn PtySession>> {
+        self.spawn_impl_in_directory(
+            cmd,
+            cols,
+            rows,
+            Some(output_wake),
+            Some(directory),
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            TestWorkerSpawnFailure::None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_impl_in_directory(
+        &self,
+        cmd: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        output_wake: Option<PtyOutputWake>,
+        #[cfg(unix)] directory: Option<Arc<std::os::fd::OwnedFd>>,
+        #[cfg(test)] worker_liveness: Option<Arc<TestWorkerLiveness>>,
+        #[cfg(test)] worker_spawn_failure: TestWorkerSpawnFailure,
+    ) -> anyhow::Result<Box<dyn PtySession>> {
         let pair = openpty_with_retry(cols, rows)?;
         let mut builder = portable_pty::CommandBuilder::new(&cmd.program);
         builder.args(&cmd.args);
+        #[cfg(unix)]
+        if let Some(directory) = directory {
+            builder.cwd_dir_fd(directory);
+        }
         // 부모의 **에이전트 세션 마커**를 먼저 지운다. deppy가 다른 코딩 에이전트
         // 안에서 실행되면(개발 중 흔하다) 그 세션 변수가 통째로 상속돼 pane에서
         // 띄운 에이전트가 "부모 세션의 자식"으로 오인된다 — 실증(2026-08-02):

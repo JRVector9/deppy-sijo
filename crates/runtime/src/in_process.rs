@@ -147,6 +147,7 @@ fn enqueue_durable_event(
 
 pub struct InProcessRuntimeClient {
     instance_token: String,
+    remote_worker: Arc<Mutex<crate::remote_worker::RemoteWorkerSlot>>,
     /// shutdown 시 None — drop되면 worker가 Disconnected로 종료한다
     command_tx: Option<SyncSender<QueuedRuntimeCommand>>,
     command_budget: Arc<RuntimeCommandQueueBudget>,
@@ -289,6 +290,8 @@ impl InProcessRuntimeClient {
         let run_logs_root = logs_root.join(format!("run-{run_ms}-{}-{seq}", std::process::id()));
         let instance_token = uuid::Uuid::new_v4().to_string();
         let worker_instance_token = instance_token.clone();
+        let remote_worker = Arc::new(Mutex::new(crate::remote_worker::RemoteWorkerSlot::default()));
+        let worker_remote_worker = Arc::clone(&remote_worker);
         let (command_tx, command_rx) = sync_channel(IN_PROCESS_CMD_QUEUE_CAP);
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let subscribers: Arc<Mutex<Vec<Subscriber>>> = Arc::default();
@@ -315,6 +318,7 @@ impl InProcessRuntimeClient {
                     scan_archive_usage_snapshot(&logs_root);
                 Worker {
                     instance_token: worker_instance_token,
+                    remote_worker: worker_remote_worker,
                     command_rx,
                     subscribers: worker_subscribers,
                     batch: Duration::from_millis(output_batch_ms.max(1)),
@@ -385,6 +389,7 @@ impl InProcessRuntimeClient {
         let worker_thread = Some(worker.thread().clone());
         Ok(Self {
             instance_token,
+            remote_worker,
             command_tx: Some(command_tx),
             command_budget,
             subscribers,
@@ -394,6 +399,30 @@ impl InProcessRuntimeClient {
         })
     }
 
+    /// Install/revoke local compute authority. Call from host setup workers only.
+    pub fn configure_remote_worker(
+        &self,
+        host: Option<crate::remote_worker::RemoteWorkerHost>,
+    ) -> anyhow::Result<()> {
+        let mut slot = self
+            .remote_worker
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+        if let Some(host) = &host {
+            anyhow::ensure!(
+                host.config.grant_epoch > slot.grant_floor,
+                "remote_worker_grant_epoch_stale"
+            );
+            slot.grant_floor = host.config.grant_epoch;
+        }
+        slot.host = host;
+        Ok(())
+    }
+
+    pub fn remote_worker_wake(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let thread = self.worker_thread.clone()?;
+        Some(Arc::new(move || thread.unpark()))
+    }
     pub fn instance_token(&self) -> &str {
         &self.instance_token
     }
@@ -906,6 +935,7 @@ struct LazyWorkspaceRestore {
 
 struct Worker {
     instance_token: String,
+    remote_worker: Arc<Mutex<crate::remote_worker::RemoteWorkerSlot>>,
     command_rx: Receiver<QueuedRuntimeCommand>,
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     batch: Duration,
@@ -2209,6 +2239,28 @@ impl Worker {
         rows: u16,
         scrollback_lines: usize,
     ) -> anyhow::Result<Session> {
+        self.spawn_session_in_directory(
+            id,
+            kind,
+            spec,
+            cols,
+            rows,
+            scrollback_lines,
+            #[cfg(unix)]
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_session_in_directory(
+        &self,
+        id: SessionId,
+        kind: session::SessionKind,
+        spec: &CommandSpec,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        #[cfg(unix)] directory: Option<Arc<std::os::fd::OwnedFd>>,
+    ) -> anyhow::Result<Session> {
         crate::command::validate_host_command(&RuntimeCommand::SpawnShell {
             cols,
             rows,
@@ -2223,6 +2275,30 @@ impl Worker {
         )?;
         let worker_thread = std::thread::current();
         let output_wake: pty::PtyOutputWake = Arc::new(move || worker_thread.unpark());
+        #[cfg(unix)]
+        let session = if let Some(directory) = directory {
+            Session::spawn_with_spec_and_output_wake_in_directory(
+                id,
+                kind,
+                spec,
+                cols,
+                rows,
+                self.requested_scrollback(scrollback_lines),
+                output_wake,
+                directory,
+            )?
+        } else {
+            Session::spawn_with_spec_and_output_wake(
+                id,
+                kind,
+                spec,
+                cols,
+                rows,
+                self.requested_scrollback(scrollback_lines),
+                output_wake,
+            )?
+        };
+        #[cfg(not(unix))]
         let session = Session::spawn_with_spec_and_output_wake(
             id,
             kind,
@@ -2253,6 +2329,7 @@ impl Worker {
         let mut next_viewport_at = std::time::Instant::now();
         let mut pending_viewport = false;
         loop {
+            self.poll_remote_work();
             let now = std::time::Instant::now();
             let wait = if pending_viewport {
                 next_viewport_at
@@ -2848,7 +2925,246 @@ impl Worker {
         }
     }
 
-    fn handle_command_inner(&mut self, mut command: RuntimeCommand) {
+    fn inspect_remote_worker(&mut self, request_id: u64) {
+        use crate::remote_worker::RemoteWorkerCapabilities;
+        let shared = Arc::clone(&self.remote_worker);
+        let capabilities = shared.lock().ok().and_then(|mut slot| {
+            let host = slot.host.as_mut()?;
+            host.active.retain(|(_, id)| {
+                self.sessions
+                    .get(id)
+                    .is_some_and(|session| session.lifecycle().is_running())
+            });
+            let active_workers = self
+                .sessions
+                .values()
+                .filter(|s| s.kind() == session::SessionKind::Agent && s.lifecycle().is_running())
+                .count()
+                .min(usize::from(host.config.max_workers)) as u8;
+            let now = std::time::Instant::now();
+            host.leases.retain(|(_, until)| *until > now);
+            if host.leases.len() >= 32 {
+                return None;
+            }
+            host.lease_counter = host.lease_counter.checked_add(1)?;
+            host.leases
+                .push((host.lease_counter, now + Duration::from_secs(30)));
+            Some(RemoteWorkerCapabilities {
+                device_id: host.config.device_id.clone(),
+                workspace_id: host.config.workspace_id.clone(),
+                incarnation: deppy_core::work_management::RuntimeIncarnationId(
+                    self.instance_token.clone(),
+                ),
+                folder: host.folder.clone(),
+                folder_anchor: host.anchor.clone(),
+                grant_epoch: host.config.grant_epoch,
+                lease_epoch: host.lease_counter,
+                profiles: host.config.profiles.clone(),
+                max_workers: host.config.max_workers,
+                active_workers,
+                active_operation_ids: host
+                    .active
+                    .iter()
+                    .map(|(operation, _)| operation.clone())
+                    .take(usize::from(active_workers))
+                    .collect(),
+            })
+        });
+        self.emit(RuntimeEvent::RemoteWorkerObserved {
+            request_id,
+            capabilities,
+        });
+    }
+
+    fn spawn_remote_work(&mut self, request: crate::remote_worker::RemoteWorkRequest) {
+        use crate::remote_worker::{
+            PendingPhase, PendingWork, Progress, RemoteWorkError as E, RemoteWorkResult as R,
+        };
+        let shared = Arc::clone(&self.remote_worker);
+        let mut slot = match shared.lock() {
+            Ok(slot) => slot,
+            Err(_) => {
+                self.emit(RuntimeEvent::RemoteWorkResolved {
+                    identity: request.identity,
+                    result: R::Rejected { code: E::Disabled },
+                });
+                return;
+            }
+        };
+        let Some(host) = slot.host.as_mut() else {
+            self.emit(RuntimeEvent::RemoteWorkResolved {
+                identity: request.identity,
+                result: R::Rejected { code: E::Disabled },
+            });
+            return;
+        };
+        if let Some(existing) = host.pending.iter().find(|p| {
+            p.request.identity.operation_id == request.identity.operation_id
+                || p.request.identity.attempt_id == request.identity.attempt_id
+        }) {
+            if existing.request != request {
+                self.emit(RuntimeEvent::RemoteWorkResolved {
+                    identity: request.identity,
+                    result: R::Rejected {
+                        code: E::IdentityConflict,
+                    },
+                });
+            }
+            return;
+        }
+        if host.pending.len() >= 32 {
+            self.emit(RuntimeEvent::RemoteWorkResolved {
+                identity: request.identity,
+                result: R::Rejected { code: E::Capacity },
+            });
+            return;
+        }
+        match self.progress_remote_work(&request, host, PendingPhase::Claim) {
+            Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
+                identity: request.identity,
+                result,
+            }),
+            Progress::Pending(phase) => host.pending.push(PendingWork { request, phase }),
+        }
+    }
+    fn poll_remote_work(&mut self) {
+        use crate::remote_worker::{PendingWork, Progress};
+        let shared = Arc::clone(&self.remote_worker);
+        let Ok(mut slot) = shared.lock() else {
+            return;
+        };
+        let Some(host) = slot.host.as_mut() else {
+            return;
+        };
+        let pending = std::mem::take(&mut host.pending);
+        for work in pending {
+            match self.progress_remote_work(&work.request, host, work.phase) {
+                Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
+                    identity: work.request.identity,
+                    result,
+                }),
+                Progress::Pending(phase) => host.pending.push(PendingWork {
+                    request: work.request,
+                    phase,
+                }),
+            }
+        }
+    }
+
+    fn progress_remote_work(
+        &mut self,
+        request: &crate::remote_worker::RemoteWorkRequest,
+        host: &mut crate::remote_worker::RemoteWorkerHost,
+        phase: crate::remote_worker::PendingPhase,
+    ) -> crate::remote_worker::Progress {
+        use crate::remote_worker::{PendingPhase, Progress as P};
+        use crate::remote_worker::{
+            RemoteWorkClaim as C, RemoteWorkError as E, RemoteWorkResult as R,
+        };
+        if let PendingPhase::Resolve(result) = phase {
+            return match host.journal.resolve(request, &result) {
+                Ok(true) => P::Complete(result),
+                Ok(false) => P::Pending(PendingPhase::Resolve(result)),
+                Err(_) => P::Complete(R::ObservationUnknown),
+            };
+        }
+        let reject = |code| R::Rejected { code };
+        let id = &request.identity;
+        if id.device_id != host.config.device_id
+            || id.workspace_id != host.config.workspace_id
+            || id.incarnation.as_str() != self.instance_token
+        {
+            return P::Complete(reject(E::WrongWorker));
+        }
+        if id.grant_epoch != host.config.grant_epoch {
+            return P::Complete(reject(E::GrantChanged));
+        }
+        if request.folder != host.folder || request.folder_anchor != host.anchor {
+            return P::Complete(reject(E::FolderChanged));
+        }
+        // This claim commits before process creation. An unresolved claim is never reclaimed.
+        match host.journal.claim(request) {
+            Ok(C::New) => {}
+            Ok(C::Pending) => return P::Pending(PendingPhase::Claim),
+            Ok(C::Existing(result)) => return P::Complete(result),
+            Ok(C::Conflict) => return P::Complete(reject(E::IdentityConflict)),
+            Err(_) => return P::Complete(reject(E::JournalUnavailable)),
+        }
+        let launch = (|| -> Result<RuntimeCommand, E> {
+            if !host.leases.iter().any(|(epoch, until)| {
+                *epoch == id.lease_epoch && *until > std::time::Instant::now()
+            }) {
+                return Err(E::StaleLease);
+            }
+            let active = self
+                .sessions
+                .values()
+                .filter(|s| s.kind() == session::SessionKind::Agent && s.lifecycle().is_running())
+                .count();
+            if active >= usize::from(host.config.max_workers)
+                || self.suspended
+                || !self.session_capacity_available()
+            {
+                return Err(E::Capacity);
+            }
+            let profile = host
+                .config
+                .profiles
+                .iter()
+                .find(|p| p.id == request.profile_id)
+                .ok_or(E::UnsupportedProfile)?;
+            let mut command = host
+                .launcher
+                .prepare(profile, request.initial_prompt.as_deref())
+                .map_err(|_| E::Invalid)?;
+            if !matches!(command, RuntimeCommand::SpawnAgent { .. })
+                || crate::command::prepare_runtime_command_for_retention_internal(&mut command)
+                    .is_err()
+            {
+                return Err(E::Invalid);
+            }
+            Ok(command)
+        })();
+        let result = match launch {
+            Err(code) => reject(code),
+            Ok(command) => {
+                let session = SessionId(self.next_id);
+                self.handle_command_inner_with_cwd(
+                    command,
+                    Some((Arc::clone(&host.directory), host.folder.clone())),
+                );
+                if self.sessions.contains_key(&session) {
+                    match host.execution_counter.checked_add(1) {
+                        Some(generation) => {
+                            host.execution_counter = generation;
+                            host.active.push((id.operation_id.clone(), session));
+                            R::Launched {
+                                session,
+                                execution_generation: generation,
+                            }
+                        }
+                        None => R::ObservationUnknown,
+                    }
+                } else {
+                    reject(E::LaunchFailed)
+                }
+            }
+        };
+        match host.journal.resolve(request, &result) {
+            Ok(true) => P::Complete(result),
+            Ok(false) => P::Pending(PendingPhase::Resolve(result)),
+            Err(_) => P::Complete(R::ObservationUnknown),
+        }
+    }
+
+    fn handle_command_inner(&mut self, command: RuntimeCommand) {
+        self.handle_command_inner_with_cwd(command, None);
+    }
+    fn handle_command_inner_with_cwd(
+        &mut self,
+        mut command: RuntimeCommand,
+        scoped_cwd: Option<(Arc<crate::remote_worker::RemoteDirectory>, String)>,
+    ) {
         // All production senders already use this primitive before queue retention. Reapplying it
         // here is an idempotent defense for direct/internal producers and preserves fail-closed
         // worker semantics without duplicating validation or canonicalization rules.
@@ -2858,6 +3174,10 @@ impl Worker {
         }
         let (command, agent_split_target) = command.into_agent_spawn_target();
         match command {
+            RuntimeCommand::InspectRemoteWorker { request_id } => {
+                self.inspect_remote_worker(request_id)
+            }
+            RuntimeCommand::SpawnRemoteWork { request } => self.spawn_remote_work(request),
             RuntimeCommand::SpawnAgentBeside { .. } => {
                 unreachable!("split launch normalized above")
             }
@@ -3019,15 +3339,22 @@ impl Worker {
                     args,
                     env,
                     // 에이전트도 워크스페이스 폴더에서 실행 — 셸과 동일 cwd(agent 이어가기).
-                    cwd: self.shell.cwd.clone(),
+                    cwd: scoped_cwd
+                        .as_ref()
+                        .map(|(_, folder)| PathBuf::from(folder))
+                        .or_else(|| self.shell.cwd.clone()),
                 };
-                match self.spawn_session(
+                match self.spawn_session_in_directory(
                     id,
                     session::SessionKind::Agent,
                     &spec,
                     cols,
                     rows,
                     scrollback_lines,
+                    #[cfg(unix)]
+                    scoped_cwd
+                        .as_ref()
+                        .map(|(directory, _)| Arc::clone(directory)),
                 ) {
                     Ok(new_session) => {
                         self.insert_session(id, new_session);
@@ -3071,7 +3398,10 @@ impl Worker {
                                 AGENT_TITLE_ID,
                                 &spec.program,
                                 &persisted_args,
-                                &Self::spawn_cwd_string(&spec.cwd),
+                                &scoped_cwd
+                                    .as_ref()
+                                    .map(|(_, folder)| folder.clone())
+                                    .unwrap_or_else(|| Self::spawn_cwd_string(&spec.cwd)),
                                 waiting_regex,
                                 approval_regex,
                                 error_regex,
@@ -7330,6 +7660,7 @@ mod tests {
         (
             Worker {
                 instance_token: uuid::Uuid::new_v4().to_string(),
+                remote_worker: Arc::default(),
                 command_rx,
                 subscribers,
                 batch: Duration::from_millis(5),
@@ -9790,6 +10121,7 @@ mod tests {
         let command_budget = Arc::new(RuntimeCommandQueueBudget::default());
         let mut client = InProcessRuntimeClient {
             instance_token: uuid::Uuid::new_v4().to_string(),
+            remote_worker: Arc::default(),
             command_tx: Some(tx),
             command_budget: Arc::clone(&command_budget),
             subscribers: Arc::default(),
@@ -9837,6 +10169,7 @@ mod tests {
         let budget = Arc::new(RuntimeCommandQueueBudget::default());
         let mut client = InProcessRuntimeClient {
             instance_token: uuid::Uuid::new_v4().to_string(),
+            remote_worker: Arc::default(),
             command_tx: Some(tx),
             command_budget: Arc::clone(&budget),
             subscribers: Arc::default(),

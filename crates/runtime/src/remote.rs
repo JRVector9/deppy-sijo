@@ -484,6 +484,18 @@ fn validate_event(event: &RuntimeEvent) -> Result<(), &'static str> {
                 .is_none_or(|token| token.is_valid() && token.owner_epoch == stamp.owner_epoch)
     };
     match event {
+        RuntimeEvent::RemoteWorkerObserved {
+            request_id,
+            capabilities,
+        } if *request_id == 0 || capabilities.as_ref().is_some_and(|c| !c.is_valid()) => {
+            return Err("remote worker proof invalid");
+        }
+        RuntimeEvent::RemoteWorkResolved { identity, result }
+            if !identity.is_valid()
+                || matches!(result,crate::remote_worker::RemoteWorkResult::Launched{session,execution_generation} if session.0==0 || *execution_generation==0) =>
+        {
+            return Err("remote work result invalid");
+        }
         RuntimeEvent::TerminalHistoryResult {
             operation_id: 0, ..
         } => return Err("history operation id 無効"),
@@ -3981,6 +3993,8 @@ mod tests {
             RuntimeEvent::TerminalControlResult { .. } => "TerminalControlResult",
             RuntimeEvent::ResizeDeferred { .. } => "ResizeDeferred",
             RuntimeEvent::TerminalHistoryResult { .. } => "TerminalHistoryResult",
+            RuntimeEvent::RemoteWorkerObserved { .. } => "RemoteWorkerObserved",
+            RuntimeEvent::RemoteWorkResolved { .. } => "RemoteWorkResolved",
             RuntimeEvent::SessionInputSubmitted { .. } => "SessionInputSubmitted",
             RuntimeEvent::SessionTitleChanged { .. } => "SessionTitleChanged",
             RuntimeEvent::SessionInputAccepted { .. } => "SessionInputAccepted",

@@ -1,0 +1,750 @@
+//! Explicit, scoped remote compute on the existing pinned TLS runtime channel.
+//! Launch profiles and durable admission are installed locally, never by a wire command.
+use crate::{RuntimeCommand, SessionId};
+use deppy_core::WorkspaceId;
+use deppy_core::work_management::{AgentSelection, AttemptId, OperationId, RuntimeIncarnationId};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::Arc;
+
+#[cfg(unix)]
+pub(crate) type RemoteDirectory = std::os::fd::OwnedFd;
+#[cfg(not(unix))]
+pub(crate) type RemoteDirectory = std::fs::File;
+
+pub const REMOTE_WORK_PROFILES_MAX: usize = 32;
+pub const REMOTE_WORK_OPERATIONS_MAX: usize = 256;
+pub const REMOTE_WORK_PROMPT_MAX: usize = 16 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkerProfile {
+    pub id: String,
+    pub agent: AgentSelection,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkerCapabilities {
+    pub device_id: String,
+    pub workspace_id: WorkspaceId,
+    pub incarnation: RuntimeIncarnationId,
+    pub folder: String,
+    pub folder_anchor: String,
+    pub grant_epoch: u64,
+    pub lease_epoch: u64,
+    pub profiles: Vec<RemoteWorkerProfile>,
+    pub max_workers: u8,
+    pub active_workers: u8,
+    pub active_operation_ids: Vec<OperationId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkIdentity {
+    pub device_id: String,
+    pub workspace_id: WorkspaceId,
+    pub attempt_id: AttemptId,
+    pub operation_id: OperationId,
+    pub incarnation: RuntimeIncarnationId,
+    pub grant_epoch: u64,
+    pub lease_epoch: u64,
+}
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteWorkRequest {
+    pub identity: RemoteWorkIdentity,
+    pub folder: String,
+    pub folder_anchor: String,
+    pub profile_id: String,
+    pub initial_prompt: Option<String>,
+}
+impl std::fmt::Debug for RemoteWorkRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RemoteWorkRequest")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteWorkError {
+    Disabled,
+    Invalid,
+    WrongWorker,
+    GrantChanged,
+    FolderChanged,
+    StaleLease,
+    UnsupportedProfile,
+    Capacity,
+    JournalUnavailable,
+    IdentityConflict,
+    LaunchFailed,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemoteWorkResult {
+    Launched {
+        session: SessionId,
+        execution_generation: u64,
+    },
+    Rejected {
+        code: RemoteWorkError,
+    },
+    ObservationUnknown,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteWorkClaim {
+    Pending,
+    New,
+    Existing(RemoteWorkResult),
+    Conflict,
+}
+
+/// Nonblocking durable admission port. Backends enqueue SQLite work on their own bounded worker.
+/// New is returned only after claim commit; Pending yields to the runtime event loop.
+/// Existing unresolved claims return ObservationUnknown and are never reclaimed as New.
+/// resolve returns true only after the result commit, false while its worker is pending.
+pub trait RemoteWorkJournal: Send + Sync {
+    fn claim(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim>;
+    fn resolve(
+        &self,
+        request: &RemoteWorkRequest,
+        result: &RemoteWorkResult,
+    ) -> anyhow::Result<bool>;
+}
+/// App adapters resolve the approved selection with the existing launcher/credential machinery.
+/// This callback must only clone an already resolved launch template and append bounded prompt
+/// arguments. No DB, keyring, network, subprocess, or filesystem work is allowed here.
+/// Only SpawnAgent is accepted. The runtime pins its cwd atomically to the granted folder.
+pub trait RemoteWorkLauncher: Send + Sync {
+    fn prepare(
+        &self,
+        profile: &RemoteWorkerProfile,
+        initial_prompt: Option<&str>,
+    ) -> anyhow::Result<RuntimeCommand>;
+}
+pub struct RemoteWorkerConfig {
+    pub device_id: String,
+    pub workspace_id: WorkspaceId,
+    pub folder: PathBuf,
+    pub grant_epoch: u64,
+    pub max_workers: u8,
+    pub profiles: Vec<RemoteWorkerProfile>,
+}
+#[derive(Default)]
+pub(crate) struct RemoteWorkerSlot {
+    pub(crate) host: Option<RemoteWorkerHost>,
+    pub(crate) grant_floor: u64,
+}
+pub(crate) enum PendingPhase {
+    Claim,
+    Resolve(RemoteWorkResult),
+}
+pub(crate) struct PendingWork {
+    pub(crate) request: RemoteWorkRequest,
+    pub(crate) phase: PendingPhase,
+}
+pub(crate) enum Progress {
+    Complete(RemoteWorkResult),
+    Pending(PendingPhase),
+}
+pub struct RemoteWorkerHost {
+    pub(crate) config: RemoteWorkerConfig,
+    pub(crate) folder: String,
+    pub(crate) anchor: String,
+    pub(crate) launcher: Arc<dyn RemoteWorkLauncher>,
+    pub(crate) journal: Arc<dyn RemoteWorkJournal>,
+    pub(crate) directory: Arc<RemoteDirectory>,
+    pub(crate) leases: Vec<(u64, std::time::Instant)>,
+    pub(crate) lease_counter: u64,
+    pub(crate) execution_counter: u64,
+    pub(crate) active: Vec<(OperationId, SessionId)>,
+    pub(crate) pending: Vec<PendingWork>,
+}
+impl RemoteWorkerHost {
+    /// Filesystem validation belongs on a host setup worker, outside rendering.
+    pub fn new(
+        config: RemoteWorkerConfig,
+        launcher: Arc<dyn RemoteWorkLauncher>,
+        journal: Arc<dyn RemoteWorkJournal>,
+    ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            id_valid(&config.device_id)
+                && id_valid(&config.workspace_id.0)
+                && config.grant_epoch > 0
+                && (1..=8).contains(&config.max_workers),
+            "remote_worker_config_invalid"
+        );
+        anyhow::ensure!(
+            !config.profiles.is_empty() && config.profiles.len() <= REMOTE_WORK_PROFILES_MAX,
+            "remote_worker_profiles_invalid"
+        );
+        for (i, p) in config.profiles.iter().enumerate() {
+            anyhow::ensure!(
+                id_valid(&p.id)
+                    && p.agent.validate().is_ok()
+                    && !config.profiles[..i].iter().any(|other| other.id == p.id),
+                "remote_worker_profile_invalid"
+            );
+        }
+        let folder = std::fs::canonicalize(&config.folder)?;
+        let folder = folder
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("remote_worker_folder_invalid"))?
+            .to_owned();
+        anyhow::ensure!(
+            folder.len() <= 4096 && !folder.chars().any(char::is_control),
+            "remote_worker_folder_invalid"
+        );
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW);
+        }
+        let directory = options.open(&folder)?;
+        let anchor = folder_anchor(&folder)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = directory.metadata()?;
+            anyhow::ensure!(
+                anchor == format!("{}:{}", metadata.dev(), metadata.ino()),
+                "remote_worker_folder_changed"
+            );
+        }
+        Ok(Self {
+            config,
+            folder,
+            anchor,
+            launcher,
+            journal,
+            directory: Arc::new(directory.into()),
+            leases: vec![],
+            lease_counter: 0,
+            execution_counter: 0,
+            active: vec![],
+            pending: vec![],
+        })
+    }
+}
+fn id_valid(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 128 && !value.chars().any(char::is_control)
+}
+impl RemoteWorkIdentity {
+    pub fn is_valid(&self) -> bool {
+        id_valid(&self.device_id)
+            && id_valid(&self.workspace_id.0)
+            && id_valid(self.attempt_id.as_str())
+            && id_valid(self.operation_id.as_str())
+            && id_valid(self.incarnation.as_str())
+            && self.grant_epoch > 0
+            && self.lease_epoch > 0
+    }
+}
+impl RemoteWorkRequest {
+    pub fn is_valid(&self) -> bool {
+        self.identity.is_valid()
+            && id_valid(&self.folder_anchor)
+            && id_valid(&self.profile_id)
+            && self.folder.len() <= 4096
+            && std::path::Path::new(&self.folder).is_absolute()
+            && !self.folder.chars().any(char::is_control)
+            && !self.folder.is_empty()
+            && self.initial_prompt.as_ref().is_none_or(|prompt| {
+                !prompt.is_empty()
+                    && prompt.len() <= REMOTE_WORK_PROMPT_MAX
+                    && !prompt.contains('\0')
+            })
+    }
+    pub fn digest(&self) -> anyhow::Result<String> {
+        let bytes = postcard::to_allocvec(self)?;
+        Ok(Sha256::digest(bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
+    pub(crate) fn canonicalize(&mut self) {
+        self.identity.device_id.shrink_to_fit();
+        self.identity.workspace_id.0.shrink_to_fit();
+        self.identity.attempt_id.0.shrink_to_fit();
+        self.identity.operation_id.0.shrink_to_fit();
+        self.identity.incarnation.0.shrink_to_fit();
+        self.folder.shrink_to_fit();
+        self.folder_anchor.shrink_to_fit();
+        self.profile_id.shrink_to_fit();
+        if let Some(prompt) = &mut self.initial_prompt {
+            prompt.shrink_to_fit();
+        }
+    }
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.identity.device_id.capacity()
+            + self.identity.workspace_id.0.capacity()
+            + self.identity.attempt_id.0.capacity()
+            + self.identity.operation_id.0.capacity()
+            + self.identity.incarnation.0.capacity()
+            + self.folder.capacity()
+            + self.folder_anchor.capacity()
+            + self.profile_id.capacity()
+            + self
+                .initial_prompt
+                .as_ref()
+                .map_or(0, |prompt| prompt.capacity())
+    }
+}
+impl RemoteWorkerCapabilities {
+    pub fn is_valid(&self) -> bool {
+        id_valid(&self.device_id)
+            && id_valid(&self.workspace_id.0)
+            && id_valid(self.incarnation.as_str())
+            && id_valid(&self.folder_anchor)
+            && self.folder.len() <= 4096
+            && std::path::Path::new(&self.folder).is_absolute()
+            && !self.folder.chars().any(char::is_control)
+            && self.grant_epoch > 0
+            && self.lease_epoch > 0
+            && (1..=8).contains(&self.max_workers)
+            && self.active_workers <= self.max_workers
+            && self.active_operation_ids.len() <= usize::from(self.active_workers)
+            && self.active_operation_ids.iter().enumerate().all(|(i, id)| {
+                id_valid(id.as_str()) && !self.active_operation_ids[..i].contains(id)
+            })
+            && !self.profiles.is_empty()
+            && self.profiles.len() <= REMOTE_WORK_PROFILES_MAX
+            && self.profiles.iter().enumerate().all(|(i, p)| {
+                id_valid(&p.id)
+                    && p.agent.validate().is_ok()
+                    && !self.profiles[..i].iter().any(|other| other.id == p.id)
+            })
+    }
+}
+pub(crate) fn folder_anchor(folder: &str) -> anyhow::Result<String> {
+    let metadata = std::fs::metadata(folder)?;
+    anyhow::ensure!(metadata.is_dir(), "remote_worker_folder_invalid");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        anyhow::bail!("remote_worker_folder_identity_unsupported")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        InProcessRuntimeClient, RemoteRuntimeClient, RemoteRuntimeServer, RuntimeCommandSink,
+        RuntimeEvent, RuntimeEventReceiver, RuntimeEventStream, RuntimeSecret,
+        RuntimeSecretResolver,
+    };
+    use secret::RedactionService;
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    #[derive(Default)]
+    struct Journal(Mutex<Vec<(String, RemoteWorkIdentity, Option<RemoteWorkResult>)>>);
+    impl RemoteWorkJournal for Journal {
+        fn claim(&self, r: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim> {
+            let digest = r.digest()?;
+            let mut rows = self.0.lock().unwrap();
+            if let Some((old, id, result)) = rows.iter().find(|(_, id, _)| {
+                id.operation_id == r.identity.operation_id || id.attempt_id == r.identity.attempt_id
+            }) {
+                return Ok(if *old == digest && *id == r.identity {
+                    RemoteWorkClaim::Existing(
+                        result
+                            .clone()
+                            .unwrap_or(RemoteWorkResult::ObservationUnknown),
+                    )
+                } else {
+                    RemoteWorkClaim::Conflict
+                });
+            }
+            anyhow::ensure!(rows.len() < REMOTE_WORK_OPERATIONS_MAX, "full");
+            rows.push((digest, r.identity.clone(), None));
+            Ok(RemoteWorkClaim::New)
+        }
+        fn resolve(
+            &self,
+            r: &RemoteWorkRequest,
+            result: &RemoteWorkResult,
+        ) -> anyhow::Result<bool> {
+            let digest = r.digest()?;
+            let mut rows = self.0.lock().unwrap();
+            let row = rows
+                .iter_mut()
+                .find(|(d, _, _)| *d == digest)
+                .ok_or_else(|| anyhow::anyhow!("missing"))?;
+            row.2 = Some(result.clone());
+            Ok(true)
+        }
+    }
+    struct Resolver;
+    impl RuntimeSecretResolver for Resolver {
+        fn resolve(&self, _: &str) -> anyhow::Result<RuntimeSecret> {
+            anyhow::bail!("fixture_has_no_secrets")
+        }
+    }
+    struct Launcher;
+    impl RemoteWorkLauncher for Launcher {
+        fn prepare(
+            &self,
+            _: &RemoteWorkerProfile,
+            _: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            Ok(RuntimeCommand::SpawnAgent {
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                agent_config_id: None,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    "pwd > actual-cwd; printf launch >> launches; sleep 2".into(),
+                ],
+                env_plain: vec![],
+                env_secrets: vec![],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+                transient_args: vec![],
+            })
+        }
+    }
+    fn profile() -> RemoteWorkerProfile {
+        RemoteWorkerProfile {
+            id: "fixture-profile".into(),
+            agent: AgentSelection {
+                provider: "fixture".into(),
+                model: None,
+                effort: None,
+            },
+        }
+    }
+    fn identity() -> crate::tls_identity::TlsIdentity {
+        let rcgen::CertifiedKey { cert, signing_key } =
+            rcgen::generate_simple_self_signed(vec!["deppy-remote".into()]).unwrap();
+        crate::tls_identity::TlsIdentity {
+            cert_der: cert.der().to_vec(),
+            key_der: signing_key.serialize_der(),
+        }
+    }
+    fn worker(
+        root: &std::path::Path,
+        id: &str,
+        journal: Arc<dyn RemoteWorkJournal>,
+    ) -> (RemoteRuntimeServer, String) {
+        std::fs::create_dir_all(root).unwrap();
+        let backend = InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            Arc::new(Resolver),
+            root.join("logs"),
+            RedactionService::new(),
+            None,
+            None,
+            vec![],
+        )
+        .unwrap();
+        backend
+            .configure_remote_worker(Some(
+                RemoteWorkerHost::new(
+                    RemoteWorkerConfig {
+                        device_id: id.into(),
+                        workspace_id: WorkspaceId(format!("workspace-{id}")),
+                        folder: root.to_path_buf(),
+                        grant_epoch: 1,
+                        max_workers: 2,
+                        profiles: vec![profile()],
+                    },
+                    Arc::new(Launcher),
+                    journal,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let identity = identity();
+        let pin = identity.fingerprint();
+        (
+            RemoteRuntimeServer::serve_tls(
+                backend,
+                "127.0.0.1:0".parse().unwrap(),
+                identity,
+                false,
+            )
+            .unwrap(),
+            pin,
+        )
+    }
+    fn wait_event(
+        rx: &RuntimeEventReceiver,
+        accept: impl Fn(&RuntimeEvent) -> bool,
+    ) -> RuntimeEvent {
+        let until = Instant::now() + Duration::from_secs(8);
+        loop {
+            for event in rx.drain() {
+                if accept(&event) {
+                    return event;
+                }
+            }
+            assert!(Instant::now() < until, "fixture response timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn inspect(
+        client: &RemoteRuntimeClient,
+        rx: &RuntimeEventReceiver,
+    ) -> RemoteWorkerCapabilities {
+        client
+            .send_command(RuntimeCommand::InspectRemoteWorker { request_id: 1 })
+            .unwrap();
+        match wait_event(rx, |e| {
+            matches!(e, RuntimeEvent::RemoteWorkerObserved { request_id: 1, .. })
+        }) {
+            RuntimeEvent::RemoteWorkerObserved {
+                capabilities: Some(c),
+                ..
+            } => c,
+            _ => panic!("registered fixture did not prove compute"),
+        }
+    }
+    fn request(c: &RemoteWorkerCapabilities, op: &str) -> RemoteWorkRequest {
+        RemoteWorkRequest {
+            identity: RemoteWorkIdentity {
+                device_id: c.device_id.clone(),
+                workspace_id: c.workspace_id.clone(),
+                attempt_id: AttemptId(format!("attempt-{op}")),
+                operation_id: OperationId(op.into()),
+                incarnation: c.incarnation.clone(),
+                grant_epoch: c.grant_epoch,
+                lease_epoch: c.lease_epoch,
+            },
+            folder: c.folder.clone(),
+            folder_anchor: c.folder_anchor.clone(),
+            profile_id: c.profiles[0].id.clone(),
+            initial_prompt: Some("controlled fixture only".into()),
+        }
+    }
+    #[test]
+    fn remote_compute_two_pinned_tls_workers_are_isolated_and_lost_reply_does_not_respawn() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-remote-compute-{}", uuid::Uuid::new_v4()));
+        let a_dir = root.join("a");
+        let b_dir = root.join("b");
+        let (a, a_pin) = worker(&a_dir, "a", Arc::new(Journal::default()));
+        let (b, b_pin) = worker(&b_dir, "b", Arc::new(Journal::default()));
+        assert!(RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &b_pin).is_err());
+        let client_a =
+            RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &a_pin).unwrap();
+        let rx_a = client_a.subscribe();
+        let client_b =
+            RemoteRuntimeClient::attach_tls(b.local_addr(), b.auth_token(), &b_pin).unwrap();
+        let rx_b = client_b.subscribe();
+        let proof_a = inspect(&client_a, &rx_a);
+        let proof_b = inspect(&client_b, &rx_b);
+        assert_ne!(proof_a.incarnation, proof_b.incarnation);
+        let request_a = request(&proof_a, "op-a");
+        let request_b = request(&proof_b, "op-b");
+        client_b
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request_a.clone(),
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&rx_b, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Rejected {
+                    code: RemoteWorkError::WrongWorker
+                },
+                ..
+            }
+        ));
+        client_a
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request_a.clone(),
+            })
+            .unwrap();
+        // Drop without reading its admission reply, after observing the fixture process side effect.
+        let until = Instant::now() + Duration::from_secs(8);
+        while !a_dir.join("launches").exists() {
+            if Instant::now() >= until {
+                for event in rx_a.drain() {
+                    if let RuntimeEvent::RemoteWorkResolved { result, .. } = event {
+                        panic!("spawn result: {result:?}");
+                    }
+                }
+                panic!("fixture did not create marker");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(client_a);
+        client_b
+            .send_command(RuntimeCommand::SpawnRemoteWork { request: request_b })
+            .unwrap();
+        let b_result = wait_event(&rx_b, |e| {
+            matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved {
+                    result: RemoteWorkResult::Launched { .. },
+                    ..
+                }
+            )
+        });
+        let again =
+            RemoteRuntimeClient::attach_tls(a.local_addr(), a.auth_token(), &a_pin).unwrap();
+        let again_rx = again.subscribe();
+        again
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request_a.clone(),
+            })
+            .unwrap();
+        let recovered = wait_event(&again_rx, |e| {
+            matches!(e, RuntimeEvent::RemoteWorkResolved { .. })
+        });
+        assert!(matches!(
+            recovered,
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched {
+                    session: SessionId(1),
+                    execution_generation: 1
+                },
+                ..
+            }
+        ));
+        assert!(matches!(
+            b_result,
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched {
+                    session: SessionId(1),
+                    ..
+                },
+                ..
+            }
+        ));
+        let mut conflicting = request_a;
+        conflicting.initial_prompt = Some("different work".into());
+        again
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: conflicting,
+            })
+            .unwrap();
+        assert!(matches!(
+            wait_event(&again_rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Rejected {
+                    code: RemoteWorkError::IdentityConflict
+                },
+                ..
+            }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(a_dir.join("launches")).unwrap(),
+            "launch"
+        );
+        let until = Instant::now() + Duration::from_secs(8);
+        while !b_dir.join("launches").exists() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            std::fs::read_to_string(b_dir.join("launches")).unwrap(),
+            "launch"
+        );
+        assert_eq!(
+            std::fs::read_to_string(a_dir.join("actual-cwd"))
+                .unwrap()
+                .trim(),
+            std::fs::canonicalize(&a_dir).unwrap().to_str().unwrap()
+        );
+        assert_eq!(
+            std::fs::read_to_string(b_dir.join("actual-cwd"))
+                .unwrap()
+                .trim(),
+            std::fs::canonicalize(&b_dir).unwrap().to_str().unwrap()
+        );
+        drop(again);
+        drop(client_b);
+        a.shutdown();
+        b.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    struct GatedJournal {
+        gate: std::sync::atomic::AtomicBool,
+        inner: Journal,
+    }
+    impl RemoteWorkJournal for GatedJournal {
+        fn claim(&self, request: &RemoteWorkRequest) -> anyhow::Result<RemoteWorkClaim> {
+            if !self.gate.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(RemoteWorkClaim::Pending)
+            } else {
+                self.inner.claim(request)
+            }
+        }
+        fn resolve(
+            &self,
+            request: &RemoteWorkRequest,
+            result: &RemoteWorkResult,
+        ) -> anyhow::Result<bool> {
+            self.inner.resolve(request, result)
+        }
+    }
+    #[test]
+    fn remote_compute_pending_journal_keeps_runtime_responsive_without_early_spawn_or_ack() {
+        let root =
+            std::env::temp_dir().join(format!("deppy-pending-journal-{}", uuid::Uuid::new_v4()));
+        let journal = Arc::new(GatedJournal {
+            gate: std::sync::atomic::AtomicBool::new(false),
+            inner: Journal::default(),
+        });
+        let (server, pin) = worker(&root, "pending", journal.clone());
+        let client =
+            RemoteRuntimeClient::attach_tls(server.local_addr(), server.auth_token(), &pin)
+                .unwrap();
+        let rx = client.subscribe();
+        let proof = inspect(&client, &rx);
+        client
+            .send_command(RuntimeCommand::SpawnRemoteWork {
+                request: request(&proof, "pending-op"),
+            })
+            .unwrap();
+        client
+            .send_command(RuntimeCommand::RequestMuxSnapshot)
+            .unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut seen_mux = false;
+        let mut early_ack = false;
+        while !seen_mux {
+            for event in rx.drain() {
+                match event {
+                    RuntimeEvent::MuxUpdated { .. } => seen_mux = true,
+                    RuntimeEvent::RemoteWorkResolved { .. } => early_ack = true,
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!early_ack, "uncommitted journal emitted launch ACK");
+        assert!(!root.join("launches").exists());
+        journal
+            .gate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(matches!(
+            wait_event(&rx, |e| matches!(
+                e,
+                RuntimeEvent::RemoteWorkResolved { .. }
+            )),
+            RuntimeEvent::RemoteWorkResolved {
+                result: RemoteWorkResult::Launched { .. },
+                ..
+            }
+        ));
+        drop(client);
+        server.shutdown();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

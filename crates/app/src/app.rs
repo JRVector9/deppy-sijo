@@ -5166,7 +5166,10 @@ fn execute_settings_job_with_repair(
 ) -> SettingsOutcome {
     if matches!(
         &job.action,
-        SettingsJobAction::CommandCenter(command_center_host::launch::SettingsRequest::Install(_))
+        SettingsJobAction::CommandCenter(
+            command_center_host::launch::SettingsRequest::Install(_)
+                | command_center_host::launch::SettingsRequest::ServerInstall { .. }
+        )
     ) || matches!(&job.action, SettingsJobAction::EditCredential { credential } if credential.secret.is_some())
         || matches!(
             job.action,
@@ -9238,10 +9241,23 @@ impl LiveSessionTracker {
 /// 실행 중인 remote TLS 서버 + 그 신원 지문(attach 클라이언트 대조용).
 /// 원격 worker는 server가 소유(move)한다 — 활성 workspace worker와 별개의 전용 worker라
 /// 수명이 서로 얽히지 않는다. Drop/shutdown이 accept 루프·접속·worker를 모두 정리한다.
+fn create_command_center_device_worker(
+    data_dir: PathBuf,
+    ctx: &egui::Context,
+) -> crate::work_management::remote_controller::RemoteDeviceWorker {
+    let wake = ctx.clone();
+    crate::work_management::remote_controller::RemoteDeviceWorker::new(
+        data_dir,
+        Arc::new(KeyringSecretStore),
+        move || wake.request_repaint(),
+    )
+}
+
 struct RemoteTlsState {
     server: runtime::RemoteRuntimeServer,
     fingerprint: String,
     policy: RemoteScrollbackPolicy,
+    execution: command_center_host::server::ExecutionServer,
 }
 
 /// 서버로 worker 소유권을 옮겨도 정책 명령과 ACK는 앱 logic에서 계속 관측한다.
@@ -9278,9 +9294,15 @@ impl RemoteScrollbackPolicy {
 
 impl RemoteTlsState {
     fn shutdown(self) {
-        let Self { server, policy, .. } = self;
+        let Self {
+            server,
+            policy,
+            execution,
+            ..
+        } = self;
         // 재시도 상태와 송신 핸들을 먼저 없애 worker 종료에 잔여 공급자를 남기지 않는다.
         drop(policy);
+        drop(execution);
         server.shutdown();
     }
 }
@@ -23201,12 +23223,17 @@ impl App {
         };
         let addr =
             std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, self.config.remote.port));
+        let execution = command_center_host::server::ExecutionServer::new(
+            worker.remote_worker_control(),
+            worker.remote_worker_wake(),
+        );
         // loopback 전용(allow_non_loopback=false) — 비-loopback 개방은 후속 UI(C-4 가드 유지).
         let server = runtime::RemoteRuntimeServer::serve_tls(worker, addr, identity, false)?;
         Ok(RemoteTlsState {
             server,
             fingerprint,
             policy,
+            execution,
         })
     }
 
@@ -43928,11 +43955,16 @@ mod tests {
             events,
             delivery: Delivery::new(7, 5000, std::time::Instant::now()),
         };
+        let execution = super::command_center_host::server::ExecutionServer::new(
+            worker.remote_worker_control(),
+            worker.remote_worker_wake(),
+        );
         let server = runtime::RemoteRuntimeServer::serve(worker, 0).unwrap();
         let mut state = super::RemoteTlsState {
             server,
             fingerprint: String::new(),
             policy,
+            execution,
         };
         let ctx = egui::Context::default();
         // factory 초기 ACK가 이미 나갔어도 동일 요청 재확인으로 완료해야 한다.

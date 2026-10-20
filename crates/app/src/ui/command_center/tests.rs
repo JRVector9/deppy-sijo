@@ -333,11 +333,40 @@ fn command_center_render_evidence() {
         ("mobile", 390.0, 1.0, true, false, false),
         ("mobile-projects", 390.0, 1.25, false, true, false),
         ("mobile-workers", 390.0, 1.25, true, false, true),
+        ("devices-desktop", 1440.0, 1.0, true, false, false),
+        ("devices-mobile", 390.0, 1.0, true, false, false),
     ] {
         let mut snapshot = rich_fixture();
         snapshot.font_scale = scale;
         snapshot.dark_mode = dark;
+        let device_view = name.starts_with("devices-");
+        if device_view {
+            let enabled = || Capability {
+                enabled: true,
+                reason: String::new(),
+            };
+            snapshot.server_execution = ServerExecutionSetup {
+                running: true,
+                endpoint: "127.0.0.1:4270".into(),
+                fingerprint: vec!["ab"; 32].join(":"),
+                status: "이 컴퓨터의 선택한 프로젝트 실행을 허용했습니다.".into(),
+                workspace_id: snapshot.selected_workspace_id.clone(),
+                exported_workspace_id: Some("controller-project".into()),
+                folder: "/projects/command-center".into(),
+                agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
+                requested_agents: vec!["Codex · GPT-6.1-Sol · xhigh".into()],
+                allow: enabled(),
+                revoke: enabled(),
+                copy: enabled(),
+                ..Default::default()
+            };
+        }
         let initial = UiState {
+            view: if device_view {
+                View::Devices
+            } else {
+                View::Main
+            },
             active_workspace: snapshot.selected_workspace_id.clone(),
             left_drawer: left,
             right_drawer: right,

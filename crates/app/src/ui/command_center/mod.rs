@@ -6,6 +6,7 @@
 mod devices;
 mod layout;
 mod main;
+mod server;
 mod settings;
 mod workers;
 
@@ -17,6 +18,7 @@ pub use devices::{
     NativeDeviceSetupRequest,
 };
 pub use layout::LayoutRects;
+pub use server::ServerExecutionSetup;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RouteTarget {
@@ -243,6 +245,8 @@ pub struct Device {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(skip)]
+    pub server_execution: ServerExecutionSetup,
     /// Pairing and execution grants are trusted native-computer actions. Never publish this form.
     #[serde(skip)]
     pub execution_setup: ExecutionSetup,
@@ -263,6 +267,7 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            server_execution: ServerExecutionSetup::default(),
             execution_setup: ExecutionSetup::default(),
             receipts: Vec::new(),
             projects: Vec::new(),
@@ -286,6 +291,18 @@ pub enum Intent {
         target: RouteTarget,
         attempt_id: String,
     },
+    #[serde(skip)]
+    AllowThisComputer {
+        workspace_id: String,
+        config_revision: String,
+        exported_workspace_id: String,
+    },
+    #[serde(skip)]
+    RevokeThisComputer,
+    #[serde(skip)]
+    CopyThisComputerConnection,
+    #[serde(skip)]
+    OpenThisComputerSettings,
     #[serde(skip)]
     SetTaskAssignment {
         target: RouteTarget,
@@ -397,6 +414,7 @@ pub enum ReceiptStatus {
 }
 #[derive(Default)]
 pub struct UiState {
+    server_workspace: Option<(String, String)>,
     device_setup: devices::DeviceSetupState,
     pub view: View,
     pub detail_tab: DetailTab,

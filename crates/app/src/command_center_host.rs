@@ -24,6 +24,8 @@ mod observe;
 mod remote;
 #[path = "command_center_routes.rs"]
 mod routes;
+#[path = "command_center_server.rs"]
+pub(super) mod server;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Capture {
@@ -810,6 +812,7 @@ impl App {
             revoke: no("로컬 실행 환경은 기기 권한 회수 대상이 아닙니다."),
         });
         host.devices.project(&mut snapshot, &self.active.id);
+        snapshot.server_execution = self.command_center_server_snapshot(host);
         if let Some(p) = host.projects.get(&self.active.id) {
             snapshot.execution_setup.assignments = assignment::choices(p, &host.devices.policies);
         }
@@ -894,6 +897,10 @@ impl App {
             );
         }
         match intent {
+            cc::Intent::AllowThisComputer { workspace_id, config_revision, exported_workspace_id } => return self.allow_command_center_server(host, id, &workspace_id, &config_revision, &exported_workspace_id),
+            cc::Intent::RevokeThisComputer => return self.revoke_command_center_server(host, id),
+            cc::Intent::CopyThisComputerConnection => return self.copy_command_center_server_connection(host, id),
+            cc::Intent::OpenThisComputerSettings => { self.settings_category=ui::settings::Category::RemoteTls; self.request_settings_open(); },
             cc::Intent::SetTaskAssignment {target,config_revision,device_id,profile_id}=>return self.amend_command_center_assignment(host,id,target,config_revision,device_id,profile_id),
             cc::Intent::CreateMain {workspace_id} => return self.begin_command_center_launch(host,id,&workspace_id,None),
             cc::Intent::CreateWorker {target} => {if host.projects.get(&target.workspace_id).and_then(|p|p.snapshot.tasks.iter().find(|t|Some(&t.id.0)==target.task_id.as_ref())).is_some_and(|t|t.execution_device.is_some()) {return self.begin_command_center_remote(host,id,&target);} return self.begin_command_center_launch(host,id,&target.workspace_id,target.task_id.as_deref());},

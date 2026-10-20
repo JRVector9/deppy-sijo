@@ -6,6 +6,23 @@ use runtime::remote_worker::{
 };
 
 pub(crate) enum SettingsRequest {
+    ServerCopy {
+        operation_id: String,
+        runtime_instance: u64,
+        control: RemoteWorkerControl,
+        grant: super::server::Grant,
+        device_id: String,
+    },
+    ServerInstall {
+        request: Box<InstallRequest>,
+        exported_workspace: WorkspaceId,
+        device_id: String,
+    },
+    ServerRevoke {
+        operation_id: String,
+        runtime_instance: u64,
+        control: RemoteWorkerControl,
+    },
     NativeIdentity {
         operation_id: String,
         workspace: String,
@@ -47,6 +64,17 @@ pub(crate) struct InstallRequest {
     pub hooks: bool,
 }
 pub(crate) enum SettingsResult {
+    ServerCopy {
+        operation_id: String,
+        runtime_instance: u64,
+        grant: super::server::Grant,
+        token: Result<secret::SecretString, String>,
+    },
+    ServerConfigured {
+        operation_id: String,
+        runtime_instance: u64,
+        result: Result<Option<super::server::Prepared>, String>,
+    },
     NativeIdentity {
         operation_id: String,
         workspace: String,
@@ -90,6 +118,31 @@ pub(crate) struct Catalog {
 impl SettingsRequest {
     pub(crate) fn failed(self) -> SettingsResult {
         match self {
+            Self::ServerCopy {
+                operation_id,
+                runtime_instance,
+                grant,
+                ..
+            } => SettingsResult::ServerCopy {
+                operation_id,
+                runtime_instance,
+                grant,
+                token: Err("연결 정보 발급을 확인하지 못했습니다. 다시 복사해 주세요.".into()),
+            },
+            Self::ServerInstall { request, .. } => SettingsResult::ServerConfigured {
+                operation_id: request.operation_id,
+                runtime_instance: request.runtime_instance,
+                result: Err("이 컴퓨터의 실행 환경을 준비하지 못했습니다.".into()),
+            },
+            Self::ServerRevoke {
+                operation_id,
+                runtime_instance,
+                ..
+            } => SettingsResult::ServerConfigured {
+                operation_id,
+                runtime_instance,
+                result: Err("실행 허용 회수를 확인하지 못했습니다. 다시 회수해 주세요.".into()),
+            },
             Self::NativeIdentity {
                 operation_id,
                 workspace,
@@ -150,6 +203,64 @@ impl SettingsRequest {
 
 pub(crate) fn execute(db: &Db, request: SettingsRequest) -> SettingsResult {
     match request {
+        SettingsRequest::ServerCopy {
+            operation_id,
+            runtime_instance,
+            control,
+            grant,
+            device_id,
+        } => {
+            let token = control
+                .issue_scoped_token(
+                    &device_id,
+                    &WorkspaceId(grant.exported_workspace.clone()),
+                    grant.epoch,
+                )
+                .map_err(|_| {
+                    "현재 프로젝트 실행 허용이 바뀌어 연결 정보를 복사하지 않았습니다.".into()
+                });
+            SettingsResult::ServerCopy {
+                operation_id,
+                runtime_instance,
+                grant,
+                token,
+            }
+        }
+        SettingsRequest::ServerInstall {
+            request,
+            exported_workspace,
+            device_id,
+        } => {
+            let mut request = *request;
+            let result = (|| -> anyhow::Result<_> {
+                request.grant_epoch = super::server::next_server_grant_epoch(&request.data_dir)?;
+                let host = prepare_host(db, &request, device_id, exported_workspace)?;
+                let folder = std::fs::canonicalize(&request.config.folder)?;
+                let folder = folder.to_str().context("server_folder_encoding")?.to_owned();
+                request.control.configure(Some(host))?;
+                Ok(Some(super::server::Prepared { profiles: host_profiles(&request.config, &request.agents), folder, epoch: request.grant_epoch }))
+            })().map_err(|_| "선택한 프로젝트의 실행 환경을 허용하지 못했습니다. 실행 중인 작업과 에이전트 설정을 확인해 주세요.".into());
+            SettingsResult::ServerConfigured {
+                operation_id: request.operation_id,
+                runtime_instance: request.runtime_instance,
+                result,
+            }
+        }
+        SettingsRequest::ServerRevoke {
+            operation_id,
+            runtime_instance,
+            control,
+        } => {
+            let result = control
+                .configure(None)
+                .map(|()| None)
+                .map_err(|_| "실행 허용을 회수하지 못했습니다. 다시 회수해 주세요.".into());
+            SettingsResult::ServerConfigured {
+                operation_id,
+                runtime_instance,
+                result,
+            }
+        }
         SettingsRequest::NativeIdentity {
             operation_id,
             workspace,
@@ -296,6 +407,21 @@ impl RemoteWorkLauncher for Templates {
     }
 }
 fn install(db: &Db, request: &InstallRequest) -> anyhow::Result<Vec<RemoteWorkerProfile>> {
+    let host = prepare_host(
+        db,
+        request,
+        format!("local-{}", request.runtime_instance),
+        request.config.workspace_id.clone(),
+    )?;
+    request.control.configure(Some(host))?;
+    Ok(host_profiles(&request.config, &request.agents))
+}
+fn prepare_host(
+    db: &Db,
+    request: &InstallRequest,
+    device_id: String,
+    exported_workspace: WorkspaceId,
+) -> anyhow::Result<RemoteWorkerHost> {
     request.config.validate()?;
     anyhow::ensure!(
         !request.agents.is_empty() && request.agents.len() <= 32,
@@ -386,8 +512,8 @@ fn install(db: &Db, request: &InstallRequest) -> anyhow::Result<Vec<RemoteWorker
     );
     let host = RemoteWorkerHost::new(
         runtime::remote_worker::RemoteWorkerConfig {
-            device_id: format!("local-{}", request.runtime_instance),
-            workspace_id: request.config.workspace_id.clone(),
+            device_id,
+            workspace_id: exported_workspace,
             folder: PathBuf::from(&request.config.folder),
             grant_epoch: request.grant_epoch,
             max_workers: request.config.max_workers,
@@ -396,9 +522,7 @@ fn install(db: &Db, request: &InstallRequest) -> anyhow::Result<Vec<RemoteWorker
         Arc::new(Templates(templates)),
         journal,
     )?;
-    let profiles = host_profiles(&request.config, &request.agents);
-    request.control.configure(Some(host))?;
-    Ok(profiles)
+    Ok(host)
 }
 fn host_profiles(
     config: &work::ProjectConfig,
@@ -725,6 +849,30 @@ impl App {
             return;
         };
         match result {
+            SettingsResult::ServerCopy {
+                operation_id,
+                runtime_instance,
+                grant,
+                token,
+            } => {
+                self.command_center = Some(host);
+                self.command_center_server_copy_result(
+                    operation_id,
+                    runtime_instance,
+                    grant,
+                    token,
+                );
+                return;
+            }
+            SettingsResult::ServerConfigured {
+                operation_id,
+                runtime_instance,
+                result,
+            } => {
+                self.command_center = Some(host);
+                self.command_center_server_result(operation_id, runtime_instance, result);
+                return;
+            }
             SettingsResult::NativeIdentity {
                 operation_id,
                 workspace,

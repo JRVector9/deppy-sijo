@@ -27,11 +27,8 @@ pub(super) struct Devices {
 }
 impl Devices {
     pub fn new(data_dir: PathBuf, ctx: &egui::Context) -> Self {
-        let wake = ctx.clone();
         Self {
-            worker: RemoteDeviceWorker::new(data_dir, Arc::new(KeyringSecretStore), move || {
-                wake.request_repaint()
-            }),
+            worker: create_command_center_device_worker(data_dir, ctx),
             policies: vec![],
             views: BTreeMap::new(),
             candidates: vec![],
@@ -244,7 +241,7 @@ impl App {
                 pinned_fingerprint: setup.pinned_fingerprint,
                 workspace_id: WorkspaceId(workspace.into()),
                 expected_folder: setup.expected_folder,
-                auth_token: setup.auth_token,
+                auth_token: secret::SecretString::new(setup.auth_token.into_inner()),
             },
         };
         host.devices.queue(id, workspace, token, job)?;

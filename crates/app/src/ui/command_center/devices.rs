@@ -1,7 +1,7 @@
 //! Native-only pairing state. The token never enters a serializable intent or snapshot.
+use super::super::credentials::SensitiveInput;
 use super::super::popup;
 use super::*;
-use secret::SecretString;
 use std::collections::BTreeSet;
 
 #[derive(Clone, Debug, Default)]
@@ -49,7 +49,7 @@ pub struct NativeDeviceSetupRequest {
     pub endpoint: String,
     pub pinned_fingerprint: String,
     pub expected_folder: String,
-    pub auth_token: SecretString,
+    pub auth_token: SensitiveInput,
 }
 #[derive(Default)]
 struct SetupForm {
@@ -74,7 +74,7 @@ impl SetupForm {
 }
 impl Drop for SetupForm {
     fn drop(&mut self) {
-        drop(SecretString::new(std::mem::take(&mut self.token)));
+        drop(SensitiveInput::try_new(std::mem::take(&mut self.token)));
     }
 }
 #[derive(Default)]
@@ -131,7 +131,8 @@ impl DeviceSetupState {
                 endpoint: f.endpoint.clone(),
                 pinned_fingerprint: f.pin.clone(),
                 expected_folder: f.folder.clone(),
-                auth_token: SecretString::new(std::mem::take(&mut self.form.token)),
+                auth_token: SensitiveInput::try_new(std::mem::take(&mut self.form.token))
+                    .map_err(|_| "연결 토큰이 너무 깁니다.")?,
             },
         ));
         Ok(id)
@@ -146,6 +147,7 @@ pub(super) fn show(
     intents: &mut Vec<Intent>,
 ) {
     ui.heading(text(snapshot, "devices"));
+    super::server::show(ui, state, snapshot, p, intents);
     if snapshot.devices.is_empty() {
         weak(ui, snapshot, text(snapshot, "no_devices"));
     }
@@ -393,7 +395,7 @@ mod tests {
             ui.take_device_setup_request(id)
                 .unwrap()
                 .auth_token
-                .expose(),
+                .into_inner(),
             "fixture-only-token"
         );
         assert!(ui.take_device_setup_request(id).is_none());

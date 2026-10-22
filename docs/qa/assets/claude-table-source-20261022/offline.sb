@@ -1,0 +1,4 @@
+(version 1)
+(allow default)
+(deny network-outbound (remote ip "*:*"))
+(deny file-write* (subpath "/Users/jr/.claude") (subpath "/Users/jr/.codex") (subpath "/Users/jr/.grok"))

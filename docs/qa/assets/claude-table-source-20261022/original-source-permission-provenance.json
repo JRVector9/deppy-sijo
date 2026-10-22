@@ -1,0 +1,20 @@
+{
+  "source": "/private/tmp/deppy-agent-table-probe-20261022/claude/profile/projects/-private-tmp-deppy-agent-table-probe-20261022-claude-project/0ef9ff64-c4e4-4b5f-8be3-a3f4658f4db9.jsonl",
+  "original_source_sha256": "3223b0854c8608932a3e91373eef9ca37888774a4980c24bc39ee625badeb9ec",
+  "copied_source": "/private/tmp/deppy-claude-table-pr2-20261022/claude/profile/projects/-private-tmp-deppy-claude-table-pr2-20261022-claude-project/0ef9ff64-c4e4-4b5f-8be3-a3f4658f4db9.jsonl",
+  "copied_sha256_after_path_rewrite": "43fc98a5d3994f40ccbc5308ddb9471d2c37c6803bd8367acb403d2250f297e9",
+  "original_permission_records": [
+    {
+      "type": "permission-mode",
+      "permissionMode": "auto",
+      "sessionId": "0ef9ff64-c4e4-4b5f-8be3-a3f4658f4db9"
+    }
+  ],
+  "copied_permission_records": [
+    {
+      "type": "permission-mode",
+      "permissionMode": "auto",
+      "sessionId": "0ef9ff64-c4e4-4b5f-8be3-a3f4658f4db9"
+    }
+  ]
+}

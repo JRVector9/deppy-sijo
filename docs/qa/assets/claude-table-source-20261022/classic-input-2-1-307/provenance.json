@@ -1,0 +1,24 @@
+{
+  "binary": "/Users/jr/.local/share/claude/versions/2.1.307",
+  "sha256": "5b113a7752119470f1da419cb0e608af3361cae25b614216b13022093958fb2a",
+  "args": [
+    "-f",
+    "/private/tmp/deppy-claude-table-pr2-20261022/offline.sb",
+    "/Users/jr/.local/share/claude/versions/2.1.307",
+    "--bare",
+    "--permission-mode",
+    "default",
+    "--setting-sources",
+    "",
+    "--strict-mcp-config",
+    "--mcp-config",
+    "{\"mcpServers\":{}}",
+    "--resume",
+    "0ef9ff64-c4e4-4b5f-8be3-a3f4658f4db9",
+    "--settings",
+    "{\"tui\": \"default\"}"
+  ],
+  "mode": "classic",
+  "version": "2.1.307",
+  "fixture_only": true
+}

@@ -1,0 +1,40 @@
+
+ ▐▛███▛█   Claude Code v2.1.307
+▝▜██████▀  Opus 4.6 · API Usage Billing
+ ▝▝   ▝▝   /…/fullscreen-input-2-1-307/project
+
+
+❯ Display the saved local fixture.
+
+⏺ Fixture paragraph: ordinary prose should wrap at the new pane width without
+  losing words. This local fixture has no model request.
+
+  ┌───────────┬────────────────────────────────────────────────────┬─────────┐
+  │   Agent   │                        Task                        │ Status  │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │           │ 한글 표의 셀 줄바꿈과 창 너비 변경을 확인합니다.   │         │
+  │ ROW_ALPHA │ Local synthetic table with enough content to wrap  │ ready   │
+  │           │ across several lines.                              │         │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_BETA  │ Independent session data stays intact when the     │ waiting │
+  │           │ pane becomes narrower and wider again.             │         │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_OMEGA │ 원문과 복사 내용을 보존합니다.                     │ done    │
+  └───────────┴────────────────────────────────────────────────────┴─────────┘
+
+❯ Show saved offline details.
+
+⏺ History filler 00: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 01: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 02: saved offline content keeps the preceding table outside the
+  live viewport.
+                            Jump to bottom (click) ↓
+                                                              ● high · /effort
+────────────────────────────────────────────────────────────────────────────────
+❯ 한글 초안 DRAFT_KEEP
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on

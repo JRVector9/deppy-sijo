@@ -1,0 +1,272 @@
+[
+  {
+    "case": "classic-input-2-1-307",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-input-2-1-307",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-input-2-1-307",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-input-2-1-307",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-305",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-305",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-305",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-305",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-307",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-307",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-307",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "classic-manual-2-1-307",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-input-2-1-307",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-input-2-1-307",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": true,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-input-2-1-307",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      116,
+      116
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-input-2-1-307",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-305",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-305",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": true,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-305",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      116,
+      116
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-305",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-307",
+    "stage": 0,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-307",
+    "stage": 1,
+    "cols": 42,
+    "complete_table_borders": [],
+    "cards": true,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-307",
+    "stage": 2,
+    "cols": 120,
+    "complete_table_borders": [
+      116,
+      116
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  },
+  {
+    "case": "fullscreen-manual-2-1-307",
+    "stage": 3,
+    "cols": 80,
+    "complete_table_borders": [
+      76,
+      76
+    ],
+    "cards": false,
+    "modal": false,
+    "auto_indicator": false
+  }
+]

@@ -1,0 +1,1 @@
+manual_selected=true manual_confirm_count=1 dismissed=true

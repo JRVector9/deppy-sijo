@@ -1,0 +1,40 @@
+
+           Claude Code v2.1.307
+ ▐▛███▛█   Opus 4.6
+▝▜██████▀  API Usage Billing
+ ▝▝   ▝▝   /…/project
+
+
+❯ Display the saved local fixture.
+
+⏺ Fixture paragraph: ordinary prose should
+  wrap at the new pane width without
+  losing words. This local fixture has no
+  model request.
+
+  Agent: ROW_ALPHA
+  Task: 한글 표의 셀 줄바꿈과 창 너비
+  변경을 확인합니다. Local synthetic
+  table with enough content to wrap
+  across several lines.
+  Status: ready
+  ────────────────────────────────────────
+  Agent: ROW_BETA
+  Task: Independent session data stays
+  intact when the pane becomes narrower
+  and wider again.
+  Status: waiting
+  ────────────────────────────────────────
+  Agent: ROW_OMEGA
+  Task: 원문과 복사 내용을 보존합니다.
+  Status: done
+
+❯ Show saved offline details.
+
+⏺ History filler 00: saved offline content
+  keeps  Jump to bottom (click) ↓ e the
+
+──────────────────────────────────────────
+❯ 한글 초안 DRAFT_KEEP
+──────────────────────────────────────────
+  ⏸ manual mode on

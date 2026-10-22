@@ -25,11 +25,23 @@ pub use remote_operations::{
 #[path = "work_devices.rs"]
 mod devices;
 pub use devices::{RegisteredExecutionDevice, StoredExecutionDevice};
+#[path = "work_management_verification.rs"]
+mod verification;
+pub use verification::VerificationClaim;
 
 pub const COMMAND_CENTER_FILE_NAME: &str = "command-center-v2.sqlite3";
 
 const APPLICATION_ID: i64 = 0x4443_4332;
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
+const VERIFICATION_SCHEMA: &str = r#"
+CREATE TABLE work_verification_evidence (
+ ordinal INTEGER PRIMARY KEY,
+ workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
+ verification_id TEXT NOT NULL CHECK(length(CAST(verification_id AS BLOB)) BETWEEN 1 AND 128),
+ body BLOB NOT NULL CHECK(typeof(body)='blob' AND length(body)<=1048576),
+ UNIQUE(workspace_id,verification_id)
+);
+"#;
 const DEVICE_SCHEMA: &str = r#"
 CREATE TABLE work_execution_devices (
  workspace_id TEXT NOT NULL CHECK(length(CAST(workspace_id AS BLOB)) BETWEEN 1 AND 128),
@@ -57,6 +69,9 @@ fn source_digest(version: i64) -> String {
     }
     if version >= 3 {
         hash.update(DEVICE_SCHEMA.as_bytes());
+    }
+    if version >= 4 {
+        hash.update(VERIFICATION_SCHEMA.as_bytes());
     }
     digest_hex(&hash.finalize())
 }
@@ -528,6 +543,7 @@ impl CommandCenterStore {
             tx.execute_batch(SCHEMA)?;
             tx.execute_batch(REMOTE_SCHEMA)?;
             tx.execute_batch(DEVICE_SCHEMA)?;
+            tx.execute_batch(VERIFICATION_SCHEMA)?;
             tx.execute(
                 "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",
                 rusqlite::params![schema_digest(&tx)?, source_digest(SCHEMA_VERSION)],
@@ -565,6 +581,9 @@ impl CommandCenterStore {
                 }
                 if version < 3 {
                     tx.execute_batch(DEVICE_SCHEMA)?;
+                }
+                if version < 4 {
+                    tx.execute_batch(VERIFICATION_SCHEMA)?;
                 }
                 tx.execute(
                     "UPDATE work_store_meta SET schema_digest=?1,source_digest=?2 WHERE id=1",

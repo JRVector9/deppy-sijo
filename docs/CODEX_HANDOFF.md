@@ -1,3 +1,43 @@
+# Current handoff — user-authorized parallel product fixes (2026-10-23)
+
+## Objective / authorization
+
+User: "제품 서브에이전트 병렬로 수정해" after main-merge additional audit. Implement confirmed product defects and preserve/integrate approved missing settings/cloud, CC and SSH on separate branch. Do not move main or original feature refs; no remote push, release or App restart requested. Root canonical integration tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023` baseCC24260718. Existing user dirty sources remain read-only.
+
+## Ownership / current status
+
+All3workers gpt-6.1-sol/xhigh, no childspawn, root owns all Cargo jobs2serial and all commits. `fix_main_lifecycle` owns its MAIN tools source in `/private/tmp/deppy-main-lifecycle-fix-20261023`; `fix_settings_preserve` owns scoped copy of approved settings/cloud in `/private/tmp/deppy-settings-integrate-20261023`; `fix_cc_ssh_integration` owns actual SSH merge and wrapper/caller/type/wire integration in `/private/tmp/deppy-cc-ssh-integrate-20261023`. No same-working-copy product edits. Root owns plan/handoff/final report in integration tree, reviews and test execution.
+
+Read actual repo/AGENTS/source/report/status. Original cwd is older dirty fleet tree; do not edit its source. Previous audit main findings and exact RED evidence in SSH docs/qa/main-merge-audit-20261023.md and evidence/main-merge-additional-20261023/. MAIN slot32 failure was actually observed previously; not claiming new fix/test yet. New worktrees created with4new branches fromCC24260718. Detailed plan docs/superpowers/plans/2026-10-23-product-review-fixes.md. Using approved audit design, writing-plans/TDD and root-cause investigation; no repeat design approval needed.
+
+## Tests / decisions / remaining
+
+First final workspace attempt (`integrated-workspace`) exited101/174.30s after compile; MCP95PASS/1FAIL/1ignored (exclude nested child1), other suites not yet executed. Failure was imported test-only TCP strengthening atserver.rs1342: macOS EINVAL setsockopt after peer FIN plus local FIN. Root retains peer via bounded release channel until post-cleanup inspection timeout is installed; product close_response unchanged. Focused deadline GREEN pending then repeat final whole-source gate. Exact original source snapshot preserved as revision entry for the one changed test source in final-source-manifest; all1071other frozen files unchanged.
+
+SSH final10PASS/0FAIL (`ssh-final-green`,12.46s). Root committed reviewed worker merge as37d82b5c (parentsCC24260718+SSH48db9bf4), then merged it without commit into canonicalROOT; automatic3way source merge clean, both MAIN/settings retained. CanonicalROOT handoff restored from owned backup after merge rather than duplicating all historical handoffs; complete SSH histories remain in37d82b5c and48db9bf4, with QA link docs/qa/2026-10-23-cc-ssh-integration.md. Main/originalfeature refs untouched. Root final whole-source workspace tests are starting; no PASS claim yet.
+
+Local source commits: MAIN17195e51 (exact3sourcepaths from worker,28PASS) and settingsc777e160 (28product/testpaths exactworkeridentity plus QA/manifests; token2PASS/cloud229PASS+3ignored/connector35+i18n8/native1). Initial human-readable settings evidence had three trailing EOF blank rows rejected by diff-check; normalized readable logs, kept exact gzip bytes/manifests unchanged, amended the owned local settings commit after passing diff-check. Do not call initial diff check PASS. Four representative native renders were generated and root visually inspected; retained in root evidence. SSH peer-review follow-up RED now actual5PASS/5FAIL (`ssh-git-manual-red`,26.19s): four Git handler side-effect routes bypassed caps, and pending manual evidence applied Passed after workspace became SSH. Minimal handler/current-result guards prepared, final GREEN pending. No new behavior scope beyond these confirmed authority paths.
+
+
+GREEN checkpoint: settings actual App transition tests2PASS/0FAIL (`settings-token-green`, exit0/48.11s); connector-ui35+i18n8PASS (`ui-i18n`, exclude nested child1duplicate); SSH actualApp5PASS/0FAIL (`ssh-behavior-green`, exit0/34.07s); MAIN integrated28PASS/0FAIL (`main-lifecycle-green-integrated`, exit0/36.98s). MAIN collector now preserves both current config and exact installed revision per resident runtime, covering failed-save durable rollback; obsolete installed Arc cannot consume recreated credentials. Node Command Center265checksPASS, Python helper packaging18PASS. Source states differ by these owned scopes; do not treat these as final whole-source workspace gates yet. Settings/MAIN now imported in canonicalROOT; SSH still owned merged worker. Additional peer review confirmed CC Git action handler bypasses disabled input/Finder capabilities; SSHowner adds targeted regression and fixes before merge. Pending: final SSH Git checks, commit scope groups, merge SSH ancestry, full integrated gates and source/ref preservation proof. No App restart, release artifact or remote push.
+
+
+Root continuation checkpoint: SSH actual behavior RED is now **0PASS/4FAIL**, exit101/60.26s (`ssh-behavior-red-fixed`): catalog scans remote workspace locally and snapshot enables local settings; remote/offline launch returns folder validation before remote rejection. Owner implementing earliest caller/capability fences. Earlier SSH behavioral compile E0616 and MAIN green compile E0505 were fixture failures, not product RED; both fixtures corrected. MAIN source is GREEN-ready/frozen, root retest pending. Settings first RED compile used a stale shared-target connector-ui artifact after old-mtime source transfer (20E0425 although function is public in source). Root refreshed imported28 source mtimes without byte changes; fresh run now recompiles i18n/connector-ui/App. `settings-token-red-fresh` running; actual lifecycle assertion failure not yet claimed. Future source transfer uses fresh timestamps. No Cargo jobs in parallel.
+
+
+Actual SSH compatibility RED executed in worker source: initial lock preflight exit101 (new3inherited workspace entries0.13.0 vs0.15.1); root corrected only those3lock versions without third-party updates, then actual compile RED exit101/73.19s with12missing control/wake/enum API errors. Source owner unblocked to GREEN. MAIN3lifecycle RED completed actual exit101/77.64s: slots33prepare blocked, sameinstalledtuple128threlaunch blocked, retiredoperation256capacity rejects newprincipal; all3FAIL expected. MAINowner unblocked toGREEN. Root now runs compile-fixed SSH actualbehavior RED to exercise Remote/Offline launch/catalog/snapshot/verification fences; result pending. Settings baseline27files imported byte-identically from worker into integration and compared hashes; early CC UI return can skip token cleanup, owner adds actual App lifecycle regression before minimal move. Root applied test-only1a42fc41 TCP strengthening in integration; no runtime product change from that patch. Prior457baseline tests+headless265/Python18 passed; separate MAIN regression0P1F is reliable RED, not a product fix. Preserve active capacities/revoked bearer/replay invariants. SSHRemote/Offline may not get local fallback authority. Combined runtime36 means helper rebuild/package/old-version refusal must be verified separately from App semver. No user artifact delivery; current test source version0.15.1 unchanged.
+
+Wait worker ready/RED requests; root serial focused checks; review diff; commit local worker results then integrate and complete combined gates. Only root may edit this handoff. Exact next commands:
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+cat docs/superpowers/plans/2026-10-23-product-review-fixes.md
+# Source workers use distinct /private/tmp/deppy-*-20261023 trees; no parallel Cargo.
+```
+
+---
+
 # Completed implementation — Command Center follow-up PR1 + PR2, 2026-10-22
 
 ## Current objective / disposition

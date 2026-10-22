@@ -165,6 +165,43 @@ fn bg01_deterministic_gate() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn check_package_build_commands(package: &str) -> anyhow::Result<()> {
+    let mut saw_build = false;
+    let mut saw_ssh_feature = false;
+    for command in package
+        .lines()
+        .map(str::trim)
+        .filter_map(|line| line.strip_prefix("cargo build "))
+    {
+        saw_build = true;
+        let args: Vec<_> = command
+            .split_whitespace()
+            .take_while(|arg| !arg.starts_with('#'))
+            .collect();
+        for flag in ["--release", "--locked", "--no-default-features"] {
+            anyhow::ensure!(
+                args.contains(&flag),
+                "macOS package build missing required flag: {flag}"
+            );
+        }
+        for package in ["deppy-sijo", "mcp-proxy", "ssh-askpass"] {
+            anyhow::ensure!(
+                args.windows(2).any(|pair| pair == ["-p", package]),
+                "macOS package build missing required package: {package}"
+            );
+        }
+        saw_ssh_feature |= args
+            .windows(2)
+            .any(|pair| pair == ["--features", "deppy-sijo/ssh-workspaces"]);
+    }
+    anyhow::ensure!(saw_build, "macOS package gate missing actual cargo build");
+    anyhow::ensure!(
+        saw_ssh_feature,
+        "macOS package gate missing explicit SSH feature build"
+    );
+    Ok(())
+}
+
 fn check_package_gate_source() -> anyhow::Result<()> {
     let root = workspace_root()?;
     let package = std::fs::read_to_string(root.join("scripts/package-macos.sh"))
@@ -173,10 +210,10 @@ fn check_package_gate_source() -> anyhow::Result<()> {
         .context("verify-macos-package.sh read failed")?;
     let workflow = std::fs::read_to_string(root.join("docs/build/bg01-deterministic-workflow.yml"))
         .context("BG01 workflow template read failed")?;
+    check_package_build_commands(&package)?;
     for required in [
         "REQUIRE_TRUSTED=${DEPPY_REQUIRE_TRUSTED_SIGNING:-1}",
         "ALLOW_UNTRUSTED=${DEPPY_ALLOW_UNTRUSTED_SIGNING:-0}",
-        "cargo build --release -p deppy-sijo -p mcp-proxy",
         "Developer ID Application:",
         "codesign --force --options runtime --timestamp",
         "DEPPY_NOTARY_KEYCHAIN_PROFILE",
@@ -1892,6 +1929,44 @@ fn production_after_tests() {
     #[test]
     fn macos_package_gate는_공증_gatekeeper와_archive를검증한다() {
         check_package_gate_source().unwrap();
+    }
+
+    #[test]
+    fn macos_package_build_gate_accepts_reordered_flags_and_both_feature_branches() {
+        let plain = "cargo build -p ssh-askpass --locked -p deppy-sijo --release -p mcp-proxy --no-default-features";
+        let package = format!("    {plain} --features deppy-sijo/ssh-workspaces\n{plain}\n");
+        check_package_build_commands(&package).unwrap();
+    }
+
+    #[test]
+    fn macos_package_build_gate_rejects_missing_required_flags_and_packages() {
+        let build = "cargo build --release --locked --no-default-features -p deppy-sijo -p mcp-proxy -p ssh-askpass --features deppy-sijo/ssh-workspaces";
+        for required in [
+            " --release",
+            " --locked",
+            " --no-default-features",
+            " -p deppy-sijo",
+            " -p mcp-proxy",
+            " -p ssh-askpass",
+            " --features deppy-sijo/ssh-workspaces",
+        ] {
+            assert!(
+                check_package_build_commands(&build.replace(required, "")).is_err(),
+                "missing {required} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_package_build_gate_comments_cannot_supply_commands_or_required_flags() {
+        let build = "cargo build --release --locked --no-default-features -p deppy-sijo -p mcp-proxy -p ssh-askpass --features deppy-sijo/ssh-workspaces";
+        assert!(check_package_build_commands(&format!("# {build}\n")).is_err());
+        assert!(check_package_build_commands(&build.replace(" --locked", " # --locked")).is_err());
+        let invalid_branch = build.replace(" --locked", "");
+        assert!(
+            check_package_build_commands(&format!("{build}\n{invalid_branch}\n")).is_err(),
+            "every actual build branch must retain the required flags"
+        );
     }
 
     #[test]

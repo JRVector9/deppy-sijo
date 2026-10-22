@@ -1,0 +1,24 @@
+[package]
+name = "deppy-remote-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = { workspace = true }
+runtime = { path = "../runtime" }
+secret = { path = "../secret" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }
+sha2 = { workspace = true }
+libc = { workspace = true }
+uuid = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "deppy-remote-host"
+path = "src/main.rs"

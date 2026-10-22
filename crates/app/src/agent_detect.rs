@@ -3811,6 +3811,7 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn independent_codex_writer_uses_real_lsof_access_fields() {
+        let _guard = COMMAND_TEST_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("deppy-writer-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();

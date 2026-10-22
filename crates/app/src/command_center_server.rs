@@ -144,8 +144,13 @@ impl App {
         };
         let state = &remote.execution;
         let p = host.projects.get(&self.active.id);
-        let ready =
-            p.is_some_and(|p| p.loaded && !p.storage_blocked && p.generation == p.saved_generation);
+        let local_execution = self
+            .require_command_center_local_workspace(&self.active.id)
+            .is_ok();
+        let ready = local_execution
+            && p.is_some_and(|p| {
+                p.loaded && !p.storage_blocked && p.generation == p.saved_generation
+            });
         let pending = !state.can_request();
         let current = state.grant.as_ref();
         cc::ServerExecutionSetup {
@@ -201,7 +206,9 @@ impl App {
                     "TLS 연결만 켜져 있습니다. 프로젝트 실행은 아직 허용하지 않았습니다.".into()
                 }
             }),
-            allow: if ready && !pending && state.pending.is_none() {
+            allow: if !local_execution {
+                no(SSH_COMMAND_CENTER_UNSUPPORTED)
+            } else if ready && !pending && state.pending.is_none() {
                 yes()
             } else {
                 no("프로젝트 설정 저장과 현재 실행 설정 응답을 먼저 확인해 주세요.")
@@ -226,6 +233,7 @@ impl App {
         revision: &str,
         exported: &str,
     ) -> Result<(), String> {
+        self.require_command_center_local_workspace(workspace)?;
         if workspace != self.active.id
             || exported.is_empty()
             || exported.len() > 128

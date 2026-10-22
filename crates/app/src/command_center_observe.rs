@@ -221,6 +221,14 @@ impl App {
         let Some(mut host) = self.command_center.take() else {
             return;
         };
+        if self
+            .require_command_center_local_workspace(&target.workspace_id)
+            .is_err()
+        {
+            reject_delayed(&mut host, &id, SSH_COMMAND_CENTER_UNSUPPORTED);
+            self.command_center = Some(host);
+            return;
+        }
         let live = host
             .inputs
             .get(&id)
@@ -287,7 +295,10 @@ impl App {
         let delayed = host.observations.delayed.remove(&id);
         let mut send = None;
         if let Some(delayed) = delayed {
-            let current = delayed.target.workspace_id == workspace
+            let current = self
+                .require_command_center_local_workspace(&workspace)
+                .is_ok()
+                && delayed.target.workspace_id == workspace
                 && delayed.target.session == session
                 && delayed.target.runtime_instance == runtime_instance
                 && delayed.runtime_token == runtime_token
@@ -351,9 +362,12 @@ impl App {
         id: String,
     ) {
         let authorized = self
-            .command_center
-            .as_ref()
-            .is_some_and(|host| input_current(host, &id, &target));
+            .require_command_center_local_workspace(&target.workspace_id)
+            .is_ok()
+            && self
+                .command_center
+                .as_ref()
+                .is_some_and(|host| input_current(host, &id, &target));
         if !authorized {
             self.command_center_input_outcome(&id, ui::composer::PromptAdmissionOutcome::Rejected);
             return;

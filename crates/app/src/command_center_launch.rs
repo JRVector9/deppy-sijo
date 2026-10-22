@@ -805,6 +805,7 @@ impl App {
         workspace: &str,
         task_id: Option<&str>,
     ) -> Result<(), String> {
+        self.require_command_center_local_workspace(workspace)?;
         if host.flight.is_some() {
             return Err("상태 저장을 마친 뒤 실행해 주세요.".into());
         }
@@ -1161,10 +1162,13 @@ impl App {
             }
         }
         // A catalog is loaded once on the existing lazy settings worker, only for the open project.
-        if let Some(p) = host
-            .projects
-            .get_mut(&self.active.id)
-            .filter(|p| p.loaded && !p.catalog_requested)
+        if self
+            .require_command_center_local_workspace(&self.active.id)
+            .is_ok()
+            && let Some(p) = host
+                .projects
+                .get_mut(&self.active.id)
+                .filter(|p| p.loaded && !p.catalog_requested)
             && self.queue_global_settings_action(
                 &self.active.id.clone(),
                 SettingsJobAction::CommandCenter(SettingsRequest::Catalog {
@@ -1187,9 +1191,13 @@ impl App {
                 continue;
             }
             let workspace = pending.record.workspace.0.clone();
-            let current = host.projects.get(&workspace).is_some_and(|p| {
-                !p.storage_blocked && p.snapshot.config.revision == pending.record.config_revision
-            });
+            let current = self
+                .require_command_center_local_workspace(&workspace)
+                .is_ok()
+                && host.projects.get(&workspace).is_some_and(|p| {
+                    !p.storage_blocked
+                        && p.snapshot.config.revision == pending.record.config_revision
+                });
             let authorized = host.main_operation_current(&id)
                 && host
                     .remote_permits
@@ -1226,6 +1234,13 @@ impl App {
                         .or_else(|| self.warm.get(&workspace))
                         .filter(|r| r.runtime_instance == pending.runtime_instance);
                     if let Some(runtime) = runtime {
+                        let Ok(control) = runtime.runtime.remote_worker_control() else {
+                            pending.record.phase = Phase::Rejected;
+                            pending.stage = Stage::Done;
+                            host.reject(&id, SSH_COMMAND_CENTER_UNSUPPORTED);
+                            host.launches.insert(id, pending);
+                            continue;
+                        };
                         if host
                             .installed
                             .get(&runtime.runtime_instance)
@@ -1263,7 +1278,7 @@ impl App {
                                 let request = SettingsRequest::GrantOwned {
                                     operation_id: id.clone(),
                                     runtime_instance: pending.runtime_instance,
-                                    control: runtime.runtime.remote_worker_control(),
+                                    control: control.clone(),
                                     attempt_id: pending.record.attempt_id.clone(),
                                     owned: owned.clone(),
                                 };
@@ -1302,7 +1317,7 @@ impl App {
                                 runtime_instance: runtime.runtime_instance,
                                 config: p.snapshot.config.clone(),
                                 agents,
-                                control: runtime.runtime.remote_worker_control(),
+                                control,
                                 wake: runtime.runtime.remote_worker_wake(),
                                 data_dir: self.data_dir().to_path_buf(),
                                 grant_epoch: host.next_grant_epoch,
@@ -1486,6 +1501,12 @@ impl App {
         runtime_instance: u64,
         events: &[runtime::RuntimeEvent],
     ) {
+        if self
+            .require_command_center_local_workspace(workspace)
+            .is_err()
+        {
+            return;
+        }
         self.observe_command_center_turn_events(runtime_instance, events);
         let Some(mut host) = self.command_center.take() else {
             return;
@@ -1589,9 +1610,11 @@ impl App {
                                 .runtime_by_instance_mut(runtime_instance)
                                 .filter(|r| r.id == workspace)
                                 .is_some_and(|r| {
+                                    let Ok(control) = r.runtime.remote_worker_control() else {
+                                        return false;
+                                    };
                                     if let Some(permit) = main_permit
-                                        && r.runtime
-                                            .remote_worker_control()
+                                        && control
                                             .guard_operation(&request.identity.operation_id, permit)
                                             .is_err()
                                     {

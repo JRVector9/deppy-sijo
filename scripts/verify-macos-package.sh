@@ -11,6 +11,7 @@ ARCHIVE=${2:-}
 APP_NAME="Deppy Sijo"
 BIN_NAME="deppy-sijo"
 PROXY_NAME="deppy-mcp-proxy"
+ASKPASS_NAME="deppy-ssh-askpass"
 EXPECTED_BUNDLE_ID="app.vector9.deppy-sijo"
 EXPECTED_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 REQUIRED_ARCHS=${DEPPY_REQUIRED_ARCHS:-$(uname -m)}
@@ -91,9 +92,22 @@ verify_bundle() {
     [ "$(plist_value "$candidate" CFBundleVersion)" = "$EXPECTED_VERSION" ] || fail "invalid bundle version"
     [ "$(plist_value "$candidate" CFBundleShortVersionString)" = "$EXPECTED_VERSION" ] || fail "invalid short version"
     [ "$(plist_value "$candidate" LSMinimumSystemVersion)" = "11.0" ] || fail "invalid minimum macOS version"
+    ssh_feature=$(plist_value "$candidate" DeppySshWorkspaces)
+    case "$ssh_feature" in
+        true)
+            [ "${DEPPY_PACKAGE_SSH_WORKSPACES:-1}" = "1" ] || fail "SSH feature differs from requested package"
+            python3 scripts/prepare-remote-host.py --source "$candidate/Contents/Resources/remote-host" --version "$EXPECTED_VERSION"
+            ;;
+        false)
+            [ "${DEPPY_PACKAGE_SSH_WORKSPACES:-0}" = "0" ] || fail "SSH feature differs from requested package"
+            [ ! -e "$candidate/Contents/Resources/remote-host" ] || fail "unexpected SSH helper resources"
+            ;;
+        *) fail "invalid SSH feature marker" ;;
+    esac
 
     verify_binary "$candidate/Contents/MacOS/$BIN_NAME"
     verify_binary "$candidate/Contents/MacOS/$PROXY_NAME"
+    verify_binary "$candidate/Contents/MacOS/$ASKPASS_NAME"
     verify_binary "$candidate/Contents/MacOS/deppy-cloudflared"
     [ -s "$candidate/Contents/Resources/cloudflared-LICENSE" ] || fail "missing tunnel companion notice"
     codesign --verify --deep --strict --verbose=2 "$candidate"
@@ -107,10 +121,14 @@ verify_bundle() {
         verify_trusted_code "$candidate" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$BIN_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$PROXY_NAME" "$team_id"
+        verify_trusted_code "$candidate/Contents/MacOS/$ASKPASS_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/deppy-cloudflared" "$team_id"
         xcrun stapler validate "$candidate"
         verify_gatekeeper "$candidate"
     fi
+    # Version checks execute code. Complete bundle integrity and the requested
+    # trust policy before allowing any companion from this candidate to run.
+    [ "$("$candidate/Contents/MacOS/$ASKPASS_NAME" --version)" = "deppy-ssh-askpass $EXPECTED_VERSION" ] || fail "invalid SSH companion version"
 }
 
 verify_bundle "$BUNDLE"
@@ -122,12 +140,18 @@ if [ -n "$ARCHIVE" ]; then
     ditto -x -k "$ARCHIVE" "$VERIFY_TMP_DIR"
     EXTRACTED_BUNDLE="$VERIFY_TMP_DIR/$APP_NAME.app"
     verify_bundle "$EXTRACTED_BUNDLE"
-    for binary_name in "$BIN_NAME" "$PROXY_NAME" deppy-cloudflared; do
+    for binary_name in "$BIN_NAME" "$PROXY_NAME" "$ASKPASS_NAME" deppy-cloudflared; do
         original_hash=$(shasum -a 256 "$BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         archived_hash=$(shasum -a 256 "$EXTRACTED_BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         [ "$original_hash" = "$archived_hash" ] || fail "archive changed $binary_name"
     done
     cmp -s "$BUNDLE/Contents/Resources/cloudflared-LICENSE" "$EXTRACTED_BUNDLE/Contents/Resources/cloudflared-LICENSE" || fail "archive changed tunnel companion notice"
+    [ "$(plist_value "$BUNDLE" DeppySshWorkspaces)" = "$(plist_value "$EXTRACTED_BUNDLE" DeppySshWorkspaces)" ] || fail "archive changed SSH feature marker"
+    if [ "$(plist_value "$BUNDLE" DeppySshWorkspaces)" = "true" ]; then
+        for resource in manifest.json linux-aarch64/deppy-remote-host linux-x86_64/deppy-remote-host; do
+            cmp -s "$BUNDLE/Contents/Resources/remote-host/$resource" "$EXTRACTED_BUNDLE/Contents/Resources/remote-host/$resource" || fail "archive changed SSH helper resource"
+        done
+    fi
 fi
 
 if [ "$REQUIRE_TRUSTED" = "1" ]; then

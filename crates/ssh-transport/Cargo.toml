@@ -1,0 +1,10 @@
+[package]
+name = "ssh-transport"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+libc.workspace = true
+ssh-askpass = { path = "../ssh-askpass" }

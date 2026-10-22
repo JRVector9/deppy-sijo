@@ -290,10 +290,10 @@ pub fn field<T>(
     .inner
 }
 
-pub fn segmented_choice<T: Copy + Eq>(
+pub fn segmented_choice<T: Copy + Eq, const N: usize>(
     ui: &mut egui::Ui,
     selected: &mut T,
-    choices: [(T, &str); 2],
+    choices: [(T, &str); N],
 ) {
     let colors = palette(ui);
     egui::Frame::NONE
@@ -305,7 +305,9 @@ pub fn segmented_choice<T: Copy + Eq>(
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 3.0;
                 ui.spacing_mut().interact_size.y = 31.0;
-                let width = (ui.available_width() - 3.0) / 2.0;
+                let width = ((ui.available_width() - 3.0 * N.saturating_sub(1) as f32)
+                    / N.max(1) as f32)
+                    .max(0.0);
                 for (value, label) in choices {
                     let is_selected = *selected == value;
                     let response = ui.add_sized(
@@ -317,6 +319,7 @@ pub fn segmented_choice<T: Copy + Eq>(
                                 colors.muted
                             },
                         ))
+                        .wrap()
                         .selected(is_selected)
                         .fill(if is_selected {
                             colors.button

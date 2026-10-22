@@ -292,6 +292,7 @@ impl App {
         expected: work::VerificationTarget,
         spec: work::VerificationSpec,
     ) -> Result<(), String> {
+        self.require_command_center_local_workspace(&route.workspace_id)?;
         if host.remote_permits.contains_key(id) {
             return Err("검증 명령은 이 컴퓨터에서 직접 확인한 뒤 실행해 주세요.".into());
         }
@@ -402,6 +403,7 @@ impl App {
         attempt: &str,
         review: (&str, bool, &str),
     ) -> Result<(), String> {
+        self.require_command_center_local_workspace(&route.workspace_id)?;
         let (revision, passed, text) = review;
         if host.verifications.busy()
             || host.flight.is_some()
@@ -455,10 +457,13 @@ impl App {
     }
     pub(super) fn pump_command_center_verification(&self, host: &mut CommandCenterHost) {
         if let Some(pending) = host.verifications.pending.as_ref()
-            && !host
-                .projects
-                .get(&pending.route.workspace_id)
-                .is_some_and(|p| exact(p, pending))
+            && (self
+                .require_command_center_local_workspace(&pending.route.workspace_id)
+                .is_err()
+                || !host
+                    .projects
+                    .get(&pending.route.workspace_id)
+                    .is_some_and(|p| exact(p, pending)))
         {
             if let Some(worker) = host.verifications.worker.as_mut() {
                 worker.cancel(&pending.evidence.id);
@@ -478,7 +483,7 @@ impl App {
                 }) => {
                     if let Some(pending) = host.verifications.pending.take() {
                         match approved {
-                            Ok(approved) if host.projects.get(&pending.route.workspace_id).is_some_and(|p| preparation_current(p, &pending, &requested, &approved)) => {
+                            Ok(approved) if self.require_command_center_local_workspace(&pending.route.workspace_id).is_ok() && host.projects.get(&pending.route.workspace_id).is_some_and(|p| preparation_current(p, &pending, &requested, &approved)) => {
                                 match host.verifications.worker.as_mut().unwrap().try_request(VerificationJob::Run(*approved)) {
                                     Ok(()) => host.verifications.pending = Some(pending),
                                     Err(_) => host.reject(&pending.operation, "검증 실행기를 준비하지 못해 명령을 실행하지 않았습니다."),
@@ -561,6 +566,9 @@ impl App {
                             .get(&pending.operation)
                             .is_none_or(|permit| permit.is_current());
                         let current = permitted
+                            && self
+                                .require_command_center_local_workspace(&pending.route.workspace_id)
+                                .is_ok()
                             && host
                                 .projects
                                 .get(&pending.route.workspace_id)
@@ -739,6 +747,60 @@ mod tests {
         );
         assert!(!folder.exists());
     }
+    #[test]
+    fn command_center_ssh_manual_evidence_rejects_changed_workspace_target() {
+        let (mut app, root) = super::super::super::tests::ssh_workspace_isolated_app_fixture();
+        let (project, route) = fixture(&root);
+        let workspace = route.workspace_id.clone();
+        let attempt = project.snapshot.attempts[0].id.0.clone();
+        let ssh_target = app.workspace_targets[&app.active.id].clone();
+        app.workspace_targets.insert(
+            workspace.clone(),
+            WorkspaceTarget::Local {
+                root: root.to_string_lossy().into_owned(),
+            },
+        );
+        let mut host = super::super::tests::host();
+        host.projects.insert(workspace.clone(), project);
+        app.begin_command_center_manual_verification(
+            &mut host,
+            "manual-target-change",
+            route,
+            &attempt,
+            ("1", true, "personally inspected the result"),
+        )
+        .unwrap();
+        assert!(host.verifications.manual.is_some());
+        app.workspace_targets.insert(workspace.clone(), ssh_target);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while host.verifications.manual.is_some() {
+            app.pump_command_center_verification(&mut host);
+            assert!(
+                std::time::Instant::now() < deadline,
+                "actual evidence worker completion"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(
+            host.projects[&workspace].snapshot.tasks[0]
+                .result
+                .as_ref()
+                .unwrap()
+                .verification,
+            work::VerificationState::NotRun
+        );
+        assert!(
+            host.flight.is_none(),
+            "changed SSH ownership must not save a passed result"
+        );
+        assert!(
+            host.receipts
+                .iter()
+                .any(|r| r.operation_id == "manual-target-change"
+                    && r.status == cc::ReceiptStatus::Rejected)
+        );
+    }
+
     #[test]
     fn command_center_verification_manual_correlation_survives_worker_redaction() {
         let dir =

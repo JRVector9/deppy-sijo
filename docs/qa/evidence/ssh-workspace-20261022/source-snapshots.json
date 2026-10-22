@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "snapshots": [
+    {
+      "label": "fixed-cohort-before-results",
+      "captured_utc": "2026-10-22T14:42:24.847391+00:00",
+      "source_git_head": "455f1dc77bc66fef0dbd50031f12ec50e56c8d4b",
+      "source_tree": "dirty",
+      "sha256": "95ac4b98e6f659b9dfd4ffb0ea8aa9beacaf91b691f219196629868e3f0b0e33",
+      "file_count": 466,
+      "input_selection": "git ls-files --cached --others --exclude-standard; existing files only; root Cargo.toml/Cargo.lock, crates/** and xtask/** .rs/.toml plus crates/**/locales/**, scripts/** .py/.sh",
+      "digest_algorithm": "Sort unique relative paths lexicographically. Concatenate path UTF-8, NUL, lowercase hex SHA256(file bytes), newline for each file. SHA256 the concatenation. Documentation, build artifacts, fixture state and credentials are excluded.",
+      "source_mutation_policy": "Root reported source frozen for the fixed gate runner. This digest was captured while that runner was active, before its full workspace result. Cohort association relies on that freeze attestation; no direct matching completion digest was captured.",
+      "after_results_check_utc": "2026-10-22T14:55:14.833083+00:00",
+      "after_results_sha256": "9975971f2a5d4f2ddc4857024040ce4863f2a1d0e665d8b854f517f8f85d41af",
+      "after_results_matches": false,
+      "after_results_note": "Root confirmed the fixed runner fully exited before applying the one-line COMMAND_TEST_LOCK correction. This after-results hash was captured after that authorized source change; its mismatch does not indicate an edit during the runner. The original cohort had a digest captured during the reported source freeze, but no direct matching completion digest was captured."
+    },
+    {
+      "label": "corrected-cohort-frozen-before-full-result",
+      "captured_utc": "2026-10-22T15:07:25.993554+00:00",
+      "source_git_head": "455f1dc77bc66fef0dbd50031f12ec50e56c8d4b",
+      "source_tree": "dirty",
+      "sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737",
+      "file_count": 470,
+      "input_selection": "git ls-files --cached --others --exclude-standard; existing files only; root Cargo.toml/Cargo.lock, crates/** and xtask/** .rs/.toml plus crates/**/locales/**, scripts/** .py/.sh",
+      "digest_algorithm": "Sort unique relative paths lexicographically. Concatenate path UTF-8, NUL, lowercase hex SHA256(file bytes), newline for each file. SHA256 the concatenation. Documentation, build artifacts, fixture state and credentials are excluded.",
+      "source_mutation_policy": "Root explicitly acknowledged all Rust and scripts frozen before the corrected runner. No source/default-exposure edits are allowed until runner completion and a matching after-result digest check. Documentation changes are excluded.",
+      "after_results_status": "verified_match",
+      "after_results_check_utc": "2026-10-22T15:19:26.669393+00:00",
+      "after_results_sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737",
+      "after_results_file_count": 470,
+      "after_results_matches": true,
+      "coverage": "All ten corrected gates and both final real Host/Linux and install-consent opt-ins completed before this after-check; source/default edits remained frozen."
+    },
+    {
+      "label": "default-exposure-frozen-before-full-result",
+      "captured_utc": "2026-10-22T15:21:00.495600+00:00",
+      "source_git_head": "be2cd5023d70d45442e0126cc288a74540f082d1",
+      "source_tree": "dirty: default-exposure policy delta only",
+      "sha256": "ae86f37cba63d251dab05e32c96c6687863db2d3bac4b32d3054edc343ce81fc",
+      "file_count": 470,
+      "input_selection": "git ls-files --cached --others --exclude-standard; existing files only; root Cargo.toml/Cargo.lock, crates/** and xtask/** .rs/.toml plus crates/**/locales/**, scripts/** .py/.sh",
+      "digest_algorithm": "Sort unique relative paths lexicographically. Concatenate path UTF-8, NUL, lowercase hex SHA256(file bytes), newline for each file. SHA256 the concatenation. Documentation, build artifacts, fixture state and credentials are excluded.",
+      "source_mutation_policy": "Root explicitly acknowledged source frozen after coordinated App Cargo and package default exposure changes. Source edits held until runner completion and matching after-digest check; docs excluded.",
+      "after_results_status": "verified_match",
+      "after_results_check_utc": "2026-10-22T15:24:05.052463+00:00",
+      "after_results_sha256": "ae86f37cba63d251dab05e32c96c6687863db2d3bac4b32d3054edc343ce81fc",
+      "after_results_file_count": 470,
+      "after_results_matches": true,
+      "coverage": "All seven normal-default exposure gates completed and the owned Linux fixture was removed before this after-check; no source edits or commits preceded this check.",
+      "root_independent_after_check": {
+        "phase": "default-exposure-after-root",
+        "captured_utc": "2026-10-22T15:25:34.439038+00:00",
+        "sha256": "ae86f37cba63d251dab05e32c96c6687863db2d3bac4b32d3054edc343ce81fc",
+        "file_count": 470,
+        "matched": true,
+        "head": "be2cd5023d70d45442e0126cc288a74540f082d1",
+        "result_json": "/private/tmp/deppy-ssh-default-source-after-root-20261023.json",
+        "result_json_sha256": "4c7b6cf0afde9ebd37a09547126b5ba507d5243822604f290254b13e6ae5cad8"
+      },
+      "subsequent_product_commit": "8489d6532ae69ce0bd3ef035e24e5601a5b1ac8e",
+      "subsequent_commit_note": "Source bytes unchanged by the Git commit; the matched source snapshot is the committed product source."
+    }
+  ]
+}

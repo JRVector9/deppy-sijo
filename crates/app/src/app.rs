@@ -8,10 +8,15 @@ pub(crate) mod file_delete;
 #[path = "keychain_startup_tests.rs"]
 mod keychain_startup_tests;
 
+#[cfg(all(test, unix))]
+mod ssh_integration_tests;
+
 use std::path::{Path, PathBuf};
 
+use crate::workspace_runtime_client::WorkspaceRuntimeClient;
 use anyhow::Context as _;
-use runtime::{InProcessRuntimeClient, RuntimeCommandSink, RuntimeEventReceiver};
+use deppy_core::workspace_target::{SshConnectionProfile, SshWorkspaceTarget, WorkspaceTarget};
+use runtime::{RuntimeCommandSink, RuntimeEventReceiver};
 
 use crate::config::Config;
 use std::sync::Arc;
@@ -1285,6 +1290,13 @@ pub(crate) fn sync_workspace_dotenv_at_root(
     workspace_id: &str,
     root: &Path,
 ) -> anyhow::Result<Option<crate::dotenv_sync::DotenvSyncReport>> {
+    anyhow::ensure!(
+        matches!(
+            db.workspace_target(workspace_id)?,
+            Some(WorkspaceTarget::Local { .. })
+        ),
+        "workspace_target_requires_local"
+    );
     let files = db.env_source_files(workspace_id)?;
     for file in &files {
         if db.project_key_file_journal_source_pending(
@@ -4039,6 +4051,12 @@ fn execute_dotenv_sync_job(
                 .map_err(|_| crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)?,
         ),
     };
+    if !matches!(
+        db.workspace_target(&job.workspace_id),
+        Ok(Some(WorkspaceTarget::Local { .. }))
+    ) {
+        return Err(crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed);
+    }
     let source_files = db
         .env_source_files(&job.workspace_id)
         .map_err(|_| crate::dotenv_sync::DotenvWorkerErrorCode::ExecuteFailed)?;
@@ -8475,7 +8493,7 @@ struct WorkspaceRuntime {
     dotenv_files: Vec<String>,
     environment_has_secrets: bool,
     environment_application: crate::environment_application::EnvironmentApplication,
-    runtime: InProcessRuntimeClient,
+    runtime: WorkspaceRuntimeClient,
     events: RuntimeEventReceiver,
     workspace_ui: ui::workspace::WorkspaceUi,
     /// 이 worker lifetime의 전체 저장 레이아웃 복원 수명주기. dotenv 대기와 실제 명령
@@ -10430,6 +10448,108 @@ struct AgentDetectInputSnapshot {
     hidden: bool,
 }
 
+struct AppSshWorkspaceRegistrar {
+    db_path: PathBuf,
+}
+impl crate::ssh_workspace_host::SshWorkspaceRegistration for AppSshWorkspaceRegistrar {
+    fn register(
+        &self,
+        name: &str,
+        profile: &SshConnectionProfile,
+        target: &SshWorkspaceTarget,
+    ) -> Result<storage::WorkspaceTargetRow, crate::ssh_workspace_add::SshWorkspaceError> {
+        let db = Db::open(&self.db_path)
+            .map_err(|_| crate::ssh_workspace_add::SshWorkspaceError::RequestFailed)?;
+        db.upsert_ssh_connection_profile(profile)
+            .map_err(|_| crate::ssh_workspace_add::SshWorkspaceError::RequestFailed)?;
+        db.find_or_create_ssh_workspace(name, target)
+            .map(|outcome| outcome.row)
+            .map_err(|_| crate::ssh_workspace_add::SshWorkspaceError::RequestFailed)
+    }
+}
+struct SshBoundHost {
+    runtime_instance: u64,
+    host: crate::ssh_workspace_host::SshWorkspaceHost,
+    authentication_ui: Option<crate::workspace_add::WorkspaceAddUi>,
+    connection_pending: bool,
+}
+struct PendingSshRpc {
+    workspace_id: String,
+    runtime_instance: u64,
+    connection_generation: u64,
+    provider: crate::ssh_workspace_files::RemoteWorkspaceFiles,
+    fence: crate::ssh_workspace_files::RemoteReplyFence,
+    action: SshProviderAction,
+}
+struct PendingSshWorkspaceClose {
+    runtime_instance: u64,
+    panes: std::collections::HashSet<String>,
+    close_queue: std::collections::VecDeque<runtime::MuxPaneId>,
+    round_started: bool,
+    barrier: Option<u64>,
+    confirmed: bool,
+    observation_failed: bool,
+    deadline: std::time::Instant,
+}
+struct SshFileObservation {
+    workspace_id: String,
+    runtime_instance: u64,
+    target: SshWorkspaceTarget,
+    generation: u64,
+    directories: Vec<PathBuf>,
+    ignored_prefixes: Vec<PathBuf>,
+    show_hidden: bool,
+    cursor: usize,
+    revision: u64,
+    next_poll: Option<std::time::Instant>,
+}
+const SSH_FILE_OBSERVATION_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+impl PendingSshWorkspaceClose {
+    fn observe_events(
+        &mut self,
+        runtime_instance: u64,
+        previous_mux: Option<&Arc<runtime::MuxSnapshot>>,
+        events: &[runtime::RuntimeEvent],
+        reliable: bool,
+    ) {
+        if runtime_instance != self.runtime_instance {
+            return;
+        }
+        self.observation_failed |= !reliable;
+        if self.observation_failed {
+            return;
+        }
+        if let Some(correlation_id) = self.barrier
+            && let Some(mux) = runtime_mux_at_durable_barrier(previous_mux, events, correlation_id)
+        {
+            self.confirmed = mux.is_some_and(|mux| mux.tabs.iter().all(|tab| tab.panes.is_empty()));
+            self.barrier = None;
+            self.round_started = false;
+        }
+    }
+}
+const SSH_WORKSPACE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const SSH_WORKSPACE_CLOSE_MAX: usize = 9;
+const SSH_WORKSPACE_CLOSE_BATCH: usize = 64;
+enum SshProviderAction {
+    Directory {
+        operation: ui::file_tree::FileTreeMaintenanceOperation,
+        generation: u64,
+        listing: crate::ssh_workspace_files::RemoteDirectoryListing,
+    },
+    Load {
+        id: ui::workspace::DocumentTabId,
+        path: PathBuf,
+    },
+    Save {
+        id: ui::workspace::DocumentTabId,
+        path: PathBuf,
+    },
+    Git {
+        intent: ui::git_panel::GitPanelIoIntent,
+    },
+}
+
 pub struct App {
     /// Shared registered-secret corpus for Command Center services and projections.
     command_center_redaction: secret::RedactionService,
@@ -10478,6 +10598,15 @@ pub struct App {
     /// 확정 시 세션(pane)만 일괄 닫고 워크스페이스(경로·설정·DB 기록)는 보존한다.
     ws_close_confirm: Option<(String, String, usize, usize)>,
     workspace_add_ui: Option<crate::workspace_add::WorkspaceAddUi>,
+    ssh_picker_host: Option<crate::ssh_workspace_host::SshWorkspaceHost>,
+    ssh_picker_draft: Option<crate::ssh_workspace_add::SshWorkspaceDraft>,
+    ssh_modal_workspace: Option<String>,
+    ssh_hosts: std::collections::HashMap<String, SshBoundHost>,
+    ssh_suppressed_workspaces: std::collections::HashSet<String>,
+    ssh_pending_rpc: std::collections::HashMap<u64, PendingSshRpc>,
+    ssh_pending_closes: std::collections::HashMap<String, PendingSshWorkspaceClose>,
+    ssh_file_observation: Option<SshFileObservation>,
+    ssh_next_request: u64,
     pending_legacy_workspace_rebind: Option<LegacyWorkspaceRebindPrompt>,
     workspace_clone_task: Option<crate::workspace_add::CloneTask>,
     /// Completed clone stays pending for one UI frame so an already visible Cancel can win.
@@ -10591,7 +10720,8 @@ pub struct App {
     agent_sessions_ui: ui::agent_sessions::AgentSessionsUi,
     /// Render가 반환한 controller action 한 건. 다음 logic tick에서만 실행해 process와
     /// protocol I/O가 render call graph에 들어오지 않게 한다.
-    pending_agent_sessions_action: Option<ui::agent_sessions::AgentSessionsDeferredAction>,
+    pending_agent_sessions_action:
+        Option<(String, ui::agent_sessions::AgentSessionsDeferredAction)>,
     /// Session-owned auxiliary tabs, filters, selection and cached results.
     session_aux: crate::session_aux::SessionAuxViews,
     /// Work history's legacy change preview; independent from the session Git view.
@@ -10922,6 +11052,9 @@ pub struct App {
     logs_base: PathBuf,
     runtime_host_factory: Arc<runtime::InProcessRuntimeHostFactory>,
     workspaces: Vec<storage::WorkspaceRow>,
+    workspace_targets: std::collections::HashMap<String, WorkspaceTarget>,
+    ssh_installed_agents:
+        std::collections::HashMap<String, Vec<deppy_remote_host::services::Agent>>,
     /// Bounded workspace projection의 all-or-nothing filesystem identity. Render/rename
     /// detection은 path/anchor를 per-workspace로 다시 조회하지 않는다.
     workspace_anchors: std::collections::HashMap<String, storage::WorkspaceFolderAnchor>,
@@ -11251,9 +11384,11 @@ enum WorkspaceCloseDisposition {
 
 fn workspace_close_disposition(
     confirmation_enabled: bool,
-    has_closeable_sessions: bool,
+    workspace: Option<&ui::file_tree::SidebarWorkspaceEntry>,
 ) -> WorkspaceCloseDisposition {
-    if !has_closeable_sessions {
+    // Idle describes runtime residency, not whether a visible workspace can be closed.
+    // Keep the clicked workspace as the target without activating/restoring it first.
+    if workspace.is_none() {
         WorkspaceCloseDisposition::Ignore
     } else if confirmation_enabled {
         WorkspaceCloseDisposition::Confirm
@@ -12445,6 +12580,14 @@ enum AuxTabWinner {
     Document,
 }
 
+/// Filesystem ownership is independent of the pane retaining a document buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DocumentTransportScope {
+    Local,
+    Ssh(SshWorkspaceTarget),
+    Unavailable,
+}
+
 /// 문서 탭에 지금 열려 있는 문서(설계 §4 `OpenDocument`). App 소유 — leaf
 /// (`ui::document`)는 이 값에서 뽑은 스냅샷만 받는다.
 struct OpenDocument {
@@ -12453,6 +12596,9 @@ struct OpenDocument {
     /// 갈린다.
     id: ui::workspace::DocumentTabId,
     path: PathBuf,
+    /// Captured when opened. A pane move, catalog refresh, or identical path on another
+    /// host cannot change the filesystem that owns this buffer and its queued operations.
+    transport_scope: DocumentTransportScope,
     /// authoritative state — Viewer는 이 값을 재직렬화·저장하지 않는다(설계 §5).
     source: String,
     mode: ui::document::DocumentViewMode,
@@ -13179,11 +13325,14 @@ fn find_recoverable_document_by_path(
     documents: &[OpenDocument],
     views: &crate::session_aux::SessionAuxViews,
     path: &Path,
+    transport_scope: &DocumentTransportScope,
 ) -> Option<ui::workspace::DocumentTabId> {
     find_open_document_by_path(
-        documents
-            .iter()
-            .filter(|document| views.document_has_dead_owner(document.id)),
+        documents.iter().filter(|document| {
+            !matches!(transport_scope, DocumentTransportScope::Unavailable)
+                && &document.transport_scope == transport_scope
+                && views.document_has_dead_owner(document.id)
+        }),
         path,
     )
 }
@@ -16430,6 +16579,1171 @@ fn retain_connector_host_completion(
 }
 
 impl App {
+    fn ssh_workspace_context(&self, workspace: &str) -> Option<ui::file_tree::SidebarSshContext> {
+        use ui::file_tree::SshConnectionStatus;
+        let WorkspaceTarget::Ssh(target) = self.workspace_targets.get(workspace)? else {
+            return None;
+        };
+        target.validate().ok()?;
+        let connected = std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .any(|runtime| {
+                runtime.id == workspace
+                    && runtime.runtime.is_remote()
+                    && runtime.runtime.is_connected()
+            });
+        let status = if connected {
+            SshConnectionStatus::Connected
+        } else if self
+            .ssh_hosts
+            .get(workspace)
+            .is_some_and(|owner| owner.connection_pending)
+        {
+            SshConnectionStatus::Connecting
+        } else {
+            SshConnectionStatus::Offline
+        };
+        let host = if target.host.contains(':') {
+            format!("[{}]", target.host)
+        } else {
+            target.host.clone()
+        };
+        Some(ui::file_tree::SidebarSshContext {
+            authority: format!("{}@{}:{}", target.account, host, target.port),
+            root: target.canonical_root.as_str().to_owned(),
+            status,
+        })
+    }
+    fn execute_agent_sessions_action(
+        &mut self,
+        origin_workspace: &str,
+        action: ui::agent_sessions::AgentSessionsDeferredAction,
+        ctx: &egui::Context,
+    ) {
+        let local_workspace = action
+            .creation_workspace()
+            .or_else(|| action.requests_catalog().then_some(origin_workspace));
+        if local_workspace.is_some_and(|id| {
+            !matches!(
+                self.workspace_targets.get(id),
+                Some(WorkspaceTarget::Local { .. })
+            )
+        }) {
+            self.notice_ssh_unsupported();
+            return;
+        }
+        self.agent_sessions_ui
+            .sync_controller_config(&self.config.agents);
+        if let Some(request) = self.agent_sessions_ui.execute_deferred(action, ctx) {
+            self.handle_agent_sessions_request(request);
+        }
+    }
+    fn refresh_agent_session_rate_limits(&mut self, ctx: &egui::Context) {
+        if !self.active.runtime.is_remote()
+            && matches!(
+                self.workspace_targets.get(&self.active.id),
+                Some(WorkspaceTarget::Local { .. })
+            )
+        {
+            self.agent_sessions_ui.refresh_rate_limits(ctx);
+        }
+    }
+    fn notice_ssh_unsupported(&mut self) {
+        let message = self
+            .i18n
+            .t("workspace_add.ssh.error.operation_unsupported", &[]);
+        let name = self.active_workspace_display_name();
+        self.notifications_ui.on_workspace_error(
+            &self.active.id,
+            &name,
+            ui::workspace::WorkspaceErrorKind::PathRejected,
+            &message,
+            &self.i18n,
+        );
+        self.set_web_notice(Some(message));
+        self.egui_ctx.request_repaint();
+    }
+    fn ssh_draft(profile: &SshConnectionProfile) -> crate::ssh_workspace_add::SshWorkspaceDraft {
+        crate::ssh_workspace_add::SshWorkspaceDraft {
+            profile_id: profile.id.clone(),
+            destination: profile.destination.clone(),
+            port: profile
+                .port
+                .map(|port| port.to_string())
+                .unwrap_or_default(),
+            use_identity_file: profile.identity_file.is_some(),
+            identity_file: profile.identity_file.clone().unwrap_or_default(),
+            name: String::new(),
+        }
+    }
+    fn spawn_ssh_host(
+        &self,
+        profile: SshConnectionProfile,
+        generation: u64,
+        target: Option<SshWorkspaceTarget>,
+    ) -> Result<
+        crate::ssh_workspace_host::SshWorkspaceHost,
+        crate::ssh_workspace_add::SshWorkspaceError,
+    > {
+        let ctx = self.egui_ctx.clone();
+        crate::ssh_workspace_host::SshWorkspaceHost::spawn(
+            profile,
+            generation,
+            target,
+            self.db_path.clone(),
+            PathBuf::new(),
+            Arc::new(move || ctx.request_repaint()),
+            Arc::new(AppSshWorkspaceRegistrar {
+                db_path: self.db_path.clone(),
+            }),
+        )
+        .map_err(|_| crate::ssh_workspace_add::SshWorkspaceError::WorkerUnavailable)
+    }
+    fn handle_ssh_workspace_intent(
+        &mut self,
+        intent: crate::ssh_workspace_add::SshWorkspaceIntent,
+    ) {
+        use crate::ssh_workspace_add::{
+            SshWorkspaceIntent as Intent, SshWorkspaceSnapshot, SshWorkspaceUpdate,
+        };
+        match intent {
+            Intent::Connect {
+                generation,
+                profile,
+            } => {
+                let bound = self.ssh_modal_workspace.clone();
+                if let Some(id) = bound.as_ref()
+                    && self.ssh_pending_closes.contains_key(id)
+                {
+                    self.notice_ssh_close_state(id, "workspace.ssh.closing");
+                    return;
+                }
+                let target = bound
+                    .as_ref()
+                    .and_then(|id| self.workspace_targets.get(id))
+                    .and_then(|target| match target {
+                        WorkspaceTarget::Ssh(target) => Some(target.clone()),
+                        _ => None,
+                    });
+                match self.spawn_ssh_host(profile, generation, target) {
+                    Ok(host) => {
+                        if let Some(id) = bound {
+                            if let Some(runtime) = std::iter::once(&mut self.active)
+                                .chain(self.warm.values_mut())
+                                .find(|runtime| runtime.id == id)
+                            {
+                                runtime.runtime.shutdown();
+                                runtime.runtime = WorkspaceRuntimeClient::offline();
+                                self.ssh_suppressed_workspaces.remove(&id);
+                                self.ssh_hosts.insert(
+                                    id,
+                                    SshBoundHost {
+                                        runtime_instance: runtime.runtime_instance,
+                                        host,
+                                        authentication_ui: None,
+                                        connection_pending: true,
+                                    },
+                                );
+                            }
+                        } else {
+                            self.ssh_picker_host = Some(host);
+                        }
+                    }
+                    Err(error) => {
+                        if let Some(ui) = self.workspace_add_ui.as_mut() {
+                            ui.apply_ssh_snapshot(SshWorkspaceSnapshot {
+                                generation,
+                                update: SshWorkspaceUpdate::Failed(error),
+                            });
+                        }
+                    }
+                }
+            }
+            Intent::Cancel { generation } | Intent::Close { generation } => {
+                let close = matches!(intent, Intent::Close { .. });
+                if self.ssh_modal_workspace.is_none()
+                    && let Some(ui) = self.workspace_add_ui.as_mut()
+                {
+                    self.ssh_picker_draft = Some(ui.ssh_mut().draft());
+                }
+                if let Some(id) = self.ssh_modal_workspace.clone() {
+                    if self
+                        .ssh_hosts
+                        .get(&id)
+                        .is_some_and(|owner| owner.host.generation() == generation)
+                    {
+                        self.ssh_hosts.remove(&id);
+                        self.ssh_suppressed_workspaces.insert(id);
+                    }
+                } else if self
+                    .ssh_picker_host
+                    .as_ref()
+                    .is_some_and(|host| host.generation() == generation)
+                {
+                    self.ssh_picker_host = None;
+                }
+                if close {
+                    self.workspace_add_ui = None;
+                    self.ssh_modal_workspace = None;
+                }
+            }
+            intent => {
+                let host = if let Some(id) = self.ssh_modal_workspace.as_ref() {
+                    self.ssh_hosts.get(id).map(|owner| &owner.host)
+                } else {
+                    self.ssh_picker_host.as_ref()
+                };
+                if let Some(error) = host
+                    .map_or(
+                        Err(crate::ssh_workspace_add::SshWorkspaceError::WorkerUnavailable),
+                        |host| host.send(intent),
+                    )
+                    .err()
+                    && let Some(ui) = self.workspace_add_ui.as_mut()
+                {
+                    let generation = ui.ssh_mut().generation();
+                    ui.apply_ssh_snapshot(SshWorkspaceSnapshot {
+                        generation,
+                        update: SshWorkspaceUpdate::Failed(error),
+                    });
+                }
+            }
+        }
+    }
+    fn ensure_ssh_workspace_hosts(&mut self) {
+        if !cfg!(feature = "ssh-workspaces") {
+            return;
+        }
+        let needed = std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .filter(|runtime| {
+                runtime.runtime.is_remote()
+                    && !self.ssh_hosts.contains_key(&runtime.id)
+                    && !self.ssh_suppressed_workspaces.contains(&runtime.id)
+                    && !self.ssh_pending_closes.contains_key(&runtime.id)
+            })
+            .map(|runtime| (runtime.id.clone(), runtime.runtime_instance))
+            .collect::<Vec<_>>();
+        for (id, runtime_instance) in needed
+            .into_iter()
+            .take(9usize.saturating_sub(self.ssh_hosts.len()))
+        {
+            let Some(WorkspaceTarget::Ssh(target)) = self.workspace_targets.get(&id).cloned()
+            else {
+                continue;
+            };
+            let Ok(Some(profile)) = self.db.ssh_connection_profile(&target.connection_id) else {
+                continue;
+            };
+            let mut dialog = crate::workspace_add::WorkspaceAddUi::new(
+                crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime,
+                PathBuf::new(),
+            );
+            dialog.open_ssh_draft(Self::ssh_draft(&profile));
+            let generation = dialog.ssh_mut().generation();
+            if let Ok(host) = self.spawn_ssh_host(profile, generation, Some(target)) {
+                self.ssh_hosts.insert(
+                    id,
+                    SshBoundHost {
+                        runtime_instance,
+                        host,
+                        authentication_ui: Some(dialog),
+                        connection_pending: true,
+                    },
+                );
+            }
+        }
+    }
+    fn poll_ssh_workspace_hosts(&mut self) {
+        use crate::ssh_workspace_host::SshHostEvent;
+        let mut events = Vec::new();
+        if let Some(host) = self.ssh_picker_host.as_ref() {
+            for _ in 0..64 {
+                let Some(event) = host.poll() else { break };
+                events.push((None, event));
+            }
+        }
+        for (id, owner) in &self.ssh_hosts {
+            for _ in 0..64 {
+                let Some(event) = owner.host.poll() else {
+                    break;
+                };
+                events.push((Some(id.clone()), event));
+            }
+        }
+        for (workspace, event) in events {
+            match event {
+                SshHostEvent::Ui(snapshot) => {
+                    if let Some(id) = workspace.as_ref() {
+                        let current = self.ssh_hosts.get(id).is_some_and(|owner| {
+                            owner.host.generation() == snapshot.generation
+                                && self
+                                    .runtime_by_instance(owner.runtime_instance)
+                                    .is_some_and(|runtime| runtime.id == *id)
+                        });
+                        if !current {
+                            continue;
+                        }
+                        if matches!(
+                            &snapshot.update,
+                            crate::ssh_workspace_add::SshWorkspaceUpdate::Failed(_)
+                                | crate::ssh_workspace_add::SshWorkspaceUpdate::Offline
+                        ) && let Some(owner) = self.ssh_hosts.get_mut(id)
+                        {
+                            owner.connection_pending = false;
+                        }
+                        if self.active.id == *id
+                            && self.workspace_add_ui.is_none()
+                            && !matches!(
+                                snapshot.update,
+                                crate::ssh_workspace_add::SshWorkspaceUpdate::Connected { .. }
+                                    | crate::ssh_workspace_add::SshWorkspaceUpdate::Directory { .. }
+                                    | crate::ssh_workspace_add::SshWorkspaceUpdate::RootVerified { .. }
+                            )
+                            && let Some(dialog) = self
+                                .ssh_hosts
+                                .get_mut(id)
+                                .and_then(|owner| owner.authentication_ui.take())
+                        {
+                            self.workspace_add_ui = Some(dialog);
+                            self.ssh_modal_workspace = Some(id.clone());
+                        }
+                        if self.ssh_modal_workspace.as_ref() != Some(id) {
+                            if let Some(ui) = self
+                                .ssh_hosts
+                                .get_mut(id)
+                                .and_then(|owner| owner.authentication_ui.as_mut())
+                            {
+                                ui.apply_ssh_snapshot(snapshot);
+                            }
+                            continue;
+                        }
+                    }
+                    if let Some(ui) = self.workspace_add_ui.as_mut() {
+                        ui.apply_ssh_snapshot(snapshot);
+                    }
+                }
+                SshHostEvent::Connected {
+                    generation,
+                    client,
+                    profile,
+                    target,
+                    home,
+                    agents,
+                } => {
+                    let Some(id) = workspace else {
+                        let _ = (profile, target, home);
+                        continue;
+                    };
+                    let current = self
+                        .ssh_hosts
+                        .get(&id)
+                        .filter(|owner| owner.host.generation() == generation)
+                        .map(|owner| owner.runtime_instance);
+                    let target_matches = matches!(self.workspace_targets.get(&id),Some(WorkspaceTarget::Ssh(expected)) if expected==&target);
+                    let Some(old_instance) = current.filter(|_| target_matches) else {
+                        client.disconnect();
+                        continue;
+                    };
+                    let Some(next) = self.next_runtime_instance.checked_add(1) else {
+                        client.disconnect();
+                        continue;
+                    };
+                    let runtime_instance = self.next_runtime_instance;
+                    self.next_runtime_instance = next;
+                    self.prune_agent_display_for_retired_instance(old_instance);
+                    let ctx = self.egui_ctx.clone();
+                    let requested_scrollback = self.config.terminal.scrollback_lines;
+                    let Some(runtime) = self
+                        .runtime_by_instance_mut(old_instance)
+                        .filter(|runtime| runtime.id == id)
+                    else {
+                        client.disconnect();
+                        continue;
+                    };
+                    runtime.runtime.shutdown();
+                    runtime.runtime = WorkspaceRuntimeClient::remote(client);
+                    runtime.runtime_instance = runtime_instance;
+                    runtime.scrollback_delivery = crate::scrollback_policy::Delivery::new(
+                        runtime_instance,
+                        requested_scrollback,
+                        std::time::Instant::now(),
+                    );
+                    runtime.events = Self::subscribe_runtime_events(&runtime.runtime, &ctx);
+                    runtime.pending_events.clear();
+                    runtime.workspace_ui = ui::workspace::WorkspaceUi::with_resize_owner(
+                        *uuid::Uuid::new_v4().as_bytes(),
+                    );
+                    runtime.live = LiveSessionTracker::default();
+                    runtime.restore_lifecycle = WorkspaceRestoreLifecycle::Delivered;
+                    runtime.dotenv_state = None;
+                    runtime.session_dotenv_states.clear();
+                    runtime.session_resource_usage.clear();
+                    runtime.environment_has_secrets = false;
+                    runtime.environment_application = Default::default();
+                    runtime.session_titles.clear();
+                    runtime.resource_usage = None;
+                    runtime.storm_episodes.clear();
+                    runtime.storm_notify_pending.clear();
+                    runtime.frozen_sessions.clear();
+                    runtime.input_pressure = None;
+                    runtime.session_input_pressure.clear();
+                    runtime.pending_agent_spawns = 0;
+                    runtime.event_overflow_pending = false;
+                    runtime.event_resync_pending = false;
+                    runtime.pending_replay_resync = false;
+                    runtime.created = std::time::Instant::now();
+                    let _ = runtime
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::RequestMuxSnapshot);
+                    if let Some(owner) = self.ssh_hosts.get_mut(&id) {
+                        owner.runtime_instance = runtime_instance;
+                        owner.connection_pending = false;
+                        owner.authentication_ui = None;
+                    }
+                    self.ssh_installed_agents.insert(id.clone(), agents);
+                    self.global_waiting
+                        .retain(|(workspace, _, _)| workspace != &id);
+                    self.global_working
+                        .retain(|(workspace, _)| workspace != &id);
+                    self.global_responses
+                        .retain(|(workspace, _)| workspace != &id);
+                    self.global_turn_done
+                        .retain(|(workspace, _), _| workspace != &id);
+                    self.notifications_ui.prune_workspace(&id);
+
+                    if self.ssh_modal_workspace.as_ref() == Some(&id) {
+                        self.workspace_add_ui = None;
+                        self.ssh_modal_workspace = None;
+                    }
+                    if self.active.id == id {
+                        self.agent_launcher_snapshot = None;
+                        self.cancel_terminal_focus_intents();
+                        self.pending_resume_agent = None;
+                        self.pending_document_open = None;
+                        self.agent_detect_epoch = self
+                            .agent_detect_epoch
+                            .checked_add(1)
+                            .expect("agent detector generation exhausted");
+                        self.agent_detect_last_input = None;
+                        self.agent_bindings.clear();
+                        self.agent_activity.clear();
+                        self.session_cwds.clear();
+                        self.restore_agents.clear();
+                        self.persisted_agents.clear();
+                        self.archived_agent_resume.clear();
+                        self.restore_loaded_for = None;
+                        self.hook_overrides.clear();
+                        self.hook_binding_history.clear();
+                        self.hook_task_prompts.clear();
+                        self.fresh_hook_task_prompts.clear();
+                        self.hook_projection_ready = false;
+                        self.pending_turn_done_clear = None;
+                        self.session_alerts.clear();
+                        self.agent_needs_input.clear();
+                        self.agent_responses.clear();
+                        self.agent_turn_done.clear();
+                        self.agent_working.clear();
+                        self.reconcile_cross_workspace_pane();
+                        self.rebind_web_dashboard();
+                        self.refresh_file_tree_root();
+                        self.open_agent_launcher_for_active();
+                    }
+                }
+                SshHostEvent::Registered { generation, row } => {
+                    let current = self
+                        .ssh_picker_host
+                        .as_ref()
+                        .is_some_and(|host| host.generation() == generation)
+                        && self
+                            .workspace_add_ui
+                            .as_mut()
+                            .is_some_and(|ui| ui.ssh_mut().generation() == generation);
+                    if !current {
+                        continue;
+                    }
+                    let purpose = self.workspace_add_ui.as_ref().map(|ui| ui.purpose());
+                    self.workspace_add_ui = None;
+                    self.ssh_picker_host = None;
+                    self.ssh_picker_draft = None;
+                    self.refresh_workspaces();
+                    if purpose == Some(crate::workspace_add::WorkspaceAddPurpose::SelectInSettings)
+                    {
+                        self.settings_workspace_id = Some(row.row.id);
+                    } else {
+                        self.switch_workspace(&row.row.id);
+                        self.reveal_terminal_session();
+                    }
+                }
+                SshHostEvent::Rpc { generation, reply } => {
+                    if let Some(id) = workspace {
+                        self.complete_ssh_rpc(&id, generation, reply);
+                    }
+                }
+                SshHostEvent::Offline { generation } => {
+                    if let Some(id) = workspace {
+                        if self
+                            .ssh_hosts
+                            .get(&id)
+                            .is_some_and(|owner| owner.host.generation() == generation)
+                        {
+                            if let Some(owner) = self.ssh_hosts.get_mut(&id) {
+                                owner.connection_pending = false;
+                            }
+                            let ids = self
+                                .ssh_pending_rpc
+                                .iter()
+                                .filter(|(_, pending)| pending.workspace_id == id)
+                                .map(|(id, _)| *id)
+                                .collect::<Vec<_>>();
+                            for request in ids {
+                                if let Some(pending) = self.ssh_pending_rpc.remove(&request) {
+                                    self.fail_ssh_rpc(pending);
+                                }
+                            }
+                        }
+                    } else if let Some(ui) = self.workspace_add_ui.as_mut() {
+                        ui.apply_ssh_snapshot(crate::ssh_workspace_add::SshWorkspaceSnapshot {
+                            generation,
+                            update: crate::ssh_workspace_add::SshWorkspaceUpdate::Offline,
+                        });
+                    }
+                }
+            }
+        }
+        // Keep finished owners as explicit offline/retry markers; do not reconnect automatically.
+        let resident = std::iter::once(self.active.id.clone())
+            .chain(self.warm.keys().cloned())
+            .collect::<std::collections::HashSet<_>>();
+        self.ssh_hosts.retain(|id, _| resident.contains(id));
+        self.retire_ssh_rpc_owners();
+        self.ensure_ssh_workspace_hosts();
+    }
+    fn retire_ssh_rpc_owners(&mut self) {
+        let retired = self
+            .ssh_pending_rpc
+            .iter()
+            .filter(|(_, pending)| {
+                !self.ssh_hosts.get(&pending.workspace_id).is_some_and(|owner| {
+                    owner.runtime_instance == pending.runtime_instance
+                        && owner.host.generation() == pending.connection_generation
+                        && self.runtime_by_instance(pending.runtime_instance).is_some_and(
+                            |runtime| runtime.id == pending.workspace_id,
+                        )
+                        && matches!(self.workspace_targets.get(&pending.workspace_id),
+                            Some(WorkspaceTarget::Ssh(target)) if target == pending.provider.target())
+                })
+            })
+            .map(|(request_id, _)| *request_id)
+            .collect::<Vec<_>>();
+        for request_id in retired {
+            if let Some(pending) = self.ssh_pending_rpc.remove(&request_id) {
+                self.fail_ssh_rpc(pending);
+            }
+        }
+    }
+    fn notice_ssh_close_state(&mut self, workspace: &str, key: &str) {
+        let message = self.i18n.t(key, &[]);
+        let name = self
+            .workspaces
+            .iter()
+            .find(|row| row.id == workspace)
+            .map(Self::workspace_display_name)
+            .unwrap_or_else(|| workspace.to_owned());
+        self.notifications_ui.on_workspace_error(
+            workspace,
+            &name,
+            ui::workspace::WorkspaceErrorKind::PathRejected,
+            &message,
+            &self.i18n,
+        );
+        self.set_web_notice(Some(message));
+        self.egui_ctx.request_repaint();
+    }
+    fn poll_ssh_workspace_closes(&mut self, now: std::time::Instant) {
+        // Each bounded round closes a projected batch, then fences all earlier FIFO
+        // commands. An accepted Spawn may materialize after the original close click.
+        // The same deadline covers discovery, queue-full retries and every ACK round.
+        let workspaces = self.ssh_pending_closes.keys().cloned().collect::<Vec<_>>();
+        for workspace in workspaces {
+            let Some(mut pending) = self.ssh_pending_closes.remove(&workspace) else {
+                continue;
+            };
+            if !pending.confirmed
+                && !pending.observation_failed
+                && pending.barrier.is_none()
+                && now < pending.deadline
+                && self
+                    .runtime_by_instance(pending.runtime_instance)
+                    .is_some_and(|runtime| {
+                        runtime.id == workspace && runtime.runtime.is_connected()
+                    })
+            {
+                if !pending.round_started {
+                    let runtime = self.runtime_by_instance(pending.runtime_instance).unwrap();
+                    let mux = runtime
+                        .pending_events
+                        .iter()
+                        .rev()
+                        .find_map(|event| match event {
+                            runtime::RuntimeEvent::MuxUpdated { snapshot } => Some(snapshot),
+                            _ => None,
+                        })
+                        .or_else(|| runtime.workspace_ui.mux());
+                    pending.close_queue = mux
+                        .into_iter()
+                        .flat_map(|mux| &mux.tabs)
+                        .flat_map(|tab| &tab.panes)
+                        .take(SSH_WORKSPACE_CLOSE_BATCH)
+                        .map(|pane| pane.id.clone())
+                        .collect();
+                    pending.round_started = true;
+                }
+                while let Some(pane) = pending.close_queue.front() {
+                    let runtime = self.runtime_by_instance(pending.runtime_instance).unwrap();
+                    if runtime
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::ClosePane { pane: pane.clone() })
+                        .is_err()
+                    {
+                        break;
+                    }
+                    pending.close_queue.pop_front();
+                }
+                // The remote backend outlives App attachments. Fresh random ids
+                // cannot reuse an old attachment's delayed FIFO acknowledgement.
+                if pending.close_queue.is_empty() {
+                    let correlation_id = u64::from_be_bytes(
+                        uuid::Uuid::new_v4().as_bytes()[8..].try_into().unwrap(),
+                    )
+                    .max(1);
+                    if self
+                        .runtime_by_instance(pending.runtime_instance)
+                        .unwrap()
+                        .runtime
+                        .send_command(runtime::RuntimeCommand::DurableEventBarrier {
+                            correlation_id,
+                        })
+                        .is_ok()
+                    {
+                        pending.barrier = Some(correlation_id);
+                    }
+                }
+                if pending.barrier.is_none() {
+                    self.egui_ctx
+                        .request_repaint_after(std::time::Duration::from_millis(50));
+                }
+            }
+            self.ssh_pending_closes.insert(workspace, pending);
+        }
+        let completed = self
+            .ssh_pending_closes
+            .iter()
+            .filter_map(|(workspace, pending)| {
+                let runtime = self
+                    .runtime_by_instance(pending.runtime_instance)
+                    .filter(|runtime| runtime.id == *workspace);
+                let confirmed = pending.confirmed
+                    && !pending.observation_failed
+                    && runtime.is_some_and(|runtime| runtime.runtime.is_connected());
+                (confirmed
+                    || runtime.is_none_or(|runtime| !runtime.runtime.is_connected())
+                    || now >= pending.deadline)
+                    .then(|| (workspace.clone(), pending.runtime_instance, confirmed))
+            })
+            .collect::<Vec<_>>();
+        for (workspace, runtime_instance, confirmed) in completed {
+            self.ssh_pending_closes.remove(&workspace);
+            self.closed_workspaces
+                .insert(workspace.clone(), ClosedWorkspaceState::Persisted);
+            let active =
+                self.active.id == workspace && self.active.runtime_instance == runtime_instance;
+            if active && confirmed {
+                self.active.runtime.finish_remote_close();
+            } else {
+                if active {
+                    self.active.runtime.shutdown();
+                    self.ssh_suppressed_workspaces.insert(workspace.clone());
+                } else if self
+                    .warm
+                    .get(&workspace)
+                    .is_some_and(|runtime| runtime.runtime_instance == runtime_instance)
+                    && let Some(mut runtime) = self.warm.remove(&workspace)
+                {
+                    runtime.runtime.shutdown();
+                    self.prune_agent_display_for_retired_instance(runtime_instance);
+                    self.warm_order.retain(|id| id != &workspace);
+                }
+                if self
+                    .ssh_hosts
+                    .get(&workspace)
+                    .is_some_and(|owner| owner.runtime_instance == runtime_instance)
+                {
+                    self.ssh_hosts.remove(&workspace);
+                }
+            }
+            if !confirmed {
+                self.notice_ssh_close_state(&workspace, "workspace.ssh.close_unconfirmed");
+            }
+            if active {
+                self.rebind_web_dashboard();
+            }
+            self.activity_rows_cache = None;
+            self.retire_ssh_rpc_owners();
+            self.refresh_warm_idle_deadline();
+            self.egui_ctx.request_repaint();
+        }
+        if let Some(deadline) = self
+            .ssh_pending_closes
+            .values()
+            .map(|pending| pending.deadline)
+            .min()
+        {
+            self.egui_ctx
+                .request_repaint_after(deadline.saturating_duration_since(now));
+        }
+    }
+    fn ssh_document_workspace(&self, id: ui::workspace::DocumentTabId) -> Option<String> {
+        let DocumentTransportScope::Ssh(expected) = &self
+            .documents
+            .iter()
+            .find(|document| document.id == id)?
+            .transport_scope
+        else {
+            return None;
+        };
+        self.session_aux
+            .document_owners()
+            .find(|(scope, view)| {
+                view.document_ids.contains(&id)
+                    && matches!(self.workspace_targets.get(&scope.workspace_id),
+                        Some(WorkspaceTarget::Ssh(target)) if target == expected)
+            })
+            .map(|(scope, _)| scope.workspace_id.clone())
+    }
+    fn document_transport_scope(&self, workspace: &str) -> DocumentTransportScope {
+        match self.workspace_targets.get(workspace) {
+            Some(WorkspaceTarget::Local { .. }) => DocumentTransportScope::Local,
+            Some(WorkspaceTarget::Ssh(target)) if target.validate().is_ok() => {
+                DocumentTransportScope::Ssh(target.clone())
+            }
+            _ => DocumentTransportScope::Unavailable,
+        }
+    }
+    fn document_uses_local_filesystem(&self, id: ui::workspace::DocumentTabId) -> bool {
+        self.documents.iter().any(|document| {
+            document.id == id && matches!(document.transport_scope, DocumentTransportScope::Local)
+        })
+    }
+    fn remote_provider(
+        &self,
+        id: &str,
+    ) -> Option<crate::ssh_workspace_files::RemoteWorkspaceFiles> {
+        match self.workspace_targets.get(id)? {
+            WorkspaceTarget::Ssh(target) => {
+                crate::ssh_workspace_files::RemoteWorkspaceFiles::new(target.clone()).ok()
+            }
+            _ => None,
+        }
+    }
+    fn queue_ssh_rpc(
+        &mut self,
+        workspace_id: String,
+        request: deppy_remote_host::services::Request,
+        action: SshProviderAction,
+    ) {
+        let prepare = (|| {
+            if self.ssh_pending_rpc.len() >= 8 {
+                return None;
+            }
+            let provider = self.remote_provider(&workspace_id)?;
+            let owner = self.ssh_hosts.get(&workspace_id)?;
+            let document_id = match &action {
+                SshProviderAction::Load { id, .. } | SshProviderAction::Save { id, .. } => {
+                    Some(*id)
+                }
+                _ => None,
+            };
+            if let Some(id) = document_id {
+                if !self.documents.iter().any(|document| {
+                    document.id == id
+                        && matches!(&document.transport_scope, DocumentTransportScope::Ssh(target)
+                        if target == provider.target())
+                }) {
+                    return None;
+                }
+                let current = self.session_aux.document_owners().any(|(scope, view)| {
+                    scope.workspace_id == workspace_id
+                        && scope.runtime_instance == owner.runtime_instance
+                        && view.document_ids.contains(&id)
+                });
+                if !current {
+                    return None;
+                }
+            }
+            let runtime = self
+                .runtime_by_instance(owner.runtime_instance)
+                .filter(|runtime| runtime.id == workspace_id && runtime.runtime.is_connected())?;
+            let request_id = self.ssh_next_request;
+            let next = request_id
+                .checked_add(1)
+                .filter(|next| *next < u64::MAX / 2)?;
+            let fence = provider.reply_fence(
+                runtime.runtime.remote_rpc_token()?.to_owned(),
+                owner.host.generation(),
+                request_id,
+            );
+            Some((
+                provider,
+                fence,
+                owner.runtime_instance,
+                owner.host.generation(),
+                request_id,
+                next,
+            ))
+        })();
+        if let Some((provider, fence, runtime_instance, connection_generation, request_id, next)) =
+            prepare
+        {
+            self.ssh_next_request = next;
+            let pending = PendingSshRpc {
+                workspace_id: workspace_id.clone(),
+                runtime_instance,
+                connection_generation,
+                provider,
+                fence,
+                action,
+            };
+            if self
+                .ssh_hosts
+                .get(&workspace_id)
+                .is_some_and(|owner| owner.host.rpc(request_id, request).is_ok())
+            {
+                self.ssh_pending_rpc.insert(request_id, pending);
+            } else {
+                self.fail_ssh_rpc(pending);
+            }
+        } else {
+            self.finish_ssh_provider_action(workspace_id, action, None);
+        }
+    }
+    fn fail_ssh_rpc(&mut self, pending: PendingSshRpc) {
+        self.finish_ssh_provider_action(pending.workspace_id, pending.action, None);
+    }
+    fn complete_ssh_rpc(&mut self, workspace: &str, generation: u64, reply: runtime::SshRpcReply) {
+        let id = reply.context.request_id;
+        // A reply from a retired host must not consume a current request.
+        let current = self.ssh_pending_rpc.get(&id).is_some_and(|pending| {
+            pending.workspace_id == workspace
+                && self.ssh_hosts.get(workspace).is_some_and(|owner| {
+                    owner.runtime_instance == pending.runtime_instance
+                        && owner.host.generation() == generation
+                        && pending.connection_generation == generation
+                })
+                && self
+                    .runtime_by_instance(pending.runtime_instance)
+                    .is_some_and(|runtime| runtime.id == workspace)
+        });
+        if !current {
+            return;
+        }
+        let pending = self
+            .ssh_pending_rpc
+            .remove(&id)
+            .expect("SSH reply owner checked");
+        let reply = pending.fence.decode(reply).ok();
+        self.finish_ssh_provider_action(
+            pending.workspace_id,
+            pending.action,
+            reply.map(|reply| (pending.provider, reply)),
+        );
+    }
+    fn finish_ssh_provider_action(
+        &mut self,
+        workspace: String,
+        action: SshProviderAction,
+        reply: Option<(
+            crate::ssh_workspace_files::RemoteWorkspaceFiles,
+            deppy_remote_host::services::Reply,
+        )>,
+    ) {
+        use crate::ssh_workspace_files::RemoteListingProgress;
+        match action {
+            SshProviderAction::Directory {
+                operation,
+                generation,
+                mut listing,
+            } => {
+                let result = reply
+                    .ok_or(crate::ssh_workspace_files::RemoteProviderError::Disconnected)
+                    .and_then(|(_, reply)| listing.accept(reply));
+                match result {
+                    Ok(RemoteListingProgress::Next(request)) => self.queue_ssh_rpc(
+                        workspace,
+                        request,
+                        SshProviderAction::Directory {
+                            operation,
+                            generation,
+                            listing,
+                        },
+                    ),
+                    result => {
+                        if self.active.id == workspace {
+                            let result = result
+                                .map(|progress| match progress {
+                                    RemoteListingProgress::Complete(snapshot) => {
+                                        ui::file_tree::FileTreeMaintenanceResult::Listing(snapshot)
+                                    }
+                                    RemoteListingProgress::Next(_) => {
+                                        unreachable!("next page handled")
+                                    }
+                                })
+                                .map_err(crate::ssh_workspace_files::maintenance_error);
+                            self.apply_app_host_completion(
+                                AppHostIoCompletion::FileTreeMaintenance(
+                                    ui::file_tree::FileTreeMaintenanceCompletion {
+                                        operation,
+                                        generation,
+                                        result,
+                                    },
+                                ),
+                            );
+                        }
+                    }
+                }
+            }
+            SshProviderAction::Load { id, path } => {
+                let outcome = reply
+                    .map(|(provider, reply)| provider.load_response(&path, reply))
+                    .unwrap_or(document_io::DocumentLoadOutcome::Failed {
+                        code: document_io::DocumentIoErrorCode::ReadFailed,
+                    });
+                self.apply_document_load_outcome(id, outcome);
+            }
+            SshProviderAction::Save { id, path } => {
+                let outcome = reply
+                    .map(|(provider, reply)| provider.save_response(&path, reply))
+                    .unwrap_or(document_io::DocumentSaveOutcome::Failed {
+                        code: document_io::DocumentIoErrorCode::ReplaceFailed,
+                    });
+                self.apply_document_save_outcome(id, outcome);
+            }
+            SshProviderAction::Git { intent } => {
+                let result = reply
+                    .map(|(provider, reply)| provider.git_response(&intent.request, reply))
+                    .or_else(|| {
+                        self.remote_provider(&workspace).map(|provider| {
+                            provider.git_response(
+                                &intent.request,
+                                Err(deppy_remote_host::services::ServiceError::TargetMismatch),
+                            )
+                        })
+                    });
+                if let Some(result) = result {
+                    self.apply_app_host_completion(AppHostIoCompletion::GitPanel(
+                        ui::git_panel::GitPanelIoCompletion {
+                            generation: intent.generation,
+                            result,
+                        },
+                    ));
+                }
+            }
+        }
+        self.egui_ctx.request_repaint();
+    }
+    fn ssh_git_workspace(&self, generation: u64) -> Option<String> {
+        self.session_aux
+            .document_owners()
+            .find(|(_, view)| {
+                [
+                    view.git_generation,
+                    view.git_diff_generation,
+                    view.git_commit_files_generation,
+                ]
+                .contains(&Some(generation))
+            })
+            .map(|(scope, _)| scope.workspace_id.clone())
+            .filter(|id| self.remote_provider(id).is_some())
+    }
+    fn local_host_action_owner(&self, workspace_id: &str, runtime_instance: u64) -> bool {
+        self.runtime_by_instance(runtime_instance)
+            .is_some_and(|runtime| runtime.id == workspace_id && !runtime.runtime.is_remote())
+            && matches!(
+                self.db.workspace_target(workspace_id),
+                Ok(Some(WorkspaceTarget::Local { .. }))
+            )
+    }
+    fn register_ssh_file_observation(
+        &mut self,
+        generation: u64,
+        plan: ui::file_tree::FileTreeWatchPlan,
+    ) -> Result<(), ui::file_tree::FileTreeMaintenanceErrorCode> {
+        let provider = self
+            .remote_provider(&self.active.id)
+            .ok_or(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot)?;
+        let (directories, ignored_prefixes, show_hidden) = plan.into_parts();
+        if directories
+            .iter()
+            .chain(&ignored_prefixes)
+            .any(|path| provider.relative_path(path).is_err())
+        {
+            return Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot);
+        }
+        if directories.is_empty() {
+            self.ssh_file_observation = None;
+            return Ok(());
+        }
+        let same_scope = self
+            .ssh_file_observation
+            .as_ref()
+            .is_some_and(|observation| {
+                observation.workspace_id == self.active.id
+                    && observation.runtime_instance == self.active.runtime_instance
+                    && observation.target == *provider.target()
+                    && observation.generation == generation
+            });
+        if same_scope {
+            let observation = self.ssh_file_observation.as_mut().unwrap();
+            if observation.directories != directories
+                || observation.ignored_prefixes != ignored_prefixes
+                || observation.show_hidden != show_hidden
+            {
+                observation.directories = directories;
+                observation.ignored_prefixes = ignored_prefixes;
+                observation.show_hidden = show_hidden;
+                observation.cursor = 0;
+                observation.next_poll = None;
+            }
+        } else {
+            self.ssh_file_observation = Some(SshFileObservation {
+                workspace_id: self.active.id.clone(),
+                runtime_instance: self.active.runtime_instance,
+                target: provider.target().clone(),
+                generation,
+                directories,
+                ignored_prefixes,
+                show_hidden,
+                cursor: 0,
+                revision: 0,
+                next_poll: None,
+            });
+        }
+        Ok(())
+    }
+    fn route_ssh_host_action(&mut self, action: AppHostIoAction) -> Option<AppHostIoAction> {
+        // Local host effects are gated by the action owner, rather than its displayed path.
+        let remote = match &action {
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance,
+                ..
+            } => !self.local_host_action_owner(workspace_id, *runtime_instance),
+            AppHostIoAction::GitPanel(intent) => !self
+                .session_aux
+                .document_owners()
+                .find(|(_, view)| {
+                    [
+                        view.git_generation,
+                        view.git_diff_generation,
+                        view.git_commit_files_generation,
+                    ]
+                    .contains(&Some(intent.generation))
+                })
+                .is_some_and(|(scope, _)| {
+                    self.local_host_action_owner(&scope.workspace_id, scope.runtime_instance)
+                }),
+            AppHostIoAction::Transcript { generation, .. } => !self
+                .session_aux
+                .document_owners()
+                .find(|(_, view)| view.transcript_generation == Some(*generation))
+                .is_some_and(|(scope, _)| {
+                    self.local_host_action_owner(&scope.workspace_id, scope.runtime_instance)
+                }),
+            AppHostIoAction::FileTree(_)
+            | AppHostIoAction::FileTreeMaintenance(_)
+            | AppHostIoAction::Diff(_)
+            | AppHostIoAction::OpenPath(_) => self.active.runtime.is_remote(),
+            _ => false,
+        };
+        if !remote {
+            return Some(action);
+        }
+        match action {
+            AppHostIoAction::FileTreeMaintenance(intent) => {
+                match intent.request {
+                    ui::file_tree::FileTreeMaintenanceRequest::ListDirectory {
+                        root,
+                        directory,
+                        max_items,
+                        max_bytes,
+                    } => {
+                        let provider = self.remote_provider(&self.active.id);
+                        let listing = provider.and_then(|provider| {
+                            if provider.relative_path(root.as_path()).ok()?.is_empty() {
+                                provider
+                                    .directory(directory.as_path(), max_items, max_bytes)
+                                    .ok()
+                            } else {
+                                None
+                            }
+                        });
+                        if let Some(listing) = listing {
+                            self.queue_ssh_rpc(
+                                self.active.id.clone(),
+                                listing.request(),
+                                SshProviderAction::Directory {
+                                    operation: intent.operation,
+                                    generation: intent.generation,
+                                    listing,
+                                },
+                            );
+                        } else {
+                            self.apply_app_host_completion(AppHostIoCompletion::FileTreeMaintenance(ui::file_tree::FileTreeMaintenanceCompletion{operation:intent.operation,generation:intent.generation,result:Err(ui::file_tree::FileTreeMaintenanceErrorCode::InvalidSnapshot)}));
+                        }
+                    }
+                    ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(plan) => {
+                        let result = self.register_ssh_file_observation(intent.generation, plan);
+                        self.apply_app_host_completion(AppHostIoCompletion::FileTreeMaintenance(
+                            ui::file_tree::FileTreeMaintenanceCompletion {
+                                operation: intent.operation,
+                                generation: intent.generation,
+                                result: result.map(|()| {
+                                    ui::file_tree::FileTreeMaintenanceResult::WatchSetApplied
+                                }),
+                            },
+                        ));
+                    }
+                }
+            }
+            AppHostIoAction::GitPanel(intent) => {
+                let workspace = self.ssh_git_workspace(intent.generation);
+                let request = workspace
+                    .as_ref()
+                    .and_then(|workspace| self.remote_provider(workspace))
+                    .and_then(|provider| provider.git_request(&intent.request).ok());
+                if let (Some(workspace), Some(request)) = (workspace, request) {
+                    self.queue_ssh_rpc(workspace, request, SshProviderAction::Git { intent });
+                } else {
+                    self.apply_app_host_completion(
+                        AppHostIoFallback::for_action(&AppHostIoAction::GitPanel(intent))
+                            .into_completion(),
+                    );
+                }
+            }
+            action => {
+                self.apply_app_host_completion(
+                    AppHostIoFallback::for_action(&action).into_completion(),
+                );
+                self.notice_ssh_unsupported();
+                tracing::warn!(
+                    kind = "ssh",
+                    error_code = "remote_operation_unsupported",
+                    "Remote operation unsupported"
+                );
+            }
+        }
+        None
+    }
     #[allow(
         clippy::result_large_err,
         reason = "Rejected imports return the exact owned payload without cloning or extra boxing"
@@ -16600,7 +17914,83 @@ impl App {
         }
     }
 
+    fn poll_ssh_file_observation(
+        &mut self,
+        now: std::time::Instant,
+        native_visible: bool,
+    ) -> Option<std::time::Duration> {
+        let observation = self.ssh_file_observation.as_mut()?;
+        let eligible = native_visible
+            && self.active.runtime.is_remote()
+            && self.active.runtime.is_connected()
+            && self.active.id == observation.workspace_id
+            && self.active.runtime_instance == observation.runtime_instance
+            && matches!(self.workspace_targets.get(&self.active.id), Some(WorkspaceTarget::Ssh(target)) if target == &observation.target)
+            && !self.ssh_pending_closes.contains_key(&self.active.id)
+            && self
+                .file_tree
+                .as_ref()
+                .is_some_and(ui::file_tree::FileTreeUi::files_are_visible);
+        if !eligible {
+            observation.next_poll = None;
+            return None;
+        }
+        let busy = self
+            .file_tree
+            .as_ref()
+            .is_some_and(ui::file_tree::FileTreeUi::maintenance_is_busy)
+            || self.pending_file_tree_maintenance.is_some()
+            || self.ssh_pending_rpc.len() >= 8
+            || self.ssh_pending_rpc.values().any(|pending| {
+                pending.workspace_id == self.active.id
+                    && matches!(&pending.action, SshProviderAction::Directory { .. })
+            });
+        if busy {
+            // Completion already wakes the App. Arm a new interval once all pages
+            // and the leaf's expanded-folder walk finish, without a catch-up sweep.
+            observation.next_poll = None;
+            return None;
+        }
+        let deadline = observation
+            .next_poll
+            .get_or_insert(now + SSH_FILE_OBSERVATION_INTERVAL);
+        if now < *deadline {
+            return Some(deadline.saturating_duration_since(now));
+        }
+        let directory = observation.directories.get(observation.cursor)?.clone();
+        observation.cursor = (observation.cursor + 1) % observation.directories.len();
+        observation.revision = observation.revision.checked_add(1)?;
+        observation.next_poll = None;
+        let event = ui::file_tree::FileTreeWatchEvent::try_new(
+            ui::file_tree::FileTreeWatchEventKind::DirtyDirectory,
+            directory,
+        )
+        .ok()?;
+        let snapshot = ui::file_tree::FileTreeWatchSnapshot::try_new(
+            observation.generation,
+            observation.revision,
+            false,
+            vec![event],
+        )
+        .ok()?;
+        self.file_tree.as_mut()?.apply_watch_snapshot(snapshot);
+        None
+    }
     fn poll_file_tree_maintenance(&mut self, ctx: &egui::Context) {
+        let visible = ctx.input(|input| input.viewport().visible()) != Some(false);
+        if let Some(delay) = self.poll_ssh_file_observation(std::time::Instant::now(), visible) {
+            ctx.request_repaint_after(delay);
+        }
+        if self.active.runtime.is_remote() {
+            self.file_tree_watcher = None;
+            if self.pending_file_tree_maintenance.is_none() {
+                self.pending_file_tree_maintenance = self
+                    .file_tree
+                    .as_mut()
+                    .and_then(ui::file_tree::FileTreeUi::take_maintenance_intent);
+            }
+            return;
+        }
         let Some(tree) = self.file_tree.as_mut() else {
             self.pending_file_tree_maintenance = None;
             self.file_tree_watcher = None;
@@ -16842,6 +18232,9 @@ impl App {
         let Some(action) = action else {
             return;
         };
+        let Some(action) = self.route_ssh_host_action(action) else {
+            return;
+        };
         match AppHostIoTask::spawn(action, ctx.clone()) {
             Ok(task) => self.app_host_io = Some(task),
             Err(fallback) => {
@@ -16864,7 +18257,12 @@ impl App {
             .map(std::path::Path::to_path_buf)
             .or_else(crate::paths::home_dir)
             .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        self.workspace_add_ui = Some(crate::workspace_add::WorkspaceAddUi::new(purpose, parent));
+        let mut dialog = crate::workspace_add::WorkspaceAddUi::new(purpose, parent);
+        self.ssh_modal_workspace = None;
+        if let Some(draft) = self.ssh_picker_draft.clone() {
+            dialog.open_ssh_draft(draft);
+        }
+        self.workspace_add_ui = Some(dialog);
     }
 
     fn render_workspace_add_dialog(&mut self, ctx: &egui::Context, catalog: &i18n::Catalog) {
@@ -16918,6 +18316,7 @@ impl App {
                 }
             }
             Some(WorkspaceAddIntent::Close) => self.workspace_add_ui = None,
+            Some(WorkspaceAddIntent::Ssh(intent)) => self.handle_ssh_workspace_intent(intent),
             Some(WorkspaceAddIntent::Clone(_)) | None => {}
         }
     }
@@ -17404,6 +18803,15 @@ impl App {
             env_project_close_confirm: None,
             ws_close_confirm: None,
             workspace_add_ui: None,
+            ssh_picker_host: None,
+            ssh_picker_draft: None,
+            ssh_modal_workspace: None,
+            ssh_hosts: Default::default(),
+            ssh_suppressed_workspaces: Default::default(),
+            ssh_pending_rpc: Default::default(),
+            ssh_pending_closes: Default::default(),
+            ssh_file_observation: None,
+            ssh_next_request: 1,
             pending_legacy_workspace_rebind: None,
             workspace_clone_task: None,
             pending_workspace_clone_result: None,
@@ -17649,6 +19057,8 @@ impl App {
             logs_base,
             runtime_host_factory,
             workspaces: Vec::new(),
+            workspace_targets: std::collections::HashMap::new(),
+            ssh_installed_agents: std::collections::HashMap::new(),
             workspace_anchors: std::collections::HashMap::new(),
             persisted_activity_panes: std::collections::HashMap::new(),
             agent_activity: std::collections::HashMap::new(),
@@ -17838,19 +19248,28 @@ impl App {
             .flatten()
             .map(PathBuf::from)
             .filter(|p| p.is_dir());
-        let runtime = runtime_host_factory
-            .create_client(runtime::RuntimeHostConfig {
-                output_batch_ms: config.performance.output_batch_ms,
-                scrollback_policy: Some((1, config.terminal.scrollback_lines)),
-                logs_root,
-                persist: Some(runtime::PersistConfig {
-                    db_path: db_path.to_path_buf(),
-                    workspace_id: workspace_id.to_owned(),
-                }),
-                cwd: shell_cwd.clone(),
-                extra_env: Self::shim_shell_env(config),
-            })
-            .expect("runtime worker thread 생성");
+        let runtime = if matches!(
+            db.workspace_target(workspace_id),
+            Ok(Some(WorkspaceTarget::Local { .. }))
+        ) {
+            WorkspaceRuntimeClient::Local(
+                runtime_host_factory
+                    .create_client(runtime::RuntimeHostConfig {
+                        output_batch_ms: config.performance.output_batch_ms,
+                        scrollback_policy: Some((1, config.terminal.scrollback_lines)),
+                        logs_root,
+                        persist: Some(runtime::PersistConfig {
+                            db_path: db_path.to_path_buf(),
+                            workspace_id: workspace_id.to_owned(),
+                        }),
+                        cwd: shell_cwd.clone(),
+                        extra_env: Self::shim_shell_env(config),
+                    })
+                    .expect("runtime worker thread 생성"),
+            )
+        } else {
+            WorkspaceRuntimeClient::offline()
+        };
         // 상태 이벤트 도착 시 UI를 깨운다 (§14.1 Warm 알림 유지). subscribe→restore 순서
         // 를 코드로 보장하려 subscribe 직후 복원 명령을 보낸다.
         let runtime_events = Self::subscribe_runtime_events(&runtime, egui_ctx);
@@ -18148,7 +19567,7 @@ impl App {
     }
 
     fn subscribe_runtime_events(
-        runtime: &InProcessRuntimeClient,
+        runtime: &WorkspaceRuntimeClient,
         ctx: &egui::Context,
     ) -> RuntimeEventReceiver {
         runtime.subscribe_with_wake(std::sync::Arc::new({
@@ -18699,6 +20118,9 @@ impl App {
     }
 
     fn request_work_history_git(&mut self, manual: bool) {
+        if self.active.runtime.is_remote() {
+            return;
+        }
         if self.work_history_rows.is_empty() {
             return;
         }
@@ -18847,6 +20269,10 @@ impl App {
     }
 
     fn stage_project_name_projection(&mut self) -> bool {
+        if self.active.runtime.is_remote() {
+            self.project_name_projection_dirty = false;
+            return false;
+        }
         const PROJECT_NAME_ITEMS_MAX: usize = 256;
         if !self.agent_state_scope_ready() {
             return false;
@@ -18868,8 +20294,14 @@ impl App {
         }
         for row in self
             .persisted_activity_panes
-            .values()
-            .flat_map(|panes| panes.iter())
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    self.workspace_targets.get(*id),
+                    Some(WorkspaceTarget::Local { .. })
+                )
+            })
+            .flat_map(|(_, panes)| panes.iter())
         {
             let cwd = &row.cwd;
             if rows.len() >= PROJECT_NAME_ITEMS_MAX {
@@ -19691,6 +21123,10 @@ impl App {
     }
 
     fn apply_resume_probe_results(&mut self, results: &[AppResumeProbeResult]) {
+        if self.active.runtime.is_remote() {
+            self.resume_probe_pending_panes.clear();
+            return;
+        }
         for result in results {
             self.resume_probe_pending_panes.remove(&result.pane_id);
             let identity_is_current =
@@ -20001,12 +21437,25 @@ impl App {
     /// (§14.1 Warm: 창이 안 보이면 logic()만 호출됨, codex 리뷰). UI(egui)에 의존하지 않는
     /// 순수 상태 갱신이라 logic()이 올바른 위치다.
     fn poll_agent_detect(&mut self) {
+        if self.active.runtime.is_remote() {
+            self.agent_detect_last_input = None;
+            self.active.workspace_ui.set_session_pids(&[]);
+            let _ = self.agent_detect_input.publish(
+                self.agent_detect_epoch,
+                Vec::new(),
+                &std::collections::HashMap::new(),
+                !self.active.render_active,
+            );
+            while self.agent_detect_rx.try_recv().is_ok() {}
+            return;
+        }
         // 워커 입력(활성 세션 pid 목록 + epoch)을 최신값으로 갱신 — 워커가 다음 tick에 읽어
         // ps/lsof/transcript 스캔을 UI 스레드 밖에서 수행한다.
         let sessions: Vec<(runtime::SessionId, u32)> = self
             .active
             .session_resource_usage
             .iter()
+            .filter(|_| !self.active.runtime.is_remote())
             .filter_map(|r| r.pid.map(|pid| (r.session, pid)))
             .collect();
         // 터미널 경로 더블클릭의 상대경로 해석용 — 같은 목록을 workspace UI에도 나른다.
@@ -20423,6 +21872,10 @@ impl App {
     /// 설치 감지 결과로 전략을 다시 계산한다. 메타데이터가 아직 없으면 실행을 보류하고,
     /// 지원하지 않는 것으로 확인된 agent만 빈 추가 인자로 새로 실행한다.
     fn dispatch_respawn_archived_agent(&mut self, session: runtime::SessionId) -> bool {
+        if self.active.runtime.is_remote() {
+            self.notice_ssh_unsupported();
+            return false;
+        }
         let Some(mux) = self.active.workspace_ui.mux().cloned() else {
             return false;
         };
@@ -20606,6 +22059,10 @@ impl App {
         extra_args: Vec<String>,
         native_session_id: &str,
     ) -> bool {
+        if self.active.runtime.is_remote() {
+            self.notice_ssh_unsupported();
+            return false;
+        }
         // 살아 있는 pane 경로(dispatch_respawn_archived_agent)와 **같은 판정**을 먼저
         // 거친다. App Server가 그 codex thread를 이미 writer로 쥐고 있으면 새 PTY로
         // `codex resume`을 또 띄워봐야 rollout 파일의 writer가 하나뿐이라
@@ -20858,6 +22315,9 @@ impl App {
         &mut self,
         bindings: &std::collections::HashMap<runtime::SessionId, crate::agent_detect::AgentBinding>,
     ) {
+        if self.active.runtime.is_remote() {
+            return;
+        }
         let mux = self.active.workspace_ui.mux().cloned();
         self.stage_pane_binding_sync(bindings);
         if self.restore_loaded_for.as_deref() != Some(self.active.id.as_str()) {
@@ -21034,6 +22494,10 @@ impl App {
         pane_title: &str,
         session: runtime::SessionId,
     ) -> bool {
+        if self.active.runtime.is_remote() {
+            self.notice_ssh_unsupported();
+            return false;
+        }
         if !self.resume_probe_pending_panes.is_empty() {
             return false;
         }
@@ -21095,6 +22559,9 @@ impl App {
     /// 세션의 현재 작업 폴더 — 감지 워커 캐시 우선, 없으면 pid로 일회성 lsof 조회
     /// (사용자 클릭 시점의 1회 조회라 스폰 비용 감수 — platform::process_cwd 관례).
     fn cached_session_cwd(&self, session: runtime::SessionId) -> Option<String> {
+        if self.active.runtime.is_remote() {
+            return None;
+        }
         self.session_cwds.get(&session).cloned()
     }
 
@@ -21220,6 +22687,12 @@ impl App {
         cwd: Option<PathBuf>,
         request: ui::git_panel::GitPanelIoRequest,
     ) {
+        let cwd = if self.active.runtime.is_remote() {
+            self.remote_provider(&self.active.id)
+                .map(|provider| PathBuf::from(provider.target().canonical_root.as_str()))
+        } else {
+            cwd
+        };
         let Some(cwd) = cwd else {
             // repo를 못 찾았다 — 고정도 함께 푼다(옛 repo에 붙잡히지 않게).
             self.session_aux.current.git_generation = None;
@@ -21740,8 +23213,13 @@ impl App {
         let Some(document) = self.documents.iter().find(|document| document.id == id) else {
             return;
         };
-        let mode = document.mode;
-        let show_mode_toggle = document.supports_preview();
+        let remote = !self.document_uses_local_filesystem(id);
+        let mode = if remote {
+            ui::document::DocumentViewMode::Source
+        } else {
+            document.mode
+        };
+        let show_mode_toggle = !remote && document.supports_preview();
         let can_save = document.can_save();
         let status_text = self.document_toolbar_status_text(id, text);
         let load_state = document.load_state.clone();
@@ -22200,6 +23678,10 @@ impl App {
         ctx: &egui::Context,
         id: ui::workspace::DocumentTabId,
     ) {
+        if !self.document_uses_local_filesystem(id) {
+            self.notice_ssh_unsupported();
+            return;
+        }
         let Some(path) = self
             .documents
             .iter()
@@ -22445,10 +23927,12 @@ impl App {
     fn begin_document_open(&mut self, path: PathBuf) {
         self.sync_session_aux_scope();
         self.prune_session_aux_views();
+        let transport_scope = self.document_transport_scope(&self.active.id);
         if let Some(id) = find_open_document_by_path(
-            self.documents
-                .iter()
-                .filter(|d| self.session_aux.current.document_ids.contains(&d.id)),
+            self.documents.iter().filter(|d| {
+                self.session_aux.current.document_ids.contains(&d.id)
+                    && d.transport_scope == transport_scope
+            }),
             &path,
         ) {
             self.activate_document_tab(id);
@@ -22456,9 +23940,12 @@ impl App {
             self.reveal_terminal_view_for_aux_tab();
             return;
         }
-        if let Some(id) =
-            find_recoverable_document_by_path(&self.documents, &self.session_aux, &path)
-            && self.session_aux.recover_document(id)
+        if let Some(id) = find_recoverable_document_by_path(
+            &self.documents,
+            &self.session_aux,
+            &path,
+            &transport_scope,
+        ) && self.session_aux.recover_document(id)
         {
             self.activate_document_tab(id);
             self.session_aux.current.document_cap_notice = false;
@@ -22480,6 +23967,7 @@ impl App {
         self.documents.push(OpenDocument {
             id,
             path: path.clone(),
+            transport_scope,
             source: String::new(),
             mode: ui::document::DocumentViewMode::Source,
             load_state: DocumentLoadState::Loading,
@@ -22847,6 +24335,27 @@ impl App {
         if self.document_load_inflight.is_none()
             && let Some((id, path)) = self.document_pending_loads.pop_front()
         {
+            if !self.document_uses_local_filesystem(id) {
+                if let Some(workspace) = self.ssh_document_workspace(id) {
+                    let request = self
+                        .remote_provider(&workspace)
+                        .and_then(|provider| provider.read_request(&path).ok());
+                    let action = SshProviderAction::Load { id, path };
+                    if let Some(request) = request {
+                        self.queue_ssh_rpc(workspace, request, action);
+                    } else {
+                        self.finish_ssh_provider_action(workspace, action, None);
+                    }
+                } else {
+                    self.apply_document_load_outcome(
+                        id,
+                        document_io::DocumentLoadOutcome::Failed {
+                            code: document_io::DocumentIoErrorCode::ReadFailed,
+                        },
+                    );
+                }
+                return;
+            }
             match self
                 .document_load_worker
                 .try_request((id, document_io::DocumentLoadRequest { path }))
@@ -22886,6 +24395,30 @@ impl App {
         if self.document_save_inflight.is_none()
             && let Some((id, request)) = self.document_pending_saves.pop_front()
         {
+            if !self.document_uses_local_filesystem(id) {
+                if let Some(workspace) = self.ssh_document_workspace(id) {
+                    let rpc = self
+                        .remote_provider(&workspace)
+                        .and_then(|provider| provider.write_request(&request).ok());
+                    let action = SshProviderAction::Save {
+                        id,
+                        path: request.path,
+                    };
+                    if let Some(request) = rpc {
+                        self.queue_ssh_rpc(workspace, request, action);
+                    } else {
+                        self.finish_ssh_provider_action(workspace, action, None);
+                    }
+                } else {
+                    self.apply_document_save_outcome(
+                        id,
+                        document_io::DocumentSaveOutcome::Failed {
+                            code: document_io::DocumentIoErrorCode::ReplaceFailed,
+                        },
+                    );
+                }
+                return;
+            }
             match self.document_save_worker.try_request((id, request)) {
                 Ok(()) => self.document_save_inflight = Some(id),
                 Err(crate::lazy_worker::LazyWorkerSubmitError::Full(job)) => {
@@ -24018,7 +25551,12 @@ impl App {
                     return WorkspaceSeed {
                         id: ws.id.clone(),
                         name: Self::workspace_display_name(ws),
-                        current_directory: Some(ws.path.clone()),
+                        current_directory: match self.workspace_targets.get(&ws.id) {
+                            Some(WorkspaceTarget::Ssh(target)) => {
+                                Some(target.canonical_root.as_str().to_owned())
+                            }
+                            _ => Some(ws.path.clone()),
+                        },
                         state: WorkspaceState::Active,
                         sessions,
                     };
@@ -24080,7 +25618,12 @@ impl App {
                 WorkspaceSeed {
                     id: ws.id.clone(),
                     name: Self::workspace_display_name(ws),
-                    current_directory: Some(ws.path.clone()),
+                    current_directory: match self.workspace_targets.get(&ws.id) {
+                        Some(WorkspaceTarget::Ssh(target)) => {
+                            Some(target.canonical_root.as_str().to_owned())
+                        }
+                        _ => Some(ws.path.clone()),
+                    },
                     state,
                     sessions,
                 }
@@ -24506,6 +26049,15 @@ impl App {
         let Some(runtime) = self.runtime_by_instance(runtime_instance) else {
             return false;
         };
+        if runtime.runtime.is_remote() {
+            return runtime.runtime.is_connected()
+                && !matches!(
+                    command,
+                    runtime::RuntimeCommand::RestoreWorkspace
+                        | runtime::RuntimeCommand::RestoreWorkspacePane { .. }
+                        | runtime::RuntimeCommand::RespawnArchivedAgent { .. }
+                );
+        }
         // 비밀 참조는 파일이 그대로여도 회전할 수 있어 매 실행 metadata를 캡처한다.
         if runtime.environment_has_secrets {
             return false;
@@ -24822,6 +26374,10 @@ impl App {
     /// 대신 실행한다. `poll_pending_workspace_focus`와 같은 틱에서 돈다(그 뒤에 호출) —
     /// 둘 다 `poll_workspace_controller`가 만든 상태를 그날 프레임 안에서 소비한다.
     fn poll_pending_resume_agent(&mut self) {
+        if self.active.runtime.is_remote() {
+            self.pending_resume_agent = None;
+            return;
+        }
         let Some(pending) = self.pending_resume_agent.clone() else {
             return;
         };
@@ -25131,6 +26687,13 @@ impl App {
                     self.env_session_banner = self.detect_session_cwd_banner(&cwd);
                 }
                 AppControllerAction::CreateWorktree { workspace_id, cwd } => {
+                    if !matches!(
+                        self.workspace_targets.get(&workspace_id),
+                        Some(WorkspaceTarget::Local { .. })
+                    ) {
+                        self.notice_ssh_unsupported();
+                        return;
+                    }
                     if self.worktree_rx.is_none() {
                         let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
                         self.worktree_rx = Some((workspace_id, result_rx));
@@ -25154,10 +26717,18 @@ impl App {
                     }
                 }
                 AppControllerAction::RemoveWorktree { workspace_id, cwd } => {
+                    if !matches!(
+                        self.workspace_targets.get(&workspace_id),
+                        Some(WorkspaceTarget::Local { .. })
+                    ) {
+                        self.notice_ssh_unsupported();
+                        return;
+                    }
                     if self.worktree_remove_rx.is_none() {
                         const SESSION_PID_MAX: usize = 256;
                         let session_pids = std::iter::once(&self.active)
                             .chain(self.warm.values())
+                            .filter(|runtime| !runtime.runtime.is_remote())
                             .flat_map(|runtime| {
                                 runtime.session_resource_usage.iter().filter_map(|usage| {
                                     usage
@@ -25744,7 +27315,10 @@ impl App {
             ColdRestoreRuntimeAdmission::Create => {
                 self.join_pending_shutdown(next.workspace_id());
                 let runtime_instance = self.next_runtime_instance;
-                self.next_runtime_instance = self.next_runtime_instance.wrapping_add(1).max(1);
+                let Some(next_runtime_instance) = self.next_runtime_instance.checked_add(1) else {
+                    return;
+                };
+                self.next_runtime_instance = next_runtime_instance;
                 let mut runtime = Self::make_runtime(
                     &self.config,
                     &self.logs_base,
@@ -25946,6 +27520,10 @@ impl App {
         if runtime.runtime_instance != runtime_instance {
             return;
         }
+        if self.ssh_pending_closes.contains_key(workspace_id) {
+            runtime.render_active = false;
+            return;
+        }
         if runtime.render_active != visible {
             let client = &runtime.runtime;
             let delivered = deliver_workspace_state_transition(
@@ -26032,6 +27610,21 @@ impl App {
     }
 
     fn activate_active_persisted_pane(&mut self, pane: runtime::MuxPaneId) {
+        if self.active.runtime.is_remote() {
+            let present = self.active.workspace_ui.mux().is_some_and(|mux| {
+                mux.tabs
+                    .iter()
+                    .flat_map(|tab| &tab.panes)
+                    .any(|candidate| candidate.id == pane)
+            });
+            if present {
+                let _ = self
+                    .active
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::FocusPane { pane });
+            }
+            return;
+        }
         // A persisted sidebar row always targets the primary workspace surface. Move App-level
         // ownership before arming the exact pane so an attached surface cannot retain input.
         self.cross_workspace_pane.focus_primary();
@@ -26066,6 +27659,10 @@ impl App {
         target_id: &str,
         preferred_pane: Option<runtime::MuxPaneId>,
     ) {
+        if self.ssh_pending_closes.contains_key(target_id) {
+            self.notice_ssh_close_state(target_id, "workspace.ssh.closing");
+            return;
+        }
         // 명시적 전환은 종료 숨김 해제 — 사용자가 다시 연 것이다(사이드바 행 클릭·
         // 워크스페이스 순환·알림/에이전트 이동·같은 폴더 재선택 모두 이 경로).
         self.reveal_closed_workspace(target_id);
@@ -26125,7 +27722,10 @@ impl App {
                 // 알림이 옛 항목과 dup으로 취급돼 안 뜬다 (codex 리뷰).
                 self.notifications_ui.prune_workspace(target_id);
                 let runtime_instance = self.next_runtime_instance;
-                self.next_runtime_instance = self.next_runtime_instance.wrapping_add(1).max(1);
+                let Some(next_runtime_instance) = self.next_runtime_instance.checked_add(1) else {
+                    return;
+                };
+                self.next_runtime_instance = next_runtime_instance;
                 (
                     Self::make_runtime(
                         &self.config,
@@ -27149,8 +28749,10 @@ impl App {
             max_warm,
             |id| {
                 self.warm.get(id).is_some_and(|runtime| {
-                    self.cross_workspace_pane
-                        .protects_runtime(id, runtime.runtime_instance)
+                    self.ssh_pending_closes.contains_key(id)
+                        || self
+                            .cross_workspace_pane
+                            .protects_runtime(id, runtime.runtime_instance)
                         || self
                             .cross_workspace_restore
                             .protects_runtime(id, runtime.runtime_instance)
@@ -27177,9 +28779,10 @@ impl App {
             .warm
             .values()
             .filter(|runtime| {
-                !self
-                    .cross_workspace_pane
-                    .protects_runtime(&runtime.id, runtime.runtime_instance)
+                !self.ssh_pending_closes.contains_key(&runtime.id)
+                    && !self
+                        .cross_workspace_pane
+                        .protects_runtime(&runtime.id, runtime.runtime_instance)
                     && !self
                         .cross_workspace_restore
                         .protects_runtime(&runtime.id, runtime.runtime_instance)
@@ -27252,6 +28855,9 @@ impl App {
     }
 
     fn suspend_warm_workspace(&mut self, workspace_id: &str, allow_idle_shells: bool) {
+        if self.ssh_pending_closes.contains_key(workspace_id) {
+            return;
+        }
         if !self.warm.contains_key(workspace_id) {
             self.warm_order.retain(|id| id != workspace_id);
             self.refresh_warm_idle_deadline();
@@ -27384,6 +28990,9 @@ impl App {
     /// 워크스페이스의 세션(pane)을 전부 닫는다 — 사이드바 「워크스페이스 종료」 확정 경로.
     /// 워크스페이스 자체(경로·설정·DB 기록)는 보존한다(설정의 「프로젝트 삭제」와 구분).
     fn close_workspace_sessions(&mut self, workspace_id: &str) -> bool {
+        if self.ssh_pending_closes.contains_key(workspace_id) {
+            return true;
+        }
         if self.document_scope_close_handoff_is_stale(DocumentScopeCloseHandoff::Workspace(
             workspace_id,
         )) {
@@ -27399,6 +29008,40 @@ impl App {
             })
         {
             return false;
+        }
+        if let Some(runtime) = std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .find(|runtime| runtime.id == workspace_id && runtime.runtime.is_remote())
+        {
+            if !runtime.runtime.is_connected()
+                || self.ssh_pending_closes.len() >= SSH_WORKSPACE_CLOSE_MAX
+            {
+                self.notice_ssh_close_state(workspace_id, "workspace.ssh.close_unconfirmed");
+                return false;
+            }
+            let pending = PendingSshWorkspaceClose {
+                runtime_instance: runtime.runtime_instance,
+                panes: runtime
+                    .workspace_ui
+                    .mux()
+                    .into_iter()
+                    .flat_map(|mux| &mux.tabs)
+                    .flat_map(|tab| &tab.panes)
+                    .take(SSH_WORKSPACE_CLOSE_BATCH)
+                    .map(|pane| pane.id.0.clone())
+                    .collect(),
+                close_queue: Default::default(),
+                round_started: false,
+                barrier: None,
+                confirmed: false,
+                observation_failed: false,
+                deadline: std::time::Instant::now() + SSH_WORKSPACE_CLOSE_TIMEOUT,
+            };
+            runtime.runtime.begin_remote_close();
+            self.ssh_pending_closes
+                .insert(workspace_id.to_owned(), pending);
+            self.egui_ctx
+                .request_repaint_after(SSH_WORKSPACE_CLOSE_TIMEOUT);
         }
         revoke_followup_authorizations(
             &mut self.pty_followup,
@@ -27471,6 +29114,32 @@ impl App {
                 self.active.workspace_ui.close_pane_now(pane);
                 self.drain_workspace_protocol_intents(runtime_instance);
             }
+        } else if self
+            .warm
+            .get(workspace_id)
+            .is_some_and(|runtime| runtime.runtime.is_remote())
+        {
+            // SSH admission is asynchronous. Keep the attachment until a matching
+            // remote Mux snapshot confirms these panes have actually disappeared.
+            let panes = self.ssh_pending_closes[workspace_id].panes.clone();
+            self.closed_workspaces.insert(
+                workspace_id.to_owned(),
+                ClosedWorkspaceState::ClosingPanes(panes.clone()),
+            );
+            if let Some(runtime) = self.warm.get_mut(workspace_id) {
+                runtime.render_active = false;
+                Self::drain_closing_workspace_protocol_intents(runtime);
+                for pane in panes {
+                    runtime
+                        .workspace_ui
+                        .close_pane_now(runtime::MuxPaneId(pane));
+                    Self::drain_closing_workspace_protocol_intents(runtime);
+                }
+                let _ = runtime
+                    .runtime
+                    .send_command(runtime::RuntimeCommand::RequestMuxSnapshot);
+            }
+            self.close_approval_workspace(workspace_id);
         } else if self.warm.contains_key(workspace_id) {
             // warm 종료는 runtime shutdown까지 동기로 끝난다 — 죽어가는 pane 추적 불필요.
             self.closed_workspaces
@@ -27594,6 +29263,9 @@ impl App {
     }
 
     fn ensure_active_runtime_restore(&mut self) {
+        if self.active.runtime.is_remote() {
+            return;
+        }
         let has_panes = self
             .persisted_activity_panes
             .get(&self.active.id)
@@ -27722,6 +29394,12 @@ impl App {
     }
 
     fn stage_runtime_restore(&mut self, runtime_instance: u64) -> bool {
+        if self
+            .runtime_by_instance(runtime_instance)
+            .is_none_or(|runtime| runtime.runtime.is_remote())
+        {
+            return false;
+        }
         let admitted = self
             .stage_dotenv_continuation(
                 runtime_instance,
@@ -27873,11 +29551,78 @@ impl App {
         }
     }
 
+    fn stage_ssh_continuation(
+        &mut self,
+        runtime_instance: u64,
+        continuation: PendingDotenvContinuation,
+    ) -> Result<(), Box<PendingDotenvContinuation>> {
+        if self
+            .runtime_by_instance(runtime_instance)
+            .is_none_or(|runtime| !runtime.runtime.is_connected())
+            || matches!(
+                dotenv_continuation_command(&continuation),
+                runtime::RuntimeCommand::RestoreWorkspace
+                    | runtime::RuntimeCommand::RestoreWorkspacePane { .. }
+                    | runtime::RuntimeCommand::RespawnArchivedAgent { .. }
+            )
+        {
+            return Err(Box::new(continuation));
+        }
+        match continuation {
+            PendingDotenvContinuation::RuntimeCommand(command) => {
+                let runtime = self
+                    .runtime_by_instance(runtime_instance)
+                    .expect("checked runtime");
+                runtime
+                    .runtime
+                    .send_command_owned(command)
+                    .map_err(|(_, command)| {
+                        Box::new(PendingDotenvContinuation::RuntimeCommand(*command))
+                    })
+            }
+            PendingDotenvContinuation::WorkspaceProtocol {
+                operation,
+                generation,
+                command,
+            } => {
+                let runtime = self
+                    .runtime_by_instance_mut(runtime_instance)
+                    .expect("checked runtime");
+                match runtime.runtime.send_command_owned(command) {
+                    Ok(()) => {
+                        runtime.workspace_ui.complete_protocol(
+                            ui::workspace::WorkspaceProtocolCompletion {
+                                operation,
+                                generation,
+                                result: Ok(()),
+                            },
+                        );
+                        Ok(())
+                    }
+                    Err((_, command)) => {
+                        Err(Box::new(PendingDotenvContinuation::WorkspaceProtocol {
+                            operation,
+                            generation,
+                            command: *command,
+                        }))
+                    }
+                }
+            }
+            other => Err(Box::new(other)),
+        }
+    }
+
     fn stage_dotenv_continuation(
         &mut self,
         runtime_instance: u64,
         mut continuation: PendingDotenvContinuation,
     ) -> Result<(), Box<PendingDotenvContinuation>> {
+        if self
+            .runtime_by_instance(runtime_instance)
+            .is_some_and(|runtime| runtime.runtime.is_remote())
+        {
+            return self.stage_ssh_continuation(runtime_instance, continuation);
+        }
         let restore_lifecycle = self
             .runtime_by_instance(runtime_instance)
             .map_or(WorkspaceRestoreLifecycle::Idle, |runtime| {
@@ -29729,6 +31474,12 @@ impl App {
     /// 지정 workspace의 프로젝트 루트. App이 이미 소유한 immutable workspace projection을
     /// 사용해 render/action 경로에서 SQLite를 다시 조회하지 않는다.
     fn workspace_tree_root(&self, workspace_id: &str) -> Option<PathBuf> {
+        if !matches!(
+            self.workspace_targets.get(workspace_id),
+            Some(WorkspaceTarget::Local { .. })
+        ) {
+            return None;
+        }
         self.workspaces
             .iter()
             .find(|workspace| workspace.id == workspace_id)
@@ -29744,6 +31495,9 @@ impl App {
     /// 만든다. cwd가 없거나 폴더가 아니면 None. 비교는 canonicalize 기준
     /// (macOS `/var`↔`/private/var`, 심링크 등)으로 하되 실패 시 원경로로 폴백.
     fn detect_session_cwd_banner(&self, cwd: &str) -> Option<EnvSessionCwdBanner> {
+        if self.active.runtime.is_remote() {
+            return None;
+        }
         let cwd = PathBuf::from(cwd);
         if !cwd.is_dir() {
             return None;
@@ -29835,6 +31589,37 @@ impl App {
     }
 
     fn open_agent_launcher_for_active(&mut self) {
+        if self.ssh_pending_closes.contains_key(&self.active.id) {
+            let workspace = self.active.id.clone();
+            self.notice_ssh_close_state(&workspace, "workspace.ssh.closing");
+            return;
+        }
+        if self.active.runtime.is_remote() && !self.active.runtime.is_connected() {
+            if self.workspace_add_ui.is_none()
+                && let Some(dialog) = self
+                    .ssh_hosts
+                    .get_mut(&self.active.id)
+                    .and_then(|owner| owner.authentication_ui.take())
+            {
+                self.ssh_modal_workspace = Some(self.active.id.clone());
+                self.workspace_add_ui = Some(dialog);
+                return;
+            }
+            if self.workspace_add_ui.is_none()
+                && let Some(WorkspaceTarget::Ssh(target)) =
+                    self.workspace_targets.get(&self.active.id)
+                && let Ok(Some(profile)) = self.db.ssh_connection_profile(&target.connection_id)
+            {
+                let mut dialog = crate::workspace_add::WorkspaceAddUi::new(
+                    crate::workspace_add::WorkspaceAddPurpose::SwitchRuntime,
+                    PathBuf::new(),
+                );
+                dialog.open_ssh_draft(Self::ssh_draft(&profile));
+                self.ssh_modal_workspace = Some(self.active.id.clone());
+                self.workspace_add_ui = Some(dialog);
+            }
+            return;
+        }
         let name = self.active_workspace_display_name();
         if offer_workspace_launcher(
             &mut self.agent_launcher_ui,
@@ -29890,6 +31675,9 @@ impl App {
     }
 
     fn request_agent_launcher_refresh(&mut self) {
+        if self.active.runtime.is_remote() {
+            return;
+        }
         self.agent_launcher_detection_requested = true;
         self.agent_model_refresh.request();
         self.agent_model_pending_requests = [None, None];
@@ -29899,6 +31687,24 @@ impl App {
     }
 
     fn poll_agent_launcher_detection(&mut self) {
+        if self.active.runtime.is_remote() {
+            self.agent_launcher_detection_requested = false;
+            self.agent_model_pending_requests = [None, None];
+            self.agent_launcher_pending_snapshot = None;
+            while self.agent_launcher_worker.try_recv().is_some() {}
+            for worker in &mut self.agent_model_workers {
+                while worker.try_recv().is_some() {}
+            }
+            self.agent_launcher_snapshot = Some(
+                crate::agent_launcher::DetectionSnapshot::from_remote_agents(
+                    self.ssh_installed_agents
+                        .get(&self.active.id)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]),
+                ),
+            );
+            return;
+        }
         if self.agent_launcher_ui.take_refresh_request() {
             self.request_agent_launcher_refresh();
         }
@@ -30099,10 +31905,12 @@ impl App {
                         .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
                     return;
                 }
-                let shim = (self.config.ui.agent_status_hooks && kind.supports_deppy_shim())
-                    .then(crate::agent_shim::shim_dir)
-                    .flatten()
-                    .map(|directory| directory.join(kind.id()));
+                let shim = (!self.active.runtime.is_remote()
+                    && self.config.ui.agent_status_hooks
+                    && kind.supports_deppy_shim())
+                .then(crate::agent_shim::shim_dir)
+                .flatten()
+                .map(|directory| directory.join(kind.id()));
                 let spec = self
                     .agent_launcher_snapshot
                     .as_ref()
@@ -30117,6 +31925,47 @@ impl App {
                         .report_error(ui::agent_launcher::LauncherErrorCode::AgentUnavailable);
                     return;
                 };
+                if self.active.runtime.is_remote() {
+                    let (kind, command, args, env_plain) = spec.into_parts();
+                    let command = runtime::RuntimeCommand::SpawnAgent {
+                        cols: 120,
+                        rows: 40,
+                        scrollback_lines: self.config.terminal.scrollback_lines as usize,
+                        agent_config_id: Some(kind.stable_config_id().to_owned()),
+                        command,
+                        args,
+                        env_plain,
+                        env_secrets: Vec::new(),
+                        waiting_regex: None,
+                        approval_regex: None,
+                        error_regex: None,
+                        done_regex: None,
+                        transient_args: Vec::new(),
+                    };
+                    let command = if let Some(target) = self.agent_launcher_split_target.as_ref() {
+                        match command.with_right_split(target.pane.clone()) {
+                            Ok(command) => command,
+                            Err(_) => {
+                                self.agent_launcher_ui.report_error(
+                                    ui::agent_launcher::LauncherErrorCode::AgentUnavailable,
+                                );
+                                return;
+                            }
+                        }
+                    } else {
+                        command
+                    };
+                    if self.active.runtime.send_command(command).is_ok() {
+                        self.active.pending_agent_spawns =
+                            self.active.pending_agent_spawns.saturating_add(1);
+                        self.reveal_active_workspace_for_new_session();
+                        self.agent_launcher_ui.launch_succeeded();
+                    } else {
+                        self.agent_launcher_ui
+                            .report_error(ui::agent_launcher::LauncherErrorCode::LaunchFailed);
+                    }
+                    return;
+                }
                 self.next_agent_launcher_request_id =
                     self.next_agent_launcher_request_id.wrapping_add(1).max(1);
                 let request_id = self.next_agent_launcher_request_id;
@@ -31774,12 +33623,25 @@ impl App {
         path.and_then(|path| (!path.trim().is_empty()).then(|| PathBuf::from(path)))
     }
 
+    fn file_tree_projection_root(&self) -> Option<PathBuf> {
+        if let Some(WorkspaceTarget::Ssh(target)) = self.workspace_targets.get(&self.active.id) {
+            return Some(PathBuf::from(target.canonical_root.as_str()));
+        }
+        if self.active.runtime.is_remote() {
+            return None;
+        }
+        self.active_tree_root()
+            .filter(|path| path.is_dir())
+            .or_else(crate::paths::home_dir)
+    }
     /// 활성 workspace 기준으로 파일 트리 상태를 새로 만든다 (ON 전환/루트 변경 시).
     fn make_file_tree(&self) -> ui::file_tree::FileTreeUi {
         let mut tree = ui::file_tree::FileTreeUi::new(self.egui_ctx.clone());
         // 앱 자신의 data dir(로그·DB·cert 등) 이벤트는 무시 — 로그 쓰기가 워처로 돌아와
         // 리페인트를 유발하는 자기-루프 차단 (workspace 루트가 홈 등 넓은 경로일 때).
-        if let Some(data_dir) = self.db_path.parent() {
+        if !self.active.runtime.is_remote()
+            && let Some(data_dir) = self.db_path.parent()
+        {
             tree.set_watch_ignore(vec![data_dir.to_path_buf()]);
         }
         // 워크스페이스 폴더 미설정이어도 파일트리는 **항상** 뜨게 — HOME으로 폴백(사용자
@@ -31787,11 +33649,7 @@ impl App {
         // ~/.env를 자동 로드하진 않는다(트리 표시 루트와 .env 원천 분리).
         // 저장 경로가 존재하지 않으면(폴더 이동/삭제/최초 실행 stale) 에러 대신 HOME으로
         // 폴백 — "폴더 못 찾음" 에러가 뜨지 않게(사용자 2026-07-08). rename 감지는 별도.
-        tree.set_root(
-            self.active_tree_root()
-                .filter(|p| p.is_dir())
-                .or_else(crate::paths::home_dir),
-        );
+        tree.set_root(self.file_tree_projection_root());
         tree
     }
 
@@ -31799,16 +33657,37 @@ impl App {
     /// 교체한다. FileTreeUi 전체를 재생성하면 workspace별 세션 펼침 상태까지 사라져,
     /// 다른 workspace를 선택하는 순간 이전 세션 트리가 자동으로 닫힌다.
     fn refresh_file_tree_root(&mut self) {
-        let root = self
-            .active_tree_root()
-            .filter(|path| path.is_dir())
-            .or_else(crate::paths::home_dir);
+        self.ssh_file_observation = None;
+        let root = self.file_tree_projection_root();
+        self.pending_file_tree_maintenance = None;
         if let Some(tree) = self.file_tree.as_mut() {
+            tree.set_root(None);
+            tree.set_watch_ignore(if self.active.runtime.is_remote() {
+                Vec::new()
+            } else {
+                self.db_path
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .into_iter()
+                    .collect()
+            });
             tree.set_root(root);
+        }
+        if self.active.runtime.is_remote() {
+            self.file_tree_watcher = None;
         }
     }
 
     fn refresh_workspaces(&mut self) {
+        self.workspace_targets = self
+            .db
+            .list_workspaces_with_targets()
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.row.id, row.target))
+                    .collect()
+            })
+            .unwrap_or_default();
         let previous_port_roots = self.port_workspace_roots();
         match self.db.settings_workspace_projection_rows() {
             Ok(list) => {
@@ -32179,6 +34058,11 @@ impl App {
     /// Agents에 넘길 cwd는 active workspace/path가 바뀔 때만 파일시스템에서 검증한다.
     /// render는 이 immutable projection만 읽는다.
     fn refresh_agent_workspace_cwd(&mut self) {
+        if self.active.runtime.is_remote() {
+            self.agent_workspace_cwd = None;
+            self.agent_workspace_cwd_key = None;
+            return;
+        }
         let candidate = self
             .workspaces
             .iter()
@@ -32207,6 +34091,9 @@ impl App {
     /// 첫 시점에 1회 감지(local_llm 일회성 워커). 앱 실행 중 재감지는 하지 않는다 —
     /// ollama를 나중에 켠 경우는 모델명을 직접 입력하면 된다(입력 즉시 적용 원칙).
     fn pump_ollama_detect(&mut self, ctx: &egui::Context) {
+        if self.active.runtime.is_remote() {
+            return;
+        }
         if let Some(rx) = &self.ollama_detect_rx {
             match rx.try_recv() {
                 Ok(snapshot) => {
@@ -32252,6 +34139,12 @@ impl App {
                 workspace_visible_after_close(&self.closed_workspaces, &workspace.id)
             })
             .filter_map(|workspace| {
+                if !matches!(
+                    self.workspace_targets.get(&workspace.id),
+                    Some(WorkspaceTarget::Local { .. })
+                ) {
+                    return None;
+                }
                 let path = PathBuf::from(workspace.path.trim());
                 if !path.is_absolute() {
                     return None;
@@ -32402,7 +34295,9 @@ impl App {
             self.warm.get(workspace_id)
         };
         runtime
-            .filter(|runtime| runtime.runtime_instance == runtime_instance)
+            .filter(|runtime| {
+                runtime.runtime_instance == runtime_instance && !runtime.runtime.is_remote()
+            })
             .and_then(|runtime| runtime.workspace_ui.mux())
             .is_some_and(|mux| pane_of_session(mux, session).is_some())
     }
@@ -32414,11 +34309,11 @@ impl App {
         action: ResourceMaintenanceAction,
     ) {
         let owns_local_runtime = (workspace_id == self.active.id
+            && !self.active.runtime.is_remote()
             && self.active.runtime_instance == runtime_instance)
-            || self
-                .warm
-                .get(&workspace_id)
-                .is_some_and(|runtime| runtime.runtime_instance == runtime_instance);
+            || self.warm.get(&workspace_id).is_some_and(|runtime| {
+                !runtime.runtime.is_remote() && runtime.runtime_instance == runtime_instance
+            });
         if !owns_local_runtime {
             return;
         }
@@ -32440,9 +34335,8 @@ impl App {
     }
 
     fn stage_unattached_inspection(&mut self) {
-        // Every resident workspace is backed by the concrete in-process runtime client. SSH
-        // sessions are child processes inside that local runtime; no RemoteRuntimeClient is owned
-        // by this collection, so maintenance cannot cross a remote transport boundary.
+        // stage_resource_target independently rejects every SSH/offline owner before any
+        // local process inspection or termination job can be queued.
         let workspace_ids = std::iter::once((self.active.id.clone(), self.active.runtime_instance))
             .chain(
                 self.warm
@@ -34029,6 +35923,20 @@ impl App {
         origin: PromptDeliveryOrigin,
         context: PromptInputContext,
     ) {
+        if matches!(&origin, PromptDeliveryOrigin::CommandCenter { .. })
+            && self
+                .require_command_center_local_workspace(&workspace_id)
+                .is_err()
+        {
+            self.reject_prompt_origin(
+                &workspace_id,
+                session,
+                &prompt,
+                &origin,
+                ui::composer::PromptAdmissionOutcome::Rejected,
+            );
+            return;
+        }
         // Unknown operations keep their exact target and payload until a correlated late ACK
         // or an explicit new action for that same source. No automatic retry gets a new ID.
         self.pending_prompt_deliveries.retain(|_, pending| {
@@ -34190,7 +36098,7 @@ impl App {
     /// keeps separate body/CR writer boundaries but reserves both parts before either.
     fn write_prompt_to_session(
         workspace_ui: &mut ui::workspace::WorkspaceUi,
-        runtime: &InProcessRuntimeClient,
+        runtime: &WorkspaceRuntimeClient,
         session: runtime::SessionId,
         prompt: &str,
         operation_id: String,
@@ -35104,17 +37012,13 @@ impl eframe::App for App {
         }
         // Render가 만든 controller action은 다음 logic tick에서 한 건만 실행한다. Client
         // process 생성과 JSON-RPC 요청은 이 경계 안에서만 시작된다.
-        if let Some(action) = self.pending_agent_sessions_action.take() {
-            self.agent_sessions_ui
-                .sync_controller_config(&self.config.agents);
-            if let Some(request) = self.agent_sessions_ui.execute_deferred(action, ctx) {
-                self.handle_agent_sessions_request(request);
-            }
+        if let Some((origin, action)) = self.pending_agent_sessions_action.take() {
+            self.execute_agent_sessions_action(&origin, action, ctx);
         }
         // 창이 숨겨져도 App Server JSON-RPC 이벤트를 드레인해 structured session 상태를 최신화한다.
         self.agent_sessions_ui
             .sync_controller_config(&self.config.agents);
-        self.agent_sessions_ui.refresh_rate_limits(ctx);
+        self.refresh_agent_session_rate_limits(ctx);
         self.agent_sessions_ui.poll();
         // 승인 대기 시각은 **뷰와 무관하게** 갱신한다 — 「작업」 페이지를 떠났다 돌아올
         // 때마다 타이머가 0으로 돌아가면 안 된다.
@@ -35156,6 +37060,7 @@ impl eframe::App for App {
         self.pump_batch_spawn(ctx);
         self.poll_settings_job_admission();
         self.poll_env_api_project_rows();
+        self.poll_ssh_workspace_hosts();
         self.poll_file_tree_maintenance(ctx);
         self.poll_workspace_clone(ctx);
         admit_workspace_add_picker(
@@ -35409,6 +37314,16 @@ impl eframe::App for App {
             if completion_events_overflowed {
                 command_center_lost_runtimes.push(rt.runtime_instance);
             }
+            if let Some(pending) = self.ssh_pending_closes.get_mut(&rt.id) {
+                pending.observe_events(
+                    rt.runtime_instance,
+                    rt.workspace_ui.mux(),
+                    &events,
+                    !completion_events_overflowed
+                        && !rt.event_overflow_pending
+                        && !rt.events.is_disconnected(),
+                );
+            }
             self.cloud_agent.observe_input_with_integrity(
                 rt.runtime_instance,
                 &events,
@@ -35576,6 +37491,16 @@ impl eframe::App for App {
         let completion_events_overflowed = self.active.events.take_overflowed();
         if completion_events_overflowed {
             self.command_center_observation_lost(self.active.runtime_instance);
+        }
+        if let Some(pending) = self.ssh_pending_closes.get_mut(&self.active.id) {
+            pending.observe_events(
+                self.active.runtime_instance,
+                self.active.workspace_ui.mux(),
+                &new_events,
+                !completion_events_overflowed
+                    && !self.active.event_overflow_pending
+                    && !self.active.events.is_disconnected(),
+            );
         }
         self.cloud_agent.observe_input_with_integrity(
             self.active.runtime_instance,
@@ -35751,6 +37676,8 @@ impl eframe::App for App {
             self.active.event_resync_pending = false;
             ctx.request_repaint();
         }
+
+        self.poll_ssh_workspace_closes(std::time::Instant::now());
 
         // 폰 미러 진입(I1b-2) — 웹 스레드가 큐에 넣은 워크스페이스 전환 요청을 처리한다.
         // ui()가 아닌 여기(logic)에서 — 데스크탑 창이 숨겨져도(폰 전용 사용) 전환돼야 한다.
@@ -36265,6 +38192,7 @@ impl eframe::App for App {
                     )
                 };
                 ui::file_tree::SidebarWorkspaceEntry {
+                    ssh_context: self.ssh_workspace_context(&workspace.id),
                     id: workspace.id.clone(),
                     name: Self::workspace_display_name(workspace),
                     state,
@@ -37073,19 +39001,15 @@ impl eframe::App for App {
                     let entry = sidebar_workspaces
                         .iter()
                         .find(|entry| entry.id == workspace_id);
-                    let has_closeable_sessions = entry.is_some_and(|entry| {
-                        entry.state != ui::file_tree::SidebarWorkspaceState::Idle
-                    });
-                    match workspace_close_disposition(
-                        self.config.ui.confirm_workspace_close,
-                        has_closeable_sessions,
-                    ) {
+                    match workspace_close_disposition(self.config.ui.confirm_workspace_close, entry)
+                    {
                         WorkspaceCloseDisposition::Confirm => {
-                            let entry = entry.expect("closeable workspace entry");
+                            let entry = entry.expect("visible workspace entry");
                             // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
                             // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
                             let s = entry.summary;
-                            let total = s.running + s.waiting + s.done + s.error + s.idle;
+                            let total =
+                                s.running + s.waiting + s.done + s.error + s.idle + s.inactive;
                             self.ws_close_confirm =
                                 Some((workspace_id, entry.name.clone(), total, s.running));
                         }
@@ -37095,10 +39019,10 @@ impl eframe::App for App {
                             );
                         }
                         WorkspaceCloseDisposition::Ignore => {
-                            // 메뉴는 Idle에 안 붙지만 요청 프레임 사이 상태 변화 방어.
+                            // 요청 프레임 사이 목록에서 사라진 대상은 종료하지 않는다.
                             tracing::info!(
                                 workspace = %workspace_id,
-                                "워크스페이스 종료 무시 — 닫을 세션/런타임 없음"
+                                "워크스페이스 종료 무시 — 대상이 목록에 없음"
                             );
                         }
                     }
@@ -37448,9 +39372,15 @@ impl eframe::App for App {
             ))
         .then(|| text.t("workspace.menu.open_in_current_view_right", &[]));
         self.last_multi_pane_terminal_rect = None;
+        let ssh_terminal_context = terminal_visible
+            .then(|| self.ssh_workspace_context(&active_workspace_id))
+            .flatten();
         egui::CentralPanel::default()
             .frame(central_frame)
             .show(ui, |ui| {
+                if let Some(context) = &ssh_terminal_context {
+                    ui::file_tree::ssh_workspace_context_strip(ui, context, &text);
+                }
                 if home_visible {
                     home_action = self.agent_terminal_ui.home(
                         ui,
@@ -38094,7 +40024,11 @@ impl eframe::App for App {
             // (`AppHostIoAction::OpenPath`)다. 파일을 `open`하면 기본 앱이 열리므로 그
             // 파일이 든 폴더를 연다.
             Some(ui::git_panel::GitPanelAction::RevealInFinder { path }) => {
+                if self.active.runtime.is_remote() {
+                    self.notice_ssh_unsupported();
+                }
                 if self.pending_app_host_action.is_none()
+                    && !self.active.runtime.is_remote()
                     && let Some(folder) = existing_reveal_folder(&path)
                 {
                     self.pending_app_host_action = Some(AppHostIoAction::OpenPath(folder));
@@ -38314,7 +40248,7 @@ impl eframe::App for App {
         if let Some(action) = agent_output.deferred_action {
             // logic()이 매 render 전에 기존 slot을 비운다. 예외적으로 남아 있어도 latest-only
             // 교체해 backlog를 만들지 않는다; generation mismatch가 stale 실행을 막는다.
-            self.pending_agent_sessions_action = Some(action);
+            self.pending_agent_sessions_action = Some((active_workspace_id.clone(), action));
         }
         if let Some(intent) = agent_output.secret_intent {
             let current_revision = self.agent_sessions_secrets_snapshot.revision();
@@ -42061,6 +43995,728 @@ mod tests {
         }
     }
 
+    fn ssh_workspace_runtime_fixture(db: &Db) -> String {
+        use deppy_core::workspace_target::{RemotePath, SshConnectionProfile, SshWorkspaceTarget};
+        let profile = SshConnectionProfile {
+            id: uuid::Uuid::new_v4().to_string(),
+            destination: "ubuntu@server-alias".into(),
+            port: None,
+            identity_file: None,
+        };
+        db.upsert_ssh_connection_profile(&profile).unwrap();
+        let target = SshWorkspaceTarget::new(
+            profile.id,
+            "server.example".into(),
+            22,
+            "ubuntu".into(),
+            "SHA256:abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG".into(),
+            "server-root".into(),
+            RemotePath::new("/srv/project").unwrap(),
+        )
+        .unwrap();
+        db.find_or_create_ssh_workspace("SSH fixture", &target)
+            .unwrap()
+            .row
+            .row
+            .id
+    }
+    pub(super) fn ssh_workspace_isolated_app_fixture() -> (App, PathBuf) {
+        use deppy_core::workspace_target::RemotePath;
+        let dir = std::env::temp_dir().join(format!("deppy-ssh-app-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let db = Db::open(&path).unwrap();
+        let original = ssh_workspace_runtime_fixture(&db);
+        let Some(WorkspaceTarget::Ssh(mut target)) = db.workspace_target(&original).unwrap() else {
+            panic!("SSH fixture")
+        };
+        let root = dir.join("same-path-on-this-Mac");
+        std::fs::create_dir(&root).unwrap();
+        target.canonical_root = RemotePath::new(root.to_str().unwrap()).unwrap();
+        let id = db
+            .find_or_create_ssh_workspace("Remote fixture", &target)
+            .unwrap()
+            .row
+            .row
+            .id;
+        let mut config = Config::default();
+        config.ui.agent_status_hooks = false;
+        config.remote.tls_enabled = false;
+        config.web.enabled = false;
+        config.relay.enabled = false;
+        let lock = Arc::new(persist::LockFile::acquire(&dir.join("deppy.lock")).unwrap());
+        let app = App::new(
+            config,
+            dir.join("config.toml"),
+            db,
+            id,
+            dir.join("logs"),
+            path,
+            egui::Context::default(),
+            None,
+            lock,
+        );
+        (app, root)
+    }
+    #[test]
+    fn ssh_workspace_actual_document_route_never_reads_same_path_on_this_mac() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let path = root.join("remote.txt");
+        std::fs::write(
+            &path,
+            "LOCAL SENTINEL: must never load as a remote document",
+        )
+        .unwrap();
+        app.begin_document_open(path);
+        let id = app
+            .session_aux
+            .current
+            .active_document
+            .expect("document queued");
+        app.poll_document_io();
+        let document = app
+            .documents
+            .iter()
+            .find(|document| document.id == id)
+            .unwrap();
+        assert!(
+            matches!(
+                document.load_state,
+                DocumentLoadState::Failed {
+                    code: document_io::DocumentIoErrorCode::ReadFailed
+                }
+            ),
+            "disconnected SSH read must fail rather than start a local file job"
+        );
+        assert!(document.source.is_empty());
+        assert!(app.document_load_inflight.is_none());
+        assert!(app.ssh_pending_rpc.is_empty());
+    }
+    #[test]
+    fn ssh_workspace_retired_rpc_owner_releases_lane_and_completes_documents() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let workspace = app.active.id.clone();
+        let retired_instance = app.active.runtime_instance;
+        let provider = app.remote_provider(&workspace).unwrap();
+        // Model requests admitted by the old attachment before its owner was evicted.
+        // No host remains to deliver Offline or replies after that owner is dropped.
+        for request_id in 1..=8 {
+            let path = root.join(format!("retired-request-{request_id}.txt"));
+            app.begin_document_open(path.clone());
+            let id = app.session_aux.current.active_document.unwrap();
+            app.ssh_pending_rpc.insert(
+                request_id,
+                PendingSshRpc {
+                    workspace_id: workspace.clone(),
+                    runtime_instance: retired_instance,
+                    connection_generation: 1,
+                    provider: provider.clone(),
+                    fence: provider.reply_fence("retired-server-runtime".into(), 1, request_id),
+                    action: SshProviderAction::Load { id, path },
+                },
+            );
+        }
+        app.document_pending_loads.clear();
+        assert_eq!(app.documents.len(), 8);
+        assert_eq!(app.ssh_pending_rpc.len(), 8);
+        assert!(app.ssh_hosts.is_empty());
+        app.active.runtime_instance = retired_instance.checked_add(1).unwrap();
+        app.ssh_suppressed_workspaces.insert(workspace);
+        app.poll_ssh_workspace_hosts();
+        assert!(
+            app.ssh_pending_rpc.is_empty(),
+            "dropped owners cannot leave all eight SSH request slots occupied forever"
+        );
+        assert!(app.documents.iter().all(|document| matches!(
+            document.load_state,
+            DocumentLoadState::Failed {
+                code: document_io::DocumentIoErrorCode::ReadFailed
+            }
+        )));
+    }
+    #[test]
+    fn ssh_workspace_context_uses_verified_target_and_preserves_workspace_alias() {
+        let (app, root) = ssh_workspace_isolated_app_fixture();
+        let context = app
+            .ssh_workspace_context(&app.active.id)
+            .expect("SSH context");
+        assert_eq!(context.authority, "ubuntu@server.example:22");
+        assert_eq!(context.root, root.to_str().unwrap());
+        assert_eq!(context.status, ui::file_tree::SshConnectionStatus::Offline);
+        assert_eq!(app.active_workspace_display_name(), "Remote fixture");
+    }
+    #[test]
+    fn ssh_workspace_actual_project_name_route_never_stages_local_filesystem_work() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"LOCAL_SENTINEL\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        app.pending_agent_state_scope = None;
+        app.session_cwds
+            .insert(runtime::SessionId(73), root.to_str().unwrap().to_owned());
+        assert!(
+            !app.stage_project_name_projection(),
+            "remote cwd must not reach the Mac project-name filesystem worker"
+        );
+    }
+    #[test]
+    fn ssh_workspace_actual_save_route_never_writes_same_path_on_this_mac() {
+        use sha2::{Digest, Sha256};
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let path = root.join("shared.txt");
+        std::fs::write(&path, "Mac file stays unchanged").unwrap();
+        app.begin_document_open(path.clone());
+        let id = app.session_aux.current.active_document.unwrap();
+        let source = b"verified remote content".to_vec();
+        let sha256 = Sha256::digest(&source)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let reply = Ok(deppy_remote_host::services::Response::File(
+            deppy_remote_host::files::FileDocument {
+                revision: deppy_remote_host::files::FileRevision {
+                    device: 1,
+                    inode: 2,
+                    length: source.len() as u64,
+                    modified_seconds: 3,
+                    modified_nanoseconds: 4,
+                    sha256,
+                },
+                content: source,
+            },
+        ));
+        let provider = app.remote_provider(&app.active.id).unwrap();
+        app.apply_document_load_outcome(id, provider.load_response(&path, reply));
+        app.document_pending_loads.clear();
+        let document = app
+            .documents
+            .iter_mut()
+            .find(|document| document.id == id)
+            .unwrap();
+        assert!(matches!(
+            document.load_state,
+            DocumentLoadState::Loaded { .. }
+        ));
+        document.source = "edited remote text".into();
+        document.dirty = true;
+        app.request_document_save(id);
+        app.poll_document_io();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "Mac file stays unchanged"
+        );
+        let document = app
+            .documents
+            .iter()
+            .find(|document| document.id == id)
+            .unwrap();
+        assert!(
+            document.save_error.is_some(),
+            "disconnected remote save must expose failure"
+        );
+        assert!(!document.saving);
+        assert!(app.document_save_inflight.is_none());
+    }
+    #[test]
+    fn ssh_workspace_document_reopen_keeps_same_path_buffers_separate_across_servers() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let path = root.join("same-name.txt");
+        app.begin_document_open(path.clone());
+        let original_id = app.session_aux.current.active_document.unwrap();
+        let original_workspace = app.active.id.clone();
+        let original = app
+            .documents
+            .iter_mut()
+            .find(|d| d.id == original_id)
+            .unwrap();
+        original.source = "Unsaved private text from the first server".into();
+        original.dirty = true;
+        let Some(WorkspaceTarget::Ssh(mut target)) =
+            app.workspace_targets.get(&original_workspace).cloned()
+        else {
+            panic!("SSH fixture")
+        };
+        target.host = "another-server.example".into();
+        target.remote_workspace_id = "another-server-root".into();
+        let destination = app
+            .db
+            .find_or_create_ssh_workspace("Second server", &target)
+            .unwrap()
+            .row
+            .row
+            .id;
+        app.refresh_workspaces();
+        app.switch_workspace(&destination);
+        app.warm.remove(&original_workspace);
+        app.begin_document_open(path);
+        let reopened_id = app.session_aux.current.active_document.unwrap();
+        assert_ne!(
+            original_id, reopened_id,
+            "a dead server owner must not transfer its buffer to another server at the same path"
+        );
+        assert!(
+            app.documents
+                .iter()
+                .find(|d| d.id == reopened_id)
+                .unwrap()
+                .source
+                .is_empty()
+        );
+        assert_eq!(
+            app.documents
+                .iter()
+                .find(|d| d.id == original_id)
+                .unwrap()
+                .source,
+            "Unsaved private text from the first server"
+        );
+    }
+    #[test]
+    fn ssh_workspace_document_reopen_keeps_remote_buffer_out_of_local_workspace() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let path = root.join("same-name.txt");
+        app.begin_document_open(path.clone());
+        let original_id = app.session_aux.current.active_document.unwrap();
+        let original_workspace = app.active.id.clone();
+        let original = app
+            .documents
+            .iter_mut()
+            .find(|d| d.id == original_id)
+            .unwrap();
+        original.source = "Unsaved server text must stay on its server scope".into();
+        original.dirty = true;
+        let destination = app.db.create_workspace("Local fixture").unwrap();
+        app.refresh_workspaces();
+        app.switch_workspace(&destination);
+        app.warm.remove(&original_workspace);
+        app.begin_document_open(path);
+        assert_ne!(
+            original_id,
+            app.session_aux.current.active_document.unwrap(),
+            "a local workspace must not adopt a remote document buffer by pathname"
+        );
+        assert!(!app.session_aux.current.document_ids.contains(&original_id));
+    }
+    #[test]
+    fn ssh_workspace_queued_remote_read_never_falls_back_to_mac_after_catalog_loss() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let path = root.join("catalog-loss.txt");
+        std::fs::write(&path, "Mac sentinel must never enter the remote buffer").unwrap();
+        app.begin_document_open(path);
+        let id = app.session_aux.current.active_document.unwrap();
+        app.workspace_targets.remove(&app.active.id);
+        app.poll_document_io();
+        assert!(
+            app.document_load_inflight.is_none(),
+            "a remote document keeps its transport scope when the catalog projection is missing"
+        );
+        assert!(matches!(
+            app.documents
+                .iter()
+                .find(|d| d.id == id)
+                .unwrap()
+                .load_state,
+            DocumentLoadState::Failed {
+                code: document_io::DocumentIoErrorCode::ReadFailed
+            }
+        ));
+    }
+    #[test]
+    fn ssh_workspace_queued_native_action_keeps_remote_owner_after_switch_and_catalog_loss() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let workspace = app.active.id.clone();
+        let runtime_instance = app.active.runtime_instance;
+        let action = AppHostIoAction::Workspace {
+            workspace_id: workspace.clone(),
+            runtime_instance,
+            intent: ui::workspace::WorkspaceIoIntent::OpenPath(
+                ui::workspace::WorkspacePathPayload::try_new(root).unwrap(),
+            ),
+        };
+        let local = app
+            .db
+            .create_workspace("Queued native Local fixture")
+            .unwrap();
+        app.refresh_workspaces();
+        app.switch_workspace(&local);
+        app.workspace_targets.remove(&workspace);
+        assert!(!app.active.runtime.is_remote());
+        assert!(app.warm[&workspace].runtime.is_remote());
+        assert!(matches!(
+            app.db.workspace_target(&workspace).unwrap(),
+            Some(WorkspaceTarget::Ssh(_))
+        ));
+        assert!(
+            app.route_ssh_host_action(action).is_none(),
+            "an SSH-owned queued native action must never reach the Mac host after a Local switch and projection loss"
+        );
+    }
+    #[test]
+    fn ssh_workspace_queued_git_action_keeps_remote_owner_after_switch_and_catalog_loss() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        let workspace = app.active.id.clone();
+        app.sync_session_aux_scope();
+        app.pending_app_host_action = None;
+        app.request_git_panel_io_at(
+            &app.egui_ctx.clone(),
+            Some(root),
+            ui::git_panel::GitPanelIoRequest::Snapshot,
+        );
+        let action = app
+            .pending_app_host_action
+            .take()
+            .expect("Git request queued");
+        assert!(matches!(&action, AppHostIoAction::GitPanel(_)));
+        let local = app.db.create_workspace("Queued Git Local fixture").unwrap();
+        app.refresh_workspaces();
+        app.switch_workspace(&local);
+        app.workspace_targets.remove(&workspace);
+        assert!(!app.active.runtime.is_remote());
+        assert!(app.warm[&workspace].runtime.is_remote());
+        assert!(matches!(
+            app.db.workspace_target(&workspace).unwrap(),
+            Some(WorkspaceTarget::Ssh(_))
+        ));
+        assert!(
+            app.route_ssh_host_action(action).is_none(),
+            "an SSH-owned queued Git request must never reach the Mac Git worker after a Local switch and projection loss"
+        );
+    }
+    #[cfg(unix)]
+    fn ssh_workspace_register_observation_fixture(app: &mut App, root: &Path) {
+        let mut tree = ui::file_tree::FileTreeUi::new(app.egui_ctx.clone());
+        tree.set_root(Some(root.to_owned()));
+        let initial = tree.take_maintenance_intent().unwrap();
+        tree.complete_maintenance(ui::file_tree::FileTreeMaintenanceCompletion {
+            operation: initial.operation,
+            generation: initial.generation,
+            result: Ok(ui::file_tree::FileTreeMaintenanceResult::Listing(
+                ui::file_tree::FileTreeListingSnapshot::try_new(Vec::new()).unwrap(),
+            )),
+        });
+        let watch = tree
+            .take_maintenance_intent()
+            .expect("real leaf watch plan");
+        assert!(matches!(
+            &watch.request,
+            ui::file_tree::FileTreeMaintenanceRequest::ReplaceWatchSet(_)
+        ));
+        app.file_tree = Some(tree);
+        assert!(
+            app.route_ssh_host_action(AppHostIoAction::FileTreeMaintenance(watch))
+                .is_none()
+        );
+        assert!(
+            app.file_tree_watcher.is_none(),
+            "SSH never starts a Mac watcher"
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ssh_workspace_change_observation_refreshes_visible_connected_tree() {
+        super::ssh_integration_tests::with_connected_ssh_app_fixture(|app, root| {
+            ssh_workspace_register_observation_fixture(app, root);
+            let now = std::time::Instant::now();
+            assert_eq!(
+                app.poll_ssh_file_observation(now, true),
+                Some(std::time::Duration::from_secs(2))
+            );
+            assert!(
+                app.file_tree
+                    .as_mut()
+                    .unwrap()
+                    .take_maintenance_intent()
+                    .is_none()
+            );
+            app.poll_ssh_file_observation(now + std::time::Duration::from_secs(3), true);
+            let listing = app
+                .file_tree
+                .as_mut()
+                .unwrap()
+                .take_maintenance_intent()
+                .expect("server change observation must schedule a remote listing");
+            assert!(
+                matches!(listing.request, ui::file_tree::FileTreeMaintenanceRequest::ListDirectory { directory, .. } if directory.as_path() == root)
+            );
+            assert!(app.file_tree_watcher.is_none());
+            assert!(
+                app.app_host_io.is_none(),
+                "poll admission must not start a local filesystem task"
+            );
+        });
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ssh_workspace_change_observation_stops_when_surface_or_owner_is_inactive() {
+        for inactive in ["hidden", "collapsed", "Local", "offline", "closing"] {
+            super::ssh_integration_tests::with_connected_ssh_app_fixture(|app, root| {
+                ssh_workspace_register_observation_fixture(app, root);
+                let now = std::time::Instant::now();
+                assert!(app.poll_ssh_file_observation(now, true).is_some());
+                match inactive {
+                    "collapsed" => app
+                        .file_tree
+                        .as_mut()
+                        .unwrap()
+                        .collapse_project_file_panel(),
+                    "Local" => {
+                        let local_root = root.parent().unwrap().join("observation-local-root");
+                        std::fs::create_dir(&local_root).unwrap();
+                        let local = app
+                            .db
+                            .create_workspace("Observation Local fixture")
+                            .unwrap();
+                        app.db
+                            .set_workspace_path(&local, local_root.to_str().unwrap())
+                            .unwrap();
+                        app.refresh_workspaces();
+                        app.switch_workspace(&local);
+                        let initial = app
+                            .file_tree
+                            .as_mut()
+                            .unwrap()
+                            .take_maintenance_intent()
+                            .expect("switching Local legitimately queues its initial listing");
+                        assert!(matches!(initial.request,
+                            ui::file_tree::FileTreeMaintenanceRequest::ListDirectory { root, directory, .. }
+                                if root.as_path() == local_root && directory.as_path() == local_root));
+                    }
+                    "offline" => app.active.runtime.shutdown(),
+                    "closing" => {
+                        assert!(app.close_workspace_sessions(&app.active.id.clone()));
+                    }
+                    "hidden" => {}
+                    _ => unreachable!(),
+                }
+                assert_eq!(
+                    app.poll_ssh_file_observation(
+                        now + std::time::Duration::from_secs(30),
+                        inactive != "hidden"
+                    ),
+                    None,
+                    "{inactive} must not schedule another timer"
+                );
+                assert!(
+                    app.file_tree
+                        .as_mut()
+                        .unwrap()
+                        .take_maintenance_intent()
+                        .is_none(),
+                    "{inactive} must not queue a directory refresh"
+                );
+            });
+        }
+    }
+    #[test]
+    #[cfg(unix)]
+    fn ssh_workspace_change_observation_keeps_one_listing_and_waits_after_completion() {
+        super::ssh_integration_tests::with_connected_ssh_app_fixture(|app, root| {
+            ssh_workspace_register_observation_fixture(app, root);
+            let now = std::time::Instant::now();
+            assert!(app.poll_ssh_file_observation(now, true).is_some());
+            app.poll_ssh_file_observation(now + std::time::Duration::from_secs(3), true);
+            let listing = app
+                .file_tree
+                .as_mut()
+                .unwrap()
+                .take_maintenance_intent()
+                .expect("first observation listing");
+            app.poll_ssh_file_observation(now + std::time::Duration::from_secs(30), true);
+            assert!(
+                app.file_tree
+                    .as_mut()
+                    .unwrap()
+                    .take_maintenance_intent()
+                    .is_none(),
+                "a slow or paginated listing owns the single maintenance slot"
+            );
+            app.file_tree.as_mut().unwrap().complete_maintenance(
+                ui::file_tree::FileTreeMaintenanceCompletion {
+                    operation: listing.operation,
+                    generation: listing.generation,
+                    result: Ok(ui::file_tree::FileTreeMaintenanceResult::Listing(
+                        ui::file_tree::FileTreeListingSnapshot::try_new(Vec::new()).unwrap(),
+                    )),
+                },
+            );
+            assert_eq!(
+                app.poll_ssh_file_observation(now + std::time::Duration::from_secs(31), true),
+                Some(std::time::Duration::from_secs(2))
+            );
+            assert!(
+                app.file_tree
+                    .as_mut()
+                    .unwrap()
+                    .take_maintenance_intent()
+                    .is_none(),
+                "completion must not start a catch-up sweep immediately"
+            );
+        });
+    }
+    #[test]
+    fn ssh_workspace_actual_offline_actions_keep_remote_root_and_reject_mac_effects() {
+        let (mut app, root) = ssh_workspace_isolated_app_fixture();
+        std::fs::remove_dir(&root).unwrap();
+        assert_eq!(
+            app.file_tree_projection_root(),
+            Some(root.clone()),
+            "remote root must survive absent Mac directory without HOME substitution"
+        );
+        assert!(!app.stage_runtime_restore(app.active.runtime_instance));
+        app.stage_resource_target(
+            app.active.id.clone(),
+            app.active.runtime_instance,
+            ResourceMaintenanceAction::InspectUnattached,
+        );
+        assert!(app.pending_resource_maintenance.is_empty());
+        assert!(
+            app.route_ssh_host_action(AppHostIoAction::OpenPath(root))
+                .is_none()
+        );
+        assert!(
+            app.notifications_ui.unread() > 0,
+            "unsupported native operation must be visible"
+        );
+        let before = app.agent_state_worker.pending_projection_count();
+        assert!(!app.stage_agent_resume("remote-pane", "Remote", runtime::SessionId(73)));
+        assert_eq!(app.agent_state_worker.pending_projection_count(), before);
+        app.poll_agent_detect();
+        assert!(
+            app.agent_detect_last_input.is_none(),
+            "remote target must not enter local process detector projection"
+        );
+    }
+    #[derive(Default)]
+    struct SshCountingStructuredHost(std::sync::atomic::AtomicUsize);
+    impl ui::agent_sessions::CodexAppServerHost for SshCountingStructuredHost {
+        fn spawn(
+            &self,
+            _override: Option<crate::codex_app_server::CodexLlmOverride>,
+            _ctx: egui::Context,
+        ) -> anyhow::Result<crate::codex_app_server::CodexAppServerClient> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            anyhow::bail!("Isolated fixture never starts a process")
+        }
+    }
+    #[test]
+    fn ssh_workspace_structured_start_never_creates_mac_app_server() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let host = Arc::new(SshCountingStructuredHost::default());
+        app.agent_sessions_ui =
+            ui::agent_sessions::AgentSessionsUi::new().with_app_server_host(host.clone());
+        let workspace = app.active.id.clone();
+        let action = app.agent_sessions_ui.start_fixture(&workspace);
+        app.execute_agent_sessions_action(&workspace, action, &app.egui_ctx.clone());
+        assert_eq!(
+            host.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Run Codex for an SSH target must not start a Mac App Server"
+        );
+    }
+    #[test]
+    fn ssh_workspace_structured_catalog_never_creates_mac_app_server() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let host = Arc::new(SshCountingStructuredHost::default());
+        app.agent_sessions_ui =
+            ui::agent_sessions::AgentSessionsUi::new().with_app_server_host(host.clone());
+        let workspace = app.active.id.clone();
+        let action = app.agent_sessions_ui.catalog_fixture();
+        app.execute_agent_sessions_action(&workspace, action, &app.egui_ctx.clone());
+        assert_eq!(
+            host.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "SSH model/skill requests must not query a Mac App Server"
+        );
+    }
+    #[test]
+    fn ssh_workspace_structured_rate_limits_never_create_mac_app_server() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let host = Arc::new(SshCountingStructuredHost::default());
+        app.agent_sessions_ui =
+            ui::agent_sessions::AgentSessionsUi::new().with_app_server_host(host.clone());
+        app.refresh_agent_session_rate_limits(&app.egui_ctx.clone());
+        assert_eq!(
+            host.0.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "automatic usage refresh must not create a Mac App Server for SSH"
+        );
+    }
+    #[test]
+    fn ssh_workspace_structured_local_catalog_keeps_original_host_admission() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let host = Arc::new(SshCountingStructuredHost::default());
+        app.agent_sessions_ui =
+            ui::agent_sessions::AgentSessionsUi::new().with_app_server_host(host.clone());
+        let local = app.db.create_workspace("Local catalog fixture").unwrap();
+        app.refresh_workspaces();
+        let action = app.agent_sessions_ui.catalog_fixture();
+        app.execute_agent_sessions_action(&local, action, &app.egui_ctx.clone());
+        assert_eq!(
+            host.0.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "an action captured for a Local workspace retains its Local host admission"
+        );
+        assert!(app.active.runtime.is_remote());
+    }
+    #[test]
+    fn ssh_workspace_make_runtime_never_creates_a_local_worker() {
+        let db_path = temp_db_path("ssh-runtime-no-local");
+        let db = Db::open(&db_path).unwrap();
+        let id = ssh_workspace_runtime_fixture(&db);
+        let logs = db_path.with_extension("logs");
+        let factory = runtime::InProcessRuntimeHostFactory::new(
+            Arc::new(AppRuntimeSecretResolver::new(db_path.clone())),
+            secret::RedactionService::new(),
+        );
+        let mut runtime = App::make_runtime(
+            &Config::default(),
+            &logs,
+            &id,
+            1,
+            &db_path,
+            &factory,
+            &db,
+            &egui::Context::default(),
+        );
+        let disconnected = runtime.events.is_disconnected();
+        runtime.runtime.shutdown();
+        assert!(
+            disconnected,
+            "SSH targets must remain offline without a verified SSH transport; local worker was created"
+        );
+    }
+    #[test]
+    fn ssh_workspace_dotenv_job_rejects_local_root_before_reading_or_persisting() {
+        let db_path = temp_db_path("ssh-dotenv-no-local");
+        let db = Db::open(&db_path).unwrap();
+        let id = ssh_workspace_runtime_fixture(&db);
+        let root = db_path.with_extension("local-directory");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(".env"),
+            "# scratch local dotenv directory; no credentials\n",
+        )
+        .unwrap();
+        let mut resource = AppDotenvResource {
+            db_path,
+            db: Some(db),
+            redaction: secret::RedactionService::new(),
+        };
+        let job = DotenvSyncJob {
+            workspace_id: id,
+            root: Some(root),
+            runtime_instance: 1,
+            previous_state: None,
+            force: true,
+            migrate_legacy: false,
+        };
+        assert!(
+            execute_dotenv_sync_job(&mut resource, job).is_err(),
+            "SSH target must never scan a local dotenv directory"
+        );
+    }
     #[test]
     fn pr5_stable_session_key_ignores_runtime_local_counter_and_keeps_workspace_boundary() {
         let mut mux = archived_resume_test_mux("durable-A");
@@ -49856,6 +52512,7 @@ mod tests {
         OpenDocument {
             id: ui::workspace::DocumentTabId(0),
             path: PathBuf::from(path),
+            transport_scope: DocumentTransportScope::Local,
             source: source.to_owned(),
             mode: ui::document::DocumentViewMode::Source,
             load_state: DocumentLoadState::Loading,
@@ -49941,6 +52598,7 @@ mod tests {
             std::slice::from_ref(&document),
             &views,
             &document.path,
+            &DocumentTransportScope::Local,
         );
         let production = include_str!("app.rs")
             .split("#[cfg(test)]\nmod tests")
@@ -58352,18 +61010,50 @@ mod tests {
 
     #[test]
     fn 워크스페이스_종료확인_policy는_기본즉시종료와_opt_in확인을_구분한다() {
+        let entry = ui::file_tree::SidebarWorkspaceEntry {
+            ssh_context: None,
+            id: "selected".into(),
+            name: "selected".into(),
+            state: ui::file_tree::SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        };
         assert_eq!(
-            workspace_close_disposition(false, true),
+            workspace_close_disposition(false, Some(&entry)),
             WorkspaceCloseDisposition::CloseNow
         );
         assert_eq!(
-            workspace_close_disposition(true, true),
+            workspace_close_disposition(true, Some(&entry)),
             WorkspaceCloseDisposition::Confirm
         );
-        assert_eq!(
-            workspace_close_disposition(false, false),
-            WorkspaceCloseDisposition::Ignore
-        );
+        for confirmation_enabled in [false, true] {
+            assert_eq!(
+                workspace_close_disposition(confirmation_enabled, None),
+                WorkspaceCloseDisposition::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_close_policy_accepts_unselected_workspaces_without_a_runtime() {
+        for persisted_sessions in [0, 3] {
+            let entry = ui::file_tree::SidebarWorkspaceEntry {
+                ssh_context: None,
+                id: "unselected".into(),
+                name: "unselected".into(),
+                state: ui::file_tree::SidebarWorkspaceState::Idle,
+                summary: ui::file_tree::SidebarSessionSummary::inactive(persisted_sessions),
+            };
+            assert_eq!(
+                workspace_close_disposition(false, Some(&entry)),
+                WorkspaceCloseDisposition::CloseNow,
+                "persisted sessions: {persisted_sessions}"
+            );
+            assert_eq!(
+                workspace_close_disposition(true, Some(&entry)),
+                WorkspaceCloseDisposition::Confirm,
+                "persisted sessions: {persisted_sessions}"
+            );
+        }
     }
 
     #[test]

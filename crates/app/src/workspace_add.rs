@@ -505,6 +505,7 @@ pub enum WorkspaceAddPurpose {
 enum WorkspaceSource {
     Local,
     GitHub,
+    Ssh,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -517,6 +518,7 @@ pub enum WorkspaceAddStatus {
 }
 
 pub enum WorkspaceAddIntent {
+    Ssh(crate::ssh_workspace_add::SshWorkspaceIntent),
     PickLocal,
     PickDestination,
     Clone(CloneRequest),
@@ -534,6 +536,7 @@ pub struct WorkspaceAddUi {
     name_edited: bool,
     status: WorkspaceAddStatus,
     error: Option<CloneError>,
+    ssh: crate::ssh_workspace_add::SshWorkspaceAddUi,
 }
 
 impl WorkspaceAddUi {
@@ -548,7 +551,24 @@ impl WorkspaceAddUi {
             name_edited: false,
             status: WorkspaceAddStatus::Ready,
             error: None,
+            ssh: crate::ssh_workspace_add::SshWorkspaceAddUi::new(),
         }
+    }
+
+    pub fn open_ssh_draft(&mut self, draft: crate::ssh_workspace_add::SshWorkspaceDraft) {
+        self.source = WorkspaceSource::Ssh;
+        self.ssh.restore_draft(draft);
+    }
+
+    pub fn ssh_mut(&mut self) -> &mut crate::ssh_workspace_add::SshWorkspaceAddUi {
+        &mut self.ssh
+    }
+
+    pub fn apply_ssh_snapshot(
+        &mut self,
+        snapshot: crate::ssh_workspace_add::SshWorkspaceSnapshot,
+    ) -> bool {
+        self.ssh.apply_snapshot(snapshot)
     }
 
     pub fn purpose(&self) -> WorkspaceAddPurpose {
@@ -595,7 +615,14 @@ impl WorkspaceAddUi {
         let mut action = None;
         let busy = self.status != WorkspaceAddStatus::Ready;
         let title = catalog.t("workspace.add.title", &[]);
-        let intro = catalog.t("workspace.add.intro", &[]);
+        let intro = catalog.t(
+            if cfg!(feature = "ssh-workspaces") {
+                "workspace.ssh.intro"
+            } else {
+                "workspace.add.intro"
+            },
+            &[],
+        );
         let close_label = catalog.t("action.close", &[]);
         let modal = crate::ui::popup::show(
             ctx,
@@ -610,23 +637,51 @@ impl WorkspaceAddUi {
             |ui| {
                 crate::ui::popup::body(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| {
-                        crate::ui::popup::segmented_choice(
-                            ui,
-                            &mut self.source,
-                            [
-                                (
-                                    WorkspaceSource::Local,
-                                    &catalog.t("workspace.add.local", &[]),
-                                ),
-                                (
-                                    WorkspaceSource::GitHub,
-                                    &catalog.t("workspace.add.github", &[]),
-                                ),
-                            ],
-                        );
+                        let previous_source = self.source;
+                        if cfg!(feature = "ssh-workspaces") {
+                            crate::ui::popup::segmented_choice(
+                                ui,
+                                &mut self.source,
+                                [
+                                    (
+                                        WorkspaceSource::Local,
+                                        &catalog.t("workspace.add.local", &[]),
+                                    ),
+                                    (
+                                        WorkspaceSource::GitHub,
+                                        &catalog.t("workspace.add.github", &[]),
+                                    ),
+                                    (WorkspaceSource::Ssh, &catalog.t("workspace.add.ssh", &[])),
+                                ],
+                            );
+                        } else {
+                            crate::ui::popup::segmented_choice(
+                                ui,
+                                &mut self.source,
+                                [
+                                    (
+                                        WorkspaceSource::Local,
+                                        &catalog.t("workspace.add.local", &[]),
+                                    ),
+                                    (
+                                        WorkspaceSource::GitHub,
+                                        &catalog.t("workspace.add.github", &[]),
+                                    ),
+                                ],
+                            );
+                        }
+                        if previous_source == WorkspaceSource::Ssh && self.source != previous_source
+                        {
+                            action = Some(WorkspaceAddIntent::Ssh(self.ssh.cancel()));
+                        }
                         // The body provides 16pt spacing; the segmented control needs 17pt.
                         ui.add_space(1.0);
                         match self.source {
+                            WorkspaceSource::Ssh => {
+                                if let Some(intent) = self.ssh.show_body(ui, catalog) {
+                                    action = Some(WorkspaceAddIntent::Ssh(intent));
+                                }
+                            }
                             WorkspaceSource::Local => {
                                 crate::ui::popup::notice(
                                     ui,
@@ -723,11 +778,24 @@ impl WorkspaceAddUi {
                 crate::ui::popup::footer(
                     ui,
                     (!busy)
-                        .then(|| catalog.t("popup.shortcut_close", &[]))
+                        .then(|| {
+                            catalog.t(
+                                if self.source == WorkspaceSource::Ssh {
+                                    "workspace.ssh.keep_remote"
+                                } else {
+                                    "popup.shortcut_close"
+                                },
+                                &[],
+                            )
+                        })
                         .as_deref(),
                     |ui| {
                         use crate::ui::popup::{ActionTone, action_button};
-                        if self.status == WorkspaceAddStatus::Cloning {
+                        if self.source == WorkspaceSource::Ssh {
+                            if let Some(intent) = self.ssh.show_footer(ui, catalog) {
+                                action = Some(WorkspaceAddIntent::Ssh(intent));
+                            }
+                        } else if self.status == WorkspaceAddStatus::Cloning {
                             if action_button(
                                 ui,
                                 &catalog.t("workspace.add.cancel_clone", &[]),
@@ -756,6 +824,7 @@ impl WorkspaceAddUi {
                                     WorkspaceSource::Local => {
                                         action = Some(WorkspaceAddIntent::PickLocal);
                                     }
+                                    WorkspaceSource::Ssh => {}
                                     WorkspaceSource::GitHub => {
                                         match CloneRequest::prepare(
                                             &self.remote_url,
@@ -788,7 +857,11 @@ impl WorkspaceAddUi {
             },
         );
         if modal && !busy && action.is_none() {
-            action = Some(WorkspaceAddIntent::Close);
+            action = Some(if self.source == WorkspaceSource::Ssh {
+                WorkspaceAddIntent::Ssh(self.ssh.close())
+            } else {
+                WorkspaceAddIntent::Close
+            });
         }
         action
     }
@@ -818,9 +891,111 @@ impl CloneError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "ssh-workspaces")]
+    use egui_kittest::kittest::By;
     use egui_kittest::kittest::Queryable;
     use std::sync::atomic::AtomicBool;
 
+    #[cfg(feature = "ssh-workspaces")]
+    #[test]
+    fn ssh_workspace_add_dialog_offers_server_source_without_starting_io() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui_state(
+                move |ui, state: &mut (WorkspaceAddUi, Vec<WorkspaceAddIntent>)| {
+                    if let Some(intent) = state.0.show(ui.ctx(), &catalog) {
+                        state.1.push(intent);
+                    }
+                },
+                (
+                    WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir()),
+                    Vec::new(),
+                ),
+            );
+        harness.run();
+        harness.get_by_label("SSH server").click();
+        harness.run();
+        harness.get_by_label("SSH address");
+        harness.get_by_label("Connect");
+        harness.get(
+            By::new()
+                .label("Add workspace")
+                .role(egui::accesskit::Role::Button),
+        );
+        assert!(
+            harness.state().1.is_empty(),
+            "selecting SSH is a UI operation only"
+        );
+    }
+
+    #[cfg(feature = "ssh-workspaces")]
+    #[test]
+    fn ssh_workspace_popup_preserves_shared_dimensions_and_fixed_footer() {
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::Ssh;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(800.0, 750.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let rect = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("workspace_add_source")))
+            .unwrap();
+        assert!((rect.width() - 562.0).abs() < 1.0, "{rect:?}");
+        for input in harness.query_all_by_role(egui::accesskit::Role::TextInput) {
+            assert!(
+                (input.rect().height() - 36.0).abs() < 0.5,
+                "{:?}",
+                input.rect()
+            );
+        }
+        let cancel = harness.get_by_label("Cancel").rect();
+        let add = harness
+            .get(
+                By::new()
+                    .label("Add workspace")
+                    .role(egui::accesskit::Role::Button),
+            )
+            .rect();
+        assert!((add.height() - 34.0).abs() < 0.5, "{add:?}");
+        assert!(
+            (add.left() - cancel.right() - 8.0).abs() < 0.5,
+            "{cancel:?}, {add:?}"
+        );
+    }
+    #[cfg(feature = "ssh-workspaces")]
+    #[test]
+    fn ssh_workspace_popup_footer_stays_inside_a_narrow_window() {
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let mut dialog =
+            WorkspaceAddUi::new(WorkspaceAddPurpose::SwitchRuntime, std::env::temp_dir());
+        dialog.source = WorkspaceSource::Ssh;
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(280.0, 360.0))
+            .build_ui(move |ui| {
+                dialog.show(ui.ctx(), &catalog);
+            });
+        harness.run();
+        let rect = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("workspace_add_source")))
+            .unwrap();
+        assert!(rect.left() >= 0.0 && rect.right() <= 280.0, "{rect:?}");
+        assert!(rect.top() >= 0.0 && rect.bottom() <= 360.0, "{rect:?}");
+        let add = harness
+            .get(
+                By::new()
+                    .label("워크스페이스 추가")
+                    .role(egui::accesskit::Role::Button),
+            )
+            .rect();
+        assert!(add.bottom() <= 360.0, "{add:?}");
+    }
     #[test]
     fn add_dialog_selects_local_picker_only_after_a_click_and_exposes_git_fields() {
         let mut harness = egui_kittest::Harness::builder()

@@ -1,0 +1,453 @@
+# Selected actual log evidence — SSH workspace, 2026-10-22
+# Excerpts retain result lines and regression test names only. Full source logs stay in /private/tmp.
+# Repeated nested subprocess summaries are executions, not deduplicated test counts.
+
+## deppy-ssh-app-integration-stage14-red-20261022.log
+sha256=f97614dac433dbac68d201a2b431f750a2279dfc0772d3afbabe284f464f6f66
+bytes=8276
+running 60 tests
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_deadline_reports_uncertain_without_claiming_pty_exit ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_can_watch_and_input_nonpersistent_helper_session ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_reattach_keeps_session_uuid_but_revokes_old_watch_without_replay ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_switch_scopes_reused_session_ids_and_old_watches ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_reaches_remote_pty_before_detaching ... ok
+thread 'app::tests::ssh_workspace_queued_native_action_keeps_remote_owner_after_switch_and_catalog_loss' (200800145) panicked at crates/app/src/app.rs:43801:9:
+thread 'app::tests::ssh_workspace_queued_git_action_keeps_remote_owner_after_switch_and_catalog_loss' (200800144) panicked at crates/app/src/app.rs:43832:9:
+test app::tests::ssh_workspace_queued_git_action_keeps_remote_owner_after_switch_and_catalog_loss ... FAILED
+test app::tests::ssh_workspace_queued_native_action_keeps_remote_owner_after_switch_and_catalog_loss ... FAILED
+thread 'app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_includes_a_spawn_admitted_before_capture' (200800062) panicked at crates/app/src/app/ssh_integration_tests.rs:789:13:
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_includes_a_spawn_admitted_before_capture ... FAILED
+test result: FAILED. 54 passed; 3 failed; 3 ignored; 0 measured; 3322 filtered out; finished in 5.44s
+
+## deppy-ssh-app-integration-stage16-red-20261022.log
+sha256=2d0310ce4d9f2a75fdec30fba4905b129ddaa3d4c573ecf5bd8807d5ee5170ae
+bytes=8916
+running 65 tests
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_can_watch_and_input_nonpersistent_helper_session ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_empty_warm_close_waits_for_preclose_spawn_acknowledgement ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_reattach_keeps_session_uuid_but_revokes_old_watch_without_replay ... ok
+thread 'app::ssh_integration_tests::tests::ssh_workspace_actual_app_restarted_close_rejects_old_accepted_barrier' (200979685) panicked at crates/app/src/app/ssh_integration_tests.rs:1118:9:
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_restarted_close_rejects_old_accepted_barrier ... FAILED
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_switch_scopes_reused_session_ids_and_old_watches ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_deadline_reports_uncertain_without_claiming_pty_exit ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_includes_a_spawn_admitted_before_capture ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_reaches_remote_pty_before_detaching ... ok
+thread 'app::tests::ssh_workspace_change_observation_keeps_one_listing_and_waits_after_completion' (200979792) panicked at crates/app/src/app.rs:44088:13:
+test app::tests::ssh_workspace_change_observation_keeps_one_listing_and_waits_after_completion ... FAILED
+thread 'app::tests::ssh_workspace_change_observation_refreshes_visible_connected_tree' (200979795) panicked at crates/app/src/app.rs:44006:13:
+test app::tests::ssh_workspace_change_observation_refreshes_visible_connected_tree ... FAILED
+thread 'app::tests::ssh_workspace_change_observation_stops_when_surface_or_owner_is_inactive' (200979803) panicked at crates/app/src/app.rs:44041:17:
+test app::tests::ssh_workspace_change_observation_stops_when_surface_or_owner_is_inactive ... FAILED
+test result: FAILED. 58 passed; 4 failed; 3 ignored; 0 measured; 3322 filtered out; finished in 2.28s
+
+## deppy-ssh-app-integration-stage18-green-20261022.log
+sha256=a984279ea1e3fde2146d5f7c8c7d2bcf9bd05d610198a4e8c2a8768ccc4eb245
+bytes=7451
+running 65 tests
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_can_watch_and_input_nonpersistent_helper_session ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_empty_warm_close_waits_for_preclose_spawn_acknowledgement ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_reattach_keeps_session_uuid_but_revokes_old_watch_without_replay ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_restarted_close_rejects_old_accepted_barrier ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_pwa_switch_scopes_reused_session_ids_and_old_watches ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_deadline_reports_uncertain_without_claiming_pty_exit ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_includes_a_spawn_admitted_before_capture ... ok
+test app::ssh_integration_tests::tests::ssh_workspace_actual_app_warm_close_reaches_remote_pty_before_detaching ... ok
+test result: ok. 62 passed; 0 failed; 3 ignored; 0 measured; 3322 filtered out; finished in 2.93s
+
+## deppy-ssh-wrapper-stage18-green-20261022.log
+sha256=ee5f3538f9fa0d476bd682716bc2581893a81f0c9a5f650db09d27e10ed403b0
+bytes=646
+running 3 tests
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3384 filtered out; finished in 0.01s
+
+## deppy-ssh-banner-regression-red-20261022.log
+sha256=6c2e477cd91959d934a4b3c857da975aba8362e0fb57e8af42ebe20d9ee2501d
+bytes=1197
+running 1 test
+test openssh_loopback_requires_explicit_trust_and_refuses_changed_key ... FAILED
+thread 'openssh_loopback_requires_explicit_trust_and_refuses_changed_key' (200549950) panicked at crates/ssh-transport/tests/openssh_loopback.rs:189:13:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.82s
+
+## deppy-ssh-banner-loopback-green-20261022.log
+sha256=fcf5aa839e5a3cac5ae3b02fab2b5d80b09a45f2cbee8ae747f4a63afe483e74
+bytes=359
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s
+
+## deppy-ssh-banner-regression-green-20261022.log
+sha256=4f44b582be0d366f7a8f265ed104c917787388dc1d42cd40f5f9d2e5c1e14a13
+bytes=3913
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.31s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-linux-arm64-pwa-20261022.log
+sha256=9324269045bce5dda00de15605bce2c25fcf5d974c2fde718e08fe3b4573ddfa
+bytes=4890
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 405 filtered out; finished in 5.04s
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-linux-x86_64-pwa-20261022.log
+sha256=05bf5b1f612e9b59b19125801db8977eac270934b8944fc7cf41e272b063d92a
+bytes=86960
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 405 filtered out; finished in 5.47s
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.76s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-pwa-helper-native-20261022.log
+sha256=5cd61078ef010d4fed9cc73749ed17f9d2603b5c7166ce9160c82a552ad51608
+bytes=2537
+running 15 tests
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.87s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-pwa-runtime-green-20261022.log
+sha256=1a7f89476eada55695f6a913f2de89bd805ac7526e7c169d2a825cc0cdd2e1e6
+bytes=2308
+running 18 tests
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 409 filtered out; finished in 0.25s
+
+## deppy-ssh-musl-build-serial-20261022.log
+sha256=39a8e11c6793a9acdd26b4e6bcc3c9b7c566244f34550a9486fd87f2ec8b3fd8
+bytes=50849
+running 34 tests
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 457 filtered out; finished in 0.07s
+running 34 tests
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 457 filtered out; finished in 0.20s
+verified static Linux helper artifacts: target/remote-host/0.13.0
+
+## deppy-ssh-host-linux-final-static-e2e-20261022.log
+sha256=44e35a12bf020ce110f55dc00f355a7e40b4cece69fe982c009a45ba8f137171
+bytes=233
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.92s
+
+## deppy-ssh-install-consent-linux-e2e-final-20261022.log
+sha256=6f6f986858c66568c39ae017384761ace2a5ed184f5d9d0578595095219fdd27
+bytes=242
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3381 filtered out; finished in 1.88s
+
+## deppy-ssh-ui-render-final-20261022.log
+sha256=1a9f0a8d1fb767f3462d31ed6ce3061ddaae9e1385bb54ed81bf676adbe2d40c
+bytes=200
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3375 filtered out; finished in 5.54s
+
+## deppy-ssh-package-trust-red-20261022.log
+sha256=6e9c4310c194089cd32cffa25fdb2c7be589dd4b69befab800ced408351966d6
+bytes=1305
+Ran 2 tests in 0.726s
+FAILED (failures=1)
+
+## deppy-ssh-final-packaging-unit-20261022.log
+sha256=58580a7bedd22931bab9eb4341d5e203dd388caca59fd731c560edce9259133d
+bytes=112
+Ran 13 tests in 1.882s
+OK
+
+## deppy-ssh-native-bundle-qa-20261022.log
+sha256=3f00f3a252f3b76a6361a84dd42800e847b3943d24642af627cc1403cab5fa3c
+bytes=647
+disposable_bundle_deep_signature=PASS
+bundle_and_archive_full_development_verifier=PASS
+feature_marker=true
+harmless_askpass_reported_version=0.13.0
+verifier_output=package verification OK: explicitly untrusted development bundle
+sealed_resource=linux-aarch64 bytes=8569664 sha256=e71c0fc37b718c2c5fdcc756e03cd93285f897bea6fc064fd06f833dbdda4f5a archive_identical=PASS
+sealed_resource=linux-x86_64 bytes=9040424 sha256=7673849a4475505f3d6178e5db2e2ba3b5a8f50f38cdfc0ecca02bf3c12ae634 archive_identical=PASS
+rehashed_resource_tamper_rejected_before_companion=PASS
+real_app_execution=NONE
+all_bundle_archive_and_tamper_fixtures_removed_on_exit=true
+
+## deppy-ssh-handshake-eof-green-20261022.log
+sha256=9567daa816dfd5e37a3a8ba4817c3ae81f1ea9226e4c7798b39c36741fe2bb6d
+bytes=2525
+running 20 tests
+test result: ok. 20 passed; 0 failed; 0 ignored; 0 measured; 409 filtered out; finished in 5.01s
+
+## deppy-ssh-fixed-workspace-20261022.log (fixed four-thread infrastructure failure)
+sha256=ce1524328da91b3a905fcfb117fd680853bebf0b7990e4c4ccab32c4e2aa741e
+bytes=596867
+thread 'agent_detect::tests::command_output_plus_one_fails_and_joins_readers' (201911493) panicked at crates/app/src/agent_detect.rs:3592:9:
+assertion `left == right` failed
+  left: 2
+ right: 0
+mutex_poison_message_count=12
+test result: FAILED. 3332 passed; 13 failed; 42 ignored; 0 measured; 0 filtered out; finished in 40.62s
+
+## deppy-ssh-compat-default-red-20261022.log (compatibility RED)
+sha256=aeeb4f0521d781f1a43b116a1ae25a64e13147b233f1ab53617a1a30733398c6
+bytes=5425
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 21 tests
+test certificate_diagnostic_uses_primary_host_key_not_id_or_ca_fingerprint ... FAILED
+test configured_md5_fingerprints_are_overridden_by_sha256_argv ... FAILED
+thread 'certificate_diagnostic_uses_primary_host_key_not_id_or_ca_fingerprint' (203253494) panicked at crates/ssh-transport/tests/worker.rs:127:5:
+thread 'configured_md5_fingerprints_are_overridden_by_sha256_argv' (203253498) panicked at crates/ssh-transport/tests/worker.rs:172:5:
+test result: FAILED. 19 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-compat-loopback-red-20261022.log (compatibility RED)
+sha256=6b159bd2e7256b09371dbf8b980e582f9edb00f7900e0a64bd3a1171af146bc6
+bytes=1668
+running 2 tests
+thread 'openssh_loopback_accepts_ca_trusted_host_certificate_and_binds_plain_key' (203337797) panicked at crates/ssh-transport/tests/openssh_loopback.rs:370:5:
+thread 'openssh_loopback_requires_explicit_trust_and_refuses_changed_key' (203338571) panicked at crates/ssh-transport/tests/openssh_loopback.rs:162:21:
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s
+
+## deppy-ssh-dev-build-red-20261022.log (compatibility RED)
+sha256=d265c22c1785b7a7a284fc83978f275cfc55c06e528935ad7212008a6abc5496
+bytes=4000
+FAIL: test_debug_and_release_build_the_askpass_companion (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_build_the_askpass_companion) (release=False)
+AssertionError: 'ssh-askpass' not found in ['deppy-sijo', 'mcp-proxy']
+FAIL: test_debug_and_release_build_the_askpass_companion (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_build_the_askpass_companion) (release=True)
+AssertionError: 'ssh-askpass' not found in ['deppy-sijo', 'mcp-proxy']
+FAIL: test_debug_and_release_use_the_locked_dependency_graph (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_use_the_locked_dependency_graph) (release=False)
+AssertionError: '--locked' not found in ['build', '-p', 'deppy-sijo', '-p', 'mcp-proxy']
+FAIL: test_debug_and_release_use_the_locked_dependency_graph (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_use_the_locked_dependency_graph) (release=True)
+AssertionError: '--locked' not found in ['build', '-p', 'deppy-sijo', '-p', 'mcp-proxy', '--release']
+Ran 2 tests in 0.483s
+FAILED (failures=4)
+
+## deppy-ssh-logverbose-unit-red-20261022.log (follow-up compatibility RED)
+sha256=16ce934f5996426bad8db41f4da4924b26001ab03c3cbc0161bc56ae53679163
+bytes=927
+running 1 test
+thread 'configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics' (203439775) panicked at crates/ssh-transport/tests/worker.rs:187:5:
+test configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.26s
+
+## deppy-ssh-logverbose-loopback-red-20261022.log (follow-up compatibility RED)
+sha256=187f64b269f96f274603f14d93acfc8f234aa00bf73c1838abbd3511a68c94fe
+bytes=1095
+running 1 test
+thread 'openssh_loopback_accepts_ca_trusted_host_certificate_and_binds_plain_key' (203440495) panicked at crates/ssh-transport/tests/openssh_loopback.rs:370:5:
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.86s
+
+## deppy-ssh-config-context-red-20261022.log (follow-up compatibility RED)
+sha256=f66895e382e8ce463a89b501cd9e117a0b16e03c0dc54452b582bcdd07827c94
+bytes=1699
+running 1 test
+thread 'config_resolution_uses_the_same_options_and_command_context_as_execution' (203491875) panicked at crates/ssh-transport/tests/config_context.rs:68:9:
+test config_resolution_uses_the_same_options_and_command_context_as_execution ... FAILED
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+
+## deppy-ssh-dev-assets-red-20261022.log (follow-up compatibility RED)
+sha256=042e680d5b8935a62bac0ff9e43f01f77f91bf5fb7c7673ccbe43b01b9527731
+bytes=12438
+FAIL: test_debug_and_release_build_the_askpass_companion (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_build_the_askpass_companion) (release=False)
+AssertionError: 'ssh-askpass' not found in ['deppy-sijo', 'mcp-proxy']
+FAIL: test_debug_and_release_build_the_askpass_companion (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_build_the_askpass_companion) (release=True)
+AssertionError: 'ssh-askpass' not found in ['deppy-sijo', 'mcp-proxy']
+FAIL: test_debug_and_release_use_the_locked_dependency_graph (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_use_the_locked_dependency_graph) (release=False)
+AssertionError: '--locked' not found in ['build', '-p', 'deppy-sijo', '-p', 'mcp-proxy']
+FAIL: test_debug_and_release_use_the_locked_dependency_graph (scripts.tests.test_dev_build.DevBuildArguments.test_debug_and_release_use_the_locked_dependency_graph) (release=True)
+AssertionError: '--locked' not found in ['build', '-p', 'deppy-sijo', '-p', 'mcp-proxy', '--release']
+FAIL: test_debug_and_release_stage_exact_pair_at_raw_executable_resource_path (scripts.tests.test_dev_build.DevBuildResources.test_debug_and_release_stage_exact_pair_at_raw_executable_resource_path) (release=False)
+AssertionError: Items in the second set but not the first:
+FAIL: test_debug_and_release_stage_exact_pair_at_raw_executable_resource_path (scripts.tests.test_dev_build.DevBuildResources.test_debug_and_release_stage_exact_pair_at_raw_executable_resource_path) (release=True)
+AssertionError: Items in the second set but not the first:
+FAIL: test_failed_validation_preserves_previous_managed_resources (scripts.tests.test_dev_build.DevBuildResources.test_failed_validation_preserves_previous_managed_resources)
+AssertionError: 0 == 0
+FAIL: test_missing_helpers_fail_during_build (scripts.tests.test_dev_build.DevBuildResources.test_missing_helpers_fail_during_build)
+AssertionError: 0 == 0
+FAIL: test_symlink_resource_destination_is_rejected_without_touching_target (scripts.tests.test_dev_build.DevBuildResources.test_symlink_resource_destination_is_rejected_without_touching_target)
+AssertionError: 0 == 0
+FAIL: test_symlink_source_binary_is_rejected (scripts.tests.test_dev_build.DevBuildResources.test_symlink_source_binary_is_rejected)
+AssertionError: 0 == 0
+FAIL: test_validated_refresh_replaces_previous_managed_bytes (scripts.tests.test_dev_build.DevBuildResources.test_validated_refresh_replaces_previous_managed_bytes)
+AssertionError: Lists differ: [{'ve[51 chars]6': '877c51593965674738a666800c3ad4e30640607b6[176 chars]256}] != [{'ve[51 chars]6': '2917b531835c0106b75c4bd2e6ee199148a5afe4d[176 chars]256}]
+FAIL: test_version_mismatch_fails_during_build (scripts.tests.test_dev_build.DevBuildResources.test_version_mismatch_fails_during_build)
+AssertionError: 0 == 0
+Ran 9 tests in 1.245s
+FAILED (failures=12)
+
+## deppy-ssh-dev-unmanaged-red-20261022.log (follow-up compatibility RED)
+sha256=6e6c18da3a799885f220472afddafa4d6629df0c5e542b3f3c3d5e0e3d874bc4
+bytes=853
+FAIL: test_refresh_refuses_unmanaged_resources (scripts.tests.test_dev_build.DevBuildResources.test_refresh_refuses_unmanaged_resources)
+AssertionError: 0 == 0
+Ran 1 test in 0.096s
+FAILED (failures=1)
+
+## deppy-ssh-compat-final-unit-20261022.log (targeted corrected GREEN)
+sha256=504eeff5f4604aae5d7e47e86d630a1bd16d909add88e74f784bd6fc9e0d7288
+bytes=4685
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 2 tests
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 22 tests
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+running 0 tests
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## deppy-ssh-compat-final-loopback-20261022.log (targeted corrected GREEN)
+sha256=479044e1e28ac2d2b2a2e807e381c428ee2be88be04baa7f9f99cc65848b0651
+bytes=441
+running 2 tests
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s
+
+## deppy-ssh-guard-parallel-green-20261022.log (targeted corrected GREEN)
+sha256=e12f9e767fa9596642302fd0b950fdfba68bead784aadbe3f62587a26526dfd3
+bytes=8352
+running 72 tests
+test result: ok. 71 passed; 0 failed; 1 ignored; 0 measured; 3315 filtered out; finished in 0.89s
+
+## deppy-ssh-ui-render-corrected-20261022.log (targeted corrected GREEN)
+sha256=4e731c88af0908e6e1664ab6920152e86ef182febd1de95d2607ef4d70b7dd39
+bytes=356
+running 1 test
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 6.47s
+
+## deppy-ssh-dev-build-final-green-20261023.log (development build GREEN; no App execution)
+sha256=511abbb09a67bafa8857cd1a40dc0862536d1634c17ef88670a4c14aa20bff84
+bytes=4153
+Ran 23 tests in 3.212s
+OK
+
+## deppy-ssh-dev-real-resources-20261023.log (development build GREEN; no App execution)
+sha256=9f45d670d038180bd44605738d6490362f557c08316457d437b80d84faf0853f
+bytes=181
+sealed real helper pair staged and verified: iteration 1
+sealed real helper pair staged and verified: iteration 2
+PASS: initial copy and managed refresh; no App/companion execution
+
+## deppy-ssh-final-linux-host-20261023.log (final corrected real Linux GREEN)
+sha256=bca30d4ca6cba88f2307bbf76d5b54e833407b4a2cf260f0c03a0c4201f7149c
+bytes=1569
+running 1 test
+test ssh_workspace_host::linux_fixture_tests::tests::ssh_linux_host_register_files_terminal_and_restart_resume ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.88s
+
+## deppy-ssh-final-linux-install-20261023.log (final corrected real Linux GREEN)
+sha256=9db49cf676af635e61df9f4295709d41292d77a565ce0ee8d48003b31aa0f2b4
+bytes=398
+running 1 test
+test ssh_workspace_host::linux_fixture_tests::tests::ssh_linux_host_installs_verified_helper_only_after_current_consent ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 1.91s
+
+## deppy-ssh-default-exposure-red-20261023.log (default-exposure policy RED)
+sha256=448f82ecd2dc2ece102212483e1da4113be4bf7451f34c6aa3a8adc7458268f4
+bytes=1467
+FAIL: test_ssh_feature_is_enabled_for_default_and_explicit_packaging (scripts.tests.test_ssh_packaging.SshPackaging.test_ssh_feature_is_enabled_for_default_and_explicit_packaging)
+AssertionError: 'deppy-sijo/ssh-workspaces' not found in ['build', '--release', '--locked', '--no-default-features', '-p', 'deppy-sijo', '-p', 'mcp-proxy', '-p', 'ssh-askpass']
+Ran 3 tests in 0.789s
+FAILED (failures=1)
+
+## deppy-ssh-default-exposure-packaging-unit-20261023.log (normal-default exposure GREEN)
+sha256=94468a25c3d393e21be953f4c906824557c99454b560c8b3bcc6c9af1749a976
+bytes=122
+Ran 23 tests in 3.739s
+OK
+
+## deppy-ssh-default-exposure-normal-default-app-20261023.log (normal-default exposure GREEN)
+sha256=bdccea5f53347d224c217137115c9f6ac6618ae0b2b3cd5b62373c3d2c934496
+bytes=336454
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.04s
+test result: ok. 3345 passed; 0 failed; 42 ignored; 0 measured; 0 filtered out; finished in 31.27s
+
+## deppy-ssh-default-exposure-clippy-20261023.log (normal-default exposure GREEN)
+sha256=6c6a330dcee001faad4eacabfed41786c58f2a7d3c68a7c36d3d7771115a25b2
+bytes=1480
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 55.32s
+
+## deppy-ssh-default-exposure-fmt-20261023.log (normal-default exposure GREEN)
+sha256=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+bytes=0
+Command exited0; empty log.
+
+## deppy-ssh-default-exposure-package-gate-20261023.log (normal-default exposure GREEN)
+sha256=a4b6a32ae8a8a1f37d779787543b23c5d5a7e263dd6ff9337f6c01ec3e5d7f13
+bytes=722
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s
+
+## deppy-ssh-default-exposure-boundary-20261023.log (normal-default exposure GREEN)
+sha256=207731560b938be6a498d4de00e5066b420153c847460af6385a700a80279017
+bytes=236
+check-boundary OK — UI leaves have zero native/runtime capability; bounded composition-root terminal tail passed
+
+## deppy-ssh-default-exposure-deps-20261023.log (normal-default exposure GREEN)
+sha256=a888c42f4e1a5e3597d9607d059e766d1236a29fb4fd28a08ed214f0be66da8d
+bytes=174
+check-deps OK — crate 30개, 금지 edge/순환 없음
+
+## deppy-ssh-default-metadata-20261023.json (read-only default-feature metadata)
+sha256=10994c1c631c7cf8b3818996b0a65fd94831d5904323e72e895f5b619f6c3b01
+exit=0
+package=deppy-sijo
+version=0.13.0
+default_features=[ssh-workspaces]
+
+## deppy-ssh-fixture-cleanup-20261023.log (owned fixture cleanup)
+sha256=9e4535373035aa0f44c43a50945d969e30665927ed0fe18ef5516e4f7333a5bc
+exit=0
+Stopped isolated fixture in /Users/jr/Desktop/projects/.deppy-ssh-linux-fixture-20261022

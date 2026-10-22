@@ -408,6 +408,12 @@ impl App {
                 continue;
             }
             let workspace = &launch.record.workspace.0;
+            if self
+                .require_command_center_local_workspace(workspace)
+                .is_err()
+            {
+                continue;
+            }
             let Some(project) = host.projects.get(workspace).filter(|p| {
                 p.loaded
                     && !p.storage_blocked

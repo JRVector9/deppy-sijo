@@ -25,6 +25,8 @@ use terminal::{
 use crate::command::RuntimeCommand;
 use crate::event::RuntimeEvent;
 
+pub(crate) mod ssh;
+
 /// 첫 프레임을 v1 원시 토큰과 구분하고 오접속을 조기 거부하는 매직.
 pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// 현재 프로토콜 버전. v3: SetSessionDefaultEnv 추가. v4: SetShellCwd 추가(끝에 append) —

@@ -720,7 +720,22 @@ fn rename_archive_no_replace_at(
             libc::RENAME_EXCL,
         )
     };
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    // musl does not export renameat2; use the same kernel operation directly.
+    #[cfg(all(target_os = "linux", target_env = "musl"))]
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.fd.as_raw_fd(),
+            temp_name.as_ptr(),
+            directory.fd.as_raw_fd(),
+            final_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    #[cfg(all(
+        any(target_os = "linux", target_os = "android"),
+        not(target_env = "musl")
+    ))]
     let result = unsafe {
         libc::renameat2(
             directory.fd.as_raw_fd(),

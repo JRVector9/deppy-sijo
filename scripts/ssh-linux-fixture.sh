@@ -89,6 +89,7 @@ umask 077
 install -d -m 700 -o deppy -g deppy /home/deppy
 install -d -m 700 -o deppy -g deppy /home/deppy/.ssh
 install -m 600 -o deppy -g deppy /fixture/client_key.pub /home/deppy/.ssh/authorized_keys
+install -d -m 700 -o deppy -g deppy /home/deppy/.local /home/deppy/.local/share /home/deppy/.local/share/deppy /home/deppy/.local/share/deppy/remote-host
 install -d -m 700 -o deppy -g deppy "/home/deppy/.local/share/deppy/remote-host/$HELPER_VERSION"
 install -m 755 -o deppy -g deppy /build-target/debug/deppy-remote-host "/home/deppy/.local/share/deppy/remote-host/$HELPER_VERSION/deppy-remote-host"
 install -d -m 700 -o deppy -g deppy /home/deppy/workspace

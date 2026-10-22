@@ -13,6 +13,20 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
+SSH_WORKSPACES=0
+case "$#" in
+    0) ;;
+    2)
+        if [ "$1" = "--features" ] && [ "$2" = "ssh-workspaces" ]; then
+            SSH_WORKSPACES=1
+        else
+            echo "usage: package-macos.sh [--features ssh-workspaces]" >&2
+            exit 2
+        fi
+        ;;
+    *) echo "usage: package-macos.sh [--features ssh-workspaces]" >&2; exit 2 ;;
+esac
+
 APP_NAME="Deppy Sijo"
 BIN_NAME="deppy-sijo"
 BUNDLE_ID="app.vector9.deppy-sijo"
@@ -67,8 +81,19 @@ if [ "$REQUIRE_TRUSTED" = "1" ]; then
     fi
 fi
 
-cargo build --release -p deppy-sijo -p mcp-proxy -p ssh-askpass
+if [ "$SSH_WORKSPACES" = "1" ]; then
+    cargo build --release --locked --no-default-features -p deppy-sijo -p mcp-proxy -p ssh-askpass --features deppy-sijo/ssh-workspaces
+else
+    cargo build --release --locked --no-default-features -p deppy-sijo -p mcp-proxy -p ssh-askpass
+fi
 python3 scripts/prepare-cloudflared.py --output target/release/deppy-cloudflared
+HELPER_ARTIFACTS=${DEPPY_REMOTE_HOST_ARTIFACTS:-target/remote-host/$VERSION}
+if [ "$SSH_WORKSPACES" = "1" ]; then
+    python3 scripts/prepare-remote-host.py --source "$HELPER_ARTIFACTS" --version "$VERSION"
+    SSH_PLIST_BOOLEAN="<true/>"
+else
+    SSH_PLIST_BOOLEAN="<false/>"
+fi
 
 BUNDLE="target/bundle/$APP_NAME.app"
 ARCHIVE="target/bundle/$APP_NAME.zip"
@@ -84,6 +109,9 @@ cp "target/release/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
 cp "target/release/deppy-ssh-askpass" "$BUNDLE/Contents/MacOS/deppy-ssh-askpass"
 cp "target/release/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-cloudflared"
 cp scripts/vendor/cloudflared-LICENSE "$BUNDLE/Contents/Resources/cloudflared-LICENSE"
+if [ "$SSH_WORKSPACES" = "1" ]; then
+    python3 scripts/prepare-remote-host.py --source "$HELPER_ARTIFACTS" --output "$BUNDLE/Contents/Resources/remote-host" --version "$VERSION"
+fi
 
 # 배포 바이너리에서만 심볼 테이블을 제거해 용량을 줄인다. target/release의 원본은
 # 그대로 두어 디버깅(lldb 스택 트레이스 등)에는 계속 심볼 있는 바이너리를 쓸 수 있다.
@@ -104,6 +132,7 @@ cat > "$BUNDLE/Contents/Info.plist" <<PLIST
     <key>CFBundleVersion</key><string>$VERSION</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>DeppySshWorkspaces</key>$SSH_PLIST_BOOLEAN
     <key>NSHighResolutionCapable</key><true/>
     <key>NSSupportsAutomaticGraphicsSwitching</key><true/>
 </dict>
@@ -185,7 +214,7 @@ if [ "$REQUIRE_TRUSTED" = "1" ]; then
     ditto -c -k --sequesterRsrc --keepParent "$BUNDLE" "$ARCHIVE"
 fi
 
-sh scripts/verify-macos-package.sh "$BUNDLE" "$ARCHIVE"
+DEPPY_PACKAGE_SSH_WORKSPACES="$SSH_WORKSPACES" sh scripts/verify-macos-package.sh "$BUNDLE" "$ARCHIVE"
 
 echo "bundle: $BUNDLE"
 echo "archive: $ARCHIVE"

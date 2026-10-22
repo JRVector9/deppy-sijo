@@ -13,7 +13,7 @@ set -eu
 
 cd "$(dirname "$0")/.."
 
-SSH_WORKSPACES=0
+SSH_WORKSPACES=1
 case "$#" in
     0) ;;
     2)

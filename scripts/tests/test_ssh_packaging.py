@@ -20,16 +20,16 @@ class SshPackaging(unittest.TestCase):
             result = subprocess.run(["sh", "scripts/package-macos.sh", *arguments], cwd=ROOT, env=environment, capture_output=True)
             return result, log.read_text().splitlines() if log.exists() else []
 
-    def test_ssh_feature_is_explicit_and_forwarded_to_cargo(self):
+    def test_ssh_feature_is_enabled_for_default_and_explicit_packaging(self):
         result, args = self.run_package(["--features", "ssh-workspaces"])
         self.assertEqual(result.returncode, 97)
         self.assertIn("--locked", args)
         self.assertIn("deppy-sijo/ssh-workspaces", args)
         result, args = self.run_package([])
         self.assertEqual(result.returncode, 97)
-        self.assertNotIn("deppy-sijo/ssh-workspaces", args)
+        self.assertIn("deppy-sijo/ssh-workspaces", args)
 
-    def test_default_features_cannot_implicitly_enable_ssh(self):
+    def test_packaging_selects_features_without_cargo_defaults(self):
         for arguments in [[], ["--features", "ssh-workspaces"]]:
             with self.subTest(arguments=arguments):
                 result, args = self.run_package(arguments)

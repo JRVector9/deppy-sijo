@@ -1954,9 +1954,7 @@ impl App {
                     id,
                     target,
                     &attempt_id,
-                    &revision,
-                    passed,
-                    &evidence,
+                    (&revision, passed, &evidence),
                 );
             }
             cc::Intent::ConfirmResult { target, revision } => {

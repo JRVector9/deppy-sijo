@@ -67,7 +67,7 @@ if [ "$REQUIRE_TRUSTED" = "1" ]; then
     fi
 fi
 
-cargo build --release -p deppy-sijo -p mcp-proxy
+cargo build --release -p deppy-sijo -p mcp-proxy -p ssh-askpass
 python3 scripts/prepare-cloudflared.py --output target/release/deppy-cloudflared
 
 BUNDLE="target/bundle/$APP_NAME.app"
@@ -80,6 +80,8 @@ cp "target/release/$BIN_NAME" "$BUNDLE/Contents/MacOS/$BIN_NAME"
 # agent-proxy 브리지 바이너리를 앱 옆에 함께 동봉한다 — mcp_proxy_bin()이 실행 파일
 # 옆에서 찾으므로, 권한계층 경유 스폰이 프록시를 확실히 찾게 한다 (codex).
 cp "target/release/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
+# OpenSSH executes this private IPC companion for host trust and temporary authentication.
+cp "target/release/deppy-ssh-askpass" "$BUNDLE/Contents/MacOS/deppy-ssh-askpass"
 cp "target/release/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-cloudflared"
 cp scripts/vendor/cloudflared-LICENSE "$BUNDLE/Contents/Resources/cloudflared-LICENSE"
 
@@ -87,6 +89,7 @@ cp scripts/vendor/cloudflared-LICENSE "$BUNDLE/Contents/Resources/cloudflared-LI
 # 그대로 두어 디버깅(lldb 스택 트레이스 등)에는 계속 심볼 있는 바이너리를 쓸 수 있다.
 strip -x "$BUNDLE/Contents/MacOS/$BIN_NAME"
 strip -x "$BUNDLE/Contents/MacOS/deppy-mcp-proxy"
+strip -x "$BUNDLE/Contents/MacOS/deppy-ssh-askpass"
 
 cat > "$BUNDLE/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -117,13 +120,13 @@ PLIST
 if [ -n "$SIGN_ID" ]; then
     case "$SIGN_ID" in
         "Developer ID Application:"*)
-            for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
+            for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-ssh-askpass" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
                 codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$binary"
             done
             codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$BUNDLE"
             ;;
         *)
-            for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
+            for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-ssh-askpass" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
                 codesign --force --sign "$SIGN_ID" "$binary"
             done
             codesign --force --sign "$SIGN_ID" "$BUNDLE"
@@ -131,7 +134,7 @@ if [ -n "$SIGN_ID" ]; then
     esac
     echo "서명: $SIGN_ID (고정 identity — TCC/키체인 권한 재빌드 후 유지)"
 else
-    for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
+    for binary in "$BUNDLE/Contents/MacOS/deppy-cloudflared" "$BUNDLE/Contents/MacOS/deppy-mcp-proxy" "$BUNDLE/Contents/MacOS/deppy-ssh-askpass" "$BUNDLE/Contents/MacOS/$BIN_NAME"; do
         codesign --force --sign - "$binary"
     done
     codesign --force --sign - "$BUNDLE"

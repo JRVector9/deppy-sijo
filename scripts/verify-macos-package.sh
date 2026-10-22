@@ -11,6 +11,7 @@ ARCHIVE=${2:-}
 APP_NAME="Deppy Sijo"
 BIN_NAME="deppy-sijo"
 PROXY_NAME="deppy-mcp-proxy"
+ASKPASS_NAME="deppy-ssh-askpass"
 EXPECTED_BUNDLE_ID="app.vector9.deppy-sijo"
 EXPECTED_VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 REQUIRED_ARCHS=${DEPPY_REQUIRED_ARCHS:-$(uname -m)}
@@ -94,6 +95,8 @@ verify_bundle() {
 
     verify_binary "$candidate/Contents/MacOS/$BIN_NAME"
     verify_binary "$candidate/Contents/MacOS/$PROXY_NAME"
+    verify_binary "$candidate/Contents/MacOS/$ASKPASS_NAME"
+    [ "$("$candidate/Contents/MacOS/$ASKPASS_NAME" --version)" = "deppy-ssh-askpass $EXPECTED_VERSION" ] || fail "invalid SSH companion version"
     verify_binary "$candidate/Contents/MacOS/deppy-cloudflared"
     [ -s "$candidate/Contents/Resources/cloudflared-LICENSE" ] || fail "missing tunnel companion notice"
     codesign --verify --deep --strict --verbose=2 "$candidate"
@@ -107,6 +110,7 @@ verify_bundle() {
         verify_trusted_code "$candidate" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$BIN_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/$PROXY_NAME" "$team_id"
+        verify_trusted_code "$candidate/Contents/MacOS/$ASKPASS_NAME" "$team_id"
         verify_trusted_code "$candidate/Contents/MacOS/deppy-cloudflared" "$team_id"
         xcrun stapler validate "$candidate"
         verify_gatekeeper "$candidate"
@@ -122,7 +126,7 @@ if [ -n "$ARCHIVE" ]; then
     ditto -x -k "$ARCHIVE" "$VERIFY_TMP_DIR"
     EXTRACTED_BUNDLE="$VERIFY_TMP_DIR/$APP_NAME.app"
     verify_bundle "$EXTRACTED_BUNDLE"
-    for binary_name in "$BIN_NAME" "$PROXY_NAME" deppy-cloudflared; do
+    for binary_name in "$BIN_NAME" "$PROXY_NAME" "$ASKPASS_NAME" deppy-cloudflared; do
         original_hash=$(shasum -a 256 "$BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         archived_hash=$(shasum -a 256 "$EXTRACTED_BUNDLE/Contents/MacOS/$binary_name" | awk '{print $1}')
         [ "$original_hash" = "$archived_hash" ] || fail "archive changed $binary_name"

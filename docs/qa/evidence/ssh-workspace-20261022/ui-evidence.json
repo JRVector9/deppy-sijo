@@ -1,0 +1,32 @@
+{
+  "scope": "Two unmodified representative PNGs from the corrected opt-in offscreen UI test. All displayed addresses, fingerprints, folders and agent labels are synthetic examples. No physical display/App launch occurred.",
+  "rendered_states": 8,
+  "rendered_widths": [
+    "normal",
+    "narrow"
+  ],
+  "total_rendered_pngs": 16,
+  "durable_pngs": 2,
+  "render_log": "/private/tmp/deppy-ssh-ui-render-corrected-20261022.log",
+  "render_log_sha256": "4e731c88af0908e6e1664ab6920152e86ef182febd1de95d2607ef4d70b7dd39",
+  "source_snapshot": "corrected-cohort-frozen-before-full-result",
+  "visual_inspection": "Root and evidence owner inspected these exact two frames. The narrow trust body clips through internal scrolling while the footer remains visible; the verified-ready frame shows remote authority/root/agent and enabled add action. Neither popup exceeds its viewport.",
+  "images": [
+    {
+      "file": "02-host-trust-narrow.png",
+      "source": "target/ssh-ui-qa/02-host-trust-narrow.png",
+      "bytes": 56737,
+      "sha256": "a8aeb945aebb27bee4ce806c5fd0c2f4e5ae8162948b97cf6839a19e73588e77",
+      "copy_identical": true
+    },
+    {
+      "file": "08-verified-ready.png",
+      "source": "target/ssh-ui-qa/08-verified-ready.png",
+      "bytes": 78785,
+      "sha256": "5a77ab7cbdf84692a8f733fdeca9b2bd93ce4eb939cfb7df525dc98e14d61eea",
+      "copy_identical": true
+    }
+  ],
+  "corroborating_full_source_sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737",
+  "snapshot_relation": "Rust UI source was frozen during the corrected render and remained unchanged through the later aggregate source snapshot. Development-script hint completion preceded that full-source snapshot; the snapshot is corroborating source provenance rather than a digest captured at render execution."
+}

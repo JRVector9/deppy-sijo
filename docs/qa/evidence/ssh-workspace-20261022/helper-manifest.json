@@ -1,0 +1,19 @@
+{
+  "purpose": "Exact sealed static helper pair used by the recorded Linux integration and disposable native bundle QA, not a delivered release.",
+  "source_version": "0.13.0",
+  "manifest_sha256": "f58d77e70f08b3fc05d6550ea4ec66a765512c18c3e2cc3fb9ab86d3a3a6a396",
+  "helpers": [
+    {
+      "version": "0.13.0",
+      "target": "linux-aarch64",
+      "sha256": "e71c0fc37b718c2c5fdcc756e03cd93285f897bea6fc064fd06f833dbdda4f5a",
+      "bytes": 8569664
+    },
+    {
+      "version": "0.13.0",
+      "target": "linux-x86_64",
+      "sha256": "7673849a4475505f3d6178e5db2e2ba3b5a8f50f38cdfc0ecca02bf3c12ae634",
+      "bytes": 9040424
+    }
+  ]
+}

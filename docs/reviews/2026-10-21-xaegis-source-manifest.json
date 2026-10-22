@@ -1,0 +1,139 @@
+{
+  "review_date": "2026-10-21",
+  "recorded_at_utc": "2026-10-20T15:46:59.029425+00:00",
+  "method": "Read-only SSH source inspection and local source tracing. No runtime parity validation or tests executed. Remote build metadata is not runtime process attestation.",
+  "remote": {
+    "host": "ubuntu@gpu3090",
+    "root": "/home/ubuntu/xAegis",
+    "build_metadata": {
+      "version": "0.1.1",
+      "number": 125,
+      "commit": "42c2464",
+      "dirty": false,
+      "builtAt": 1792473408462
+    },
+    "files": {
+      "hub.mjs": {
+        "sha256": "9b4f7ec8b6661bc88fc862854a84bd476b5715359aa64e516d4d2635b35e85d6",
+        "lines": 1319
+      },
+      "coach.mjs": {
+        "sha256": "4d86df23ead49cc84348ade6add96d119ae39c344ae7bf347315a6f6f1e252a1",
+        "lines": 277
+      },
+      "agent.mjs": {
+        "sha256": "83f1568e851c342d63232688c9055240d5a9230a7b8715ea57ea001367806afa",
+        "lines": 1039
+      },
+      "autonomy.mjs": {
+        "sha256": "123a8cf5a9d5fe852ae9e665280b5cf6762bc66c5746f315ba325995aeb782cc",
+        "lines": 475
+      },
+      "allocation.mjs": {
+        "sha256": "8035f3621455a239e26e0750753ee29cc2cd6c9c709362e4766308330d4e1ccf",
+        "lines": 32
+      },
+      "project-plan.mjs": {
+        "sha256": "8c4361d25ff1426dfc8a95d46e54ec6ed09cb9a3bda09bebeed932d7686ec6e7",
+        "lines": 52
+      },
+      "join.mjs": {
+        "sha256": "0b525058b24e50f067bc7612b6796620386f42d8f01236743f060419036742e6",
+        "lines": 140
+      },
+      "local-llm.mjs": {
+        "sha256": "168eae35719bd024dcc7b83f21b65e1567eaa59d96d1fb655960e12f9ff833ec",
+        "lines": 325
+      },
+      "reports.mjs": {
+        "sha256": "d44e8b6f4396f3d8422be641bc76f0759bb80d161c2dbdd8bce91657a23b3399",
+        "lines": 205
+      },
+      "report-artifacts.mjs": {
+        "sha256": "3fef1d94dd0a9c7a8bb39338855b724c4dd35742913801155ee22738507aa00d",
+        "lines": 62
+      },
+      "build.json": {
+        "sha256": "1482fd9f185c60eb3379c70a3e43b22a74163e3d4f25fc76f92c5962d53d857d",
+        "lines": 7
+      }
+    },
+    "development_checkout": {
+      "root": "/home/ubuntu/projects/xAegis",
+      "commit": "b90e0601eb142b176fb3d522950b3b52a1c7d74b",
+      "status": ""
+    }
+  },
+  "local": {
+    "root": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020",
+    "branch": "feat/agent-command-center-v2-20261020",
+    "commit": "7584ed75fdc5949647a58574369c29606a076a86",
+    "version": "0.15.1",
+    "files": {
+      "Cargo.toml": {
+        "sha256": "e7deb822c7109864039c0026dba92d36ed417bb94987fc687b6c03382e0f27f8",
+        "lines": 122
+      },
+      "crates/app/src/command_center_host.rs": {
+        "sha256": "d7f0ff03069e342ad9c85a2cffd26905dc0649eba43c66aa877cb75a34808c39",
+        "lines": 4311
+      },
+      "crates/app/src/command_center_observe.rs": {
+        "sha256": "0b7493b9a6276060e3fd133e11f6c12a65203b91241fbf06fa908d4fdba66b44",
+        "lines": 1009
+      },
+      "crates/app/src/command_center_assignment.rs": {
+        "sha256": "be5f5ab50bf9d408f3014e57ce64401f95d8a8a5df7566fe009ec947de790ad7",
+        "lines": 888
+      },
+      "crates/app/src/ui/command_center/main.rs": {
+        "sha256": "db0dbfbd688eba62519265889fdcf425b6c2c9fad7b0271a0b427759d112a6f2",
+        "lines": 1374
+      },
+      "crates/app/src/ui/command_center/devices.rs": {
+        "sha256": "9763c9d445eec4ca654876d5e7c2202830fdbc5014c9803f86d23689128d99db",
+        "lines": 538
+      },
+      "crates/app/src/work_management/provider_adapter.rs": {
+        "sha256": "0e5bedc3de28cfb5d38259519d1d55b38492a9e82eecfb6871c9dd6f9e14cdc9",
+        "lines": 102
+      },
+      "crates/app/src/work_management/orchestrator.rs": {
+        "sha256": "d64d3abfd0b5c9a9848ae1836b31670e46399c2fc3aaa966d9779c4710bba63f",
+        "lines": 168
+      },
+      "crates/app/src/work_management/queue.rs": {
+        "sha256": "bb0c52aaf8ec8761256a1274b58ea29c0123d86ca0b20a47a16aeab64b0889e2",
+        "lines": 62
+      },
+      "crates/app/src/work_management/devices.rs": {
+        "sha256": "ecbabfb93b2fdb293c71ff6cf094e6739ef063a2f37da9b1772df1f7c2042f40",
+        "lines": 920
+      },
+      "crates/app/src/work_management/task_worktree.rs": {
+        "sha256": "6dee86932f000b6697ae0a7a7753d612240dc8e0aeb6f89f5bf0f7f586367036",
+        "lines": 712
+      },
+      "crates/core/src/work_management.rs": {
+        "sha256": "1b6cca4e00c81e771a252813edf69d8493d81d4468fd6fce13e37287f03839dd",
+        "lines": 613
+      },
+      "crates/agent-mcp/src/lib.rs": {
+        "sha256": "29787e07bc4dcb782121f117b144dadef73267b8c94d610c06eb539ab7b2f0af",
+        "lines": 171
+      },
+      "crates/app/src/local_llm.rs": {
+        "sha256": "db065ff5bf1319a1221a26d1d91e9a1b13a4e0de96478632dbc1dc69a5e40ef7",
+        "lines": 349
+      },
+      "crates/web-remote/src/push.rs": {
+        "sha256": "f37f79381fb65e008be637219ad21b597f1d9ce33071753519898418d822335d",
+        "lines": 2826
+      },
+      "docs/command-center-v2.md": {
+        "sha256": "2af41670f54a229f46e48f6ab6ea74aafceaf029347440ded890f331e046ca26",
+        "lines": 40
+      }
+    }
+  }
+}

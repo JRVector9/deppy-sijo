@@ -1,5 +1,8 @@
 //! Bounded asynchronous local shell execution; durable evidence is separate from task completion.
-use super::verification::{ApprovedVerification, now_ms, same_directory};
+use super::ProjectWorkState;
+use super::verification::{
+    ApprovedVerification, approve_local, matches_current, now_ms, same_directory,
+};
 use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::*;
@@ -10,6 +13,11 @@ use std::sync::{Arc, atomic::AtomicBool};
 use std::time::{Duration, Instant};
 
 pub(crate) enum VerificationJob {
+    Prepare {
+        state: Box<ProjectWorkState>,
+        requested: Box<CommandVerificationEvidence>,
+        cancel: Arc<AtomicBool>,
+    },
     Run(ApprovedVerification),
     Load {
         workspace_id: WorkspaceId,
@@ -19,14 +27,30 @@ pub(crate) enum VerificationJob {
         evidence: ManualVerificationEvidence,
     },
 }
+impl VerificationJob {
+    /// Pure admission: folder resolution and pinning happen only inside the worker.
+    pub fn prepare(state: ProjectWorkState, requested: CommandVerificationEvidence) -> Self {
+        Self::Prepare {
+            state: Box::new(state),
+            requested: Box::new(requested),
+            cancel: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VerificationError {
     Unavailable,
     Persistence,
     UnsafeMetadata,
     Conflict,
+    InvalidApproval,
+    Cancelled,
 }
 pub(crate) enum VerificationResult {
+    Prepared {
+        requested: Box<CommandVerificationEvidence>,
+        approved: Result<Box<ApprovedVerification>, VerificationError>,
+    },
     Finished {
         evidence: Box<CommandVerificationEvidence>,
         cancelled: bool,
@@ -75,14 +99,17 @@ impl VerificationWorker {
     pub fn try_request(
         &mut self,
         job: VerificationJob,
-    ) -> Result<(), LazyWorkerSubmitError<VerificationJob>> {
+    ) -> Result<(), Box<LazyWorkerSubmitError<VerificationJob>>> {
         let active = match &job {
+            VerificationJob::Prepare {
+                requested, cancel, ..
+            } => Some((requested.id.clone(), cancel.clone())),
             VerificationJob::Run(approved) => {
                 Some((approved.id().clone(), approved.cancel.clone()))
             }
             _ => None,
         };
-        self.worker.try_request(job)?;
+        self.worker.try_request(job).map_err(Box::new)?;
         self.active = active;
         Ok(())
     }
@@ -111,6 +138,10 @@ impl VerificationWorker {
         }) = &mut result
         {
             *flag |= cancelled;
+        }
+        if cancelled && let Ok(VerificationResult::Prepared { approved, .. }) = &mut result {
+            // Cancellation after preparation but before host receipt must revoke the permit too.
+            *approved = Err(VerificationError::Cancelled);
         }
         Some(result)
     }
@@ -167,6 +198,53 @@ fn execute(
     job: VerificationJob,
 ) -> VerificationResult {
     match job {
+        VerificationJob::Prepare {
+            state,
+            requested,
+            cancel,
+        } => {
+            let approved = (|| {
+                if cancel.load(Ordering::Acquire) {
+                    return Err(VerificationError::Cancelled);
+                }
+                if !safe_metadata(
+                    redaction,
+                    &requested.id,
+                    &requested.target,
+                    Some(&requested.spec),
+                ) {
+                    return Err(VerificationError::UnsafeMetadata);
+                }
+                if requested.outcome != CommandVerificationOutcome::Running
+                    || !matches_current(&state, &requested)
+                {
+                    return Err(VerificationError::InvalidApproval);
+                }
+                let mut approved = approve_local(
+                    &state,
+                    &requested.target.task_id,
+                    requested.target.result_revision,
+                    requested.spec.clone(),
+                )
+                .map_err(|_| VerificationError::InvalidApproval)?;
+                if approved.target() != &requested.target || cancel.load(Ordering::Acquire) {
+                    return Err(if cancel.load(Ordering::Acquire) {
+                        VerificationError::Cancelled
+                    } else {
+                        VerificationError::InvalidApproval
+                    });
+                }
+                // Retain the native review identity. Neither this DTO nor the permit can be
+                // reconstructed from persisted history; only an explicit Prepare job creates it.
+                approved.initial = (*requested).clone();
+                approved.cancel = cancel;
+                Ok(Box::new(approved))
+            })();
+            VerificationResult::Prepared {
+                requested,
+                approved,
+            }
+        }
         VerificationJob::Run(mut approved) => {
             let failure =
                 |e: &CommandVerificationEvidence, error| VerificationResult::ExecutionFailed {

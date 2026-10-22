@@ -67,3 +67,19 @@ CARGO_TARGET_DIR=/private/tmp/deppy-cc-verification-target-20261022 CARGO_BUILD_
 cargo fmt --all --check
 git diff --check
 ```
+
+## Final integrated review correction: asynchronous preparation and manual correlation
+
+Root requested independent read-only review at integrated `d1eedbba` plus its dirty glue. Two confirmed issues were authorized for correction: manual completion compared mutable redacted text and could silently lose a pending receipt when the secret corpus changed; native admission called filesystem canonicalize/open/pin directly on the UI thread.
+
+Isolated test baseline `771c8b3f` copies root's then-current integration glue for compilation only; **never cherry-pick that baseline**. The correction commit contains only `command_center_verification.rs`, `work_management/verification_worker.rs`, its test module, and this note. Root owns the manual host callsite tuple change: `&attempt_id, (&revision, passed, &evidence)`.
+
+Actual new RED: `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo command_center_verification_ -- --test-threads=1` produced **3 passed / 2 failed**. The unavailable-directory review failed with `approved local attempt folder is unavailable`; the actual manual worker changed the returned evidence under a newly registered synthetic secret, and host correlation failed. After the correction, those five tests passed.
+
+Final focused correction run (same isolated target/jobs2): `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo verification_ -- --test-threads=1` produced **31 passed / 0 failed / 1 ignored**, 1.50s execution. This includes actual Prepare→host exact revalidation→Run→durable evidence→separate final confirmation, no command or journal creation during Prepare, cancellation after preparation completes but before receipt, unavailable-folder/stale-source rejection without spawn or journal, changed manual text correlation, and explicit mismatch receipt rejection. Existing real timeout/output caps/process-group cancel/Drop/restore tests also passed in this run.
+
+Production now builds/validates only a pure reviewed DTO in native admission. The existing bounded worker performs Prepare, including canonical folder resolution and descriptor pinning, then returns its private runtime permit. Host retains Pending across both phases (so busy/owns prevent eviction), rechecks exact target/spec/config/binding/folder and cancellation before submitting Run. Prepare alone cannot spawn or open the evidence journal. Cancel also revokes a prepared permit already queued for delivery. `approve_local` filesystem work has no production UI callsite; `matches_current`, `review_verification`, and `exact` remain pure.
+
+Manual completion matches immutable id/target/time/pass fields, consumes returned redacted text for history, and explicitly rejects a mismatched identity instead of dropping its receipt. `try_request` boxes its known-unsent job error to satisfy strict Clippy without changing retry semantics; manual review groups revision/pass/text into one tuple. Removed the root test's unused mutable store variable.
+
+At source handoff, strict app all-target Clippy and the broader Command Center run are still running/queued; no success is claimed yet. Root will run final integrated gates. No release, app lifecycle action, paid call or user-session input.

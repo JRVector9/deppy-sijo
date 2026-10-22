@@ -181,6 +181,65 @@ fn exact(project: &Project, pending: &Pending) -> bool {
                 && a.folder == pending.folder
         })
 }
+fn preparation_current(
+    project: &Project,
+    pending: &Pending,
+    requested: &work::CommandVerificationEvidence,
+    approved: &approval::ApprovedVerification,
+) -> bool {
+    pending.evidence == *requested
+        && !pending.cancelled
+        && exact(project, pending)
+        && approved.evidence() == requested
+}
+fn review_verification(
+    project: &Project,
+    expected: &work::VerificationTarget,
+    spec: work::VerificationSpec,
+) -> Result<work::CommandVerificationEvidence, String> {
+    let requested = work::CommandVerificationEvidence {
+        id: work::VerificationId::new(),
+        target: expected.clone(),
+        spec,
+        started_at_ms: now_ms(),
+        ended_at_ms: None,
+        outcome: work::CommandVerificationOutcome::Running,
+        exit_code: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        error: None,
+    };
+    // This gate is deliberately pure: the worker resolves and pins the reviewed directory.
+    if !approval::matches_current(&project.state(), &requested) {
+        return Err("현재 로컬 결과와 검증 명령을 다시 확인해 주세요.".into());
+    }
+    Ok(requested)
+}
+fn same_manual_request(
+    a: &work::ManualVerificationEvidence,
+    b: &work::ManualVerificationEvidence,
+) -> bool {
+    a.id == b.id
+        && a.target == b.target
+        && a.recorded_at_ms == b.recorded_at_ms
+        && a.passed == b.passed
+}
+fn take_manual_request(
+    host: &mut CommandCenterHost,
+    evidence: &work::ManualVerificationEvidence,
+) -> Option<Manual> {
+    let pending = host.verifications.manual.take()?;
+    if !same_manual_request(&pending.evidence, evidence) {
+        host.reject(
+            &pending.operation,
+            "수동 검증 응답의 식별자가 달라 현재 상태에 적용하지 않았습니다.",
+        );
+        return None;
+    }
+    Some(pending)
+}
 fn apply_evidence(
     project: &mut Project,
     pending: &Pending,
@@ -253,18 +312,12 @@ impl App {
         {
             return Err("검증할 결과·시도·소스가 바뀌었습니다. 다시 확인해 주세요.".into());
         }
-        let approved = approval::approve_local(
-            &p.state(),
-            &expected.task_id,
-            expected.result_revision,
-            spec,
-        )
-        .map_err(|e| e.to_string())?;
+        let requested = review_verification(p, &expected, spec)?;
         if !wm::verification_worker::safe_metadata(
             &self.command_center_redaction,
-            approved.id(),
-            approved.target(),
-            Some(approved.spec()),
+            &requested.id,
+            &requested.target,
+            Some(&requested.spec),
         ) {
             return Err(
                 "검증 명령·경로·식별자에 등록된 비밀값이 포함되어 실행하지 않았습니다.".into(),
@@ -273,7 +326,7 @@ impl App {
         let pending = Pending {
             operation: id.into(),
             route,
-            evidence: approved.evidence().clone(),
+            evidence: requested.clone(),
             config: p.snapshot.config.revision,
             binding: p
                 .snapshot
@@ -290,12 +343,13 @@ impl App {
                 .map(|a| a.folder.clone())
                 .unwrap_or_default(),
         };
+        let preparation = VerificationJob::prepare(p.state(), requested);
         self.ensure_command_center_verification(host);
         host.verifications
             .worker
             .as_mut()
             .unwrap()
-            .try_request(VerificationJob::Run(approved))
+            .try_request(preparation)
             .map_err(|_| "검증 실행기가 사용 중입니다. 명령을 실행하지 않았습니다.".to_owned())?;
         host.verifications.pending = Some(pending);
         host.publication_dirty = true;
@@ -346,10 +400,9 @@ impl App {
         id: &str,
         route: cc::RouteTarget,
         attempt: &str,
-        revision: &str,
-        passed: bool,
-        text: &str,
+        review: (&str, bool, &str),
     ) -> Result<(), String> {
+        let (revision, passed, text) = review;
         if host.verifications.busy()
             || host.flight.is_some()
             || remote::handoff_pending(host, &route)
@@ -419,6 +472,25 @@ impl App {
             .and_then(|w| w.try_recv());
         if let Some(result) = result {
             match result {
+                Ok(VerificationResult::Prepared {
+                    requested,
+                    approved,
+                }) => {
+                    if let Some(pending) = host.verifications.pending.take() {
+                        match approved {
+                            Ok(approved) if host.projects.get(&pending.route.workspace_id).is_some_and(|p| preparation_current(p, &pending, &requested, &approved)) => {
+                                match host.verifications.worker.as_mut().unwrap().try_request(VerificationJob::Run(*approved)) {
+                                    Ok(()) => host.verifications.pending = Some(pending),
+                                    Err(_) => host.reject(&pending.operation, "검증 실행기를 준비하지 못해 명령을 실행하지 않았습니다."),
+                                }
+                            }
+                            Ok(_) | Err(wm::verification_worker::VerificationError::Cancelled) => {
+                                host.finish(&pending.operation, cc::ReceiptStatus::Acknowledged, "검증 준비가 취소되었거나 대상이 바뀌어 명령을 실행하지 않았습니다.");
+                            }
+                            Err(error) => host.reject(&pending.operation, format!("로컬 검증 준비를 완료하지 못해 명령을 실행하지 않았습니다 ({error:?}).")),
+                        }
+                    }
+                }
                 Ok(VerificationResult::Finished {
                     evidence,
                     cancelled,
@@ -483,12 +555,7 @@ impl App {
                     }
                 }
                 Ok(VerificationResult::ManualRecorded { evidence, result }) => {
-                    if let Some(pending) = host
-                        .verifications
-                        .manual
-                        .take()
-                        .filter(|p| p.evidence == evidence)
-                    {
+                    if let Some(pending) = take_manual_request(host, &evidence) {
                         let permitted = host
                             .remote_permits
                             .get(&pending.operation)
@@ -651,29 +718,192 @@ mod tests {
         }
     }
     #[test]
+    fn command_center_verification_review_defers_unavailable_folder_to_the_worker() {
+        let folder = std::env::temp_dir().join(format!("cc-not-created-{}", uuid::Uuid::new_v4()));
+        let (project, route) = fixture(&folder);
+        let expected = result_target(&project, &route).unwrap();
+        let result = review_verification(
+            &project,
+            &expected,
+            work::VerificationSpec {
+                command: "true".into(),
+                cwd: folder.to_string_lossy().into_owned(),
+                timeout_ms: 1000,
+                output_limit_bytes: 128,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "native review must not resolve or open a folder: {:?}",
+            result.err()
+        );
+        assert!(!folder.exists());
+    }
+    #[test]
+    fn command_center_verification_manual_correlation_survives_worker_redaction() {
+        let dir =
+            std::env::temp_dir().join(format!("cc-manual-redaction-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let (project, route) = fixture(&dir);
+        let original = work::ManualVerificationEvidence {
+            id: work::VerificationId::new(),
+            target: result_target(&project, &route).unwrap(),
+            recorded_at_ms: now_ms(),
+            passed: true,
+            evidence: "inspected newly-registered-manual-secret-value personally".into(),
+        };
+        let redaction = secret::RedactionService::new();
+        // Registration occurs after the native review captured its original text.
+        redaction
+            .register_permanent(&secret::SecretString::new(
+                "newly-registered-manual-secret-value".into(),
+            ))
+            .unwrap();
+        let mut worker = VerificationWorker::new(dir.clone(), redaction, || {});
+        worker
+            .try_request(VerificationJob::RecordManual {
+                evidence: original.clone(),
+            })
+            .ok()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let result = loop {
+            if let Some(result) = worker.try_recv() {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let VerificationResult::ManualRecorded { evidence, result } = result else {
+            panic!("manual result")
+        };
+        result.unwrap();
+        assert!(evidence.evidence.contains("[REDACTED]"));
+        assert_ne!(evidence.evidence, original.evidence);
+        assert!(
+            same_manual_request(&original, &evidence),
+            "worker redaction must not lose the pending receipt"
+        );
+        let operation = work::OperationId::new().0;
+        let mut host = CommandCenterHost::new(dir.clone(), &egui::Context::default());
+        host.verifications.manual = Some(Manual {
+            operation: operation.clone(),
+            route,
+            evidence: original,
+            config: project.snapshot.config.revision,
+            binding: project.snapshot.attempts[0].runtime_binding.clone(),
+        });
+        let pending = take_manual_request(&mut host, &evidence).unwrap();
+        assert_eq!(pending.operation, operation);
+        assert!(
+            !host
+                .receipts
+                .iter()
+                .any(|receipt| receipt.status == cc::ReceiptStatus::Rejected)
+        );
+        drop(worker);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn command_center_verification_mismatched_manual_response_finishes_original_receipt() {
+        let (project, route) = fixture(&std::env::temp_dir());
+        let original = work::ManualVerificationEvidence {
+            id: work::VerificationId::new(),
+            target: result_target(&project, &route).unwrap(),
+            recorded_at_ms: now_ms(),
+            passed: true,
+            evidence: "personal inspection".into(),
+        };
+        let operation = work::OperationId::new().0;
+        let mut host = CommandCenterHost::new(std::env::temp_dir(), &egui::Context::default());
+        host.verifications.manual = Some(Manual {
+            operation: operation.clone(),
+            route,
+            evidence: original.clone(),
+            config: project.snapshot.config.revision,
+            binding: project.snapshot.attempts[0].runtime_binding.clone(),
+        });
+        let mut mismatched = original.clone();
+        mismatched.target.result_revision.0 += 1;
+        assert!(take_manual_request(&mut host, &mismatched).is_none());
+        assert!(!host.verifications.busy());
+        assert!(
+            host.receipts
+                .iter()
+                .any(|receipt| receipt.operation_id == operation
+                    && receipt.status == cc::ReceiptStatus::Rejected)
+        );
+        let mut changed = original.clone();
+        changed.id = work::VerificationId::new();
+        assert!(!same_manual_request(&original, &changed));
+        let mut changed = original.clone();
+        changed.passed = false;
+        assert!(!same_manual_request(&original, &changed));
+        changed = original.clone();
+        changed.recorded_at_ms += 1;
+        assert!(!same_manual_request(&original, &changed));
+    }
+    #[test]
     fn command_center_verification_real_shell_durable_evidence_requires_separate_final_confirmation()
      {
         let dir =
             std::env::temp_dir().join(format!("cc-host-verification-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir(&dir).unwrap();
         let (mut project, route) = fixture(&dir);
-        let approved = approval::approve_local(
-            &project.state(),
-            &project.snapshot.tasks[0].id,
-            work::ResultRevision(1),
+        let requested = review_verification(
+            &project,
+            &result_target(&project, &route).unwrap(),
             work::VerificationSpec {
-                command: "printf root-owned-evidence".into(),
+                command: "printf prepared > command-ran.txt; printf root-owned-evidence".into(),
                 cwd: dir.to_string_lossy().into_owned(),
                 timeout_ms: 1000,
                 output_limit_bytes: 128,
             },
         )
         .unwrap();
-        let pending = pending(&project, route, &approved);
+        let pending = Pending {
+            operation: work::OperationId::new().0,
+            route,
+            evidence: requested.clone(),
+            config: project.snapshot.config.revision,
+            binding: project.snapshot.attempts[0].runtime_binding.clone(),
+            cancelled: false,
+            folder: project.snapshot.attempts[0].folder.clone(),
+        };
         let mut worker =
             VerificationWorker::new(dir.clone(), secret::RedactionService::new(), || {});
         worker
-            .try_request(VerificationJob::Run(approved))
+            .try_request(VerificationJob::prepare(project.state(), requested.clone()))
+            .ok()
+            .unwrap();
+        let prepare_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let prepared = loop {
+            if let Some(result) = worker.try_recv() {
+                break result.unwrap();
+            }
+            assert!(std::time::Instant::now() < prepare_deadline);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let VerificationResult::Prepared {
+            requested: captured,
+            approved,
+        } = prepared
+        else {
+            panic!("preparation result")
+        };
+        let approved = approved.ok().unwrap();
+        assert!(preparation_current(
+            &project, &pending, &captured, &approved
+        ));
+        assert!(!dir.join("command-ran.txt").exists());
+        assert!(!dir.join(stored::COMMAND_CENTER_FILE_NAME).exists());
+        project.snapshot.config.revision.0 += 1;
+        assert!(!preparation_current(
+            &project, &pending, &captured, &approved
+        ));
+        project.snapshot.config.revision.0 -= 1;
+        worker
+            .try_request(VerificationJob::Run(*approved))
             .ok()
             .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -692,7 +922,7 @@ mod tests {
             panic!("expected durable result")
         };
         assert_eq!(evidence.stdout, "root-owned-evidence");
-        let mut store = stored::CommandCenterStore::open(&dir).unwrap();
+        let store = stored::CommandCenterStore::open(&dir).unwrap();
         assert!(store.load_verifications(&evidence.target.workspace_id).unwrap().iter().any(|record|matches!(record,work::VerificationEvidence::AppLocal(stored) if stored==evidence.as_ref())));
         assert!(apply_evidence(&mut project, &pending, &evidence, cancelled).unwrap());
         assert_eq!(

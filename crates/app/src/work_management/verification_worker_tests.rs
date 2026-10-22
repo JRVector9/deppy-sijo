@@ -315,7 +315,7 @@ fn verification_async_cancel_after_exit_keeps_evidence_but_blocks_application() 
     }
     assert!(matches!(
         worker.try_request(VerificationJob::Run(dir.approve("printf duplicate"))),
-        Err(LazyWorkerSubmitError::Full(_))
+        Err(error) if matches!(*error, LazyWorkerSubmitError::Full(_))
     ));
     assert!(worker.cancel(&id));
     let VerificationResult::Finished {
@@ -390,4 +390,87 @@ fn verification_async_journal_failure_never_executes_the_command() {
         }
     ));
     assert!(!dir.0.join("persistence-failed.txt").exists());
+}
+
+#[test]
+fn verification_async_prepare_is_inert_until_explicit_run_and_cancellable_after_receipt_ready() {
+    let dir = Fixture::new();
+    let data = dir.0.join("journal");
+    let state = fixture(&dir.0);
+    let requested = approve_local(
+        &state,
+        &state.tasks[0].id,
+        ResultRevision(1),
+        spec(&dir.0, "printf unauthorized > must-not-run.txt"),
+    )
+    .unwrap()
+    .initial;
+    let id = requested.id.clone();
+    let wake = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let signal = wake.clone();
+    let mut worker = VerificationWorker::new(data.clone(), RedactionService::new(), move || {
+        signal.fetch_add(1, Ordering::SeqCst);
+    });
+    worker
+        .try_request(VerificationJob::prepare(state, requested.clone()))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while wake.load(Ordering::SeqCst) == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // Cancellation after the prepared permit is queued still revokes it before host delivery.
+    assert!(worker.cancel(&id));
+    let VerificationResult::Prepared {
+        requested: captured,
+        approved,
+    } = recv(&mut worker)
+    else {
+        panic!("prepared")
+    };
+    assert_eq!(*captured, requested);
+    assert!(matches!(approved, Err(VerificationError::Cancelled)));
+    assert!(!data.exists());
+    assert!(!dir.0.join("must-not-run.txt").exists());
+}
+
+#[test]
+fn verification_async_prepare_missing_folder_and_stale_source_never_spawns_or_journals() {
+    let dir = Fixture::new();
+    let state = fixture(&dir.0);
+    let requested = approve_local(
+        &state,
+        &state.tasks[0].id,
+        ResultRevision(1),
+        spec(&dir.0, "printf unauthorized > must-not-run.txt"),
+    )
+    .unwrap()
+    .initial;
+    let data = dir.0.with_extension("journal");
+    let mut worker = VerificationWorker::new(data.clone(), RedactionService::new(), || {});
+    let mut stale = requested.clone();
+    stale.target.source_revision = Some("changed-source".into());
+    worker
+        .try_request(VerificationJob::prepare(state.clone(), stale))
+        .unwrap();
+    assert!(matches!(
+        recv(&mut worker),
+        VerificationResult::Prepared {
+            approved: Err(VerificationError::InvalidApproval),
+            ..
+        }
+    ));
+    std::fs::remove_dir(&dir.0).unwrap();
+    worker
+        .try_request(VerificationJob::prepare(state, requested))
+        .unwrap();
+    assert!(matches!(
+        recv(&mut worker),
+        VerificationResult::Prepared {
+            approved: Err(VerificationError::InvalidApproval),
+            ..
+        }
+    ));
+    assert!(!data.exists());
+    assert!(!dir.0.exists());
 }

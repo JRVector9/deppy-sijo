@@ -1,0 +1,23 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/private/tmp/deppy-cc-conversation-target-20261022/debug/deps/web_remote-dfc968581fb454ba)
+
+running 1 test
+test work::tests::work_verification_execution_remains_native_only_for_every_remote_permission ... FAILED
+
+failures:
+
+---- work::tests::work_verification_execution_remains_native_only_for_every_remote_permission stdout ----
+
+thread 'work::tests::work_verification_execution_remains_native_only_for_every_remote_permission' (194512737) panicked at crates/web-remote/src/work.rs:522:21:
+assertion `left == right` failed: execute_verification: false/false
+  left: Bool(true)
+ right: false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    work::tests::work_verification_execution_remains_native_only_for_every_remote_permission
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 408 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p web-remote --lib`

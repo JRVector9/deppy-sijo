@@ -1,0 +1,103 @@
+   Compiling syn v2.0.119
+   Compiling smallvec v1.15.2
+   Compiling num-traits v0.2.19
+   Compiling memchr v2.8.2
+   Compiling hashbrown v0.17.1
+   Compiling serde v1.0.229
+   Compiling kurbo v0.13.1
+   Compiling bytemuck_derive v1.10.2
+   Compiling thiserror-impl v2.0.18
+   Compiling bytemuck v1.25.0
+   Compiling font-types v0.12.4
+   Compiling thiserror v2.0.18
+   Compiling color v0.3.3
+   Compiling euclid v0.22.14
+   Compiling serde_json v1.0.151
+   Compiling zerocopy v0.8.52
+   Compiling guillotiere v0.7.0
+   Compiling peniko v0.6.1
+   Compiling read-fonts v0.41.0
+   Compiling tracing-attributes v0.1.31
+   Compiling parking_lot_core v0.9.12
+   Compiling hashlink v0.12.0
+   Compiling tracing-core v0.1.36
+   Compiling getrandom v0.2.17
+   Compiling rusqlite v0.40.2
+   Compiling tracing v0.1.44
+   Compiling vello_common v0.1.0
+   Compiling ring v0.17.14
+   Compiling parking_lot v0.12.5
+   Compiling thiserror-impl v1.0.69
+   Compiling crypto-bigint v0.7.5
+   Compiling deppy-core v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/core)
+   Compiling aho-corasick v1.1.4
+   Compiling objc2 v0.6.4
+   Compiling crc32fast v1.5.0
+   Compiling emath v0.36.1
+   Compiling ecolor v0.36.1
+   Compiling regex-automata v0.4.18
+   Compiling ahash v0.8.12
+   Compiling thiserror v1.0.69
+   Compiling vello_cpu v0.1.0
+   Compiling skrifa v0.44.0
+   Compiling harfrust v0.12.0
+   Compiling cursor-icon v1.2.0
+   Compiling simd-adler32 v0.3.9
+   Compiling epaint v0.36.1
+   Compiling miniz_oxide v0.9.1
+   Compiling vte v0.15.0
+   Compiling filedescriptor v0.8.3
+   Compiling rustls-webpki v0.103.15
+   Compiling alacritty_terminal v0.26.0 (/private/tmp/deppy-cc-conversation-20261022/third_party/alacritty_terminal-0.26.0)
+   Compiling time v0.3.53
+   Compiling portable-pty v0.9.0 (/private/tmp/deppy-cc-conversation-20261022/third_party/portable-pty-0.9.0)
+   Compiling egui v0.36.1
+   Compiling rustls v0.23.46
+   Compiling objc2-foundation v0.3.2
+   Compiling elliptic-curve v0.14.1
+   Compiling flate2 v1.1.10
+   Compiling secret v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/secret)
+   Compiling mux v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/mux)
+   Compiling persist v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/persist)
+   Compiling terminal v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/terminal)
+   Compiling audit v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/audit)
+   Compiling pty v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/pty)
+   Compiling yasna v0.6.0
+   Compiling regex v1.13.1
+   Compiling rfc6979 v0.6.0
+   Compiling primefield v0.14.0
+   Compiling mcp-store v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/mcp-store)
+   Compiling storage-core v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/storage-core)
+   Compiling cobs v0.3.0
+   Compiling ecdsa v0.17.0
+   Compiling postcard v1.1.3
+   Compiling storage v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/storage)
+   Compiling primeorder v0.14.0
+   Compiling session v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/session)
+   Compiling rcgen v0.14.10
+   Compiling tungstenite v0.30.0
+   Compiling ureq v3.4.0
+   Compiling runtime v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/runtime)
+   Compiling p256 v0.14.0
+   Compiling web-remote v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/web-remote)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 40.62s
+     Running unittests src/lib.rs (/private/tmp/deppy-cc-conversation-target-20261022/debug/deps/web_remote-dfc968581fb454ba)
+
+running 1 test
+test work::tests::work_four_bounded_main_conversations_and_verification_outputs_keep_publishing ... FAILED
+
+failures:
+
+---- work::tests::work_four_bounded_main_conversations_and_verification_outputs_keep_publishing stdout ----
+
+thread 'work::tests::work_four_bounded_main_conversations_and_verification_outputs_keep_publishing' (194503936) panicked at crates/web-remote/src/work.rs:588:14:
+four valid bounded conversations and outputs must keep publishing: WorkError
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    work::tests::work_four_bounded_main_conversations_and_verification_outputs_keep_publishing
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 408 filtered out; finished in 0.06s
+
+error: test failed, to rerun pass `-p web-remote --lib`

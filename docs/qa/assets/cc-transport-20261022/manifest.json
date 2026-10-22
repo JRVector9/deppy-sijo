@@ -1,0 +1,7 @@
+{
+  "crates/web-remote/src/work.rs": "ee73e4bd6644355c52438f2645a06323632d69f8c4d7ee8bc4574d185eaec974",
+  "docs/qa/assets/cc-transport-20261022/clippy.log": "d1198508a214d43d818cb0d0fd89943c39c9c8e62a053292193872489e3d8492",
+  "docs/qa/assets/cc-transport-20261022/green.log": "8630cf838bc69631243b86d2297396f4478aeb2122e407bfec58ce89f8993487",
+  "docs/qa/assets/cc-transport-20261022/permissions-red.log": "c10ca83b9c4d6dfc67013c5c97a2fc92d0d2b66b0543e639c25b78529d5bdd85",
+  "docs/qa/assets/cc-transport-20261022/red.log": "857bec569f960d85da3d6731d157f909b11bcc445a5df20bbcd47098460dedf8"
+}

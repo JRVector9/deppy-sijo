@@ -191,9 +191,7 @@ pub fn encode_frame(v: &Value, input: bool, approval: bool) -> Result<String, Wo
         return Err(WorkError);
     }
     let mut projection = v.clone();
-    if !input || !approval {
-        filter(&mut projection, input, approval);
-    }
+    filter(&mut projection, input, approval);
     let frame = |projection: &Value| {
         serde_json::to_string(&serde_json::json!({"type":"work_snapshot","snapshot":projection}))
             .map_err(|_| WorkError)
@@ -227,6 +225,7 @@ fn compact_projection(projection: &mut Value) -> Result<(), WorkError> {
     let Some(projects) = projection.get_mut("projects").and_then(Value::as_array_mut) else {
         return Err(WorkError);
     };
+    compact_observations(projects)?;
     for project in projects {
         for key in ["goal", "main_summary"] {
             if let Some(value) = project.get_mut(key) {
@@ -317,6 +316,79 @@ fn compact_projection(projection: &mut Value) -> Result<(), WorkError> {
     ));
     Ok(())
 }
+
+/// Keep exact observation identities and reviewed process specs. Only display records/output
+/// may be omitted under frame pressure; every omission retains its existing truncation marker.
+fn compact_observations(projects: &mut [Value]) -> Result<(), WorkError> {
+    fn prefix(value: &mut Value, limit: usize) -> bool {
+        let Some(text) = value.as_str().filter(|text| text.len() > limit) else {
+            return false;
+        };
+        let mut end = limit;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        *value = Value::String(text[..end].to_owned());
+        true
+    }
+    let conversation_count = projects
+        .iter()
+        .filter(|project| project["main_conversation"].is_object())
+        .count();
+    let evidence_count = projects
+        .iter()
+        .filter_map(|project| project["tasks"].as_array())
+        .flatten()
+        .filter(|task| task["command_verification"].is_object())
+        .count();
+    let entry_budget = (64 * 1024 / conversation_count.max(1)).min(16 * 1024);
+    let output_limit = (64 * 1024 / evidence_count.max(1) / 2).min(512);
+    for project in projects {
+        if let Some(conversation) = project.get_mut("main_conversation")
+            && let Some(entries) = conversation
+                .get_mut("entries")
+                .and_then(Value::as_array_mut)
+        {
+            let original = std::mem::take(entries);
+            let original_len = original.len();
+            let mut budget = entry_budget;
+            let mut truncated = original_len > 20;
+            for mut entry in original.into_iter().rev().take(20) {
+                if let Some(text) = entry.get_mut("text") {
+                    truncated |= prefix(text, 512);
+                }
+                let size = serde_json::to_vec(&entry).map_err(|_| WorkError)?.len() + 1;
+                if size > budget {
+                    truncated = true;
+                    break;
+                }
+                budget -= size;
+                entries.push(entry);
+            }
+            entries.reverse();
+            if truncated {
+                conversation["truncated"] = Value::Bool(true);
+            }
+        }
+        if let Some(tasks) = project.get_mut("tasks").and_then(Value::as_array_mut) {
+            for task in tasks {
+                if let Some(evidence) = task.get_mut("command_verification") {
+                    for (stream, flag) in [
+                        ("stdout", "stdout_truncated"),
+                        ("stderr", "stderr_truncated"),
+                    ] {
+                        if let Some(output) = evidence.get_mut(stream)
+                            && prefix(output, output_limit)
+                        {
+                            evidence[flag] = Value::Bool(true);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
 /// Second outbound gate for callers that already hold a typed ServerMsg.
 pub fn projection_allowed(value: &Value, input: bool, approval: bool) -> bool {
     let mut filtered = value.clone();
@@ -333,6 +405,18 @@ fn filter(value: &mut Value, input: bool, approval: bool) {
         }
         Value::Object(m) => {
             for (key, v) in m {
+                if ["execute_verification", "cancel_verification"].contains(&key.as_str()) {
+                    if let Some(cap) = v.as_object_mut() {
+                        cap.insert("enabled".into(), Value::Bool(false));
+                        cap.insert(
+                            "reason".into(),
+                            Value::String(
+                                "로컬 검증 실행과 취소는 이 컴퓨터에서 직접 확인해 주세요.".into(),
+                            ),
+                        );
+                    }
+                    continue;
+                }
                 if key == "approval" && !approval {
                     *v = Value::Null;
                     continue;
@@ -505,6 +589,166 @@ mod tests {
                 true
             )
             .is_err()
+        );
+    }
+    #[test]
+    fn work_verification_execution_remains_native_only_for_every_remote_permission() {
+        let source = json!({"projects":[{"id":"w","tasks":[{
+            "execute_verification":{"enabled":true,"reason":"native admission"},
+            "cancel_verification":{"enabled":true,"reason":"native owned process"}
+        }]}]});
+        for input in [false, true] {
+            for approval in [false, true] {
+                let frame: Value =
+                    serde_json::from_str(&encode_frame(&source, input, approval).unwrap()).unwrap();
+                for key in ["execute_verification", "cancel_verification"] {
+                    let cap = &frame["snapshot"]["projects"][0]["tasks"][0][key];
+                    assert_eq!(cap["enabled"], false, "{key}: {input}/{approval}");
+                    assert!(!cap["reason"].as_str().unwrap().is_empty());
+                    assert_eq!(source["projects"][0]["tasks"][0][key]["enabled"], true);
+                }
+                assert!(!projection_allowed(&source, input, approval));
+                assert!(projection_allowed(&frame["snapshot"], input, approval));
+            }
+        }
+        for kind in ["execute_verification", "cancel_verification"] {
+            assert!(!validate_intent(
+                &json!({"type":kind,"target":{"workspace_id":"w","session_id":"s","task_id":"t"}})
+            ));
+        }
+    }
+
+    #[test]
+    fn work_four_bounded_main_conversations_and_verification_outputs_keep_publishing() {
+        use deppy_core::work_management::CommandVerificationEvidence;
+        let projects: Vec<_> = (0..4)
+            .map(|project| {
+                let workspace = format!("workspace-{project}");
+                let route = json!({"workspace_id":workspace,"session_id":format!("opaque-main-{project}"),"task_id":null});
+                let target = json!({"workspace_id":workspace,"task_id":format!("task-{project}"),"attempt_id":"exact-attempt","result_revision":7,"source_revision":"exact-source","artifact_revision":"exact-artifact"});
+                let evidence = json!({
+                    "id":format!("verification-{project}"),"target":target,
+                    "spec":{"command":"printf 'literal command'\n# exact command","cwd":"/project/exact-attempt","timeout_ms":60000,"output_limit_bytes":32768},
+                    "started_at_ms":1000,"ended_at_ms":2000,"outcome":"passed","exit_code":0,
+                    "stdout":format!("{}ab", "출".repeat(10922)),"stderr":format!("{}ab", "오".repeat(10922)),
+                    "stdout_truncated":false,"stderr_truncated":true,"error":null
+                });
+                let mut small = evidence.clone();
+                small["id"] = json!(format!("small-{project}"));
+                small["spec"]["output_limit_bytes"] = json!(1);
+                small["stdout"] = json!("x");
+                small["stderr"] = json!("y");
+                let mut running = small.clone();
+                running["id"] = json!(format!("pending-{project}"));
+                running["outcome"] = json!("running");
+                running["ended_at_ms"] = Value::Null;
+                running["exit_code"] = Value::Null;
+                running["stdout"] = json!("");
+                running["stderr"] = json!("");
+                let entries: Vec<_> = (0..100).map(|entry| json!({
+                    "id":format!("{}-{project}-{entry}","i".repeat(300)),
+                    "turn_id":format!("{}-{project}-{entry}","t".repeat(300)),
+                    "kind":"tool","tool_name":"exec_command","state":"completed","observed_at":null,
+                    "text":if entry >= 84 { format!("{}ab","말".repeat(2730)) } else { String::new() }
+                })).collect();
+                json!({"id":workspace,"main_target":route,
+                    "main_conversation":{"target":route,"generation":format!("{}-{project}","g".repeat(300)),"entries":entries,"truncated":false,"status":"실제 관측 기록"},
+                    "tasks":[{"command_verification":evidence},{"command_verification":small},{"command_verification":running}]
+                })
+            })
+            .collect();
+        let source = json!({"projects":projects,"status":"Observed"});
+        for project in source["projects"].as_array().unwrap() {
+            for task in project["tasks"].as_array().unwrap() {
+                serde_json::from_value::<CommandVerificationEvidence>(
+                    task["command_verification"].clone(),
+                )
+                .unwrap()
+                .validate()
+                .unwrap();
+            }
+        }
+        let encoded = encode_frame(&source, true, true)
+            .expect("four valid bounded conversations and outputs must keep publishing");
+        assert!(encoded.len() <= MAX_WORK_SNAPSHOT_BYTES);
+        let frame: Value = serde_json::from_str(&encoded).unwrap();
+        for (index, project) in frame["snapshot"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .enumerate()
+        {
+            let original = &source["projects"][index];
+            let conversation = &project["main_conversation"];
+            let entries = conversation["entries"].as_array().unwrap();
+            assert!(!entries.is_empty() && entries.len() <= 20);
+            assert_eq!(conversation["truncated"], true);
+            assert_eq!(
+                conversation["generation"],
+                original["main_conversation"]["generation"]
+            );
+            assert_eq!(
+                conversation["target"],
+                original["main_conversation"]["target"]
+            );
+            let original_entries = original["main_conversation"]["entries"].as_array().unwrap();
+            for (entry, original) in entries.iter().zip(&original_entries[100 - entries.len()..]) {
+                for key in ["id", "turn_id", "kind", "tool_name", "state", "observed_at"] {
+                    assert_eq!(entry[key], original[key], "{key}");
+                }
+                let text = entry["text"].as_str().unwrap();
+                assert!(text.len() <= 512 && original["text"].as_str().unwrap().starts_with(text));
+            }
+            for (index, task) in project["tasks"].as_array().unwrap().iter().enumerate() {
+                let evidence = &task["command_verification"];
+                let original = &original["tasks"][index]["command_verification"];
+                serde_json::from_value::<CommandVerificationEvidence>(evidence.clone())
+                    .unwrap()
+                    .validate()
+                    .unwrap();
+                for key in [
+                    "id",
+                    "target",
+                    "spec",
+                    "started_at_ms",
+                    "ended_at_ms",
+                    "outcome",
+                    "exit_code",
+                    "error",
+                ] {
+                    assert_eq!(evidence[key], original[key], "{key}");
+                }
+                for (stream, flag) in [
+                    ("stdout", "stdout_truncated"),
+                    ("stderr", "stderr_truncated"),
+                ] {
+                    let text = evidence[stream].as_str().unwrap();
+                    assert!(
+                        text.len() <= 512 && original[stream].as_str().unwrap().starts_with(text)
+                    );
+                    if evidence[stream] != original[stream] || original[flag] == true {
+                        assert_eq!(evidence[flag], true);
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            source["projects"][0]["main_conversation"]["entries"]
+                .as_array()
+                .unwrap()
+                .len(),
+            100
+        );
+        assert_eq!(
+            source["projects"][0]["main_conversation"]["truncated"],
+            false
+        );
+        assert_eq!(
+            source["projects"][0]["tasks"][0]["command_verification"]["stdout"]
+                .as_str()
+                .unwrap()
+                .len(),
+            32768
         );
     }
     #[test]

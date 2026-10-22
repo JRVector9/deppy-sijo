@@ -417,6 +417,21 @@ mod remote_tests {
             |write| write(),
         )
     }
+    fn wait_for_barrier(events: &RuntimeEventReceiver, correlation_id: u64) {
+        let until = Instant::now() + Duration::from_secs(2);
+        loop {
+            if events.drain().iter().any(|event| {
+                matches!(event, runtime::RuntimeEvent::DurableEventBarrierReached { correlation_id: reached } if *reached == correlation_id)
+            }) {
+                return;
+            }
+            assert!(
+                Instant::now() < until,
+                "SSH command barrier {correlation_id}"
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
     #[test]
     fn remote_wrapper_delegates_runtime_but_rejects_local_inspection_and_automatic_input() {
         let root =
@@ -577,10 +592,18 @@ mod remote_tests {
                 pane: runtime::MuxPaneId("closing-fixture".into()),
             })
             .unwrap();
+        captured_sink(RuntimeCommand::DurableEventBarrier { correlation_id: 41 });
+        wait_for_barrier(&events, 41);
         client.finish_remote_close();
         client
             .send_command(RuntimeCommand::RequestMuxSnapshot)
             .unwrap();
+        // Queue admission is not transport completion. Interrupt only after the
+        // final complete frame reached the backend, without masking truncated I/O.
+        client
+            .send_command(RuntimeCommand::DurableEventBarrier { correlation_id: 42 })
+            .unwrap();
+        wait_for_barrier(&events, 42);
         let start = Instant::now();
         client.shutdown();
         assert!(

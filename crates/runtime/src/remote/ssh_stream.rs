@@ -10,6 +10,7 @@ use crate::{
     InProcessRuntimeClient, RuntimeCommand, RuntimeCommandSendError, RuntimeCommandSink,
     RuntimeEventReceiver, RuntimeEventStream,
 };
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -24,6 +25,51 @@ const COMMAND_QUEUE_CAP: usize = 256;
 const COMMAND_QUEUE_BYTES: usize = 32 * 1024 * 1024;
 const RPC_PENDING_CAP: usize = 32;
 const RPC_WORK_QUEUE_CAP: usize = 8;
+
+// A remote supervisor has no Mac persistence DB. Its wire-facing session UUIDs
+// must still remain stable across bridge attachments and distinct from every
+// other verified target/runtime that can reuse the same numeric session IDs.
+fn session_uuid_scope(identity: &SshTargetIdentity, runtime: &str) -> anyhow::Result<Sha256> {
+    let identity = postcard::to_stdvec(identity)?;
+    let mut scope = Sha256::new();
+    scope.update(b"deppy.ssh.session-uuid.v1\0");
+    for field in [identity.as_slice(), runtime.as_bytes()] {
+        scope.update((field.len() as u64).to_be_bytes());
+        scope.update(field);
+    }
+    Ok(scope)
+}
+
+fn project_session_uuids(event: &mut crate::RuntimeEvent, scope: &Sha256) {
+    let crate::RuntimeEvent::MuxUpdated { snapshot } = event else {
+        return;
+    };
+    if !snapshot.tabs.iter().any(|tab| {
+        tab.panes
+            .iter()
+            .any(|pane| pane.session_id.is_some() && pane.persistent_session_id.is_none())
+    }) {
+        return;
+    }
+    for pane in Arc::make_mut(snapshot)
+        .tabs
+        .iter_mut()
+        .flat_map(|tab| &mut tab.panes)
+    {
+        if let Some(session) = pane.session_id
+            && pane.persistent_session_id.is_none()
+        {
+            let mut hash = scope.clone();
+            hash.update(session.0.to_be_bytes());
+            let mut bytes = [0; 16];
+            bytes.copy_from_slice(&hash.finalize()[..16]);
+            // RFC 9562 UUIDv8 permits an application-defined SHA256 layout.
+            bytes[6] = (bytes[6] & 0x0f) | 0x80;
+            bytes[8] = (bytes[8] & 0x3f) | 0x80;
+            pane.persistent_session_id = Some(uuid::Uuid::from_bytes(bytes).to_string());
+        }
+    }
+}
 
 struct RpcJob {
     context: SshRequestContext,
@@ -201,6 +247,7 @@ pub fn serve_ssh_stream_with_rpc_executor<R: Read + Send + 'static, W: Write + S
             connection_generation: hello.connection_generation,
             request_id: 0,
         };
+        let session_scope = session_uuid_scope(&hello.identity, &hello.runtime_instance)?;
         let pump = std::thread::Builder::new()
             .name("ssh-event-pump".into())
             .spawn(move || {
@@ -223,9 +270,10 @@ pub fn serve_ssh_stream_with_rpc_executor<R: Read + Send + 'static, W: Write + S
                             write_ssh_frame(&mut writer, &payload, limit)?;
                         }
                         for _ in 0..64 {
-                            let Some(event) = outbound.pop_front() else {
+                            let Some(mut event) = outbound.pop_front() else {
                                 break;
                             };
+                            project_session_uuids(&mut event, &session_scope);
                             validate_event(&event).map_err(anyhow::Error::msg)?;
                             let payload = postcard::to_stdvec(&SshResponseFrame::Event {
                                 context: event_context.clone(),
@@ -576,13 +624,10 @@ impl SshRuntimeClient {
         })();
         let _ = deadline_tx.send(());
         let _ = watchdog.join();
-        let hello = match handshake {
-            Ok(hello) => hello,
-            Err(error) => {
-                interrupt();
-                return Err(error);
-            }
-        };
+        // Completed I/O drops the stream normally. The transport owner must
+        // still observe natural exits such as a missing helper (127); cancelling
+        // here can overwrite that result. The watchdog interrupts blocked I/O.
+        let hello = handshake?;
         let (commands, command_rx) = sync_channel::<Vec<u8>>(COMMAND_QUEUE_CAP);
         let (rpc_tx, rpc_rx) = sync_channel(RPC_PENDING_CAP);
         let (liveness, liveness_rx) = sync_channel(1);
@@ -991,6 +1036,162 @@ mod tests {
             },
             backend.instance_token().into(),
         )
+    }
+
+    fn mux_identity_fixture() -> crate::RuntimeEvent {
+        let pane = crate::MuxPaneId::new();
+        let tab = crate::MuxTabId::new();
+        crate::RuntimeEvent::MuxUpdated {
+            snapshot: Arc::new(crate::MuxSnapshot {
+                active_tab: Some(tab.clone()),
+                focused_pane: Some(pane.clone()),
+                tabs: vec![crate::TabSnapshot {
+                    id: tab,
+                    title: "fixture".into(),
+                    layout: crate::LayoutNode::Pane(pane.clone()),
+                    panes: vec![crate::PaneSnapshot {
+                        id: pane,
+                        session_id: Some(crate::SessionId(1)),
+                        title: "fixture".into(),
+                        persistent_session_id: None,
+                    }],
+                }],
+            }),
+        }
+    }
+
+    #[test]
+    fn ssh_stream_completed_handshake_eof_preserves_owned_transport_exit() {
+        let backend = backend();
+        let hello = SshClientHello::new(config(&backend).identity, 1);
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&interrupts);
+        let result = SshRuntimeClient::connect(
+            std::io::Cursor::new(Vec::<u8>::new()),
+            Vec::<u8>::new(),
+            hello,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        assert!(result.is_err(), "EOF cannot establish a runtime client");
+        assert_eq!(
+            interrupts.load(Ordering::SeqCst),
+            0,
+            "a completed handshake failure must let the SSH owner observe the natural exit code"
+        );
+    }
+
+    #[test]
+    fn ssh_stream_partial_handshake_deadline_still_interrupts_blocked_transport() {
+        struct PartialFrame {
+            prefix_sent: bool,
+            interrupted: Receiver<()>,
+        }
+        impl Read for PartialFrame {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if !self.prefix_sent {
+                    self.prefix_sent = true;
+                    bytes[0] = 1;
+                    return Ok(1);
+                }
+                self.interrupted
+                    .recv_timeout(Duration::from_secs(7))
+                    .expect("hello deadline must unblock the partial frame");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "fixture interrupted",
+                ))
+            }
+        }
+        let backend = backend();
+        let hello = SshClientHello::new(config(&backend).identity, 1);
+        let (interrupt, interrupted) = sync_channel(1);
+        let interrupts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&interrupts);
+        let result = SshRuntimeClient::connect(
+            PartialFrame {
+                prefix_sent: false,
+                interrupted,
+            },
+            Vec::<u8>::new(),
+            hello,
+            Arc::new(move || {
+                observed.fetch_add(1, Ordering::SeqCst);
+                let _ = interrupt.try_send(());
+            }),
+        );
+        assert!(result.is_err());
+        assert!(interrupts.load(Ordering::SeqCst) >= 1);
+    }
+
+    fn projected_uuid(identity: &SshTargetIdentity, runtime: &str, session: u64) -> String {
+        let mut event = mux_identity_fixture();
+        let crate::RuntimeEvent::MuxUpdated { snapshot } = &mut event else {
+            unreachable!()
+        };
+        Arc::make_mut(snapshot).tabs[0].panes[0].session_id = Some(crate::SessionId(session));
+        project_session_uuids(&mut event, &session_uuid_scope(identity, runtime).unwrap());
+        let crate::RuntimeEvent::MuxUpdated { snapshot } = event else {
+            unreachable!()
+        };
+        snapshot.tabs[0].panes[0]
+            .persistent_session_id
+            .clone()
+            .unwrap()
+    }
+
+    #[test]
+    fn ssh_stream_session_uuid_is_stable_and_scoped_to_full_target_runtime_and_session() {
+        let identity = SshTargetIdentity {
+            remote_workspace_id: "workspace".into(),
+            account: "account".into(),
+            canonical_root: "/project".into(),
+            host_key_sha256: "SHA256:key".into(),
+        };
+        let id = projected_uuid(&identity, "runtime-a", 1);
+        let parsed = uuid::Uuid::parse_str(&id).unwrap();
+        assert_eq!(parsed.get_version_num(), 8);
+        assert_eq!(id, projected_uuid(&identity, "runtime-a", 1));
+        assert_ne!(id, projected_uuid(&identity, "runtime-a", 2));
+        assert_ne!(id, projected_uuid(&identity, "runtime-b", 1));
+        for field in 0..4 {
+            let mut other = identity.clone();
+            match field {
+                0 => other.remote_workspace_id.push('b'),
+                1 => other.account.push('b'),
+                2 => other.canonical_root.push('b'),
+                _ => other.host_key_sha256.push('b'),
+            }
+            assert_ne!(id, projected_uuid(&other, "runtime-a", 1));
+        }
+    }
+
+    #[test]
+    fn ssh_stream_uuid_projection_preserves_existing_ids_and_backend_snapshot() {
+        let backend = backend();
+        let identity = config(&backend).identity;
+        let scope = session_uuid_scope(&identity, backend.instance_token()).unwrap();
+        let original = mux_identity_fixture();
+        let mut projected = original.clone();
+        project_session_uuids(&mut projected, &scope);
+        let crate::RuntimeEvent::MuxUpdated { snapshot } = original else {
+            unreachable!()
+        };
+        assert!(snapshot.tabs[0].panes[0].persistent_session_id.is_none());
+        let crate::RuntimeEvent::MuxUpdated { snapshot } = &mut projected else {
+            unreachable!()
+        };
+        let preserved = uuid::Uuid::new_v4().to_string();
+        Arc::make_mut(snapshot).tabs[0].panes[0].persistent_session_id = Some(preserved.clone());
+        project_session_uuids(&mut projected, &scope);
+        let crate::RuntimeEvent::MuxUpdated { snapshot } = projected else {
+            unreachable!()
+        };
+        assert_eq!(
+            snapshot.tabs[0].panes[0].persistent_session_id,
+            Some(preserved)
+        );
     }
 
     #[test]

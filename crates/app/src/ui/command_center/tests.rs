@@ -70,6 +70,178 @@ fn fixture() -> Snapshot {
     }
 }
 
+fn conversation_fixture() -> Snapshot {
+    let mut value = serde_json::to_value(fixture()).unwrap();
+    value["projects"][0]["main_summary"] = "계획 요약은 대화가 아님".into();
+    value["projects"][0]["main_conversation"] = serde_json::json!({
+        "target": value["projects"][0]["main_target"],
+        "generation": "runtime-7:execution-3",
+        "entries": [
+            {"id":"input-1","turn_id":"turn-9","kind":"user","text":"사용자가 실제 전송한 목표"},
+            {"id":"tool-1","turn_id":"turn-9","kind":"tool","text":"cargo test --offline\n실행 출력","tool_name":"exec_command","state":"completed","observed_at":"2026-10-22 14:20"},
+            {"id":"answer-1","turn_id":"turn-9","kind":"agent","text":"메인이 실제로 응답한 내용"}
+        ],
+        "truncated": false,
+        "status": "정확한 메인 세션에서 관측"
+    });
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn main_conversation_renders_bound_user_agent_and_real_tool_activity() {
+    let snapshot = conversation_fixture();
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1400.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            UiState::default(),
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    harness.get_by_label("사용자가 실제 전송한 목표");
+    harness.get_by_label("메인이 실제로 응답한 내용");
+    harness.get_by_label("cargo test --offline\n실행 출력");
+    harness.get_by_label("exec_command · 완료");
+    harness.get_by_label("2026-10-22 14:20");
+    assert_eq!(harness.query_all_by_label("계획·배정").count(), 2);
+}
+
+#[test]
+fn main_conversation_never_renders_a_previous_main_or_foreign_workspace() {
+    for field in ["session_id", "workspace_id", "task_id"] {
+        let mut value = serde_json::to_value(conversation_fixture()).unwrap();
+        value["projects"][0]["main_conversation"]["target"][field] = "different-owner".into();
+        let snapshot: Snapshot = serde_json::from_value(value).unwrap();
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1400.0))
+            .build_ui_state(
+                |ui, state| {
+                    show(ui, state, &snapshot);
+                },
+                UiState::default(),
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        assert!(
+            harness
+                .query_by_label("사용자가 실제 전송한 목표")
+                .is_none(),
+            "{field}"
+        );
+        assert!(
+            harness
+                .query_by_label("메인이 실제로 응답한 내용")
+                .is_none(),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn main_conversation_bounds_latest_entries_and_utf8_before_rendering() {
+    let mut snapshot = conversation_fixture();
+    assert_eq!(
+        snapshot.projects[0]
+            .main_conversation
+            .as_ref()
+            .unwrap()
+            .entries[1]
+            .state,
+        Some(ConversationActivityState::Completed)
+    );
+    let project = &mut snapshot.projects[0];
+    let source = project.main_conversation.as_mut().unwrap();
+    let entry = source.entries[0].clone();
+    source.entries = (0..103)
+        .map(|i| ConversationEntry {
+            id: format!("record-{i}"),
+            text: "기록".into(),
+            ..entry.clone()
+        })
+        .collect();
+    let bounded = project.visible_main_conversation().unwrap();
+    let bounded = bounded.bounded();
+    assert_eq!(bounded.entries.len(), 100);
+    assert_eq!(bounded.entries[0].id, "record-3");
+    assert_eq!(bounded.entries.last().unwrap().id, "record-102");
+    assert!(bounded.truncated);
+    let source = project.main_conversation.as_mut().unwrap();
+    for entry in &mut source.entries {
+        entry.text = "한😀".repeat(9000);
+    }
+    let bounded = project.visible_main_conversation().unwrap();
+    assert!(bounded.entries.iter().all(|entry| entry.text.len() <= 8192));
+    assert!(
+        bounded
+            .entries
+            .iter()
+            .map(|entry| entry.text.len())
+            .sum::<usize>()
+            <= 128 * 1024
+    );
+    assert!(bounded.truncated);
+    assert_eq!(bounded.entries.last().unwrap().id, "record-102");
+    project
+        .main_conversation
+        .as_mut()
+        .unwrap()
+        .generation
+        .clear();
+    assert!(project.visible_main_conversation().is_none());
+    project.main_conversation.as_mut().unwrap().generation = "next-generation".into();
+    project.main_target.session_id = None;
+    assert!(project.visible_main_conversation().is_none());
+}
+
+#[test]
+#[ignore = "offscreen GPU conversation evidence; never starts the app"]
+fn main_conversation_render_evidence() {
+    let output = std::env::var_os("DEPPY_CC_CONVERSATION_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/private/tmp/deppy-cc-conversation-evidence-20261022".into());
+    std::fs::create_dir_all(&output).unwrap();
+    for width in [1440.0, 390.0] {
+        for dark in [true, false] {
+            let mut snapshot = conversation_fixture();
+            snapshot.dark_mode = dark;
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(
+                    width,
+                    if width == 390.0 { 844.0 } else { 1000.0 },
+                ))
+                .build_ui_state(
+                    |ui, state| {
+                        let rect = ui.ctx().viewport_rect();
+                        let mut surface = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                        surface.set_clip_rect(rect);
+                        show(&mut surface, state, &snapshot);
+                    },
+                    UiState::default(),
+                );
+            use_korean_font(&mut harness);
+            harness.remove_cursor();
+            harness.run();
+            let name = format!(
+                "conversation-{}-{}",
+                width as u32,
+                if dark { "dark" } else { "light" }
+            );
+            harness
+                .render()
+                .expect("offscreen egui conversation")
+                .save(output.join(format!("{name}.png")))
+                .unwrap();
+            std::fs::write(
+                output.join(format!("{name}.snapshot.json")),
+                serde_json::to_vec_pretty(&snapshot).unwrap(),
+            )
+            .unwrap();
+        }
+    }
+}
+
 #[test]
 fn terminal_view_exposes_native_slot_separate_from_composer() {
     let snapshot = fixture();

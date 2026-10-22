@@ -9,6 +9,28 @@ const str = value => typeof value === 'string' ? value : '';
 const list = value => Array.isArray(value) ? value : [];
 const copy = value => JSON.parse(JSON.stringify(value));
 const routeKey = target => target ? JSON.stringify([target.workspace_id, target.session_id ?? null, target.task_id ?? null]) : '';
+const CONVERSATION_ENTRIES = 100, CONVERSATION_TEXT = 8 * 1024, CONVERSATION_TOTAL = 128 * 1024;
+function boundedConversationText(value, limit) {
+  const text = str(value).slice(0, limit), data = encoder.encode(text);
+  if (data.length <= limit) return text;
+  let end = limit;
+  while (end && (data[end] & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(data.subarray(0, end));
+}
+function mainConversation(p) {
+  const source = p.main_conversation, target = p.main_target;
+  if (!source || !target?.session_id || target.workspace_id !== p.id || target.task_id != null || routeKey(source.target) !== routeKey(target) || !str(source.generation).trim()) return null;
+  const supplied = list(source.entries), entries = []; let budget = CONVERSATION_TOTAL, truncated = source.truncated === true || supplied.length > CONVERSATION_ENTRIES;
+  for (const entry of supplied.slice(-CONVERSATION_ENTRIES).reverse()) {
+    if (!['user', 'agent', 'tool'].includes(entry?.kind)) continue;
+    if (!budget) { truncated = true; break; }
+    const text = boundedConversationText(entry.text, Math.min(CONVERSATION_TEXT, budget));
+    truncated ||= text !== entry.text;
+    budget -= bytes(text);
+    entries.push({...entry, id: boundedConversationText(entry.id, 256), turn_id: boundedConversationText(entry.turn_id, 256), tool_name: boundedConversationText(entry.tool_name, 256), observed_at: boundedConversationText(entry.observed_at, 256), text});
+  }
+  return {...source, generation: boundedConversationText(source.generation, 256), status: boundedConversationText(source.status, 1024), truncated, entries: entries.reverse()};
+}
 const states = {
   plan_review: ['계획 검토', 'amber'], queued: ['실행 대기', 'muted'], running: ['실행 중', 'accent'],
   waiting_approval: ['승인 대기', 'amber'], waiting_input: ['입력 대기', 'amber'],
@@ -470,6 +492,23 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       section.append(node('span', 'cc-thread-label', key.toUpperCase()), body); body.append(node('h2', '', caption)); content.append(section); return body;
     };
     const mainBody = thread('main', tasks.length ? '구현과 독립 리뷰를 나누고, 결과를 모아 검증합니다.' : '첫 목표를 메인 에이전트에게 맡겨 주세요.');
+    const conversation = mainConversation(p);
+    if (conversation) {
+      mainBody.querySelector('h2').textContent = '메인 대화';
+      const transcript = node('div', 'cc-conversation'); transcript.dataset.ccConversation = ''; transcript.dataset.ccGeneration = conversation.generation;
+      for (const entry of conversation.entries) {
+        const item = node('article', 'cc-conversation-entry cc-conversation-' + entry.kind); item.dataset.ccConversationEntry = entry.id;
+        if (entry.turn_id) { item.dataset.ccTurn = entry.turn_id; item.title = '턴 · ' + entry.turn_id; }
+        const metadata = node('div', 'cc-conversation-meta');
+        const activity = {running: '실행 중', completed: '완료', failed: '실패', cancelled: '취소됨', unknown: '관측 불명'}[entry.state];
+        metadata.append(node('strong', '', entry.kind === 'user' ? '사용자' : entry.kind === 'agent' ? '메인' : [entry.tool_name || '도구', activity].filter(Boolean).join(' · ')));
+        if (entry.observed_at) metadata.append(node('time', '', entry.observed_at));
+        item.append(metadata, node(entry.kind === 'tool' ? 'pre' : 'p', entry.kind === 'tool' ? 'cc-log' : 'cc-conversation-text', entry.text)); transcript.append(item);
+      }
+      if (conversation.status) transcript.append(node('p', 'cc-muted cc-conversation-status', conversation.status));
+      if (conversation.truncated) transcript.append(node('p', 'cc-muted cc-conversation-status', '최근 대화 일부를 표시합니다. 전체 내용은 원문 터미널에서 확인하세요.'));
+      mainBody.append(transcript, node('h3', 'cc-conversation-context', '계획·배정'));
+    }
     mainBody.append(node('p', 'cc-main-summary', p.main_summary || (tasks.length ? '메인은 범위와 완료 조건을 정합니다. 각 작업자는 독립 세션에서 실행하고, 현재 진행은 오른쪽에서 계속 확인할 수 있습니다.' : '아래 입력창에 목표를 쓰면 배정안을 확인할 수 있습니다.')));
     const outline = node('div', 'cc-assignment-outline');
     tasks.slice(0, 3).forEach((task, index) => {

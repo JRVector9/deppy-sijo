@@ -31,6 +31,27 @@ const click=selector=>{const button=view.element.querySelector(selector);check(!
 const message=async()=>{try{
  let snapshot=makeSnapshot();receive(snapshot);await tick();
  check(view.element.textContent.includes('실제 프로젝트 A'),'real snapshot project must render');
+ { // MAIN conversation is supplied by the exact bound host, never inferred from a project summary.
+ const conversation=makeSnapshot(),conversationSent=[],cp=conversation.projects[0];
+ cp.main_conversation={target:cp.main_target,generation:'runtime-7:execution-3',entries:[
+  {id:'input-1',turn_id:'turn-9',kind:'user',text:'사용자가 실제 전송한 목표'},
+  {id:'tool-1',turn_id:'turn-9',kind:'tool',text:'cargo test --offline\n실행 출력',tool_name:'exec_command',state:'completed',observed_at:'2026-10-22 14:20'},
+  {id:'answer-1',turn_id:'turn-9',kind:'agent',text:'메인이 실제로 응답한 내용'}
+ ],truncated:false,status:'정확한 메인 세션에서 관측'};
+ const cv=createCommandCenterView({host:mount,send:msg=>{conversationSent.push(msg);return true;}}),cq=s=>cv.element.querySelector(s),cr=()=>cv.accept({type:'work_snapshot',snapshot:conversation});cr();
+ check([...cv.element.querySelectorAll('[data-cc-conversation-entry]')].map(e=>e.dataset.ccConversationEntry).join('|')==='input-1|tool-1|answer-1','MAIN renders actual user, tool and agent records in host order');
+ check(cq('[data-cc-conversation-entry="input-1"]').textContent.includes('사용자가 실제 전송한 목표')&&cq('[data-cc-conversation-entry="answer-1"]').textContent.includes('메인이 실제로 응답한 내용'),'MAIN uses actual user and agent text');
+ check(cq('[data-cc-conversation-entry="tool-1"]').textContent.includes('exec_command · 완료')&&cq('[data-cc-conversation-entry="tool-1"] pre').textContent==='cargo test --offline\n실행 출력','MAIN shows the actual tool name, state and command/output');
+ check(cq('[data-cc-conversation-entry="tool-1"] time').textContent==='2026-10-22 14:20'&&!cq('[data-cc-conversation-entry="input-1"] time')&&!cq('[data-cc-conversation-entry="answer-1"] time'),'MAIN only shows host supplied timestamps');
+ check(cq('[data-cc-conversation-entry="tool-1"]').dataset.ccTurn==='turn-9'&&cq('[data-cc-conversation]').dataset.ccGeneration==='runtime-7:execution-3','MAIN preserves exact source generation and turn');
+ for(const width of [1440,390]){mount.style.width=width+'px';await tick();check(cq('[data-cc-conversation]').getBoundingClientRect().width<=cq('.cc-content').clientWidth&&cv.element.querySelector('.cc-app').scrollWidth<=width,'actual conversation fits approved viewport '+width);}
+ const originalTarget=cp.main_conversation.target;for(const field of ['workspace_id','session_id','task_id']){cp.main_conversation.target={...cp.main_target,[field]:'other-owner'};cr();check(!cq('[data-cc-conversation-entry]'),'MAIN rejects stale or foreign '+field);}cp.main_conversation.target=originalTarget;
+ cp.main_conversation.generation='';cr();check(!cq('[data-cc-conversation-entry]'),'MAIN rejects missing source generation');cp.main_conversation.generation='runtime-8:execution-1';
+ cp.main_conversation.entries=Array.from({length:103},(_,i)=>({id:'bounded-'+i,turn_id:'turn-10',kind:'agent',text:'bounded record '+i}));cr();check(cv.element.querySelectorAll('[data-cc-conversation-entry]').length===100&&cq('[data-cc-conversation-entry]').dataset.ccConversationEntry==='bounded-3','MAIN keeps latest one hundred actual records');
+ cp.main_conversation.entries=Array.from({length:100},(_,i)=>({id:'bytes-'+i,kind:'agent',text:'한'.repeat(9000)}));cr();const boundedTexts=[...cv.element.querySelectorAll('.cc-conversation-text')].map(e=>e.textContent);check(boundedTexts.every(text=>new TextEncoder().encode(text).length<=8192&&!text.includes('�'))&&boundedTexts.reduce((sum,text)=>sum+new TextEncoder().encode(text).length,0)<=131072&&!!cq('.cc-conversation-status'),'MAIN byte limits preserve UTF8 and bound total source text');
+ cp.main_conversation.entries=[{id:'literal',kind:'agent',text:'<img src=x onerror=alert(1)> <script>unsafe</script>'}];cr();check(!cq('[data-cc-conversation] img')&&!cq('[data-cc-conversation] script')&&cq('[data-cc-conversation-entry="literal"]').textContent.includes('<script>unsafe</script>'),'MAIN treats untrusted source text as text');
+ check(conversationSent.length===0,'conversation rendering emits no mutation');cv.destroy(); }
+
  check(view.element.querySelectorAll('[data-cc-nav]').length===5,'approved five navigation entries');
  // Snapshot updates must preserve non-text controls and modal keyboard ownership.
  const snapshotFailures=[];

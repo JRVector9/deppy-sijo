@@ -239,6 +239,92 @@ fn home(
         rule(ui, snapshot);
     }
     thread(ui, snapshot, "MAIN", |ui| {
+        if let Some(conversation) = p.visible_main_conversation() {
+            title(ui, snapshot, "메인 대화");
+            for (index, entry) in conversation.entries.iter().enumerate() {
+                ui.push_id(
+                    (
+                        "main-conversation",
+                        &conversation.generation,
+                        &entry.id,
+                        index,
+                    ),
+                    |ui| {
+                        ui.add_space(12.0);
+                        let caption = match entry.kind {
+                            ConversationEntryKind::User => "사용자".to_owned(),
+                            ConversationEntryKind::Agent => "메인".to_owned(),
+                            ConversationEntryKind::Tool => {
+                                let name = entry
+                                    .tool_name
+                                    .as_deref()
+                                    .filter(|v| !v.is_empty())
+                                    .unwrap_or("도구");
+                                entry.state.map_or_else(
+                                    || name.to_owned(),
+                                    |s| format!("{name} · {}", s.label()),
+                                )
+                            }
+                        };
+                        ui.horizontal_wrapped(|ui| {
+                            let response = ui.label(
+                                egui::RichText::new(caption)
+                                    .size(11.0 * snapshot.font_scale)
+                                    .strong(),
+                            );
+                            if let Some(turn) = &entry.turn_id {
+                                response.on_hover_text(format!(
+                                    "턴 · {turn}\n세대 · {}",
+                                    conversation.generation
+                                ));
+                            }
+                            if let Some(time) = &entry.observed_at {
+                                weak(ui, snapshot, time);
+                            }
+                        });
+                        ui.add_space(8.0);
+                        if entry.kind == ConversationEntryKind::Tool {
+                            egui::ScrollArea::vertical()
+                                .id_salt("tool-output")
+                                .max_height(200.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            egui::RichText::new(&entry.text)
+                                                .monospace()
+                                                .size(11.0 * snapshot.font_scale),
+                                        )
+                                        .wrap()
+                                        .selectable(true),
+                                    );
+                                });
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(&entry.text)
+                                        .size(12.0 * snapshot.font_scale)
+                                        .line_height(Some(22.2 * snapshot.font_scale)),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        }
+                    },
+                );
+            }
+            if !conversation.status.is_empty() {
+                weak(ui, snapshot, &conversation.status);
+            }
+            if conversation.truncated {
+                weak(
+                    ui,
+                    snapshot,
+                    "최근 대화 일부를 표시합니다. 전체 내용은 원문 터미널에서 확인하세요.",
+                );
+            }
+            ui.add_space(20.0);
+            title(ui, snapshot, "계획·배정");
+        }
         title(
             ui,
             snapshot,

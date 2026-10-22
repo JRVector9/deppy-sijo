@@ -1,0 +1,123 @@
+{
+  "receipts": [],
+  "projects": [
+    {
+      "main_conversation": {
+        "target": {
+          "workspace_id": "project-a",
+          "session_id": "opaque-pane-a",
+          "task_id": null
+        },
+        "generation": "runtime-7:execution-3",
+        "entries": [
+          {
+            "id": "input-1",
+            "turn_id": "turn-9",
+            "kind": "user",
+            "text": "사용자가 실제 전송한 목표",
+            "tool_name": null,
+            "state": null,
+            "observed_at": null
+          },
+          {
+            "id": "tool-1",
+            "turn_id": "turn-9",
+            "kind": "tool",
+            "text": "cargo test --offline\n실행 출력",
+            "tool_name": "exec_command",
+            "state": "completed",
+            "observed_at": "2026-10-22 14:20"
+          },
+          {
+            "id": "answer-1",
+            "turn_id": "turn-9",
+            "kind": "agent",
+            "text": "메인이 실제로 응답한 내용",
+            "tool_name": null,
+            "state": null,
+            "observed_at": null
+          }
+        ],
+        "truncated": false,
+        "status": "정확한 메인 세션에서 관측"
+      },
+      "available_agents": [],
+      "pending_approvals": [],
+      "create_main": {
+        "enabled": false,
+        "reason": ""
+      },
+      "loaded": false,
+      "storage_retry": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "planner_prompt": null,
+      "id": "project-a",
+      "name": "프로젝트 A",
+      "directory": "/projects/a",
+      "goal": "",
+      "main_summary": "계획 요약은 대화가 아님",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "project-a",
+        "session_id": "opaque-pane-a",
+        "task_id": null
+      },
+      "main_provider": "",
+      "main_model": "",
+      "main_effort": "",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [],
+      "tasks": [],
+      "history": [],
+      "config": {
+        "allowed_scope_roots": [],
+        "name": "",
+        "directory": "",
+        "main_session_id": null,
+        "provider": "",
+        "model": "",
+        "effort": "",
+        "worker_providers": [],
+        "parallel_limit": 0,
+        "automation": "",
+        "use_worktrees": false,
+        "revision": ""
+      },
+      "save_settings": {
+        "enabled": false,
+        "reason": ""
+      },
+      "available_providers": [],
+      "available_models": [],
+      "available_efforts": [],
+      "available_automation": []
+    }
+  ],
+  "selected_workspace_id": "project-a",
+  "devices": [],
+  "dark_mode": true,
+  "font_scale": 1.0,
+  "labels": {},
+  "add_project": {
+    "enabled": false,
+    "reason": ""
+  },
+  "manage_devices": {
+    "enabled": false,
+    "reason": ""
+  },
+  "status": ""
+}

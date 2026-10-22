@@ -261,6 +261,128 @@ pub struct SidebarWorkspaceEntry {
     pub name: String,
     pub state: SidebarWorkspaceState,
     pub summary: SidebarSessionSummary,
+    pub ssh_context: Option<SidebarSshContext>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SshConnectionStatus {
+    Connecting,
+    Connected,
+    Offline,
+}
+
+/// Validated target metadata supplied by App, independent of the editable workspace alias.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSshContext {
+    pub authority: String,
+    pub root: String,
+    pub status: SshConnectionStatus,
+}
+
+impl SidebarSshContext {
+    fn status_text(&self, catalog: &i18n::Catalog) -> String {
+        catalog.t(
+            match self.status {
+                SshConnectionStatus::Connecting => "workspace.ssh.status.connecting",
+                SshConnectionStatus::Connected => "workspace.ssh.status.connected",
+                SshConnectionStatus::Offline => "workspace.ssh.status.offline",
+            },
+            &[],
+        )
+    }
+    fn status_color(&self, colors: crate::ui::designall::Tokens) -> egui::Color32 {
+        match self.status {
+            SshConnectionStatus::Connected => colors.success,
+            SshConnectionStatus::Connecting => colors.warning,
+            SshConnectionStatus::Offline => colors.muted_text,
+        }
+    }
+    fn tooltip(&self, catalog: &i18n::Catalog) -> String {
+        format!(
+            "{}\n{}\n{}",
+            self.authority,
+            self.root,
+            self.status_text(catalog)
+        )
+    }
+}
+
+pub fn ssh_workspace_context_strip(
+    ui: &mut egui::Ui,
+    context: &SidebarSshContext,
+    catalog: &i18n::Catalog,
+) {
+    let colors = crate::ui::designall::tokens(ui.visuals());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), 28.0), egui::Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0.0, colors.workspace_background);
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        crate::ui::designall::separator_stroke(ui.visuals()),
+    );
+    response.on_hover_text(context.tooltip(catalog));
+    if rect.width() < 100.0 {
+        return;
+    }
+    let badge = egui::Rect::from_min_size(rect.min + egui::vec2(8.0, 4.0), egui::vec2(28.0, 20.0));
+    ui.put(
+        badge,
+        egui::Label::new(
+            egui::RichText::new("SSH")
+                .size(10.0)
+                .strong()
+                .color(colors.accent),
+        ),
+    )
+    .on_hover_text(context.tooltip(catalog));
+    let status = context.status_text(catalog);
+    let status_width = ui.fonts_mut(|fonts| {
+        fonts
+            .layout_no_wrap(
+                status.clone(),
+                egui::FontId::proportional(11.0),
+                colors.text,
+            )
+            .size()
+            .x
+    });
+    let status_rect = egui::Rect::from_min_max(
+        egui::pos2(
+            (rect.right() - status_width - 8.0).max(badge.right()),
+            rect.top() + 4.0,
+        ),
+        egui::pos2(rect.right() - 8.0, rect.bottom() - 4.0),
+    );
+    ui.put(
+        status_rect,
+        egui::Label::new(
+            egui::RichText::new(status)
+                .size(11.0)
+                .color(context.status_color(colors)),
+        )
+        .truncate(),
+    )
+    .on_hover_text(context.tooltip(catalog));
+    let identity_rect = egui::Rect::from_min_max(
+        egui::pos2(badge.right() + 6.0, rect.top() + 4.0),
+        egui::pos2(
+            (status_rect.left() - 8.0).max(badge.right() + 6.0),
+            rect.bottom() - 4.0,
+        ),
+    );
+    ui.put(
+        identity_rect,
+        egui::Label::new(
+            egui::RichText::new(format!("{} · {}", context.authority, context.root))
+                .monospace()
+                .size(11.0)
+                .color(colors.muted_text),
+        )
+        .truncate(),
+    )
+    .on_hover_text(context.tooltip(catalog));
 }
 
 /// 접힌 워크스페이스 행에 표시할 세션 상태 총합. 한 세션은 정확히 한 상태에만 들어간다.
@@ -1342,6 +1464,17 @@ impl FileTreeUi {
 
     pub fn collapse_project_file_panel(&mut self) {
         self.collapsed = true;
+    }
+
+    pub fn files_are_visible(&self) -> bool {
+        !self.collapsed && self.selected_tool == SidebarTool::Files
+    }
+
+    pub fn maintenance_is_busy(&self) -> bool {
+        self.maintenance_intent.is_some()
+            || self.pending_maintenance.is_some()
+            || !self.pending_refresh_dirs.is_empty()
+            || self.listing_walk.is_some()
     }
 
     /// Worker completions can request this dialog before the sidebar renders it.
@@ -5441,6 +5574,11 @@ fn workspace_row(
             workspace.name.as_str(),
         )
     });
+    let response = if let Some(context) = &workspace.ssh_context {
+        response.on_hover_text(context.tooltip(catalog))
+    } else {
+        response
+    };
     if !ui.is_rect_visible(full_rect) {
         return WorkspaceRowResponse {
             row: response,
@@ -5496,14 +5634,28 @@ fn workspace_row(
     ui.painter().rect_filled(avatar, 1.0, avatar_fill);
     // 아바타는 빠른 식별용 마크라 첫 글자를 항상 대문자로 고정한다. 반대로 실제
     // 워크스페이스 이름은 사용자가 지정한 대소문자를 그대로 보존한다.
-    let initial = workspace_initial(&workspace.name);
-    ui.painter().text(
-        avatar.center(),
-        egui::Align2::CENTER_CENTER,
-        initial,
-        crate::fonts::sidebar_font(ui.ctx(), 9.0),
-        egui::Color32::WHITE,
-    );
+    let compact_ssh = workspace.ssh_context.is_some() && rect.width() < 96.0;
+    if compact_ssh {
+        ui.put(
+            avatar,
+            egui::Label::new(
+                egui::RichText::new("SSH")
+                    .size(7.0)
+                    .strong()
+                    .color(egui::Color32::WHITE),
+            ),
+        )
+        .on_hover_text(workspace.ssh_context.as_ref().unwrap().tooltip(catalog));
+    } else {
+        let initial = workspace_initial(&workspace.name);
+        ui.painter().text(
+            avatar.center(),
+            egui::Align2::CENTER_CENTER,
+            initial,
+            crate::fonts::sidebar_font(ui.ctx(), 9.0),
+            egui::Color32::WHITE,
+        );
+    }
     // 접힌 행에만 상태 점. 아바타 오른쪽 위 모서리에 얹고 배경색 테두리로 떼어 내
     // 어떤 워크스페이스 고유색 위에서도 읽히게 한다.
     if expanded == Some(false)
@@ -5558,12 +5710,39 @@ fn workspace_row(
         } else {
             7.0
         };
-        let name_width = (rect.right() - reserved_right - avatar.right() - 7.5).max(0.0);
+        let ssh_width = if workspace.ssh_context.is_some() && !compact_ssh {
+            30.0
+        } else {
+            0.0
+        };
+        if ssh_width > 0.0
+            && let Some(context) = &workspace.ssh_context
+        {
+            let badge = egui::Rect::from_min_size(
+                egui::pos2(rect.right() - reserved_right - 24.0, rect.center().y - 8.0),
+                egui::vec2(24.0, 16.0),
+            );
+            let colors = crate::ui::designall::tokens(ui.visuals());
+            ui.painter()
+                .rect_filled(badge, 2.0, colors.accent.gamma_multiply(0.10));
+            ui.put(
+                badge,
+                egui::Label::new(
+                    egui::RichText::new("SSH")
+                        .size(9.0)
+                        .strong()
+                        .color(colors.accent),
+                ),
+            )
+            .on_hover_text(context.tooltip(catalog));
+        }
+        let name_right = rect.right() - reserved_right - ssh_width;
+        let name_width = (name_right - avatar.right() - 7.5).max(0.0);
         if let Some(edit) = edit {
             let input_rect = egui::Rect::from_min_max(
                 egui::pos2(avatar.right() + 7.5, full_rect.top() + 3.0),
                 egui::pos2(
-                    (rect.right() - reserved_right).max(avatar.right() + 8.5),
+                    name_right.max(avatar.right() + 8.5),
                     full_rect.bottom() - 3.0,
                 ),
             );
@@ -8763,6 +8942,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ssh_workspace_sidebar_badge_preserves_alias_and_exposes_server_context() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let workspace = SidebarWorkspaceEntry {
+            id: "remote-sidebar-fixture".into(),
+            name: "My project alias".into(),
+            state: SidebarWorkspaceState::Active,
+            summary: Default::default(),
+            ssh_context: Some(SidebarSshContext {
+                authority: "ubuntu@verified.example:2222".into(),
+                root: "/srv/project".into(),
+                status: SshConnectionStatus::Offline,
+            }),
+        };
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(320.0, 100.0))
+            .with_step_dt(1.0)
+            .build_ui(move |ui| {
+                workspace_row(
+                    ui,
+                    &workspace,
+                    egui::Color32::LIGHT_BLUE,
+                    true,
+                    None,
+                    None,
+                    &catalog,
+                );
+            });
+        harness.run();
+        harness.get_by_label("My project alias");
+        harness.get_by_label("SSH").hover();
+        harness.run();
+        assert!(
+            harness
+                .query_by_label_contains("ubuntu@verified.example:2222")
+                .is_some()
+        );
+        assert!(harness.query_by_label_contains("/srv/project").is_some());
+    }
+
+    #[test]
+    fn ssh_workspace_terminal_context_shows_identity_and_connection_in_narrow_space() {
+        use egui_kittest::kittest::Queryable as _;
+        for (status, label) in [
+            (SshConnectionStatus::Connected, "Connected"),
+            (SshConnectionStatus::Connecting, "Connecting…"),
+            (SshConnectionStatus::Offline, "Offline"),
+        ] {
+            let context = SidebarSshContext {
+                authority: "ubuntu@verified.example:2222".into(),
+                root: "/srv/project with spaces/deep/folder".into(),
+                status,
+            };
+            let catalog = i18n::Catalog::load("en-US").unwrap();
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(egui::vec2(240.0, 100.0))
+                .build_ui(move |ui| ssh_workspace_context_strip(ui, &context, &catalog));
+            harness.run();
+            let badge = harness.get_by_label("SSH").rect();
+            let state = harness.get_by_label(label).rect();
+            let identity = harness
+                .get_by_label_contains("ubuntu@verified.example:2222")
+                .rect();
+            assert!(badge.left() >= 0.0 && state.right() <= 240.0);
+            assert!(identity.left() >= badge.right() && identity.right() <= state.left());
+        }
+    }
+
+    #[test]
     fn file_tree_os_drop은_공유_오른쪽_경계를_소유하지_않는다() {
         let tree_area = egui::Rect::from_min_max(egui::pos2(10.0, 20.0), egui::pos2(110.0, 120.0));
 
@@ -9105,6 +9353,7 @@ mod tests {
     fn 같은_이니셜의_워크스페이스도_서로_다른_색상_계열을_쓴다() {
         let workspaces = (0..6)
             .map(|index| SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: format!("stable-id-{index}"),
                 name: format!("same-{index}"),
                 state: SidebarWorkspaceState::Idle,
@@ -9143,6 +9392,7 @@ mod tests {
         let context = egui::Context::default();
         install_sidebar_test_fonts(&context);
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -9206,6 +9456,7 @@ mod tests {
     #[test]
     fn 워크스페이스_선택이_바뀌어도_생성순서가_고정된다() {
         let workspaces = ["first", "second", "third"].map(|id| SidebarWorkspaceEntry {
+            ssh_context: None,
             id: id.to_owned(),
             name: id.to_owned(),
             state: SidebarWorkspaceState::Idle,
@@ -10672,6 +10923,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -11284,6 +11536,7 @@ mod tests {
         drain_listings(&mut tree);
         let workspaces: Vec<SidebarWorkspaceEntry> = (0..5)
             .map(|i| SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
                 state: SidebarWorkspaceState::Idle,
@@ -11455,12 +11708,14 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![
             SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: "workspace-a".to_owned(),
                 name: "Workspace A".to_owned(),
                 state: SidebarWorkspaceState::Active,
                 summary: SidebarSessionSummary::default(),
             },
             SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: "workspace-b".to_owned(),
                 name: "Workspace B".to_owned(),
                 state: SidebarWorkspaceState::Warm,
@@ -11639,12 +11894,14 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![
             SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: "workspace-a".to_owned(),
                 name: "Workspace A".to_owned(),
                 state: SidebarWorkspaceState::Active,
                 summary: SidebarSessionSummary::default(),
             },
             SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: "workspace-b".to_owned(),
                 name: "Workspace B".to_owned(),
                 state: SidebarWorkspaceState::Warm,
@@ -11781,6 +12038,7 @@ mod tests {
         drain_listings(&mut tree);
         let workspaces: Vec<SidebarWorkspaceEntry> = (0..13)
             .map(|i| SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: format!("ws-{i}"),
                 name: format!("workspace-{i}"),
                 state: SidebarWorkspaceState::Idle,
@@ -12114,6 +12372,7 @@ mod tests {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces: Vec<SidebarWorkspaceEntry> = (0..count)
             .map(|index| SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: format!("workspace-{index:02}"),
                 name: format!("Workspace {index:02}"),
                 state: if index == 0 {
@@ -14706,6 +14965,7 @@ mod tests {
     fn kittest_워크스페이스_우클릭이_종료메뉴를_연다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-close".to_owned(),
             name: "closer".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -14742,6 +15002,7 @@ mod tests {
             ),
         ] {
             let workspace = SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: "ws-close".to_owned(),
                 name: "closer".to_owned(),
                 state,
@@ -14773,6 +15034,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-session".to_owned(),
             name: "session-target".to_owned(),
             state: SidebarWorkspaceState::Idle,
@@ -14805,6 +15067,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-rename".to_owned(),
             name: "sleeper".to_owned(),
             state: SidebarWorkspaceState::Idle,
@@ -14833,6 +15096,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load("en-US").unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-inline".into(),
             name: "Serenity".into(),
             state: SidebarWorkspaceState::Active,
@@ -14944,12 +15208,14 @@ mod tests {
         ] {
             let workspaces = [
                 SidebarWorkspaceEntry {
+                    ssh_context: None,
                     id: "workspace-a".to_owned(),
                     name: "Workspace A".to_owned(),
                     state: SidebarWorkspaceState::Active,
                     summary: SidebarSessionSummary::default(),
                 },
                 SidebarWorkspaceEntry {
+                    ssh_context: None,
                     id: "workspace-b".to_owned(),
                     name: "Workspace B".to_owned(),
                     state,
@@ -14997,6 +15263,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-b".to_owned(),
             name: "Workspace B".to_owned(),
             state: SidebarWorkspaceState::Warm,
@@ -15091,6 +15358,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -15169,6 +15437,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -15282,6 +15551,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -15400,6 +15670,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-b".to_owned(),
             name: "Workspace B".to_owned(),
             state: SidebarWorkspaceState::Warm,
@@ -15484,6 +15755,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-b".to_owned(),
             name: "Workspace B".to_owned(),
             state: SidebarWorkspaceState::Warm,
@@ -15663,6 +15935,7 @@ mod tests {
             let workspace_id = "workspace-a";
             let active_workspace_id = "workspace-a";
             let workspace = SidebarWorkspaceEntry {
+                ssh_context: None,
                 id: workspace_id.to_owned(),
                 name: workspace_id.to_owned(),
                 state,
@@ -15724,6 +15997,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspace = SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-narrow".to_owned(),
             name: "narrow".to_owned(),
             state: SidebarWorkspaceState::Active,
@@ -16363,6 +16637,7 @@ mod tests {
             .save(output.join("13-delete.png"))
             .unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-inline".into(),
             name: "Serenity".into(),
             state: SidebarWorkspaceState::Active,
@@ -16861,6 +17136,7 @@ mod tests {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-audit".into(),
             name: "Audit workspace".into(),
             state: SidebarWorkspaceState::Active,
@@ -17118,6 +17394,7 @@ mod tests {
 
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "workspace-a".to_owned(),
             name: "Workspace A".to_owned(),
             state: SidebarWorkspaceState::Active,

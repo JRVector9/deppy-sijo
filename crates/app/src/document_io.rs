@@ -86,6 +86,8 @@ pub enum DocumentIoErrorCode {
     ReplaceFailed,
     /// 저장할 내용이 상한을 넘는다.
     ContentTooLarge,
+    /// Revision belongs to a different execution target.
+    TargetMismatch,
 }
 
 impl DocumentIoErrorCode {
@@ -103,6 +105,7 @@ impl DocumentIoErrorCode {
             Self::TempSyncFailed => "document_temp_sync_failed",
             Self::ReplaceFailed => "document_replace_failed",
             Self::ContentTooLarge => "document_content_too_large",
+            Self::TargetMismatch => "document_target_mismatch",
         }
     }
 }
@@ -110,7 +113,27 @@ impl DocumentIoErrorCode {
 /// 저장 시 외부 변경을 감지하는 데 쓰는 스냅샷 — mtime + len (+ unix면 device/inode).
 /// 내용은 담지 않는다.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DocumentRevision {
+pub enum DocumentRevision {
+    Local(LocalDocumentRevision),
+    Remote {
+        scope: [u8; 32],
+        revision: RemoteDocumentRevision,
+    },
+}
+
+/// Remote helper revision, kept separate from local filesystem metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteDocumentRevision {
+    pub device: u64,
+    pub inode: u64,
+    pub length: u64,
+    pub modified_seconds: i64,
+    pub modified_nanoseconds: i64,
+    pub sha256: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalDocumentRevision {
     modified: std::time::SystemTime,
     len: u64,
     #[cfg(any(unix, windows))]
@@ -132,12 +155,12 @@ impl DocumentRevision {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            Ok(Self {
+            Ok(Self::Local(LocalDocumentRevision {
                 modified,
                 len: metadata.len(),
                 device: metadata.dev(),
                 inode: metadata.ino(),
-            })
+            }))
         }
         #[cfg(windows)]
         {
@@ -155,20 +178,20 @@ impl DocumentRevision {
             }
             // SAFETY: the successful API call initialized every field.
             let identity = unsafe { identity.assume_init() };
-            Ok(Self {
+            Ok(Self::Local(LocalDocumentRevision {
                 modified,
                 len: metadata.len(),
                 device: u64::from(identity.dwVolumeSerialNumber),
                 inode: (u64::from(identity.nFileIndexHigh) << 32)
                     | u64::from(identity.nFileIndexLow),
-            })
+            }))
         }
         #[cfg(not(any(unix, windows)))]
         {
-            Ok(Self {
+            Ok(Self::Local(LocalDocumentRevision {
                 modified,
                 len: metadata.len(),
-            })
+            }))
         }
     }
 }
@@ -483,6 +506,11 @@ pub enum DocumentSaveOutcome {
 /// 읽어 비교하고, 다르면(또는 파일이 사라졌으면) **덮어쓰지 않고** 충돌을 돌려준다(§7).
 /// 외부 변경을 자동으로 다시 읽지는 않는다 — 호출자가 재로드 여부를 선택한다.
 pub fn save_document(request: DocumentSaveRequest) -> DocumentSaveOutcome {
+    if matches!(request.expected_revision, DocumentRevision::Remote { .. }) {
+        return DocumentSaveOutcome::Failed {
+            code: DocumentIoErrorCode::TargetMismatch,
+        };
+    }
     let byte_len = request.contents.len() as u64;
     if byte_len > DOCUMENT_REFUSE_BYTES_MAX {
         let code = DocumentIoErrorCode::ContentTooLarge;
@@ -552,6 +580,35 @@ pub fn save_document(request: DocumentSaveRequest) -> DocumentSaveOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_document_revision_cannot_enter_the_local_save_lane() {
+        let dir = unique_dir("remote-revision");
+        let path = write_file(&dir, "same.md", b"local original");
+        let outcome = save_document(DocumentSaveRequest {
+            path: path.clone(),
+            contents: "remote content".into(),
+            expected_revision: DocumentRevision::Remote {
+                scope: [1; 32],
+                revision: RemoteDocumentRevision {
+                    device: 1,
+                    inode: 2,
+                    length: 3,
+                    modified_seconds: 4,
+                    modified_nanoseconds: 5,
+                    sha256: [6; 32],
+                },
+            },
+        });
+        assert!(matches!(
+            outcome,
+            DocumentSaveOutcome::Failed {
+                code: DocumentIoErrorCode::TargetMismatch
+            }
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), b"local original");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     type BeforeCommit = Box<dyn FnOnce(&Path)>;
     thread_local! {

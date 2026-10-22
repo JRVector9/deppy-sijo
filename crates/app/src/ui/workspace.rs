@@ -22404,6 +22404,7 @@ https://example.test/login \
         let text = catalog();
         let config = TerminalConfig::default();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-input".into(),
             name: "Input regression".into(),
             state: SidebarWorkspaceState::Active,
@@ -22732,6 +22733,7 @@ https://example.test/login \
         let text = catalog();
         let config = TerminalConfig::default();
         let workspaces = vec![SidebarWorkspaceEntry {
+            ssh_context: None,
             id: "ws-inline".into(),
             name: "Serenity".into(),
             state: SidebarWorkspaceState::Active,

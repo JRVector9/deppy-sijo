@@ -66,6 +66,19 @@ fn verification_worker_distinguishes_nonzero_exit_and_spawn_failure() {
 }
 
 #[test]
+fn verification_worker_rejects_replaced_directory_at_the_same_approved_path() {
+    let dir = Fixture::new();
+    let approved = dir.approve("printf escaped > should-not-run.txt");
+    let moved = Fixture(dir.0.with_extension("moved"));
+    std::fs::rename(&dir.0, &moved.0).unwrap();
+    std::fs::create_dir(&dir.0).unwrap();
+    let evidence = run(approved, &RedactionService::new());
+    assert_eq!(evidence.outcome, CommandVerificationOutcome::SpawnFailed);
+    assert!(!dir.0.join("should-not-run.txt").exists());
+    assert!(!moved.0.join("should-not-run.txt").exists());
+}
+
+#[test]
 fn verification_worker_redacts_before_capping_each_stream_and_drains_without_deadlock() {
     let dir = Fixture::new();
     let redaction = RedactionService::new();

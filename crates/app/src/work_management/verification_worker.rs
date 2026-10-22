@@ -1,5 +1,5 @@
 //! Bounded asynchronous local shell execution; durable evidence is separate from task completion.
-use super::verification::{ApprovedVerification, now_ms};
+use super::verification::{ApprovedVerification, now_ms, same_directory};
 use crate::lazy_worker::{LazyBoundedWorker, LazyWorkerSubmitError};
 use deppy_core::WorkspaceId;
 use deppy_core::work_management::*;
@@ -123,7 +123,7 @@ impl Drop for VerificationWorker {
     }
 }
 
-fn safe_metadata(
+pub(crate) fn safe_metadata(
     redaction: &RedactionService,
     id: &VerificationId,
     target: &VerificationTarget,
@@ -287,12 +287,19 @@ fn run(
         mut initial,
         cancel,
         canonical_folder,
+        folder_handle,
     } = approved;
     if cancel.load(Ordering::Acquire) {
         terminal(&mut initial, CommandVerificationOutcome::Cancelled, None);
         return initial;
     }
-    if std::fs::canonicalize(&initial.spec.cwd).ok().as_ref() != Some(&canonical_folder) {
+    let folder_identity_matches = std::fs::metadata(&initial.spec.cwd)
+        .ok()
+        .zip(folder_handle.metadata().ok())
+        .is_some_and(|(current, pinned)| same_directory(&current, &pinned));
+    if std::fs::canonicalize(&initial.spec.cwd).ok().as_ref() != Some(&canonical_folder)
+        || !folder_identity_matches
+    {
         terminal(
             &mut initial,
             CommandVerificationOutcome::SpawnFailed,
@@ -302,17 +309,29 @@ fn run(
     }
     #[cfg(unix)]
     {
+        use std::os::fd::AsRawFd as _;
         use std::os::unix::process::CommandExt as _;
         use std::process::{Command, Stdio};
         let mut command = Command::new("/bin/sh");
         command
             .arg("-c")
             .arg(&initial.spec.command)
-            .current_dir(&initial.spec.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .process_group(0);
+        let folder_fd = folder_handle.as_raw_fd();
+        // SAFETY: folder_handle stays alive through spawn; fchdir is async-signal-safe.
+        // The child enters the reviewed inode, so a path/symlink replacement after the
+        // parent-side check cannot redirect execution into another directory.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::fchdir(folder_fd) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         let child = match command.spawn() {
             Ok(child) => child,
             Err(_) => {

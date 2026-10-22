@@ -7,6 +7,7 @@ pub(crate) struct ApprovedVerification {
     pub(super) initial: CommandVerificationEvidence,
     pub(super) cancel: Arc<AtomicBool>,
     pub(super) canonical_folder: std::path::PathBuf,
+    pub(super) folder_handle: std::fs::File,
 }
 impl ApprovedVerification {
     pub fn id(&self) -> &VerificationId {
@@ -65,6 +66,28 @@ pub(crate) fn approve_local(
             "verification cwd must be the exact local attempt folder".into(),
         ));
     }
+    let expected_metadata = std::fs::metadata(&canonical_folder)
+        .map_err(|_| ValidationError("approved local attempt folder is unavailable".into()))?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let folder_handle = options
+        .open(&canonical_folder)
+        .map_err(|_| ValidationError("approved local attempt folder cannot be pinned".into()))?;
+    let pinned_metadata = folder_handle
+        .metadata()
+        .map_err(|_| ValidationError("approved local attempt folder cannot be inspected".into()))?;
+    if !same_directory(&expected_metadata, &pinned_metadata)
+        || std::fs::canonicalize(&spec.cwd).ok().as_ref() != Some(&canonical_folder)
+    {
+        return Err(ValidationError(
+            "approved local attempt folder changed during review".into(),
+        ));
+    }
     let initial = CommandVerificationEvidence {
         id: VerificationId::new(),
         target: VerificationTarget {
@@ -90,8 +113,22 @@ pub(crate) fn approve_local(
     Ok(ApprovedVerification {
         initial,
         canonical_folder,
+        folder_handle,
         cancel: Arc::new(AtomicBool::new(false)),
     })
+}
+
+pub(super) fn same_directory(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        a.is_dir() && b.is_dir() && a.dev() == b.dev() && a.ino() == b.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a, b);
+        false
+    }
 }
 
 fn verifiable_state(state: WorkState) -> bool {

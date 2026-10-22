@@ -1,3 +1,21 @@
+# 워크스페이스 비선택 우클릭 종료 — 구현·검증 완료 (2026-10-22)
+
+- Current objective: main에서 선택하지 않은 사이드바 워크스페이스를 hover/우클릭해 해당 워크스페이스 종료 메뉴를 사용하도록 수정 완료. 아래 세 파일을 local main에 커밋했으며 사용자 보고를 마무리한다.
+- Canonical worktree: `/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022`, actual branch `main`, base/origin `f78ebb69`. origin/main fetch 후 기존 main을 fast-forward했다. nominal dirty worktree 및 Command Center feature 브랜치는 보존한다.
+- Completed: 메뉴에서 Idle 제한 제거; App handler도 visible entry 존재만 확인하여 Idle 종료를 접수; missing/hidden target은 Ignore 유지; 확인 설정 유지 및 세션 수에 inactive 포함. 우클릭한 B의 ID로 종료하며 A를 선택/전환하지 않는다.
+- Modified files: `crates/app/src/ui/file_tree.rs`, `crates/app/src/app.rs`, `docs/CODEX_HANDOFF.md`만 변경.
+- Root cause: snapshot은 비선택/비warm workspace를 저장된 pane 유무와 무관하게 Idle로 만들지만 메뉴와 App dispatch가 `state != Idle`을 요구했다. Idle은 런타임 상주 상태이지 종료 가능 여부가 아니다. row/context menu의 대상 id 전달은 기존부터 정확했다.
+- Design decisions: 모든 visible workspace에 종료 메뉴 제공(빈 Idle 포함). 기존 종료 정책 유지: live/warm 세션 정리, 프로젝트 설정 보존, Idle의 수동 재열기용 persisted layout 보존 및 closed ID 영속화/자동복원 차단. 새 runtime 생성·선택 전환·layout 삭제는 추가하지 않았다. 기존 공용 확인창의 디자인/컴포넌트는 변경하지 않았다.
+- Parallel review: GPT-6.1-Sol/xhigh `workspace_menu_fix`는 file_tree 구현/테스트, `workspace_close_review`는 snapshot/dispatch/대상별 cleanup/영속 종료 읽기 전용 검토. root가 App 수정·통합·Cargo를 수행했다. 독립 최종 diff review CLEAN. 컨트롤러의 A 보존은 실제 UI action 회귀+기존 was_active guard 소스로 확인했으며 실제 사용자 App runtime 통합 테스트로 주장하지 않는다.
+- Actual RED: menu-body 0PASS/1FAIL(Idle 메뉴 누락), App policy 0PASS/1FAIL(Ignore vs CloseNow). 최초 UI cohort 0PASS/2FAIL 중 actual-popup 하나는 잘못된 한국어 literal fixture이므로 제품 재현으로 세지 않는다. catalog label로 교정 후 actual A/B popup RED 0PASS/1FAIL(Idle 메뉴 누락, Warm 통과). 로그 `/private/tmp/deppy-workspace-menu-red-{ui,ui-corrected,app}-20261022.log`.
+- Actual GREEN commands: `CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-sijo --bin deppy-sijo <filter> -- --nocapture`. filters/results: `kittest_workspace_close_menu` 2PASS; `workspace_close_policy_accepts_unselected_workspaces_without_a_runtime` 1PASS; `ui::file_tree::tests` 205PASS/3ignored; `workspace_close` 9PASS/1ignored; `워크스페이스_종료확인_policy` 1PASS; `initial_workspace_` 3PASS; `closed_workspace_never_admits_an_automatic_catalog_restore` 1PASS; `영속_종료는_stale_pane` 1PASS. 로그 test name 중복 제거 **218PASS/0FAIL/4ignored**. ignored 4개는 기존 opt-in 시각검증용 harness이며 이번에 실행하지 않았다. 결과 `/private/tmp/deppy-workspace-menu-tests-20261022.json` 및 각 연결 log.
+- Final gates: App-only rustfmt 교정 후 `cargo fmt --all --check` exit0; `CARGO_BUILD_JOBS=2 cargo clippy --offline --locked -p deppy-sijo --bin deppy-sijo --tests -- -D warnings` exit0; `git diff --check` exit0. 결과 `/private/tmp/deppy-workspace-menu-checks-20261022.json`. 별도 main target을 APFS clone하여 다른 tree 빌드와 분리했다.
+- Failed approaches: 한국어 label literal 가정은 catalog 반환값 사용으로 교정; 최초 fmt check의 App match 줄바꿈 1곳 교정 후 성공. 이 Git 버전에서 unsupported `git worktree add --ignore-other-worktrees` exit129; 이전 main worktree 경로가 실제 사라졌음을 확인한 뒤 `git worktree add -f <canonical> main`으로 생성했다. 기존 파일 삭제/reset/prune 없음.
+- Release/runtime: 사용자용 산출물 배포 없이 source+test만 수정, version bump 불필요. 앱 종료·실행·재시작·사용자 세션 종료·push는 하지 않았다. 원 feature branch는 별도 보존한다.
+- Remaining: 제품 수정/필수 검증 없음. local main commit `fix: allow closing unselected sidebar workspaces` 완료. Exact inspection commands (canonical에서): `git status --short`; `git log -1 --format='%h %s'`; `git show --stat HEAD`. 이후 새 요청이 없다면 재빌드·재실행·원격 push를 하지 않는다.
+
+---
+
 # 최종 인계 — 제품 완료, 증거 PR236
 
 - 제품 구현·교차리뷰·실제 검증·main 반영·0.13.0 package 검증은 모두 완료됐다. 제품PR235/main0b54b888, 검증headfa2c2489. 상세명령/수치/미검증범위는 바로아래와 QAguide/package-result.json을 기준으로 한다. 새제품수정·재빌드·재실행은 필요하지 않다.

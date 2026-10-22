@@ -5748,9 +5748,8 @@ fn disclosure_chevron_points(center: egui::Pos2, expanded: bool) -> [egui::Pos2;
     }
 }
 
-/// 워크스페이스 행 우클릭 메뉴 — 「세션 추가」와 「이름 바꾸기」(별칭 편집)는 세션이
-/// 없어도 항상, 「워크스페이스 종료」(세션 일괄 닫기, 선택적 확인은 App)는 닫을
-/// 세션이 있는 비 Idle만.
+/// 워크스페이스 행 우클릭 메뉴 — 선택·런타임·세션 유무와 관계없이 클릭한 워크스페이스의
+/// 세션 추가·이름 바꾸기·종료를 제공한다. 종료 확인과 실제 처리는 App 소관이다.
 fn workspace_context_menu(
     resp: &egui::Response,
     workspace: &SidebarWorkspaceEntry,
@@ -5762,9 +5761,7 @@ fn workspace_context_menu(
     });
 }
 
-/// 메뉴 본문 — 팝업 없이 렌더할 수 있게 분리해 kittest 대상으로 삼는다
-/// (workspace.rs last_output_menu_items 관례 — kittest는 press/release를 다른
-/// 프레임에 재생해 실제 팝업 안 버튼의 clicked를 관측하지 못한다).
+/// 메뉴 본문 — 실제 행 우클릭 경로와 별도로 상태별 액션을 검증할 수 있게 분리한다.
 fn workspace_context_menu_items(
     ui: &mut egui::Ui,
     workspace: &SidebarWorkspaceEntry,
@@ -5776,8 +5773,7 @@ fn workspace_context_menu_items(
     let close_label = catalog.t("sidebar.menu.close_workspace", &[]);
     // 메뉴 폭이 좁으면 「워크스페이스 종료」가 두 줄로 접혀 잘렸다(2026-07-18 사용자
     // 스샷). 가장 긴 항목의 no-wrap 폭으로 최소 폭을 강제해(max_rect까지 확장된다)
-    // 어느 로케일에서도 모든 항목이 항상 한 줄로 그려지게 한다. Idle이라 종료 항목이
-    // 빠져도 세 항목 모두 재서 메뉴 폭이 상태에 따라 널뛰지 않게 한다.
+    // 어느 로케일에서도 모든 항목이 항상 한 줄로 그려지게 한다.
     let font = egui::TextStyle::Button.resolve(ui.style());
     let widest = [
         open_session_label.as_str(),
@@ -5803,14 +5799,12 @@ fn workspace_context_menu_items(
         *action = Some(SidebarAction::RenameWorkspace(workspace.id.clone()));
         ui.close();
     }
-    if workspace.state != SidebarWorkspaceState::Idle {
-        ui.separator();
-        if super::context_menu::danger_button(ui, close_label, super::context_menu::Icon::Close)
-            .clicked()
-        {
-            *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
-            ui.close();
-        }
+    ui.separator();
+    if super::context_menu::danger_button(ui, close_label, super::context_menu::Icon::Close)
+        .clicked()
+    {
+        *action = Some(SidebarAction::CloseWorkspace(workspace.id.clone()));
+        ui.close();
     }
 }
 
@@ -14707,9 +14701,7 @@ mod tests {
         harness
     }
 
-    /// 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).
-    /// 팝업 안 버튼 클릭은 kittest가 press/release를 다른 프레임에 재생해 관측 불가
-    /// — 액션 방출은 아래 분리 본문 테스트가 검증한다.
+    /// 활성 워크스페이스 행 우클릭 → 「워크스페이스 종료」 메뉴가 열린다 (실제 팝업 경로).
     #[test]
     fn kittest_워크스페이스_우클릭이_종료메뉴를_연다() {
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
@@ -14726,33 +14718,52 @@ mod tests {
         );
     }
 
-    /// 종료 메뉴 본문 클릭 → CloseWorkspace(id) 액션 방출 (last_output_menu_items 관례).
+    /// 런타임·세션 유무와 관계없이 종료 메뉴는 클릭한 워크스페이스 id를 보존한다.
     #[test]
-    fn kittest_종료메뉴_클릭이_close_workspace_액션을_낸다() {
+    fn kittest_workspace_close_menu_items_preserve_target_for_every_state() {
         use egui_kittest::kittest::Queryable;
         let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let workspace = SidebarWorkspaceEntry {
-            id: "ws-close".to_owned(),
-            name: "closer".to_owned(),
-            state: SidebarWorkspaceState::Warm,
-            summary: SidebarSessionSummary::default(),
-        };
-        let mut harness = egui_kittest::Harness::new_ui_state(
-            |ui, action: &mut Option<SidebarAction>| {
-                workspace_context_menu_items(ui, &workspace, &catalog, action);
-            },
-            None,
-        );
-        harness.run();
-        harness.get_by_label("Close workspace sessions").click();
-        harness.run();
-        assert!(
-            matches!(
-                harness.state(),
-                Some(SidebarAction::CloseWorkspace(id)) if id == "ws-close"
+        for (state, summary) in [
+            (
+                SidebarWorkspaceState::Active,
+                SidebarSessionSummary::default(),
             ),
-            "종료 메뉴 클릭이 CloseWorkspace 액션을 내지 않음"
-        );
+            (
+                SidebarWorkspaceState::Warm,
+                SidebarSessionSummary::default(),
+            ),
+            (
+                SidebarWorkspaceState::Idle,
+                SidebarSessionSummary::inactive(2),
+            ),
+            (
+                SidebarWorkspaceState::Idle,
+                SidebarSessionSummary::inactive(0),
+            ),
+        ] {
+            let workspace = SidebarWorkspaceEntry {
+                id: "ws-close".to_owned(),
+                name: "closer".to_owned(),
+                state,
+                summary,
+            };
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                |ui, action: &mut Option<SidebarAction>| {
+                    workspace_context_menu_items(ui, &workspace, &catalog, action);
+                },
+                None,
+            );
+            harness.run();
+            harness.get_by_label("Close workspace sessions").click();
+            harness.run();
+            assert!(
+                matches!(
+                    harness.state(),
+                    Some(SidebarAction::CloseWorkspace(id)) if id == "ws-close"
+                ),
+                "종료 메뉴가 대상 id를 보존하지 않음: {state:?}, {summary:?}"
+            );
+        }
     }
 
     /// 워크스페이스 상태와 관계없이 대상 워크스페이스에서 새 세션을 시작할 수 있어야
@@ -14910,27 +14921,74 @@ mod tests {
         assert!(ctx.text_edit_focused());
     }
 
-    /// Idle(비활성) 워크스페이스 메뉴에도 「세션 추가」와 「이름 바꾸기」는 있고 종료
-    /// 항목만 없다 — 닫을 세션이 없다.
+    /// A를 선택한 채 B를 hover/우클릭/종료한다. Idle은 런타임 상태이므로 저장된 세션이
+    /// 있거나 비어 있어도 B를 먼저 선택할 필요가 없고, 종료 대상 역시 B여야 한다.
     #[test]
-    fn kittest_비활성_워크스페이스에는_종료메뉴가_없다() {
-        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
-        let workspaces = vec![SidebarWorkspaceEntry {
-            id: "ws-idle".to_owned(),
-            name: "sleeper".to_owned(),
-            state: SidebarWorkspaceState::Idle,
-            summary: SidebarSessionSummary::inactive(0),
-        }];
-        let mut harness = close_menu_harness(&workspaces, "ws-active-elsewhere", &catalog);
-        assert!(
-            right_click_scan(&mut harness, "Rename workspace"),
-            "Idle 워크스페이스 행에 이름 바꾸기 메뉴가 없다"
-        );
-        assert!(
-            !right_click_scan(&mut harness, "Close workspace sessions"),
-            "Idle 워크스페이스 행에 종료 메뉴가 떴다"
-        );
-        assert!(harness.state().1.is_empty(), "Idle 행 우클릭이 액션을 냄");
+    fn kittest_workspace_close_menu_targets_unselected_workspace_without_switching() {
+        use egui_kittest::kittest::Queryable;
+        let catalog = i18n::Catalog::load("ko-KR").unwrap();
+        let close_label = catalog.t("sidebar.menu.close_workspace", &[]);
+        for (state, summary) in [
+            (
+                SidebarWorkspaceState::Warm,
+                SidebarSessionSummary::default(),
+            ),
+            (
+                SidebarWorkspaceState::Idle,
+                SidebarSessionSummary::inactive(2),
+            ),
+            (
+                SidebarWorkspaceState::Idle,
+                SidebarSessionSummary::inactive(0),
+            ),
+        ] {
+            let workspaces = [
+                SidebarWorkspaceEntry {
+                    id: "workspace-a".to_owned(),
+                    name: "Workspace A".to_owned(),
+                    state: SidebarWorkspaceState::Active,
+                    summary: SidebarSessionSummary::default(),
+                },
+                SidebarWorkspaceEntry {
+                    id: "workspace-b".to_owned(),
+                    name: "Workspace B".to_owned(),
+                    state,
+                    summary,
+                },
+            ];
+            let mut harness = close_menu_harness(&workspaces, "workspace-a", &catalog);
+            harness.run();
+            let target = harness.get_by_label("Workspace B").rect().center();
+            harness.hover_at(target);
+            harness.run();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos: target,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            assert!(
+                harness.state().1.is_empty(),
+                "B hover/우클릭이 워크스페이스 전환 액션을 냄: {state:?}, {summary:?}"
+            );
+            assert_eq!(
+                harness.state().0.last_sidebar_active_workspace.as_deref(),
+                Some("workspace-a")
+            );
+            harness.get_by_label(&close_label).click();
+            harness.run();
+            assert!(
+                matches!(
+                    harness.state().1.as_slice(),
+                    [SidebarAction::CloseWorkspace(id)] if id == "workspace-b"
+                ),
+                "선택하지 않은 B의 실제 메뉴가 B 종료 액션을 내지 않음: {state:?}, {summary:?}"
+            );
+        }
     }
 
     #[test]

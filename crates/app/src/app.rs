@@ -11144,9 +11144,11 @@ enum WorkspaceCloseDisposition {
 
 fn workspace_close_disposition(
     confirmation_enabled: bool,
-    has_closeable_sessions: bool,
+    workspace: Option<&ui::file_tree::SidebarWorkspaceEntry>,
 ) -> WorkspaceCloseDisposition {
-    if !has_closeable_sessions {
+    // Idle describes runtime residency, not whether a visible workspace can be closed.
+    // Keep the clicked workspace as the target without activating/restoring it first.
+    if workspace.is_none() {
         WorkspaceCloseDisposition::Ignore
     } else if confirmation_enabled {
         WorkspaceCloseDisposition::Confirm
@@ -36812,19 +36814,15 @@ impl eframe::App for App {
                     let entry = sidebar_workspaces
                         .iter()
                         .find(|entry| entry.id == workspace_id);
-                    let has_closeable_sessions = entry.is_some_and(|entry| {
-                        entry.state != ui::file_tree::SidebarWorkspaceState::Idle
-                    });
-                    match workspace_close_disposition(
-                        self.config.ui.confirm_workspace_close,
-                        has_closeable_sessions,
-                    ) {
+                    match workspace_close_disposition(self.config.ui.confirm_workspace_close, entry)
+                    {
                         WorkspaceCloseDisposition::Confirm => {
-                            let entry = entry.expect("closeable workspace entry");
+                            let entry = entry.expect("visible workspace entry");
                             // 세션·실행 중 수는 사이드바 행이 그린 것과 같은 원천(summary) —
                             // 다이얼로그 숫자가 방금 본 행 요약과 어긋나지 않는다.
                             let s = entry.summary;
-                            let total = s.running + s.waiting + s.done + s.error + s.idle;
+                            let total =
+                                s.running + s.waiting + s.done + s.error + s.idle + s.inactive;
                             self.ws_close_confirm =
                                 Some((workspace_id, entry.name.clone(), total, s.running));
                         }
@@ -36834,10 +36832,10 @@ impl eframe::App for App {
                             );
                         }
                         WorkspaceCloseDisposition::Ignore => {
-                            // 메뉴는 Idle에 안 붙지만 요청 프레임 사이 상태 변화 방어.
+                            // 요청 프레임 사이 목록에서 사라진 대상은 종료하지 않는다.
                             tracing::info!(
                                 workspace = %workspace_id,
-                                "워크스페이스 종료 무시 — 닫을 세션/런타임 없음"
+                                "워크스페이스 종료 무시 — 대상이 목록에 없음"
                             );
                         }
                     }
@@ -58085,18 +58083,48 @@ mod tests {
 
     #[test]
     fn 워크스페이스_종료확인_policy는_기본즉시종료와_opt_in확인을_구분한다() {
+        let entry = ui::file_tree::SidebarWorkspaceEntry {
+            id: "selected".into(),
+            name: "selected".into(),
+            state: ui::file_tree::SidebarWorkspaceState::Active,
+            summary: Default::default(),
+        };
         assert_eq!(
-            workspace_close_disposition(false, true),
+            workspace_close_disposition(false, Some(&entry)),
             WorkspaceCloseDisposition::CloseNow
         );
         assert_eq!(
-            workspace_close_disposition(true, true),
+            workspace_close_disposition(true, Some(&entry)),
             WorkspaceCloseDisposition::Confirm
         );
-        assert_eq!(
-            workspace_close_disposition(false, false),
-            WorkspaceCloseDisposition::Ignore
-        );
+        for confirmation_enabled in [false, true] {
+            assert_eq!(
+                workspace_close_disposition(confirmation_enabled, None),
+                WorkspaceCloseDisposition::Ignore
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_close_policy_accepts_unselected_workspaces_without_a_runtime() {
+        for persisted_sessions in [0, 3] {
+            let entry = ui::file_tree::SidebarWorkspaceEntry {
+                id: "unselected".into(),
+                name: "unselected".into(),
+                state: ui::file_tree::SidebarWorkspaceState::Idle,
+                summary: ui::file_tree::SidebarSessionSummary::inactive(persisted_sessions),
+            };
+            assert_eq!(
+                workspace_close_disposition(false, Some(&entry)),
+                WorkspaceCloseDisposition::CloseNow,
+                "persisted sessions: {persisted_sessions}"
+            );
+            assert_eq!(
+                workspace_close_disposition(true, Some(&entry)),
+                WorkspaceCloseDisposition::Confirm,
+                "persisted sessions: {persisted_sessions}"
+            );
+        }
     }
 
     #[test]

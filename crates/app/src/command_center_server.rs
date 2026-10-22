@@ -265,6 +265,7 @@ impl App {
             .checked_add(1)
             .ok_or("실행 허용 번호를 더 만들 수 없습니다.")?;
         let request = launch::InstallRequest {
+            main_tools: None,
             operation_id: id.into(),
             runtime_instance: remote.policy.runtime_instance,
             config: p.snapshot.config.clone(),

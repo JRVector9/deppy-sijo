@@ -515,6 +515,7 @@ mod tests {
         host.launches.insert(
             assignment.attempt.operation_id.0.clone(),
             launch::Pending {
+                main_binding: None,
                 record: launch::Record {
                     operation_id: assignment.attempt.operation_id.clone(),
                     attempt_id: assignment.attempt.id.clone(),

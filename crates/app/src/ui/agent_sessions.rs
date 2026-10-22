@@ -4486,6 +4486,37 @@ mod tests {
     }
 
     #[test]
+    fn command_center_conversation_source_requires_exact_runtime_owned_session() {
+        let mut ui = AgentSessionsUi::new();
+        ui.sessions.push(command_center_approval_session());
+        ui.command_center_connection_epoch = 4;
+        ui.attached_threads.insert("approval-app".into());
+        assert!(
+            ui.command_center_session("workspace-a", "approval-app")
+                .is_some()
+        );
+        assert!(
+            ui.command_center_session("workspace-b", "approval-app")
+                .is_none()
+        );
+        assert!(
+            ui.command_center_session("workspace-a", "another-session")
+                .is_none()
+        );
+        ui.persisted_placeholders.insert("approval-app".into());
+        assert!(
+            ui.command_center_session("workspace-a", "approval-app")
+                .is_none()
+        );
+        ui.persisted_placeholders.clear();
+        ui.attached_threads.clear();
+        assert!(
+            ui.command_center_session("workspace-a", "approval-app")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn command_center_approval_rejects_stale_handle_and_other_workspace_before_transport() {
         let mut ui = AgentSessionsUi::new();
         ui.sessions.push(command_center_approval_session());

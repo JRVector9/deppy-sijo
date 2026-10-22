@@ -339,6 +339,13 @@ fn bounded_response(
         }
     }
     redact(&mut value, &redaction.snapshot());
+    if serde_json::to_vec(&value)
+        .map_err(|_| "main_response_too_large_no_effect")?
+        .len()
+        > MAX_RESPONSE_BYTES
+    {
+        return Err("main_response_too_large_no_effect".into());
+    }
     Ok(value)
 }
 fn field(args: &Value, name: &str, max: usize) -> Result<String, String> {
@@ -528,6 +535,96 @@ mod tests {
         caller.join().unwrap()
     }
     #[test]
+    fn command_center_main_real_http_uses_actual_host_scope_queue_and_receipts() {
+        use super::super::main_host;
+        let (mut host, current) = main_host::tests::fixture();
+        let goal = host.projects[&current.workspace_id]
+            .snapshot
+            .goals
+            .last()
+            .unwrap()
+            .id
+            .0
+            .clone();
+        let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        tools
+            .prepare(PendingMainScope {
+                workspace_id: current.workspace_id.clone(),
+                runtime_instance: current.runtime_instance,
+                runtime_token: current.runtime_token.clone(),
+                config_revision: current.config_revision,
+                launch_operation_id: current.launch_operation_id.clone(),
+            })
+            .unwrap();
+        let token = tools
+            .registration_slot(
+                &current.workspace_id,
+                current.runtime_instance,
+                current.config_revision,
+            )
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .token
+            .expose()
+            .to_owned();
+        tools
+            .activate(&current.launch_operation_id, current.clone())
+            .unwrap();
+        let read = invoke(
+            &mut tools,
+            &token,
+            &current,
+            &goal,
+            "cc_get_project",
+            json!({}),
+            |scope, call, id| main_host::call(&mut host, scope, call, id),
+        );
+        assert_eq!(read["workspace_id"], current.workspace_id);
+        let args = json!({"goal_id":goal,"config_revision":current.config_revision,"operation_id":"actual-plan-op","plan_json":"{}"});
+        let accepted = invoke(
+            &mut tools,
+            &token,
+            &current,
+            &goal,
+            "cc_propose_plan",
+            args.clone(),
+            |scope, call, id| main_host::call(&mut host, scope, call, id),
+        );
+        assert_eq!(accepted["status"], "accepted");
+        assert_eq!(host.pending.len(), 1);
+        let duplicate = invoke(
+            &mut tools,
+            &token,
+            &current,
+            &goal,
+            "cc_propose_plan",
+            args,
+            |_, _, _| panic!("same operation replayed into host"),
+        );
+        assert_eq!(duplicate, accepted);
+        assert_eq!(host.pending.len(), 1);
+        let op = accepted["host_operation_id"].as_str().unwrap();
+        host.reject(
+            op,
+            "배정안 스키마를 확인하지 못했습니다. 실행하지 않았습니다.",
+        );
+        let receipt = invoke(
+            &mut tools,
+            &token,
+            &current,
+            &goal,
+            "cc_get_operation",
+            json!({"operation_id":"actual-plan-op"}),
+            |scope, call, id| main_host::call(&mut host, scope, call, id),
+        );
+        assert_eq!(receipt["receipt"]["status"], "rejected");
+        assert!(host.projects[&current.workspace_id].confirmed.is_empty());
+    }
+    #[test]
     fn command_center_main_registration_consumes_only_one_secret_spawn() {
         let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
         let slot = tools.registration_slot("project-a", 7, 3).unwrap();
@@ -706,6 +803,17 @@ mod tests {
             |_, _, _| panic!("a dropped result must not repeat dispatch"),
         );
         assert_eq!(first, replay);
+    }
+
+    #[test]
+    fn command_center_main_response_limit_applies_after_redaction_expansion() {
+        let redaction = secret::RedactionService::new();
+        redaction.register(&secret::SecretString::new("abcdef".into()));
+        let response = json!({"text":"abcdef ".repeat(8000)});
+        assert!(serde_json::to_vec(&response).unwrap().len() < MAX_RESPONSE_BYTES);
+        assert!(
+            matches!(bounded_response(response, &redaction), Err(code) if code == "main_response_too_large_no_effect")
+        );
     }
 
     #[test]

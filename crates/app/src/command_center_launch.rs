@@ -62,7 +62,7 @@ pub(crate) struct InstallRequest {
     pub grant_epoch: u64,
     pub scrollback: usize,
     pub hooks: bool,
-    pub main_tools: Option<super::main_tools::MainRegistration>,
+    pub(super) main_tools: Option<super::main_tools::MainRegistration>,
 }
 pub(crate) enum SettingsResult {
     ServerCopy {
@@ -458,7 +458,14 @@ fn prepare_host(
 ) -> anyhow::Result<RemoteWorkerHost> {
     request.config.validate()?;
     anyhow::ensure!(
-        !request.agents.is_empty() && request.agents.len() <= 32,
+        !request.agents.is_empty()
+            && host_profiles(
+                &request.config,
+                &request.agents,
+                request.main_tools.is_some()
+            )
+            .len()
+                <= 32,
         "command_center_profile_capacity"
     );
     let detected =
@@ -600,6 +607,14 @@ fn host_profiles(
     profiles
 }
 
+pub(super) fn worker_profile_limit(provider: &str, main_tools: bool) -> usize {
+    if main_tools && provider == "codex" {
+        31
+    } else {
+        32
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Record {
     pub operation_id: work::OperationId,
@@ -632,6 +647,7 @@ pub(super) struct Installed {
 pub(super) struct Pending {
     pub record: Record,
     pub runtime_instance: u64,
+    pub main_binding: Option<work::RuntimeBinding>,
     pub generation: u64,
     pub stage: Stage,
     pub request: Option<runtime::remote_worker::RemoteWorkRequest>,
@@ -765,6 +781,7 @@ pub(super) fn restore_records(host: &mut CommandCenterHost, workspace: &str) {
             Pending {
                 record,
                 runtime_instance: 0,
+                main_binding: None,
                 generation: 0,
                 stage: Stage::Done,
                 request: None,
@@ -910,6 +927,7 @@ impl App {
             Pending {
                 record,
                 runtime_instance: runtime.runtime_instance,
+                main_binding: None,
                 generation,
                 stage: Stage::Durable,
                 request: None,
@@ -1172,10 +1190,11 @@ impl App {
             let current = host.projects.get(&workspace).is_some_and(|p| {
                 !p.storage_blocked && p.snapshot.config.revision == pending.record.config_revision
             });
-            let authorized = host
-                .remote_permits
-                .get(&id)
-                .is_none_or(|permit| permit.is_current());
+            let authorized = host.main_operation_current(&id)
+                && host
+                    .remote_permits
+                    .get(&id)
+                    .is_none_or(|permit| permit.is_current());
             if !current || !authorized || std::time::Instant::now() >= pending.deadline {
                 let unknown = matches!(
                     pending.stage,
@@ -1416,6 +1435,7 @@ impl App {
                                     host.save(&workspace, Some(after), None)?;
                                     pending.stage = Stage::Input;
                                 } else {
+                                    pending.main_binding = Some(binding.clone());
                                     p.snapshot.main_binding = Some(persistent(&live).ok_or(
                                         "생성된 메인 세션의 영구 바인딩을 확인할 수 없습니다.",
                                     )?);
@@ -1489,15 +1509,18 @@ impl App {
                         })
                         .map(|(id, _)| id.clone());
                     if let Some(id) = id {
+                        let main_authorized = host.main_operation_current(&id);
+                        let main_permit = host.main_guards.get(&id).map(|g| g.permit.clone());
                         let pending = host.launches.get_mut(&id).unwrap();
                         let current = host.projects.get(workspace).is_some_and(|p| {
                             p.snapshot.config.revision == pending.record.config_revision
                                 && !p.storage_blocked
                         });
-                        let authorized = host
-                            .remote_permits
-                            .get(&id)
-                            .is_none_or(|permit| permit.is_current());
+                        let authorized = main_authorized
+                            && host
+                                .remote_permits
+                                .get(&id)
+                                .is_none_or(|permit| permit.is_current());
                         if let Some(cap) = capabilities.as_ref().filter(|cap| {
                             current
                                 && authorized
@@ -1566,6 +1589,14 @@ impl App {
                                 .runtime_by_instance_mut(runtime_instance)
                                 .filter(|r| r.id == workspace)
                                 .is_some_and(|r| {
+                                    if let Some(permit) = main_permit
+                                        && r.runtime
+                                            .remote_worker_control()
+                                            .guard_operation(&request.identity.operation_id, permit)
+                                            .is_err()
+                                    {
+                                        return false;
+                                    }
                                     r.runtime
                                         .send_command(runtime::RuntimeCommand::SpawnRemoteWork {
                                             request,
@@ -1706,6 +1737,7 @@ mod tests {
                 phase: Phase::SpawnRequested,
             },
             runtime_instance: 19,
+            main_binding: None,
             generation: 2,
             stage: Stage::Spawn,
             request: Some(request),
@@ -1890,6 +1922,17 @@ mod tests {
         assert_eq!(env_plain[0].1, "configured-env");
         assert_eq!(env_secrets.len(), 1);
         assert!(transient_args.is_empty());
+    }
+
+    #[test]
+    fn main_profile_capacity_includes_the_main_only_slot() {
+        assert_eq!(worker_profile_limit("codex", true), 31);
+        assert_eq!(worker_profile_limit("codex", false), 32);
+        assert_eq!(worker_profile_limit("claude", true), 32);
+        let mut config = super::super::tests::attempted().0.snapshot.config;
+        config.main_agent.provider = "codex".into();
+        let agents = vec![config.main_agent.clone(); worker_profile_limit("codex", true)];
+        assert_eq!(host_profiles(&config, &agents, true).len(), 32);
     }
 
     #[test]

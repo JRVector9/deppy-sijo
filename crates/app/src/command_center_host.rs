@@ -24,6 +24,10 @@ pub(super) mod launch;
 pub(super) mod layout;
 #[path = "command_center_local_close.rs"]
 mod local_close;
+#[path = "command_center_main_host.rs"]
+mod main_host;
+#[path = "command_center_main_tools.rs"]
+mod main_tools;
 #[path = "command_center_observe.rs"]
 mod observe;
 #[path = "command_center_remote.rs"]
@@ -32,6 +36,8 @@ mod remote;
 mod routes;
 #[path = "command_center_server.rs"]
 pub(super) mod server;
+#[path = "command_center_verification.rs"]
+mod verification;
 
 #[derive(Clone, Debug, PartialEq)]
 struct Capture {
@@ -148,6 +154,10 @@ pub(super) struct CommandCenterHost {
     installed: BTreeMap<u64, launch::Installed>,
     execution_bindings: Vec<(Capture, work::RuntimeBinding, work::AgentSelection)>,
     next_grant_epoch: u64,
+    main_tools: Option<main_tools::MainTools>,
+    main_guards: BTreeMap<String, main_host::Guard>,
+    current_main_scopes: Vec<agent_mcp::MainScope>,
+    verifications: verification::Verifications,
     observations: observe::Observations,
     conversations: conversation::Conversations,
     conversation_revision: u64,
@@ -195,6 +205,10 @@ impl CommandCenterHost {
             installed: BTreeMap::new(),
             execution_bindings: vec![],
             next_grant_epoch: 0,
+            main_tools: None,
+            main_guards: BTreeMap::new(),
+            current_main_scopes: vec![],
+            verifications: Default::default(),
             observations: observe::Observations::new(ctx),
             conversations: Default::default(),
             conversation_revision: 0,
@@ -221,6 +235,32 @@ impl CommandCenterHost {
         self.publication_dirty = true;
     }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
+        let detail = detail.into();
+        if let Some(guard) = self.main_guards.get(id) {
+            let target = cc::RouteTarget {
+                workspace_id: guard.scope.workspace_id.clone(),
+                session_id: Some(guard.scope.main_session_id.clone()),
+                task_id: None,
+            };
+            let tool = guard.tool.clone();
+            conversation::record(
+                self,
+                &target,
+                cc::ConversationEntry {
+                    id: format!("tool:{id}"),
+                    turn_id: None,
+                    kind: cc::ConversationEntryKind::Tool,
+                    text: detail.clone(),
+                    tool_name: Some(tool),
+                    state: Some(match status {
+                        cc::ReceiptStatus::Acknowledged => cc::ConversationActivityState::Completed,
+                        cc::ReceiptStatus::Rejected => cc::ConversationActivityState::Failed,
+                        cc::ReceiptStatus::Uncertain => cc::ConversationActivityState::Unknown,
+                    }),
+                    observed_at: None,
+                },
+            );
+        }
         self.remote_permits.remove(id);
         if status != cc::ReceiptStatus::Uncertain {
             self.input_draft_versions.remove(id);
@@ -238,7 +278,7 @@ impl CommandCenterHost {
                 let _ = launch::save_record(p, &pending.record);
             }
         }
-        let detail = bounded(&detail.into(), 512);
+        let detail = bounded(&detail, 512);
         self.publication_dirty = true;
         self.status = detail.clone();
         if let Some(receipt) = self.receipts.iter_mut().find(|r| r.operation_id == id) {
@@ -959,7 +999,7 @@ impl App {
                         .map(|r| {
                             match r.verification {
                                 work::VerificationState::NotRun => "검증 미실행",
-                                work::VerificationState::Passed => "사용자가 수행한 검증 통과",
+                                work::VerificationState::Passed => "검증 통과",
                                 work::VerificationState::Failed => "검증 실패",
                             }
                             .into()
@@ -1070,6 +1110,10 @@ impl App {
                     structured_final_response: false,
                     tool_execution_restricted: false,
                 });
+            for task in &mut tasks {
+                host.verifications
+                    .project(task, p, ready, &self.command_center_redaction);
+            }
             let history = approval::history(p, &tasks);
             snapshot.projects.push(cc::Project { main_conversation:self.command_center_main_conversation(host, &main_target), pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.display_goal().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_agents: agents.iter().map(|a| cc::AgentOption { provider: a.provider.clone(), model: a.model.clone().unwrap_or_default(), effort: a.effort.clone().unwrap_or_default() }).collect(), available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
@@ -1148,10 +1192,17 @@ impl App {
     ) -> Result<(), String> {
         // An intent is transactional in memory as well as in the sidecar: a full queue,
         // draft capacity error, or validation failure must not expose partial edits.
+        if !host.main_operation_current(id) {
+            return Err(
+                "메인 실행·목표·설정이 바뀌어 이전 관리 요청을 실행하지 않았습니다.".into(),
+            );
+        }
         let workspace = intent_workspace(&intent).map(str::to_owned);
-        project_transaction(host, workspace.as_deref(), |host| {
+        let result = project_transaction(host, workspace.as_deref(), |host| {
             self.apply_command_center_intent(host, id, intent)
-        })
+        });
+        host.retire_main_operations();
+        result
     }
 
     fn apply_command_center_intent(
@@ -1170,6 +1221,24 @@ impl App {
             );
         }
         match intent {
+            cc::Intent::ExecuteVerification {
+                target,
+                expected,
+                spec,
+            } => return self.begin_command_center_verification(host, id, target, expected, spec),
+            cc::Intent::CancelVerification {
+                target,
+                expected,
+                verification_id,
+            } => {
+                return self.cancel_command_center_verification(
+                    host,
+                    id,
+                    &target,
+                    &expected,
+                    &verification_id,
+                );
+            }
             cc::Intent::AllowThisComputer {
                 workspace_id,
                 config_revision,
@@ -1485,8 +1554,11 @@ impl App {
                 allowed_agents
                     .sort_by_key(|a| (a.provider.clone(), a.model.clone(), a.effort.clone()));
                 allowed_agents.dedup();
-                if allowed_agents.len() > 32 {
-                    return Err("허용 실행 프로필은 32개까지 저장할 수 있습니다.".into());
+                let profile_limit = launch::worker_profile_limit(&selection.provider, true);
+                if allowed_agents.len() > profile_limit {
+                    return Err(format!(
+                        "메인 전용 연결을 포함해 실행 프로필은 32개까지 사용할 수 있습니다. 현재 워커 프로필은 {profile_limit}개까지 저장할 수 있습니다."
+                    ));
                 }
                 if config
                     .worker_providers
@@ -1877,49 +1949,15 @@ impl App {
                 passed,
                 evidence,
             } => {
-                if remote::handoff_pending(host, &target) {
-                    return Err("실제 입력 승인 응답을 확인한 뒤 검증해 주세요.".into());
-                }
-                if evidence.trim().is_empty() || evidence.len() > 4096 {
-                    return Err(
-                        "직접 수행한 검증의 명령과 결과를 4KiB 이하로 기록해 주세요.".into(),
-                    );
-                }
-                let p = host
-                    .projects
-                    .get_mut(&target.workspace_id)
-                    .ok_or("프로젝트가 없습니다.")?;
-                let task = p
-                    .snapshot
-                    .tasks
-                    .iter()
-                    .find(|t| Some(&t.id.0) == target.task_id.as_ref())
-                    .ok_or("현재 작업이 없습니다.")?;
-                let result = task
-                    .result
-                    .as_ref()
-                    .filter(|r| r.revision.0.to_string() == revision)
-                    .ok_or("검증할 결과 리비전이 바뀌었습니다.")?;
-                apply_user_work_event(
-                    p,
-                    &target,
+                return self.begin_command_center_manual_verification(
+                    host,
+                    id,
+                    target,
                     &attempt_id,
-                    work::WorkEventKind::VerificationFinished {
-                        result_revision: result.revision,
-                        outcome: if passed {
-                            work::VerificationState::Passed
-                        } else {
-                            work::VerificationState::Failed
-                        },
-                    },
-                    format!(
-                        "사용자 직접 검증 · {}\n{}",
-                        if passed { "통과" } else { "실패" },
-                        evidence
-                    ),
-                )?;
-                host.save(&target.workspace_id, None, Some(id.into()))?;
-                return Ok(());
+                    &revision,
+                    passed,
+                    &evidence,
+                );
             }
             cc::Intent::ConfirmResult { target, revision } => {
                 if remote::handoff_pending(host, &target) {
@@ -1973,6 +2011,8 @@ impl App {
             && host.pending.is_empty()
             && host.requested_loads.is_empty()
             && host.inputs.is_empty()
+            && host.main_tools.is_none()
+            && !host.verifications.busy()
             && !host.observations.has_pending()
             && !host.devices.has_pending()
             && host.launches.values().all(|l| l.finished())
@@ -2003,6 +2043,8 @@ impl App {
             return;
         }
         self.refresh_command_center_routes(&mut host);
+        self.pump_command_center_main_tools(&mut host);
+        self.pump_command_center_verification(&mut host);
         if let Some((target, action)) = host.pending_git.take()
             && host
                 .route(&target)
@@ -2046,6 +2088,7 @@ impl App {
                         result,
                     }),
                 ) if workspace_id.0 == workspace && found == token => {
+                    host.verifications.retry_load(&workspace);
                     finish_project_load(&mut host, &workspace, receipt, result);
                 }
                 (
@@ -2066,10 +2109,12 @@ impl App {
                             p.ack_saved(revision, generation);
                         }
                         if let Some(after) = after {
-                            let authorized = host
-                                .remote_permits
-                                .get(&after.id)
-                                .is_none_or(|permit| permit.is_current());
+                            let main_authorized = host.main_operation_current(&after.id);
+                            let authorized = main_authorized
+                                && host
+                                    .remote_permits
+                                    .get(&after.id)
+                                    .is_none_or(|permit| permit.is_current());
                             let live = host.route(&after.input.target).cloned();
                             let p = host.projects.get_mut(&workspace).unwrap();
                             let valid = authorized
@@ -2290,6 +2335,10 @@ impl App {
                 for project in &mut remote.projects {
                     project.create_main = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
                     for task in &mut project.tasks {
+                        task.execute_verification =
+                            no("이 컴퓨터에서 검증 명령을 직접 확인하고 실행해 주세요.");
+                        task.cancel_verification =
+                            no("이 컴퓨터에서 로컬 검증 실행을 취소해 주세요.");
                         task.create_worker = no("이 컴퓨터에서 새 실행을 시작해 주세요.");
                         task.close_worker = no("이 컴퓨터에서 워커 실행을 종료해 주세요.");
                         if task
@@ -2625,6 +2674,7 @@ fn admit_project_load(
                     .pending
                     .iter()
                     .any(|(_, intent)| intent_workspace(intent) == Some(id.as_str()))
+                && !host.verifications.owns(id)
                 && !host.flight.as_ref().is_some_and(|flight| match flight {
                     Flight::Load { workspace, .. } | Flight::Save { workspace, .. } => {
                         workspace == *id
@@ -2695,6 +2745,8 @@ fn intent_workspace(intent: &cc::Intent) -> Option<&str> {
         | cc::Intent::DispatchTask { target }
         | cc::Intent::ReportResult { target, .. }
         | cc::Intent::VerifyResult { target, .. }
+        | cc::Intent::ExecuteVerification { target, .. }
+        | cc::Intent::CancelVerification { target, .. }
         | cc::Intent::ConfirmResult { target, .. } => Some(&target.workspace_id),
         _ => None,
     }

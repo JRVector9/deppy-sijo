@@ -54,8 +54,11 @@ impl PlannerRequest {
         self.runtime_binding = Some(binding);
         Ok(self)
     }
+    pub(crate) fn response_shape(&self) -> serde_json::Value {
+        serde_json::json!({"config_revision":self.config.revision,"plan":{"workspace_id":self.goal.workspace_id,"goal_id":self.goal.id,"tasks":[{"workspace_id":self.goal.workspace_id,"id":"<unique task id>","goal_id":self.goal.id,"parent_task_id":null,"role":"<role appropriate to this goal>","scope":"<approved relative root; multiple roots separated by newline>","assigned_agent":self.policy.allowed_agents[0],"execution_device":null,"title":"<short task title>","instructions":"<bounded task instruction>","acceptance_criteria":"<observable completion conditions>","state":"plan_review","current_attempt_id":null,"dependencies":[],"result":null}]}})
+    }
     pub fn to_prompt(&self) -> Result<String, ValidationError> {
-        let schema = serde_json::json!({"config_revision":self.config.revision,"plan":{"workspace_id":self.goal.workspace_id,"goal_id":self.goal.id,"tasks":[{"workspace_id":self.goal.workspace_id,"id":"<unique task id>","goal_id":self.goal.id,"parent_task_id":null,"role":"<role appropriate to this goal>","scope":"<approved relative root; multiple roots separated by newline>","assigned_agent":self.policy.allowed_agents[0],"execution_device":null,"title":"<short task title>","instructions":"<bounded task instruction>","acceptance_criteria":"<observable completion conditions>","state":"plan_review","current_attempt_id":null,"dependencies":[],"result":null}]}});
+        let schema = self.response_shape();
         let agents = serde_json::to_string(&self.policy.allowed_agents)
             .map_err(|_| ValidationError("cannot encode allowed agents".into()))?;
         let roots = serde_json::to_string(&self.policy.allowed_scope_roots)

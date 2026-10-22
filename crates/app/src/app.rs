@@ -34044,6 +34044,20 @@ impl App {
         let admission = execution.map(|execution| {
             let deadline = std::time::Instant::now() + PROMPT_ADMISSION_TIMEOUT;
             if let PromptDeliveryOrigin::CommandCenter { operation_id, .. } = &origin
+                && let Some(permit) = self.command_center_main_input_permit(operation_id)
+            {
+                let intent = if automatic {
+                    runtime::AgentInputIntent::AutomaticPrompt
+                } else {
+                    runtime::AgentInputIntent::ExplicitPrompt
+                };
+                runtime::InputAdmission::new(permit, deadline, move |admit| {
+                    if execution.is_current() {
+                        admit();
+                    }
+                })
+                .with_agent_guard(execution.input_guard_for(intent))
+            } else if let PromptDeliveryOrigin::CommandCenter { operation_id, .. } = &origin
                 && let Some(permit) = self.command_center_input_permit(operation_id)
             {
                 let intent = if automatic {

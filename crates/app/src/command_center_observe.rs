@@ -597,7 +597,8 @@ fn input_current(host: &CommandCenterHost, id: &str, target: &FleetPromptTarget)
     let Some(project) = host.projects.get(&input.target.workspace_id) else {
         return false;
     };
-    project.loaded
+    host.main_operation_current(id)
+        && project.loaded
         && !project.storage_blocked
         && host.route(&input.target).is_some_and(|live| {
             live.capture.prompt.as_ref() == Some(target)

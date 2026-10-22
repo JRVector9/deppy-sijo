@@ -339,12 +339,13 @@ impl EnvironmentUi {
             env.modern_files(ui, snapshot, catalog, env_intent);
             return;
         }
-        ui.add(
+        let search = ui.add(
             egui::TextEdit::singleline(&mut self.search)
                 .hint_text(catalog.t("env.modern.search", &[]))
                 .char_limit(256)
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &search);
         let query = self.search.to_lowercase();
         if matches!(self.tab, Tab::All | Tab::Api) {
             credentials.modern_list(ui, credential_snapshot, catalog, &query, credential_intent);

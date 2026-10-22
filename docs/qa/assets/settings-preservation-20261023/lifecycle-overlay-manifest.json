@@ -1,0 +1,69 @@
+{
+  "schema": 1,
+  "scope": "Separately authorized correction: shared early/late settings token disposal across App UI layouts, plus two actual App lifecycle regressions.",
+  "base_transfer_manifest_sha256": "10e7045af40a1f93a3a46a07382115d9ed67bb9224aa99305ca77a33d27f5f0f",
+  "integration_base": "2426071872327faadfbb507d714d588989e0560e",
+  "root_red_evidence": {
+    "canonical_root": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/evidence/product-review-fixes-20261023",
+    "label": "settings-token-red-fresh",
+    "exit_code": 101,
+    "passed": 0,
+    "failed": 2,
+    "seconds": 60.68,
+    "failure": "Both actual App lifecycle tests fail only at displayed-token disposal assertion; preceding retention, CC-mode and zero-Keychain-access controls pass."
+  },
+  "root_green_status": "Root executed actual App lifecycle filter: 2 passed, 0 failed, exit0; exact execution JSON/log preserved separately.",
+  "files": [
+    {
+      "path": "crates/app/src/app.rs",
+      "before_overlay_sha256": "c3d83b8ad6581a340609bfce436982099d439b84fff95fb3119aa9d9918c191a",
+      "final_sha256": "ceadc8e40548e62ece958cb18c49ab63192ca981bb09c52998683933ee57999a",
+      "operations": [
+        {
+          "before_text": "",
+          "after_text": "    fn clear_inactive_cloud_connection_token(&mut self) {\n        if !self.settings_open || self.settings_category != ui::settings::Category::CloudAgents {\n            self.cloud_agent.clear_connection_token();\n        }\n    }\n\n"
+        },
+        {
+          "before_text": "    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {\n",
+          "after_text": "    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {\n        // Command Center의 조기 반환도 설정 비밀값의 표시 수명을 지킨다.\n        self.clear_inactive_cloud_connection_token();\n"
+        },
+        {
+          "before_text": "        if !self.settings_open || self.settings_category != ui::settings::Category::CloudAgents {\n            self.cloud_agent.clear_connection_token();\n        }\n        // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.\n",
+          "after_text": "        self.clear_inactive_cloud_connection_token();\n        // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.\n"
+        }
+      ]
+    },
+    {
+      "path": "crates/app/src/cloud_agent.rs",
+      "before_overlay_sha256": "38aa665e1a2040906553b6c4c793cf910c1d07c93b96fe93f05f8b7636eb6c75",
+      "final_sha256": "201cad5556e0da23a2ca4e58de3457fea165ae513050c991affea93abb60ac0b",
+      "operations": [
+        {
+          "before_text": "",
+          "after_text": "    #[cfg(test)]\n    pub(crate) fn displayed_connection_token_for_test(\n        &mut self,\n    ) -> &mut Option<(String, secret::SecretString)> {\n        &mut self.displayed_connection_token\n    }\n\n"
+        }
+      ]
+    },
+    {
+      "path": "crates/app/src/keychain_startup_tests.rs",
+      "before_overlay_sha256": "3bb08b07131415db377140df3f3ecd7f5778f31869205172c224d4ec385ee344",
+      "final_sha256": "5aa726f9d5d58dbf595511ce026115d0d8c09686fb0136658daed6912b0e1055",
+      "operations": [
+        {
+          "before_text": "",
+          "after_text": "    fn settings_token_lifecycle_in_command_center(close_settings: bool) {\n        let _serial = STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());\n        let dir = std::env::temp_dir().join(format!(\n            \"deppy-settings-token-lifecycle-{}\",\n            uuid::Uuid::new_v4()\n        ));\n        std::fs::create_dir_all(&dir).unwrap();\n        let path = dir.join(\"metadata.sqlite3\");\n        let db = Db::open(&path).unwrap();\n        let workspace_id = db.ensure_default_workspace().unwrap();\n        let spy = CountingStore::new();\n        let _store_guard = StoreGuard::install(Arc::clone(&spy));\n        let mut config = Config::default();\n        config.ui.agent_status_hooks = false;\n        config.ui.file_tree_enabled = false;\n        config.remote.tls_enabled = false;\n        config.web.enabled = false;\n        config.relay.enabled = false;\n        config.cloud_agent.automatic = false;\n        config.cloud_agent.reconnect = false;\n        let context = egui::Context::default();\n        let run_lock = Arc::new(persist::LockFile::acquire(&dir.join(\"deppy.lock\")).unwrap());\n        let mut app = App::new(\n            config,\n            dir.join(\"config.toml\"),\n            db,\n            workspace_id,\n            dir.join(\"logs\"),\n            path,\n            context.clone(),\n            None,\n            run_lock,\n        );\n        app.command_center_layout = command_center_host::layout::LayoutSwitch::from_flag(Some(\"1\"));\n        // Create the inert, local sidecar owner without a visible project load or provider turn.\n        app.command_center_layout.use_original();\n        app.pump_command_center(&context);\n        app.command_center_layout.open();\n        assert!(app.command_center.is_some());\n        app.settings_open = true;\n        app.set_settings_category(ui::settings::Category::CloudAgents);\n        *app.cloud_agent.displayed_connection_token_for_test() = Some((\n            \"synthetic-display-owner\".into(),\n            secret::SecretString::new(\"synthetic-settings-token-lifecycle-secret\".into()),\n        ));\n        let mut frame = eframe::Frame::_new_kittest();\n        context\n            .run_ui(egui::RawInput::default(), |ui| {\n                eframe::App::ui(&mut app, ui, &mut frame);\n            })\n            .drop_without_applying_deltas();\n        let retained_while_cloud_settings_open = app\n            .cloud_agent\n            .displayed_connection_token_for_test()\n            .is_some();\n        if close_settings {\n            app.settings_open = false;\n        } else {\n            app.set_settings_category(ui::settings::Category::General);\n        }\n        context\n            .run_ui(egui::RawInput::default(), |ui| {\n                eframe::App::ui(&mut app, ui, &mut frame);\n            })\n            .drop_without_applying_deltas();\n        let cleared_after_transition = app\n            .cloud_agent\n            .displayed_connection_token_for_test()\n            .is_none();\n        let stayed_in_command_center = app.command_center_layout.mode\n            == command_center_host::layout::LayoutMode::CommandCenter;\n        app.shutdown_on_exit();\n        drop(app);\n        std::fs::remove_dir_all(dir).unwrap();\n        assert!(\n            retained_while_cloud_settings_open,\n            \"an open CloudAgents category keeps its newly displayed token\"\n        );\n        assert!(\n            stayed_in_command_center,\n            \"exercise the actual Command Center UI return\"\n        );\n        assert_eq!(\n            spy.calls(),\n            0,\n            \"the isolated App lifecycle must not access Keychain\"\n        );\n        assert!(\n            cleared_after_transition,\n            \"the actual App UI must dispose the displayed token before the Command Center return after settings close/category change\"\n        );\n    }\n\n    #[test]\n    fn settings_token_lifecycle_actual_app_close_clears_before_command_center_return() {\n        settings_token_lifecycle_in_command_center(true);\n    }\n\n    #[test]\n    fn settings_token_lifecycle_actual_app_category_change_clears_before_command_center_return() {\n        settings_token_lifecycle_in_command_center(false);\n    }\n\n"
+        }
+      ]
+    }
+  ],
+  "root_green_evidence": {
+    "label": "settings-token-green",
+    "passed": 2,
+    "failed": 0,
+    "exit_code": 0,
+    "seconds": 48.11,
+    "json": "lifecycle-green-execution.json",
+    "log": "lifecycle-green-execution.log.gz",
+    "log_sha256": "21219f47bbe0cc20a4a689c54085d2b3f6d93a33872d1dff19526a82ec8e5e43"
+  }
+}

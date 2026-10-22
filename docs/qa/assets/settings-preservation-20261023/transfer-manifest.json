@@ -1,0 +1,225 @@
+{
+  "schema": 1,
+  "source_root": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015",
+  "source_head": "f78ebb69c94ec7cb72ae9a1159d2137c0d6a5679",
+  "integration_root": "/private/tmp/deppy-settings-integrate-20261023",
+  "integration_base": "2426071872327faadfbb507d714d588989e0560e",
+  "source_status_sha256": "632d0445364763bbe6273e2363aa4d9b9d2bff82409f40eb0cf8bc71b07b19bf",
+  "integration_workspace_version": "0.15.1",
+  "cargo_executed_by_agent": false,
+  "tests_executed_by_agent": false,
+  "files": [
+    {
+      "path": "crates/app/src/cloud_agent.rs",
+      "source_sha256": "38aa665e1a2040906553b6c4c793cf910c1d07c93b96fe93f05f8b7636eb6c75",
+      "integration_base_sha256": "9224a6e4f1d8dc14651817579787d2db717c534c56c8b9e0059a12eab114ccdd",
+      "mode": "exact_copy",
+      "integration_sha256": "38aa665e1a2040906553b6c4c793cf910c1d07c93b96fe93f05f8b7636eb6c75"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/access.rs",
+      "source_sha256": "aa8aff85d5d747757657e10b865b7a8ad99e2287d3f32bd10a03771bfe9ce2bc",
+      "integration_base_sha256": "762eb852c4fe14befb2ce581bd5dd54aec4abd65e252c443b0310f1720355862",
+      "mode": "exact_copy",
+      "integration_sha256": "aa8aff85d5d747757657e10b865b7a8ad99e2287d3f32bd10a03771bfe9ce2bc"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui.rs",
+      "source_sha256": "a0b00ad1337562f6e9519305a5c29ee410d847f4f098ce0a889c8aafa64d20a8",
+      "integration_base_sha256": "34c2457f14915b7c9f69d27c7b817204d53b4adb6a01a77527cec912b0866bbc",
+      "mode": "exact_copy",
+      "integration_sha256": "a0b00ad1337562f6e9519305a5c29ee410d847f4f098ce0a889c8aafa64d20a8"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/connections.rs",
+      "source_sha256": "84b55061a044e9b3e0da2a42553442891a7c76f65797ccc5bffc4b6f88d330e4",
+      "integration_base_sha256": "8d727358cc13c6823f580bfc41d50740ede81bcfa5f2abc4b9d8a2525afa41fa",
+      "mode": "exact_copy",
+      "integration_sha256": "84b55061a044e9b3e0da2a42553442891a7c76f65797ccc5bffc4b6f88d330e4"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/layout.rs",
+      "source_sha256": "f3438617ec2cf75129598db419b441e6dcacc994a0338797427e901b13c2ba6b",
+      "integration_base_sha256": "db467bf669be611193c14030b797843b7b2d3df0bb6a1ba53711b2073014953c",
+      "mode": "exact_copy",
+      "integration_sha256": "f3438617ec2cf75129598db419b441e6dcacc994a0338797427e901b13c2ba6b"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/permissions.rs",
+      "source_sha256": "98fb17bc85f0bba9d2b94b7cc6cc5d7659ee216e36b4a8522e5e7a647d0f092d",
+      "integration_base_sha256": "79e9568d44afd1d931c6359cae3a4a5112f986f97492affa931b306cb54c84d7",
+      "mode": "exact_copy",
+      "integration_sha256": "98fb17bc85f0bba9d2b94b7cc6cc5d7659ee216e36b4a8522e5e7a647d0f092d"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/settings.rs",
+      "source_sha256": "9128d2dcea1d34694cc5d2b9a32e09eac7f6ed9cf3b64796b46508c9dcdac59a",
+      "integration_base_sha256": "00ca06560d28c88476d56572bb44bec75edda4db46114d37c93a73a1666173ef",
+      "mode": "exact_copy",
+      "integration_sha256": "9128d2dcea1d34694cc5d2b9a32e09eac7f6ed9cf3b64796b46508c9dcdac59a"
+    },
+    {
+      "path": "crates/app/src/ui/activity.rs",
+      "source_sha256": "ad5cd75baabd70609777e30e6257d4feb95390e98ef91a02a4085144da451485",
+      "integration_base_sha256": "1cb30e904d8dea026a72ade0a684aa481a32386d2433b38abdc95e2ed59888d3",
+      "mode": "exact_copy",
+      "integration_sha256": "ad5cd75baabd70609777e30e6257d4feb95390e98ef91a02a4085144da451485"
+    },
+    {
+      "path": "crates/app/src/ui/agents.rs",
+      "source_sha256": "25ea5016d7bc06e8ebc48fec4ea5ec0f067a42345c1a70453094cefb660cb30a",
+      "integration_base_sha256": "b0e79d5ba1ec77ac731c9a8f63c8763c03a6b87d8b2c37dfc5e0b65490a3ad56",
+      "mode": "exact_copy",
+      "integration_sha256": "25ea5016d7bc06e8ebc48fec4ea5ec0f067a42345c1a70453094cefb660cb30a"
+    },
+    {
+      "path": "crates/app/src/ui/credentials.rs",
+      "source_sha256": "40c6050d4d7de8bd8e895beef7fa2aa9f8121c3648b498b734d558f8d58c8357",
+      "integration_base_sha256": "e8f79e6f5a1131175b01d258fdaeb1f534c9878b6a6b03c438cd247b5d6107dd",
+      "mode": "exact_copy",
+      "integration_sha256": "40c6050d4d7de8bd8e895beef7fa2aa9f8121c3648b498b734d558f8d58c8357"
+    },
+    {
+      "path": "crates/app/src/ui/credentials/modern.rs",
+      "source_sha256": "c0f6bf06d469cef2d8d2379e0209d2ba2f80c35edc9d80572bbe3116068349f9",
+      "integration_base_sha256": "0ac31fecdf2d8dca400f42f2f8303a6953e1cada34f35459059edfc18a9ca3c9",
+      "mode": "exact_copy",
+      "integration_sha256": "c0f6bf06d469cef2d8d2379e0209d2ba2f80c35edc9d80572bbe3116068349f9"
+    },
+    {
+      "path": "crates/app/src/ui/env_profiles.rs",
+      "source_sha256": "f26076946dcb2c802c55c4f38382ca1dc76d7484d8b42d392d1a15bc41a38808",
+      "integration_base_sha256": "fb07040c51e55a1c44d78f175b48d8f7def11ef22682fa7abc8b69989a10d3d2",
+      "mode": "exact_copy",
+      "integration_sha256": "f26076946dcb2c802c55c4f38382ca1dc76d7484d8b42d392d1a15bc41a38808"
+    },
+    {
+      "path": "crates/app/src/ui/env_profiles/modern.rs",
+      "source_sha256": "8bd44029445ce1fcabcb11b6fa7b7fdab519a626ac4191b29ee93085e1e2a8a3",
+      "integration_base_sha256": "8bbc83f5bae487c12fee0955cdde65cfbf386a9d62858f3aa7fa3c7326b574df",
+      "mode": "exact_copy",
+      "integration_sha256": "8bd44029445ce1fcabcb11b6fa7b7fdab519a626ac4191b29ee93085e1e2a8a3"
+    },
+    {
+      "path": "crates/app/src/ui/environment.rs",
+      "source_sha256": "20e9cb042e85b432b25c4b408991591ee0981704ad14fbb5db93d47764ab60be",
+      "integration_base_sha256": "765c0fe7415836bfc8fa28a6700599f3450a586dc7447add32713f98df0b55b9",
+      "mode": "exact_copy",
+      "integration_sha256": "20e9cb042e85b432b25c4b408991591ee0981704ad14fbb5db93d47764ab60be"
+    },
+    {
+      "path": "crates/app/src/ui/settings.rs",
+      "source_sha256": "da203b324d9270ce3b31d73de60542705dcf03165b6f4360d0bcf52a4b6c775b",
+      "integration_base_sha256": "4b475fe97cf7b718d60770495c4725ec057f1b8e7c1d7b0efc87922fa72ba9e7",
+      "mode": "exact_copy",
+      "integration_sha256": "da203b324d9270ce3b31d73de60542705dcf03165b6f4360d0bcf52a4b6c775b"
+    },
+    {
+      "path": "crates/connector-ui/src/lib.rs",
+      "source_sha256": "a7cd0343a4af31411516a477237953332e8b3cece3c930c533a94e47ffadaf49",
+      "integration_base_sha256": "854aa0f7129fb404c573d58d972ef8471675ac32ef15fbf6441a2d9571a44e5d",
+      "mode": "exact_copy",
+      "integration_sha256": "a7cd0343a4af31411516a477237953332e8b3cece3c930c533a94e47ffadaf49"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/management_tests.rs",
+      "source_sha256": "06104f20e534aceff2b9a93dbdf1dcb6a99350d2c3fde8132f0932c147b70f75",
+      "integration_base_sha256": "35eab7de0b14a6bc7e64092726ef17d9cda21eadcba16ba0fd72e29b5ae9bfbd",
+      "mode": "exact_copy",
+      "integration_sha256": "06104f20e534aceff2b9a93dbdf1dcb6a99350d2c3fde8132f0932c147b70f75"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/redesign_tests.rs",
+      "source_sha256": "d73cbe7301535597bfc10efdcfd2acbafa277f0a2814f997bad2b658f75e810b",
+      "integration_base_sha256": "9a13a8e015516eeedd6b349f297de0267981cf81ddbd4f3fbca5b90314cf8f63",
+      "mode": "exact_copy",
+      "integration_sha256": "d73cbe7301535597bfc10efdcfd2acbafa277f0a2814f997bad2b658f75e810b"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/one_screen.rs",
+      "source_sha256": "f32e3201749896999b8f55179a1a51fe46c858565e9458483e2f22ced7ed5bcc",
+      "integration_base_sha256": null,
+      "mode": "exact_copy",
+      "integration_sha256": "f32e3201749896999b8f55179a1a51fe46c858565e9458483e2f22ced7ed5bcc"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/one_screen_tests.rs",
+      "source_sha256": "76670bf795a4f62fe7364defd692ae5df9c9ea2db7a3c32ee95e6324a8cc6530",
+      "integration_base_sha256": null,
+      "mode": "exact_copy",
+      "integration_sha256": "76670bf795a4f62fe7364defd692ae5df9c9ea2db7a3c32ee95e6324a8cc6530"
+    },
+    {
+      "path": "crates/app/src/ui/settings/design_rule_tests.rs",
+      "source_sha256": "7bed2cbce013308d952771a495e13694378f3e8b05d03fba7855ff1b2cca77f1",
+      "integration_base_sha256": null,
+      "mode": "exact_copy",
+      "integration_sha256": "7bed2cbce013308d952771a495e13694378f3e8b05d03fba7855ff1b2cca77f1"
+    },
+    {
+      "path": "crates/app/src/app.rs",
+      "source_sha256": "4642aefcabaed7c1b6f80e041f030a753e93f5671ae3538c9cda570a26a34f9e",
+      "integration_base_sha256": "35c12d074b5ab821a2fcf88f12e02d3eeefc77dc95211af7d4297a3d5a36d1f0",
+      "mode": "scoped_app_patch",
+      "source_patch_sha256": "b6bba336a73ce79b3ed139e5a35ecd3d1d39d953519caebb36dd406e11efb6d8",
+      "insertion_offset": 1748776,
+      "insertion_text": "        if !self.settings_open || self.settings_category != ui::settings::Category::CloudAgents {\n            self.cloud_agent.clear_connection_token();\n        }\n",
+      "integration_sha256": "c3d83b8ad6581a340609bfce436982099d439b84fff95fb3119aa9d9918c191a"
+    },
+    {
+      "path": "crates/i18n/locales/en-US/messages.txt",
+      "source_sha256": "4e47b3b1f4a4898badf46d780fb852f956575d7a6bf8342b84ae168bd8240fd1",
+      "integration_base_sha256": "1e55ffd782e89397d418da9ccd995c3762b36df32c2e30365d9c3f8f87d2ec7c",
+      "mode": "scoped_locale_append",
+      "insertion_offset": 106525,
+      "insertion_text": "\n# Cloud agent single-screen setup\ncloud.one.title = Cloud agents\ncloud.one.intro = Enter the URL and token in your agent, then select sessions to share.\ncloud.one.connection = Connection\ncloud.one.details = Connection details for your agent\ncloud.one.address = Connection URL\ncloud.one.generated = Automatically generated\ncloud.one.token = Connection token\ncloud.one.preparing = Preparing external URL\ncloud.one.ready = External access ready\ncloud.one.prepare = Prepare a public URL before sharing connection details.\ncloud.one.copy_all = Copy all connection details\ncloud.one.copied = Copied connection details.\ncloud.one.issue = Issue token\ncloud.one.new_token = Issue new token\ncloud.one.issue_confirm = Issue token now\ncloud.one.issued = New token issued. Copy it before leaving this screen.\ncloud.one.token_note_status = New token issued.\ncloud.one.token_note_hint = Copy it before leaving this screen.\ncloud.one.hide = Hide\ncloud.one.show = Show\ncloud.one.unavailable = Previously issued tokens cannot be displayed again.\ncloud.one.oauth = Browser authentication. No token entry is needed.\ncloud.one.renew_confirm = The previous token and session permissions for {name} will be revoked. Reconnect with the new token and select sessions again.\ncloud.one.sessions = Sessions to share\ncloud.one.no_sessions = No sessions selected\ncloud.one.session_count = {count} sessions shared\ncloud.one.reclaim_all = Revoke all input\ncloud.one.session_state = Session · current status\ncloud.one.read = View screen\ncloud.one.input = Send input\ncloud.one.completion = Completion notification\ncloud.one.control = Input control\ncloud.one.unsupported = Unsupported\ncloud.one.guide_permissions = Permission settings\ncloud.one.guide_permissions_text = Viewing includes receiving answers. Allow input and completion notifications separately.\ncloud.one.guide_completion_text = Available for currently supported Codex sessions.\ncloud.one.guide_control_text = Allowing input does not transfer control automatically. Revoking input does not stop work already running.\ncloud.one.more = Other connection methods · more settings\ncloud.one.no_auth = No authentication observed yet.\ncloud.one.check_hint = Start the connection from your agent after entering its connection details.\ncloud.one.check = Check connection\ncloud.one.reclaim = Revoke\n",
+      "preserved_cc_suffix_lines": 108,
+      "integration_sha256": "c9b7fb76cf18e3499d196c1def3eb7b2c12091e03f1fbf63efe12633743fca72"
+    },
+    {
+      "path": "crates/i18n/locales/ja-JP/messages.txt",
+      "source_sha256": "efb6bb216d8128009fce3428961924201dfcdc449db80750081358a994e9c435",
+      "integration_base_sha256": "37f0c5b36f3a3c40e6697acefd04012b9c4ef0d72c2ef9898286a1b0b6421f75",
+      "mode": "scoped_locale_append",
+      "insertion_offset": 128190,
+      "insertion_text": "\n# Cloud agent single-screen setup\ncloud.one.title = クラウドエージェント\ncloud.one.intro = URLとトークンをエージェントに入力し、共有するセッションを選択してください。\ncloud.one.connection = 接続\ncloud.one.details = エージェント用の接続情報\ncloud.one.address = 接続URL\ncloud.one.generated = 自動生成\ncloud.one.token = 接続トークン\ncloud.one.preparing = 外部URLを準備中\ncloud.one.ready = 外部アクセス準備完了\ncloud.one.prepare = 接続情報を渡す前に公開URLを準備してください。\ncloud.one.copy_all = 接続情報をまとめてコピー\ncloud.one.copied = 接続情報をコピーしました。\ncloud.one.issue = トークン発行\ncloud.one.new_token = 新しいトークンを発行\ncloud.one.issue_confirm = 発行する\ncloud.one.issued = 新しいトークンを発行しました。この画面を閉じる前にコピーしてください。\ncloud.one.token_note_status = 新しいトークンを発行しました。\ncloud.one.token_note_hint = この画面を閉じる前にコピーしてください。\ncloud.one.hide = 非表示\ncloud.one.show = 表示\ncloud.one.unavailable = 以前発行したトークンは再表示できません。\ncloud.one.oauth = ブラウザー認証の接続です。トークン入力は不要です。\ncloud.one.renew_confirm = {name}の既存トークンとセッション権限は取り消されます。新しいトークンで接続し、セッションを再選択してください。\ncloud.one.sessions = 共有するセッション\ncloud.one.no_sessions = セッション未選択\ncloud.one.session_count = {count}セッションを共有\ncloud.one.reclaim_all = すべての入力を取り消す\ncloud.one.session_state = セッション・現在の状態\ncloud.one.read = 画面を見る\ncloud.one.input = 入力を送信\ncloud.one.completion = 完了通知\ncloud.one.control = 入力制御\ncloud.one.unsupported = 未対応\ncloud.one.guide_permissions = 権限設定\ncloud.one.guide_permissions_text = 画面の閲覧には回答の受信が含まれます。入力と完了通知は個別に許可します。\ncloud.one.guide_completion_text = 現在対応しているCodexセッションで使用できます。\ncloud.one.guide_control_text = 入力を許可しても制御権は自動で移りません。入力を取り消しても実行中の作業は続きます。\ncloud.one.more = 他の接続方法・追加設定\ncloud.one.no_auth = 認証はまだ確認されていません。\ncloud.one.check_hint = 接続情報を入力してエージェントから接続を開始してください。\ncloud.one.check = 接続を確認\ncloud.one.reclaim = 取り消す\n",
+      "preserved_cc_suffix_lines": 108,
+      "integration_sha256": "bbbaef4b92675980222566f287b4c813cdbc38231ac97c8732eb4d6ee9d9d430"
+    },
+    {
+      "path": "crates/i18n/locales/ko-KR/messages.txt",
+      "source_sha256": "5ce5f9c114021ea4e3e1737e7129f4bd0e23bbfa9598b75af55b77d05e1e2903",
+      "integration_base_sha256": "422672171766eb32e71487d911038eaf4d14d487f28952fe27fa201247c915e5",
+      "mode": "scoped_locale_append",
+      "insertion_offset": 118551,
+      "insertion_text": "\n# Cloud agent single-screen setup\ncloud.one.title = 클라우드 에이전트\ncloud.one.intro = 주소와 토큰을 에이전트에 넣고, 공유할 세션을 선택하세요.\ncloud.one.connection = 연결\ncloud.one.details = 에이전트에 넣을 연결 정보\ncloud.one.address = 연결 주소\ncloud.one.generated = 자동 생성\ncloud.one.token = 연결 토큰\ncloud.one.preparing = 외부 주소 준비 중\ncloud.one.ready = 외부 접속 준비됨\ncloud.one.prepare = 연결 정보를 전달하기 전에 외부 접속 주소를 준비하세요.\ncloud.one.copy_all = 연결 정보 한 번에 복사\ncloud.one.copied = 연결 정보를 복사했습니다.\ncloud.one.issue = 토큰 발급\ncloud.one.new_token = 새 토큰 발급\ncloud.one.issue_confirm = 발급하기\ncloud.one.issued = 새 토큰이 발급됐습니다. 이 화면을 닫기 전에 복사해 두세요.\ncloud.one.token_note_status = 새 토큰이 발급됐습니다.\ncloud.one.token_note_hint = 이 화면을 닫기 전에 복사해 두세요.\ncloud.one.hide = 숨기기\ncloud.one.show = 표시\ncloud.one.unavailable = 이전에 발급한 토큰은 다시 표시할 수 없습니다.\ncloud.one.oauth = 브라우저 인증 연결입니다. 토큰 입력이 필요하지 않습니다.\ncloud.one.renew_confirm = {name}의 기존 토큰과 세션 권한이 해제됩니다. 새 토큰으로 연결하고 공유할 세션을 다시 선택하세요.\ncloud.one.sessions = 공유할 세션\ncloud.one.no_sessions = 선택한 세션 없음\ncloud.one.session_count = {count}개 세션 공유\ncloud.one.reclaim_all = 입력 모두 회수\ncloud.one.session_state = 세션 · 현재 상태\ncloud.one.read = 화면 보기\ncloud.one.input = 입력 보내기\ncloud.one.completion = 완료 알림\ncloud.one.control = 입력 제어\ncloud.one.unsupported = 미지원\ncloud.one.guide_permissions = 권한 설정\ncloud.one.guide_permissions_text = 화면 보기는 답변 수신을 포함합니다. 입력·완료 알림은 별도로 허용합니다.\ncloud.one.guide_completion_text = 현재 지원되는 Codex 세션에서 사용할 수 있습니다.\ncloud.one.guide_control_text = 입력을 허용해도 제어권이 자동으로 바뀌지는 않습니다. 입력을 회수해도 실행 중인 작업은 계속됩니다.\ncloud.one.more = 다른 연결 방식 · 추가 설정\ncloud.one.no_auth = 아직 인증 기록이 없습니다.\ncloud.one.check_hint = 연결 정보를 넣은 뒤 에이전트에서 연결을 시작하세요.\ncloud.one.check = 연결 확인\ncloud.one.reclaim = 회수\n",
+      "preserved_cc_suffix_lines": 108,
+      "integration_sha256": "1da22b04ff215292262991c3839cb488384fe70947da792ddd20dad33e1080ec"
+    },
+    {
+      "path": "crates/i18n/locales/zh-Hans/messages.txt",
+      "source_sha256": "3c311c9409bd7359680299af0889548cbf13840aedd4452f192a00bf7efdf473",
+      "integration_base_sha256": "a909eedf6c24bb7a7f5fcaf442aa3b1135671dcc109d2ba396da2e6d29facb05",
+      "mode": "scoped_locale_append",
+      "insertion_offset": 103575,
+      "insertion_text": "\n# Cloud agent single-screen setup\ncloud.one.title = 云端代理\ncloud.one.intro = 在代理中输入地址和令牌，然后选择要共享的会话。\ncloud.one.connection = 连接\ncloud.one.details = 供代理使用的连接信息\ncloud.one.address = 连接地址\ncloud.one.generated = 自动生成\ncloud.one.token = 连接令牌\ncloud.one.preparing = 正在准备外部地址\ncloud.one.ready = 外部访问已就绪\ncloud.one.prepare = 共享连接信息前，请先准备外部访问地址。\ncloud.one.copy_all = 复制全部连接信息\ncloud.one.copied = 已复制连接信息。\ncloud.one.issue = 签发令牌\ncloud.one.new_token = 签发新令牌\ncloud.one.issue_confirm = 确认签发\ncloud.one.issued = 新令牌已签发。请在离开此页面前复制。\ncloud.one.token_note_status = 新令牌已签发。\ncloud.one.token_note_hint = 请在离开此页面前复制。\ncloud.one.hide = 隐藏\ncloud.one.show = 显示\ncloud.one.unavailable = 无法再次显示以前签发的令牌。\ncloud.one.oauth = 使用浏览器认证，无需输入令牌。\ncloud.one.renew_confirm = {name} 的旧令牌和会话权限将被撤销。请使用新令牌重新连接并选择会话。\ncloud.one.sessions = 要共享的会话\ncloud.one.no_sessions = 未选择会话\ncloud.one.session_count = 已共享 {count} 个会话\ncloud.one.reclaim_all = 撤销全部输入\ncloud.one.session_state = 会话 · 当前状态\ncloud.one.read = 查看屏幕\ncloud.one.input = 发送输入\ncloud.one.completion = 完成通知\ncloud.one.control = 输入控制\ncloud.one.unsupported = 不支持\ncloud.one.guide_permissions = 权限设置\ncloud.one.guide_permissions_text = 查看屏幕包含接收答复。输入和完成通知需分别授权。\ncloud.one.guide_completion_text = 可用于当前支持的 Codex 会话。\ncloud.one.guide_control_text = 允许输入不会自动转移控制权。撤销输入不会停止正在运行的任务。\ncloud.one.more = 其他连接方式 · 更多设置\ncloud.one.no_auth = 尚未观察到认证。\ncloud.one.check_hint = 输入连接信息后，从代理发起连接。\ncloud.one.check = 检查连接\ncloud.one.reclaim = 收回\n",
+      "preserved_cc_suffix_lines": 108,
+      "integration_sha256": "fce6d0a43743b5d18404db27d0b9e1f7d65498e403d0c1aa2b03fd98cdf86bc5"
+    },
+    {
+      "path": "crates/i18n/locales/zh-Hant/messages.txt",
+      "source_sha256": "bfb8849a8a6233340b7f1e57af046c16762fef21f99df064065fe89d1403165c",
+      "integration_base_sha256": "21056c220d694dcf5cc865ee24dcaee5a843e04f91930d57cf7ab972b9d530e6",
+      "mode": "scoped_locale_append",
+      "insertion_offset": 105140,
+      "insertion_text": "\n# Cloud agent single-screen setup\ncloud.one.title = 雲端代理\ncloud.one.intro = 在代理中輸入位址和權杖，然後選擇要分享的工作階段。\ncloud.one.connection = 連線\ncloud.one.details = 供代理使用的連線資訊\ncloud.one.address = 連線位址\ncloud.one.generated = 自動產生\ncloud.one.token = 連線權杖\ncloud.one.preparing = 正在準備外部位址\ncloud.one.ready = 外部存取已就緒\ncloud.one.prepare = 分享連線資訊前，請先準備外部存取位址。\ncloud.one.copy_all = 複製全部連線資訊\ncloud.one.copied = 已複製連線資訊。\ncloud.one.issue = 簽發權杖\ncloud.one.new_token = 簽發新權杖\ncloud.one.issue_confirm = 確認簽發\ncloud.one.issued = 新權杖已簽發。請在離開此畫面前複製。\ncloud.one.token_note_status = 新權杖已簽發。\ncloud.one.token_note_hint = 請在離開此畫面前複製。\ncloud.one.hide = 隱藏\ncloud.one.show = 顯示\ncloud.one.unavailable = 無法再次顯示先前簽發的權杖。\ncloud.one.oauth = 使用瀏覽器驗證，無需輸入權杖。\ncloud.one.renew_confirm = {name} 的舊權杖和工作階段權限將被撤銷。請使用新權杖重新連線並選擇工作階段。\ncloud.one.sessions = 要分享的工作階段\ncloud.one.no_sessions = 未選取工作階段\ncloud.one.session_count = 已分享 {count} 個工作階段\ncloud.one.reclaim_all = 撤銷全部輸入\ncloud.one.session_state = 工作階段 · 目前狀態\ncloud.one.read = 檢視畫面\ncloud.one.input = 傳送輸入\ncloud.one.completion = 完成通知\ncloud.one.control = 輸入控制\ncloud.one.unsupported = 不支援\ncloud.one.guide_permissions = 權限設定\ncloud.one.guide_permissions_text = 檢視畫面包含接收答覆。輸入和完成通知需分別授權。\ncloud.one.guide_completion_text = 可用於目前支援的 Codex 工作階段。\ncloud.one.guide_control_text = 允許輸入不會自動轉移控制權。撤銷輸入不會停止正在執行的工作。\ncloud.one.more = 其他連線方式 · 更多設定\ncloud.one.no_auth = 尚未觀察到驗證。\ncloud.one.check_hint = 輸入連線資訊後，從代理發起連線。\ncloud.one.check = 檢查連線\ncloud.one.reclaim = 收回\n",
+      "preserved_cc_suffix_lines": 108,
+      "integration_sha256": "a994174e96625da8098b2ffba79bf05c2ca9466553e116b5f8f8314cd8ec0745"
+    }
+  ],
+  "protected_integration_files": {
+    "Cargo.toml": "e7deb822c7109864039c0026dba92d36ed417bb94987fc687b6c03382e0f27f8",
+    "Cargo.lock": "701f155eed953348605118b22cc0627e32554b55c472ab093aa8c91a3455436f",
+    "CHANGELOG.md": "d9d57c998703b933723ee837d3297d121322696ad40d73ec9f7a8b5fa2385ed7"
+  }
+}

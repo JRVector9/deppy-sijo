@@ -1,0 +1,21 @@
+{
+  "phase": "test-only RED prepared; not executed by this agent",
+  "base_product_transfer_manifest": "transfer-manifest.json",
+  "files": [
+    {
+      "path": "crates/app/src/app.rs",
+      "sha256": "c3d83b8ad6581a340609bfce436982099d439b84fff95fb3119aa9d9918c191a"
+    },
+    {
+      "path": "crates/app/src/cloud_agent.rs",
+      "sha256": "201cad5556e0da23a2ca4e58de3457fea165ae513050c991affea93abb60ac0b"
+    },
+    {
+      "path": "crates/app/src/keychain_startup_tests.rs",
+      "sha256": "5aa726f9d5d58dbf595511ce026115d0d8c09686fb0136658daed6912b0e1055"
+    }
+  ],
+  "filter": "settings_token_lifecycle_",
+  "cargo_executor": "root only",
+  "production_fix_applied": false
+}

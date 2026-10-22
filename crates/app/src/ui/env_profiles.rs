@@ -579,13 +579,14 @@ impl EnvProfilesUi {
                 let draft = self
                     .source_draft
                     .get_or_insert_with(|| sources.selected_files.join("\n"));
-                ui.add_enabled(
+                let source = ui.add_enabled(
                     !self.source_pending,
                     egui::TextEdit::multiline(draft)
                         .desired_rows(3)
                         .desired_width(f32::INFINITY)
                         .char_limit(8192),
                 );
+                connector_ui::paint_text_edit_focus(ui, &source);
                 truncate_utf8(draft, 8192);
                 let files: Vec<String> = draft
                     .lines()
@@ -1248,6 +1249,7 @@ fn compact_env_var_form(
                 .id(env_var_key_input_id())
                 .desired_width(180.0),
         );
+        connector_ui::paint_text_edit_focus(ui, &key_response);
         state.var_key_input_state.track(ui.ctx(), key_response.id);
         let response = ui.add(
             egui::TextEdit::singleline(&mut state.var_plain_value)
@@ -1256,6 +1258,7 @@ fn compact_env_var_form(
                 .hint_text(catalog.t("common.value", &[]))
                 .desired_width(240.0),
         );
+        connector_ui::paint_text_edit_focus(ui, &response);
         state.var_value_input_state.track(ui.ctx(), response.id);
         // Bound same-frame paste input before validation or intent construction.
         truncate_utf8(&mut state.var_key, ENV_KEY_INPUT_MAX_BYTES);

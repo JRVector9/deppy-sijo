@@ -9,22 +9,6 @@ pub(super) enum Tab {
     Work,
     Advanced,
 }
-impl Tab {
-    pub(super) const ALL: [Self; 4] = [
-        Self::Connections,
-        Self::Permissions,
-        Self::Work,
-        Self::Advanced,
-    ];
-    pub(super) fn key(self) -> &'static str {
-        match self {
-            Self::Connections => "cloud.ui.connections",
-            Self::Permissions => "cloud.ui.permissions",
-            Self::Work => "cloud.ui.work",
-            Self::Advanced => "cloud.ui.advanced",
-        }
-    }
-}
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub(super) enum WorkKind {
     #[default]
@@ -40,13 +24,12 @@ pub(super) struct SettingsState {
     pub(super) rename: String,
     pub(super) editing: bool,
     pub(super) adding: bool,
-    pub(super) manual: bool,
-    pub(super) server_info: bool,
-    pub(super) approval: Option<String>,
     pub(super) manual_name: String,
-    pub(super) manual_input_scope: bool,
     pub(super) profile: Option<usize>,
     pub(super) profile_editing: bool,
+    pub(super) renew: Option<String>,
+    pub(super) token_hidden: bool,
+    pub(super) checking: bool,
     pub(super) notice: Option<(&'static str, Option<String>)>,
 }
 pub(super) fn state_id() -> egui::Id {

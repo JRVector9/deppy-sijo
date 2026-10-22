@@ -3,8 +3,14 @@ use crate::ui::settings::{SETTINGS_DETAIL as METRICS, SETTINGS_TYPE as TYPE};
 use egui::{Color32, FontId, RichText, Stroke, Ui};
 
 pub(super) const CONTROL_HEIGHT: f32 = METRICS.control_height;
-pub(super) const TAB_HEIGHT: f32 = 43.0;
-pub(super) const FOOTER_HEIGHT: f32 = 35.0;
+pub(super) const RADIUS: u8 = 5;
+pub(super) const PERMISSION_COLUMN: f32 = 88.0;
+pub(super) const CONTROL_COLUMN: f32 = 132.0;
+pub(super) const SESSION_ROW_HEIGHT: f32 = 48.0;
+pub(super) const SESSION_TABLE_MIN: f32 = 660.0;
+// HTML의 전체 viewport 대신 사이드바를 제외한 설정 본문 폭을 사용한다.
+pub(super) const COMPACT_WIDTH: f32 = 600.0;
+pub(super) const MEDIUM_WIDTH: f32 = 800.0;
 
 /// Approved settings palette; shared typography and geometry stay inherited.
 pub(super) fn apply_palette(ui: &mut Ui) {
@@ -21,6 +27,8 @@ pub(super) fn apply_palette(ui: &mut Ui) {
     let line = rgb([52, 56, 64], [188, 193, 204]);
     let text = rgb([220, 222, 226], [35, 38, 44]);
     let accent = rgb([57, 184, 232], [8, 113, 142]);
+    ui.spacing_mut().icon_width = 16.0;
+    ui.spacing_mut().button_padding = egui::vec2(12.0, 5.0);
     let v = ui.visuals_mut();
     v.override_text_color = Some(text);
     v.extreme_bg_color = bg;
@@ -31,10 +39,11 @@ pub(super) fn apply_palette(ui: &mut Ui) {
     v.widgets.noninteractive.bg_fill = surface;
     v.widgets.noninteractive.bg_stroke = Stroke::new(1.0, line);
     for (widget, fill) in [
-        (&mut v.widgets.inactive, bg),
+        (&mut v.widgets.inactive, surface),
         (&mut v.widgets.hovered, hover),
         (&mut v.widgets.active, selected),
     ] {
+        widget.corner_radius = egui::CornerRadius::same(RADIUS);
         widget.bg_fill = fill;
         widget.weak_bg_fill = fill;
         widget.bg_stroke = Stroke::new(1.0, line);
@@ -94,7 +103,7 @@ pub(super) fn text_input(ui: &mut Ui, width: f32, edit: egui::TextEdit<'_>) -> e
 }
 pub(super) fn primary(ui: &mut Ui, text: &str) -> egui::Response {
     let color = if ui.visuals().dark_mode {
-        Color32::from_rgb(7, 26, 34)
+        Color32::from_rgb(16, 23, 28)
     } else {
         Color32::WHITE
     };
@@ -141,20 +150,6 @@ pub(super) fn child(
     );
     child.set_clip_rect(rect.intersect(ui.clip_rect()));
     child
-}
-pub(super) fn padded(ui: &mut Ui, contents: impl FnOnce(&mut Ui)) {
-    egui::Frame::NONE
-        .inner_margin(egui::Margin {
-            left: METRICS.pad_x as i8,
-            right: METRICS.pad_x as i8,
-            top: 18,
-            bottom: 26,
-        })
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing.y = 0.0;
-            contents(ui);
-        });
 }
 pub(super) struct RowContent<'a> {
     pub(super) title: &'a str,
@@ -465,4 +460,36 @@ pub(super) fn toggle(ui: &mut Ui, on: &mut bool, label: &str) -> bool {
         },
     );
     changed
+}
+
+/// 표시와 접근성이 같은 셀 사각형을 사용하는 고정 열 라벨.
+pub(super) fn cell_label(
+    ui: &mut Ui,
+    rect: egui::Rect,
+    text: &str,
+    size: f32,
+    color: Color32,
+    centered: bool,
+) -> egui::Response {
+    let response = ui.allocate_rect(rect, egui::Sense::hover());
+    response
+        .widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Label, ui.is_enabled(), text));
+    ui.painter()
+        .with_clip_rect(rect.intersect(ui.clip_rect()))
+        .text(
+            if centered {
+                rect.center()
+            } else {
+                rect.left_center()
+            },
+            if centered {
+                egui::Align2::CENTER_CENTER
+            } else {
+                egui::Align2::LEFT_CENTER
+            },
+            text,
+            FontId::proportional(size),
+            color,
+        );
+    response
 }

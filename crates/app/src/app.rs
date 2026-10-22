@@ -30420,6 +30420,12 @@ impl App {
         self.env_project_rows_failed = false;
     }
 
+    fn clear_inactive_cloud_connection_token(&mut self) {
+        if !self.settings_open || self.settings_category != ui::settings::Category::CloudAgents {
+            self.cloud_agent.clear_connection_token();
+        }
+    }
+
     /// 설정 창 내부 nav 외에 벨/홈/단축키로 나갈 때도 대기 중인 초안을 폐기한다.
     fn set_settings_category(&mut self, category: ui::settings::Category) {
         if self.settings_category == ui::settings::Category::Environment
@@ -35796,6 +35802,8 @@ impl eframe::App for App {
 
     // egui 0.35부터 update(&Context) 대신 ui(&mut Ui) 시그니처를 쓴다.
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        // Command Center의 조기 반환도 설정 비밀값의 표시 수명을 지킨다.
+        self.clear_inactive_cloud_connection_token();
         self.sync_session_aux_scope();
         self.publish_popup_input_fence(ui.ctx());
         self.frame_stats.begin();
@@ -39417,6 +39425,7 @@ impl eframe::App for App {
                 ui.ctx().request_repaint();
             }
         }
+        self.clear_inactive_cloud_connection_token();
         // T1: 설정 창이 닫히면 세션 폴더 배너를 버린다 — 다음 우클릭 진입에서 재감지.
         if !self.settings_open {
             self.cloud_agent.reveal = false;

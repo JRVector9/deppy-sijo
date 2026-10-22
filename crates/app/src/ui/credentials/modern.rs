@@ -247,6 +247,7 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(f32::INFINITY),
             );
+            connector_ui::paint_text_edit_focus(ui, &response);
             self.provider_input_state.track(ui.ctx(), response.id);
         }
         field_label(ui, catalog, "env.modern.api_name_optional");
@@ -257,6 +258,7 @@ impl CredentialsUi {
                 .hint_text(catalog.t("env.modern.api_name_hint", &[]))
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &name_response);
         self.label_input_state.track(ui.ctx(), name_response.id);
         field_label(ui, catalog, "env.modern.variable_name");
         let binding_response = ui.add(
@@ -267,6 +269,7 @@ impl CredentialsUi {
                 .hint_text("OPENAI_API_KEY")
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &binding_response);
         self.env_name_input_state
             .track(ui.ctx(), binding_response.id);
         ui.label(
@@ -282,6 +285,7 @@ impl CredentialsUi {
                 .hint_text(catalog.t("env.modern.paste_key", &[]))
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &response);
         self.secret_input_state.track(ui.ctx(), response.id);
         if self.secret_input.len() > CREDENTIAL_SENSITIVE_ITEM_MAX_BYTES {
             clear_sensitive_string(&mut self.secret_input);

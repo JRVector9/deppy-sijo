@@ -571,7 +571,7 @@ fn workspace_card(ui: &mut egui::Ui, catalog: &i18n::Catalog, row: &ActivityWork
                                 ui.label(
                                     egui::RichText::new(catalog.t("activity.resource_storm", &[]))
                                         .strong()
-                                        .color(egui::Color32::from_rgb(240, 150, 150))
+                                        .color(ui.visuals().warn_fg_color)
                                         .size(11.0),
                                 );
                             }

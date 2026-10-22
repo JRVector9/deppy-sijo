@@ -4,6 +4,7 @@ mod advanced;
 mod connections;
 mod history;
 mod layout;
+mod one_screen;
 mod permissions;
 mod runs;
 mod settings;
@@ -25,179 +26,52 @@ const CLOUD_AGENT_INSTRUCTIONS: &str = concat!(
 #[cfg(test)]
 mod management_tests;
 #[cfg(test)]
+mod one_screen_tests;
+#[cfg(test)]
 mod redesign_tests;
 
 impl CloudAgent {
     pub fn contents(&mut self, ui: &mut egui::Ui, catalog: &i18n::Catalog) {
-        use settings::{SettingsState, Tab};
         ui.scope(|ui| {
             crate::ui::settings::apply_component_style(ui);
-            ui.style_mut().override_font_id = Some(egui::FontId::proportional(14.0));
+            ui.style_mut().override_font_id = None;
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
             layout::apply_palette(ui);
-            let mut state: SettingsState = settings::state(ui);
+            let mut state = settings::state(ui);
             if self.selected_record.is_some() {
-                state.tab = Tab::Work;
+                state.tab = settings::Tab::Work;
                 state.work_kind = settings::WorkKind::Answers;
             }
-            let rect = ui.available_rect_before_wrap();
-            ui.painter()
-                .rect_filled(rect, 0.0, ui.visuals().extreme_bg_color);
-            ui.allocate_rect(rect, egui::Sense::hover());
-            let head = egui::Rect::from_min_size(rect.min, egui::vec2(rect.width(), 80.0));
-            let mut header = layout::child(ui, head, "cloud-page-header");
-            egui::Frame::NONE
-                .inner_margin(egui::Margin {
-                    left: 26,
-                    right: 26,
-                    top: 18,
-                    bottom: 15,
-                })
-                .show(&mut header, |ui| {
-                    ui.scope(|ui| {
-                        ui.spacing_mut().interact_size.y = 18.0;
-                        ui.horizontal(|ui| {
-                            layout::hint(ui, catalog.t("cloud.ui.breadcrumb", &[]));
-                            ui.label(
-                                egui::RichText::new(catalog.t("cloud.ui.title", &[]))
-                                    .size(15.0)
-                                    .strong(),
-                            );
-                        });
-                    });
-                    layout::hint(ui, catalog.t("cloud.ui.intro", &[]));
-                });
-            ui.painter().hline(
-                head.x_range(),
-                head.bottom(),
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
+            ui.painter().rect_filled(
+                ui.available_rect_before_wrap(),
+                0.0,
+                ui.visuals().extreme_bg_color,
             );
-            let tabs_rect = egui::Rect::from_min_size(
-                egui::pos2(rect.left(), head.bottom()),
-                egui::vec2(rect.width(), layout::TAB_HEIGHT),
-            );
-            let mut tabs = layout::child(ui, tabs_rect, "cloud-settings-tabs");
-            egui::Frame::NONE
-                .inner_margin(egui::Margin::symmetric(26, 0))
-                .show(&mut tabs, |ui| {
-                    ui.spacing_mut().item_spacing.x = 22.0;
-                    ui.horizontal(|ui| {
-                        let mut ids = Vec::new();
-                        let mut focused = None;
-                        for tab in Tab::ALL {
-                            let text = catalog.t(tab.key(), &[]);
-                            let display = if tab == Tab::Connections {
-                                format!("{}  {}", text, self.connection_infos().len())
-                            } else {
-                                text.clone()
-                            };
-                            let selected = tab == state.tab;
-                            let response = ui.add(
-                                egui::Button::new(egui::RichText::new(&display).size(14.0).color(
-                                    if selected {
-                                        layout::accent(ui)
-                                    } else {
-                                        layout::secondary(ui)
-                                    },
-                                ))
-                                .frame(false)
-                                .min_size(egui::vec2(0.0, layout::TAB_HEIGHT - 1.0)),
-                            );
-                            ui.ctx().accesskit_node_builder(response.id, |node| {
-                                node.set_role(egui::accesskit::Role::Tab);
-                                node.set_label(text.clone());
-                                node.set_selected(selected);
-                            });
-                            if selected {
-                                ui.painter().hline(
-                                    response.rect.x_range(),
-                                    tabs_rect.bottom() - 1.0,
-                                    egui::Stroke::new(2.0, layout::accent(ui)),
-                                );
-                            }
-                            ids.push(response.id);
-                            if response.has_focus() {
-                                focused = Some(tab);
-                            }
-                            if response.clicked() {
-                                state.tab = tab;
-                                response.request_focus();
-                            }
-                        }
-                        if let Some(focused) = focused {
-                            let index =
-                                Tab::ALL.iter().position(|tab| *tab == focused).unwrap_or(0);
-                            let next = ui.input_mut(|input| {
-                                if input.consume_key(egui::Modifiers::NONE, egui::Key::Home) {
-                                    Some(0)
-                                } else if input.consume_key(egui::Modifiers::NONE, egui::Key::End) {
-                                    Some(3)
-                                } else if input
-                                    .consume_key(egui::Modifiers::NONE, egui::Key::ArrowRight)
-                                {
-                                    Some((index + 1) % 4)
-                                } else if input
-                                    .consume_key(egui::Modifiers::NONE, egui::Key::ArrowLeft)
-                                {
-                                    Some((index + 3) % 4)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(next) = next {
-                                state.tab = Tab::ALL[next];
-                                ui.memory_mut(|memory| {
-                                    // egui also queues geometric arrow navigation at begin_pass.
-                                    // This tab strip owns that navigation; avoid a second move.
-                                    memory.move_focus(egui::FocusDirection::None);
-                                    memory.request_focus(ids[next]);
-                                });
-                                ui.ctx().request_repaint();
-                            }
-                        }
-                    });
-                });
-            ui.painter().hline(
-                tabs_rect.x_range(),
-                tabs_rect.bottom(),
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-            );
-            let footer = egui::Rect::from_min_max(
-                egui::pos2(
-                    rect.left(),
-                    (rect.bottom() - layout::FOOTER_HEIGHT).max(tabs_rect.bottom()),
-                ),
-                rect.max,
-            );
-            let body = egui::Rect::from_min_max(
-                egui::pos2(rect.left(), tabs_rect.bottom()),
-                footer.min + egui::vec2(rect.width(), 0.0),
-            );
-            let mut content = layout::child(ui, body, ("cloud-settings-body", state.tab));
             egui::ScrollArea::vertical()
-                .id_salt(("cloud-settings-scroll", state.tab))
+                .id_salt("cloud-one-screen-scroll")
                 .auto_shrink([false, false])
-                .show(&mut content, |ui| {
-                    layout::padded(ui, |ui| match state.tab {
-                        Tab::Connections => self.connection_settings(ui, catalog, &mut state),
-                        Tab::Permissions => self.permission_settings(ui, catalog, &mut state),
-                        Tab::Work => self.work_settings(ui, catalog, &mut state),
-                        Tab::Advanced => self.advanced_settings(ui, catalog, &mut state),
-                    });
+                .show(ui, |ui| {
+                    let width = ui.available_width();
+                    let compact = width < layout::COMPACT_WIDTH;
+                    let pad_x = if compact {
+                        16
+                    } else if width < layout::MEDIUM_WIDTH {
+                        20
+                    } else {
+                        26
+                    };
+                    egui::Frame::NONE
+                        .inner_margin(egui::Margin {
+                            left: pad_x,
+                            right: pad_x,
+                            top: if compact { 18 } else { 22 },
+                            bottom: 14,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            self.one_screen(ui, catalog, &mut state, compact);
+                        });
                 });
-            ui.painter()
-                .rect_filled(footer, 0.0, ui.visuals().faint_bg_color);
-            ui.painter().hline(
-                footer.x_range(),
-                footer.top(),
-                egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color),
-            );
-            let mut feedback = layout::child(
-                ui,
-                footer.shrink2(egui::vec2(26.0, 8.0)),
-                "cloud-settings-feedback",
-            );
-            settings::notice(&mut feedback, catalog, &state);
             settings::store(ui, state);
         });
     }
@@ -206,7 +80,7 @@ impl CloudAgent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use egui_kittest::kittest::Queryable as _;
+    use egui_kittest::kittest::{NodeT as _, Queryable as _};
     fn harness(bridge: CloudAgent) -> egui_kittest::Harness<'static, CloudAgent> {
         let catalog = i18n::Catalog::load("en-US").unwrap();
         egui_kittest::Harness::builder()
@@ -238,12 +112,11 @@ mod tests {
         bridge.server =
             Some(agent_mcp::Server::start(0, "starting.trycloudflare.com", || {}).unwrap());
         bridge.connection = super::super::Connection::Verifying;
-        let mut h = harness(bridge);
+        let h = harness(bridge);
         h.get_by_label("Verifying public URL…");
         assert!(h.query_by_label("Public MCP URL verified").is_none());
-        h.get_by_label("Connection information").click();
-        h.run();
-        assert!(h.query_by_label("Copy URL").is_none());
+
+        assert!(h.get_by_label("Copy URL").accesskit_node().is_disabled());
     }
     #[test]
     fn setup_state_public_readiness_keeps_client_registration_separate() {
@@ -252,10 +125,9 @@ mod tests {
             Some(agent_mcp::Server::start(0, "ready.trycloudflare.com", || {}).unwrap());
         bridge.generated_hostname = Some("ready.trycloudflare.com".into());
         bridge.connection = super::super::Connection::Ready;
-        let mut h = harness(bridge);
-        h.get_by_label("Public MCP URL verified");
-        h.get_by_label("Connection information").click();
-        h.run();
+        let h = harness(bridge);
+        h.get_by_label("External access ready");
+
         h.get_by_label("https://ready.trycloudflare.com/mcp");
         h.get_by_label("Copy URL");
         assert!(h.query_by_label("MCP connected").is_none());
@@ -267,38 +139,28 @@ mod tests {
         bridge.hostname = "deppy.example.com".into();
         bridge.server = Some(agent_mcp::Server::start(0, &bridge.hostname, || {}).unwrap());
         bridge.connection = super::super::Connection::Ready;
-        let mut h = harness(bridge);
+        let h = harness(bridge);
         h.get_by_label("Fixed public URL configured · check your tunnel and connector");
-        h.get_by_label("Connection information").click();
-        h.run();
+
         h.get_by_label("https://deppy.example.com/mcp");
         assert!(h.query_by_label("Public MCP URL verified").is_none());
     }
     #[test]
-    fn setup_state_manual_local_only_preserves_local_url_and_token_controls() {
+    fn setup_state_manual_local_only_hides_local_endpoint_and_disables_copy() {
         let mut bridge = CloudAgent::memory();
         bridge.automatic = false;
         bridge.server = Some(agent_mcp::Server::start(0, "", || {}).unwrap());
         bridge.connection = super::super::Connection::Ready;
         let url = format!("http://{}/mcp", bridge.server.as_ref().unwrap().addr);
-        let mut h = harness(bridge);
-        h.get_by_label("Connection information").click();
-        h.run();
-        h.get_by_label(&url);
-        h.get_by_label("Copy URL");
-        h.get_by_label("Advanced settings").click();
-        h.run();
-        h.get_by_label("Shared token · ended sessions · agent instructions")
-            .click();
-        h.run();
-        h.get_by_label("Copy token");
+        let h = harness(bridge);
+        assert!(h.query_by_label(&url).is_none());
+        assert!(h.get_by_label("Copy URL").accesskit_node().is_disabled());
     }
     #[test]
     fn setup_state_copy_instruction_delivers_multiline_bounds_and_receipt_contract() {
         let mut h = harness(CloudAgent::memory());
-        h.get_by_label("Add first connection").click();
-        h.run();
-        h.get_by_label("Instructions for the agent").click();
+        h.get_by_label("Other connection methods · more settings")
+            .click();
         h.run();
         h.get_by_label("Copy agent instructions").click();
         h.run();
@@ -373,7 +235,7 @@ mod tests {
         h.state_mut().selected_record = Some("answer-0".into());
         h.run();
         h.get_by_label("Answer body 0\nFull result");
-        h.get_by_label("Connections").click();
+        h.get_by_label("Work · answers").click();
         h.run();
         h.get_by_label("Work · answers").click();
         h.run();

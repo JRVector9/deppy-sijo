@@ -1,0 +1,26 @@
+{
+  "label": "settings-token-green",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "settings_token_lifecycle_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 48.11,
+  "summaries": [
+    "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 3647 filtered out; finished in 0.27s"
+  ],
+  "log_sha256": "21219f47bbe0cc20a4a689c54085d2b3f6d93a33872d1dff19526a82ec8e5e43"
+}

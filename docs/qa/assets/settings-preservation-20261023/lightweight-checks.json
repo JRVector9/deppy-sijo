@@ -1,0 +1,63 @@
+{
+  "cargo_executed": false,
+  "checks": [
+    {
+      "command": [
+        "python3",
+        "docs/qa/assets/settings-preservation-20261023/verify_transfer.py",
+        "--check-source"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.184,
+      "stdout": "PASS: 27 approved paths, missing 0; 21 exact copies; App 3-line scope; locale 44-line additions + CC108-line suffixes; release files unchanged.\nPASS: original source HEAD, complete Git status and 27 approved source digests remain unchanged.\nNo Cargo, runtime, native renderer, live app or release verification is performed by this script.\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true",
+        "crates/app/src/cloud_agent.rs",
+        "crates/app/src/cloud_agent/access.rs",
+        "crates/app/src/cloud_agent/ui.rs",
+        "crates/app/src/cloud_agent/ui/connections.rs",
+        "crates/app/src/cloud_agent/ui/layout.rs",
+        "crates/app/src/cloud_agent/ui/permissions.rs",
+        "crates/app/src/cloud_agent/ui/settings.rs",
+        "crates/app/src/ui/activity.rs",
+        "crates/app/src/ui/agents.rs",
+        "crates/app/src/ui/credentials.rs",
+        "crates/app/src/ui/credentials/modern.rs",
+        "crates/app/src/ui/env_profiles.rs",
+        "crates/app/src/ui/env_profiles/modern.rs",
+        "crates/app/src/ui/environment.rs",
+        "crates/app/src/ui/settings.rs",
+        "crates/connector-ui/src/lib.rs",
+        "crates/app/src/cloud_agent/ui/management_tests.rs",
+        "crates/app/src/cloud_agent/ui/redesign_tests.rs",
+        "crates/app/src/cloud_agent/ui/one_screen.rs",
+        "crates/app/src/cloud_agent/ui/one_screen_tests.rs",
+        "crates/app/src/ui/settings/design_rule_tests.rs",
+        "crates/app/src/app.rs"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.594,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.033,
+      "stdout": "",
+      "stderr": ""
+    }
+  ]
+}

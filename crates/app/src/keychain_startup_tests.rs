@@ -76,6 +76,109 @@ mod tests {
         }
     }
 
+    fn settings_token_lifecycle_in_command_center(close_settings: bool) {
+        let _serial = STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "deppy-settings-token-lifecycle-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("metadata.sqlite3");
+        let db = Db::open(&path).unwrap();
+        let workspace_id = db.ensure_default_workspace().unwrap();
+        let spy = CountingStore::new();
+        let _store_guard = StoreGuard::install(Arc::clone(&spy));
+        let mut config = Config::default();
+        config.ui.agent_status_hooks = false;
+        config.ui.file_tree_enabled = false;
+        config.remote.tls_enabled = false;
+        config.web.enabled = false;
+        config.relay.enabled = false;
+        config.cloud_agent.automatic = false;
+        config.cloud_agent.reconnect = false;
+        let context = egui::Context::default();
+        let run_lock = Arc::new(persist::LockFile::acquire(&dir.join("deppy.lock")).unwrap());
+        let mut app = App::new(
+            config,
+            dir.join("config.toml"),
+            db,
+            workspace_id,
+            dir.join("logs"),
+            path,
+            context.clone(),
+            None,
+            run_lock,
+        );
+        app.command_center_layout = command_center_host::layout::LayoutSwitch::from_flag(Some("1"));
+        // Create the inert, local sidecar owner without a visible project load or provider turn.
+        app.command_center_layout.use_original();
+        app.pump_command_center(&context);
+        app.command_center_layout.open();
+        assert!(app.command_center.is_some());
+        app.settings_open = true;
+        app.set_settings_category(ui::settings::Category::CloudAgents);
+        *app.cloud_agent.displayed_connection_token_for_test() = Some((
+            "synthetic-display-owner".into(),
+            secret::SecretString::new("synthetic-settings-token-lifecycle-secret".into()),
+        ));
+        let mut frame = eframe::Frame::_new_kittest();
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                eframe::App::ui(&mut app, ui, &mut frame);
+            })
+            .drop_without_applying_deltas();
+        let retained_while_cloud_settings_open = app
+            .cloud_agent
+            .displayed_connection_token_for_test()
+            .is_some();
+        if close_settings {
+            app.settings_open = false;
+        } else {
+            app.set_settings_category(ui::settings::Category::General);
+        }
+        context
+            .run_ui(egui::RawInput::default(), |ui| {
+                eframe::App::ui(&mut app, ui, &mut frame);
+            })
+            .drop_without_applying_deltas();
+        let cleared_after_transition = app
+            .cloud_agent
+            .displayed_connection_token_for_test()
+            .is_none();
+        let stayed_in_command_center = app.command_center_layout.mode
+            == command_center_host::layout::LayoutMode::CommandCenter;
+        app.shutdown_on_exit();
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(
+            retained_while_cloud_settings_open,
+            "an open CloudAgents category keeps its newly displayed token"
+        );
+        assert!(
+            stayed_in_command_center,
+            "exercise the actual Command Center UI return"
+        );
+        assert_eq!(
+            spy.calls(),
+            0,
+            "the isolated App lifecycle must not access Keychain"
+        );
+        assert!(
+            cleared_after_transition,
+            "the actual App UI must dispose the displayed token before the Command Center return after settings close/category change"
+        );
+    }
+
+    #[test]
+    fn settings_token_lifecycle_actual_app_close_clears_before_command_center_return() {
+        settings_token_lifecycle_in_command_center(true);
+    }
+
+    #[test]
+    fn settings_token_lifecycle_actual_app_category_change_clears_before_command_center_return() {
+        settings_token_lifecycle_in_command_center(false);
+    }
+
     #[test]
     fn keychain_startup_actual_app_relay_off_and_settings_load_do_not_access_store() {
         let _serial = STORE_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());

@@ -200,6 +200,7 @@ pub struct CloudAgent {
     pending: HashMap<String, PendingInput>,
     redaction: secret::RedactionService,
     token_lease: Option<secret::RedactionLease>,
+    displayed_connection_token: Option<(String, secret::SecretString)>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Connection {
@@ -277,8 +278,16 @@ impl CloudAgent {
             pending: HashMap::new(),
             redaction,
             token_lease: None,
+            displayed_connection_token: None,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn displayed_connection_token_for_test(
+        &mut self,
+    ) -> &mut Option<(String, secret::SecretString)> {
+        &mut self.displayed_connection_token
+    }
+
     #[cfg(test)]
     fn memory() -> Self {
         let mut result = Self::with_worker(

@@ -1,0 +1,48 @@
+{
+  "cargo_executed_by_agent": false,
+  "root_actual_tests_read_from_evidence": true,
+  "all_four_root_log_digests_verified": true,
+  "new_QA_text_trailing_whitespace_check": "pass",
+  "checks": [
+    {
+      "command": [
+        "python3",
+        "docs/qa/assets/settings-preservation-20261023/verify_transfer.py",
+        "--check-source",
+        "--with-lifecycle"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.183,
+      "stdout": "PASS: 27 approved paths, missing 0; 21 exact copies; App 3-line scope; locale 44-line additions + CC108-line suffixes; release files unchanged.\nPASS: separately authorized lifecycle overlay reverses exactly to the original transfer; final product/test inventory is 28 paths.\nPASS: original source HEAD, complete Git status and 27 approved source digests remain unchanged.\nNo Cargo, runtime, native renderer, live app or release verification is performed by this script.\n",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "rustfmt",
+        "--check",
+        "--edition",
+        "2024",
+        "--config",
+        "skip_children=true",
+        "crates/app/src/app.rs",
+        "crates/app/src/cloud_agent.rs",
+        "crates/app/src/keychain_startup_tests.rs"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.465,
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_seconds": 0.034,
+      "stdout": "",
+      "stderr": ""
+    }
+  ]
+}

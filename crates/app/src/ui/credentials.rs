@@ -820,6 +820,7 @@ impl CredentialsUi {
                                 .hint_text(catalog.t("credentials.env_name", &[]))
                                 .desired_width(200.0),
                         );
+                        connector_ui::paint_text_edit_focus(ui, &response);
                         draft.input_state.track(ui.ctx(), response.id);
                         truncate_utf8(&mut draft.value, 256);
                         let valid = draft.value.trim().is_empty()
@@ -864,6 +865,7 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.provider", &[]))
                     .desired_width(120.0),
             );
+            connector_ui::paint_text_edit_focus(ui, &provider_response);
             self.provider_input_state
                 .track(ui.ctx(), provider_response.id);
             let name_response = ui.add(
@@ -873,6 +875,7 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.label", &[]))
                     .desired_width(160.0),
             );
+            connector_ui::paint_text_edit_focus(ui, &name_response);
             self.label_input_state.track(ui.ctx(), name_response.id);
             for kind in ["api_key", "token"] {
                 ui.selectable_value(&mut self.kind, kind, kind);
@@ -884,6 +887,7 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.env_name", &[]))
                     .desired_width(200.0),
             );
+            connector_ui::paint_text_edit_focus(ui, &binding_response);
             self.env_name_input_state
                 .track(ui.ctx(), binding_response.id);
             truncate_utf8(&mut self.env_name, 256);
@@ -894,6 +898,7 @@ impl CredentialsUi {
                     .hint_text(catalog.t("credentials.secret", &[]))
                     .desired_width(220.0),
             );
+            connector_ui::paint_text_edit_focus(ui, &response);
             self.secret_input_state.track(ui.ctx(), response.id);
             truncate_utf8(&mut self.provider, CREDENTIAL_TEXT_INPUT_MAX_BYTES);
             truncate_utf8(&mut self.label, CREDENTIAL_TEXT_INPUT_MAX_BYTES);

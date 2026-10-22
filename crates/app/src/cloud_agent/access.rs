@@ -7,7 +7,7 @@ impl CloudAgent {
         &mut self,
         name: &str,
         input_scope: bool,
-    ) -> Result<String, String> {
+    ) -> Result<(String, secret::SecretString), String> {
         if self.issued_leases.len() >= 64 {
             return Err("client_permission_limit".into());
         }
@@ -24,8 +24,8 @@ impl CloudAgent {
                 return Err("token_redaction_capacity_no_connection".into());
             }
         };
-        self.issued_leases.insert(principal.id, lease);
-        Ok(token.as_str().to_owned())
+        self.issued_leases.insert(principal.id.clone(), lease);
+        Ok((principal.id, secret))
     }
     pub(super) fn retire_run_lease(&mut self, run: &agent_mcp::CloudRun) {
         if (run.state.is_terminal() || run.state == agent_mcp::RunState::Unknown)
@@ -121,6 +121,13 @@ impl CloudAgent {
         Ok(())
     }
     pub fn revoke_connection(&mut self, id: &str) {
+        if self
+            .displayed_connection_token
+            .as_ref()
+            .is_some_and(|(shown, _)| shown == id)
+        {
+            self.clear_connection_token();
+        }
         self.revoke_completions(Some(id), None);
         if let Some(server) = &self.server {
             server.auth.revoke_connection(id);

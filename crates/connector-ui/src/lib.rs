@@ -21,6 +21,19 @@ pub use connector_contract as contract;
 mod draft_text_edit;
 pub mod popup;
 
+/// egui는 TextEdit 선택 글자와 포커스 테두리에 selection.stroke를 함께 사용한다.
+/// 실제 프레임 위를 같은 rect의 accent 테두리로 덮어 선택 글자색과 분리한다.
+pub fn paint_text_edit_focus(ui: &Ui, response: &egui::Response) {
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            ui.style().interact(response).corner_radius,
+            egui::Stroke::new(2.0, ui.visuals().hyperlink_color),
+            egui::StrokeKind::Inside,
+        );
+    }
+}
+
 #[cfg(test)]
 mod oauth_secret_tests;
 
@@ -383,7 +396,7 @@ fn render_selected_server(
     intent: &mut Option<ConnectorIntent>,
 ) {
     ui.horizontal_wrapped(|ui| {
-        ui.heading(&server.name);
+        ui.label(egui::RichText::new(&server.name).size(14.0).strong());
         ui.label(transport_label(server.transport, labels));
         if ui.button(&labels.discover).clicked() {
             offer_intent(intent, ConnectorIntent::Discover(server.id.clone()));
@@ -530,12 +543,13 @@ fn render_import_controls(
     intent: &mut Option<ConnectorIntent>,
 ) {
     ui.strong(&labels.import_title);
-    ui.add(
+    let input = ui.add(
         TextEdit::multiline(paste_input)
             .desired_rows(3)
             .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes)
             .hint_text(r#"{"mcpServers":{"name":{"command":"..."}}}"#),
     );
+    paint_text_edit_focus(ui, &input);
     truncate_utf8(
         paste_input,
         ResourceLimits::PRODUCTION_CEILING.import_input_bytes,
@@ -711,12 +725,13 @@ fn render_add_server_modal(
                         ui.label(&labels.command);
                         popup::text_input(ui, &mut current.command, "");
                         ui.label(&labels.arguments);
-                        ui.add_sized(
+                        let input = ui.add_sized(
                             [ui.available_width(), 120.0],
                             TextEdit::multiline(&mut current.arguments)
                                 .font(egui::FontId::proportional(13.0))
                                 .margin(egui::Margin::symmetric(10, 8)),
                         );
+                        paint_text_edit_focus(ui, &input);
                     }
                 }
                 ui.checkbox(&mut current.enabled, &labels.enabled);
@@ -770,7 +785,7 @@ fn render_invoke_modal(
         |ui| {
             popup::window_body(ui, |ui| {
                 ui.label(&labels.arguments_json);
-                ui.add_sized(
+                let input = ui.add_sized(
                     [ui.available_width(), ui.available_height().max(136.0)],
                     TextEdit::multiline(&mut current.arguments_json)
                         .code_editor()
@@ -778,6 +793,7 @@ fn render_invoke_modal(
                         .desired_rows(1)
                         .margin(egui::Margin::symmetric(10, 8)),
                 );
+                paint_text_edit_focus(ui, &input);
                 truncate_utf8(
                     &mut current.arguments_json,
                     ResourceLimits::PRODUCTION_CEILING.tool_input_bytes,
@@ -1067,10 +1083,11 @@ fn render_oauth_client_form(
         return;
     };
     ui.label(&labels.client_id);
-    ui.add(
+    let client_id = ui.add(
         TextEdit::singleline(&mut current.client_id)
             .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
     );
+    paint_text_edit_focus(ui, &client_id);
     ui.label(&labels.client_secret);
     let secret_id = ui.make_persistent_id("connector_oauth_client_secret");
     current.secret_input_state.track(ui.ctx(), secret_id);
@@ -1082,10 +1099,11 @@ fn render_oauth_client_form(
         popup::secret_input(ui, &mut secret, secret_id, "", false);
     }
     ui.label(&labels.workspace_hint);
-    ui.add(
+    let workspace = ui.add(
         TextEdit::singleline(&mut current.workspace_hint)
             .char_limit(ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2),
     );
+    paint_text_edit_focus(ui, &workspace);
     truncate_utf8(
         &mut current.client_id,
         ResourceLimits::PRODUCTION_CEILING.import_input_bytes / 2,

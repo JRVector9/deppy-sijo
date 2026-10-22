@@ -553,21 +553,34 @@ impl AgentsUi {
         intent: &mut Option<AgentsIntent>,
     ) {
         ui.separator();
-        ui.heading(catalog.t("agents.register", &[]));
+        ui.label(
+            egui::RichText::new(catalog.t("agents.register", &[]))
+                .size(super::settings::SETTINGS_TYPE.section_title)
+                .strong(),
+        );
         ui.horizontal(|ui| {
             ui.label(catalog.t("common.name", &[]));
-            ui.text_edit_singleline(&mut self.name);
+            super::settings::settings_text_input(
+                ui,
+                ui.spacing().text_edit_width.min(ui.available_width()),
+                egui::TextEdit::singleline(&mut self.name),
+            );
         });
         ui.horizontal(|ui| {
             ui.label(catalog.t("common.command", &[]));
-            ui.text_edit_singleline(&mut self.command);
+            super::settings::settings_text_input(
+                ui,
+                ui.spacing().text_edit_width.min(ui.available_width()),
+                egui::TextEdit::singleline(&mut self.command),
+            );
         });
         ui.label(catalog.t("agents.args_one_per_line", &[]));
-        ui.add(
+        let arguments = ui.add(
             egui::TextEdit::multiline(&mut self.args_input)
                 .desired_rows(3)
                 .font(egui::TextStyle::Monospace),
         );
+        connector_ui::paint_text_edit_focus(ui, &arguments);
         ui.collapsing(catalog.t("agents.status_regex", &[]), |ui| {
             for (label, field) in [
                 ("waiting", &mut self.waiting_regex),
@@ -577,7 +590,11 @@ impl AgentsUi {
             ] {
                 ui.horizontal(|ui| {
                     ui.label(label);
-                    ui.add(egui::TextEdit::singleline(field).font(egui::TextStyle::Monospace));
+                    super::settings::settings_text_input(
+                        ui,
+                        ui.spacing().text_edit_width.min(ui.available_width()),
+                        egui::TextEdit::singleline(field).font(egui::TextStyle::Monospace),
+                    );
                 });
             }
         });
@@ -589,7 +606,9 @@ impl AgentsUi {
             self.render_backend_picker(ui, snapshot, catalog);
             ui.horizontal(|ui| {
                 ui.label(catalog.t("agents.config_flag", &[]));
-                ui.add(
+                super::settings::settings_text_input(
+                    ui,
+                    ui.spacing().text_edit_width.min(ui.available_width()),
                     egui::TextEdit::singleline(&mut self.mcp_config_flag)
                         .font(egui::TextStyle::Monospace),
                 );

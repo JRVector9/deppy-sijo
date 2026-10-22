@@ -1,0 +1,29 @@
+{
+  "label": "settings-native-render",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "env",
+    "DEPPY_SETTINGS_DESIGN_IMAGES=/private/tmp/deppy-product-settings-images-20261023",
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "ui::settings::design_rule_tests::design_rule_render_native_review_images",
+    "--",
+    "--ignored",
+    "--exact",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 3.91,
+  "summaries": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3656 filtered out; finished in 3.62s"
+  ],
+  "log_sha256": "9ac4c32d9830dbf9d6d037d27dfd26f870a40d08427db414a96ccaea15f0a424"
+}

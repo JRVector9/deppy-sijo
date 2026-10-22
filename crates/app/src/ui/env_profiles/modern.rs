@@ -175,6 +175,7 @@ impl EnvProfilesUi {
                 .hint_text("APP_ENV")
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &key_response);
         self.var_key_input_state.track(ui.ctx(), key_response.id);
         field_label(ui, catalog, "common.value");
         let response = ui.add(
@@ -184,6 +185,7 @@ impl EnvProfilesUi {
                 .hint_text("development")
                 .desired_width(f32::INFINITY),
         );
+        connector_ui::paint_text_edit_focus(ui, &response);
         self.var_value_input_state.track(ui.ctx(), response.id);
         field_label(ui, catalog, "env.modern.save_file");
         let files = snapshot
@@ -294,13 +296,14 @@ impl EnvProfilesUi {
             let draft = self
                 .source_draft
                 .get_or_insert_with(|| sources.selected_files.join("\n"));
-            ui.add_enabled(
+            let source = ui.add_enabled(
                 !self.source_pending,
                 egui::TextEdit::multiline(draft)
                     .desired_rows(3)
                     .desired_width(f32::INFINITY)
                     .char_limit(8192),
             );
+            connector_ui::paint_text_edit_focus(ui, &source);
             truncate_utf8(draft, 8192);
             let files: Vec<String> = draft
                 .lines()

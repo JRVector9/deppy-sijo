@@ -48,7 +48,7 @@ ApprovedVerification::{id, target, spec, evidence} // borrowed immutable getters
 verification::matches_current(&ProjectWorkState, &CommandVerificationEvidence) -> bool
 verification::result_state(&CommandVerificationEvidence) -> Option<VerificationState>
 VerificationWorker::new(PathBuf, secret::RedactionService, impl Fn() + Send + Sync + 'static)
-VerificationWorker::try_request(VerificationJob) -> Result<(), LazyWorkerSubmitError<VerificationJob>>
+VerificationWorker::try_request(VerificationJob) -> Result<(), Box<LazyWorkerSubmitError<VerificationJob>>>
 VerificationWorker::cancel(&VerificationId) -> bool
 VerificationWorker::try_recv() -> Option<Result<VerificationResult, VerificationError>>
 ```
@@ -83,3 +83,8 @@ Production now builds/validates only a pure reviewed DTO in native admission. Th
 Manual completion matches immutable id/target/time/pass fields, consumes returned redacted text for history, and explicitly rejects a mismatched identity instead of dropping its receipt. `try_request` boxes its known-unsent job error to satisfy strict Clippy without changing retry semantics; manual review groups revision/pass/text into one tuple. Removed the root test's unused mutable store variable.
 
 At source handoff, strict app all-target Clippy and the broader Command Center run are still running/queued; no success is claimed yet. Root will run final integrated gates. No release, app lifecycle action, paid call or user-session input.
+
+
+Final correction evidence: source `78b25fe0` integrated by root as `f732f931`, manual tuple callsite `6edfb039`. Actual isolated strict `cargo clippy --offline --locked -p deppy-sijo --all-targets -- -D warnings`: **exit0**, 1m13s. Final broader `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo command_center -- --test-threads=1`: **178 passed / 0 failed / 3 ignored**, 10.97s. `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo work_management:: -- --test-threads=1`: **99 passed / 0 failed**, 2.61s. Standalone `cargo fmt --all --check` and `git diff --check`: **exit0**. All use the isolated target/jobs2 noted above.
+
+Failed broader-test approach: two attempts executed the older copied main-host stale-child fixture (176PASS/1FAIL/3ignored, failure at old line592). Copying current root dependencies with preserved old mtimes made Cargo treat the outdated binary as fresh; touching only those copied nonowned dependency files forced recompilation. Current root fixtures then passed the 178-test gate above. These dependency copies and the local tuple callsite remain outside the corrective source commit. No product failure is claimed from this fixture/cache mismatch. The independently reviewed verification authority/lifecycle flow has no remaining confirmed finding after the two corrections. Root owns whole-tree final gates and shared handoff.

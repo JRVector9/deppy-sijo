@@ -18,6 +18,9 @@ impl ApprovedVerification {
     pub fn spec(&self) -> &VerificationSpec {
         &self.initial.spec
     }
+    pub fn evidence(&self) -> &CommandVerificationEvidence {
+        &self.initial
+    }
 }
 
 /// Call only in response to the native user's explicit review/execute action.
@@ -205,6 +208,8 @@ pub(super) mod tests {
             Some("provider-turn-actual")
         );
         assert!(matches_current(&state, &approved.initial));
+        assert_eq!(approved.evidence().id, *approved.id());
+        assert!(approved.evidence().started_at_ms > 0);
         assert!(approve_local(&state, &id, ResultRevision(2), spec(&dir, "printf ok")).is_err());
         assert!(
             approve_local(
@@ -225,5 +230,46 @@ pub(super) mod tests {
         assert!(!matches_current(&state, &approved.initial));
         state.workspace_id = WorkspaceId::new();
         assert!(!matches_current(&state, &approved.initial));
+    }
+
+    #[test]
+    fn verification_pass_needs_current_revision_and_separate_user_confirmation() {
+        let dir = std::env::temp_dir();
+        let mut state = fixture(&dir);
+        let approved = approve_local(
+            &state,
+            &state.tasks[0].id,
+            ResultRevision(1),
+            spec(&dir, "printf ok"),
+        )
+        .unwrap();
+        let mut evidence = approved.initial;
+        evidence.outcome = CommandVerificationOutcome::Passed;
+        evidence.exit_code = Some(0);
+        evidence.ended_at_ms = Some(now_ms());
+        assert!(matches_current(&state, &evidence));
+        assert_eq!(result_state(&evidence), Some(VerificationState::Passed));
+        let attempt = &state.attempts[0];
+        state
+            .apply_event(WorkEvent {
+                id: EventId::new(),
+                workspace_id: state.workspace_id.clone(),
+                task_id: attempt.task_id.clone(),
+                attempt_id: attempt.id.clone(),
+                runtime_binding: attempt.runtime_binding.clone().unwrap(),
+                sequence: 2,
+                kind: WorkEventKind::VerificationFinished {
+                    result_revision: ResultRevision(1),
+                    outcome: VerificationState::Passed,
+                },
+            })
+            .unwrap();
+        assert_eq!(state.tasks[0].state, WorkState::AwaitingUserConfirmation);
+        state.tasks[0].result.as_mut().unwrap().revision = ResultRevision(2);
+        assert!(!matches_current(&state, &evidence));
+        evidence.outcome = CommandVerificationOutcome::Cancelled;
+        assert_eq!(result_state(&evidence), None);
+        evidence.outcome = CommandVerificationOutcome::Interrupted;
+        assert_eq!(result_state(&evidence), None);
     }
 }

@@ -350,21 +350,25 @@ impl VerificationEvidence {
     pub fn validate(&self) -> Result<(), ValidationError> {
         match self {
             Self::AppLocal(e) => e.validate(),
-            Self::UserManual(e) => {
-                validate_id(&e.id.0)?;
-                e.target.validate()?;
-                bounded(
-                    "manual verification evidence",
-                    &e.evidence,
-                    WORK_EVENT_MAX_BYTES,
-                    false,
-                )?;
-                if e.recorded_at_ms == 0 {
-                    return Err(ValidationError("missing manual evidence time".into()));
-                }
-                Ok(())
-            }
+            Self::UserManual(e) => e.validate(),
         }
+    }
+}
+
+impl ManualVerificationEvidence {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_id(&self.id.0)?;
+        self.target.validate()?;
+        bounded(
+            "manual verification evidence",
+            &self.evidence,
+            WORK_EVENT_MAX_BYTES,
+            false,
+        )?;
+        if self.recorded_at_ms == 0 {
+            return Err(ValidationError("missing manual evidence time".into()));
+        }
+        Ok(())
     }
 }
 
@@ -842,6 +846,14 @@ mod tests {
             },
             CommandVerificationEvidence {
                 stdout: "x".repeat(1025),
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                error: Some("x".repeat(WORK_EVENT_MAX_BYTES + 1)),
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                outcome: CommandVerificationOutcome::NonzeroExit,
                 ..valid.clone()
             },
             CommandVerificationEvidence {

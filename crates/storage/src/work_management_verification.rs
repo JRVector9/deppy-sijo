@@ -10,7 +10,7 @@ pub const VERIFICATION_RECORD_MAX_BYTES: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VerificationClaim {
     New,
-    Existing(CommandVerificationEvidence),
+    Existing(Box<CommandVerificationEvidence>),
     Conflict,
 }
 
@@ -83,7 +83,7 @@ impl CommandCenterStore {
         if let Some(old) = read(&tx, &evidence.target.workspace_id, &evidence.id)? {
             return Ok(match old {
                 VerificationEvidence::AppLocal(old) if same_request(&old, evidence) => {
-                    VerificationClaim::Existing(old)
+                    VerificationClaim::Existing(Box::new(old))
                 }
                 _ => VerificationClaim::Conflict,
             });
@@ -204,7 +204,7 @@ mod tests {
         );
         assert_eq!(
             store.start_command_verification(&initial).unwrap(),
-            VerificationClaim::Existing(initial.clone())
+            VerificationClaim::Existing(Box::new(initial.clone()))
         );
         let mut conflict = initial.clone();
         conflict.target.result_revision = ResultRevision(2);

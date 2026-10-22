@@ -24,7 +24,7 @@ impl Fixture {
         fs::create_dir(&root).unwrap();
         let program = root.join("ssh");
         let script = format!(
-            "#!/usr/bin/python3\nimport os,sys,time,signal,socket,struct,subprocess\nif '-G' in sys.argv:\n print('hostname resolved.example.test\\nuser deploy\\nport 2200');sys.exit(0)\ndebug=open(sys.argv[sys.argv.index('-E')+1],'w',buffering=1) if '-E' in sys.argv else sys.stderr\nopen({:?},'w').write(str(os.getpid()))\n{}\n",
+            "#!/usr/bin/python3\nimport os,sys,time,signal,socket,struct,subprocess\nif '-G' in sys.argv:\n print('hostname resolved.example.test\\nuser deploy\\nport 2200');sys.exit(0)\ndebug=open(sys.argv[sys.argv.index('-E')+1],'w',buffering=1) if '-E' in sys.argv else sys.stderr\npid_path={:?}\nwith open(pid_path+'.tmp','w') as pid_file:\n pid_file.write(str(os.getpid()))\nos.replace(pid_path+'.tmp',pid_path)\n{}\n",
             root.join("pid").to_str().unwrap(),
             body
         );

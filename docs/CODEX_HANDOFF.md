@@ -12,6 +12,12 @@ Read actual repo/AGENTS/source/report/status. Original cwd is older dirty fleet 
 
 ## Tests / decisions / remaining
 
+Follow-up fixture GREEN: `ssh-worker-fixture-green` exit0/5.80s,22PASS/0FAIL (including Timeout/Cancelled and actual child reaping). Imported only Python fixture atomic PID publication; strict readiness deadline, parse, cancel/reap assertions unchanged. All-workspace/alltargets strictClippy `integrated-clippy` already PASS exit0/100.59s before this one test-only change. Root commits isolated fixture hunk, updates frozen-source revision, reruns final whole gate plus incremental fmt/Clippy; no product behavior changed since a1fc8f49.
+
+
+No-fail-fast whole gate `integrated-workspace-green` actually FAILED exit101/391.19s: all targets passed except SSH transport worker integration21PASS/1FAIL. App3696PASS/46ignored, runtime456PASS/1ignored, storage523PASS, web408PASS/1ignored and remaining unit/integration/doc targets passed. Do NOT label this run fullGREEN. Sole failure at worker.rs211 is ParseIntError Empty: fixture checks PID path existence while Python open(...,w).write(...) exposes an empty file before buffered close. SSH owner correcting producer atomic PID publication (write+close temporary then os.replace); unchanged cancel/timeout/kill assertions. ROOT Clippy currently running, source remains frozen until completion; followup test-only source changes then failed suite/full final gate pending. Historical failed log retained.
+
+
 Final source checkpoint: additional host fix actual GREEN32PASS/0FAIL (`main-host-guard-green`,exit0/26.52s), including original28+new4controls. Root verified worker host differs only by preserved SSH localownership fence6lines. Boundary after byte-identical fixture relocation PASS (`integrated-boundary-green`,exit0/4.37s); checker unchanged. Root freezes product source now for no-fail-fast wholeworkspace and strict alltargets Clippy. Focused gates pass; full gate not yet claimed. MAIN active256quota and wholehost immutable1024replay quota remain intentionally enforced.
 
 

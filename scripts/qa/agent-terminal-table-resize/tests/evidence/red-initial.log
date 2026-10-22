@@ -1,0 +1,147 @@
+test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) ...
+  test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) (filename='grok-fullscreen-42-cropped.txt') ... FAIL
+  test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) (filename='codex-inline-120.txt') ... FAIL
+test_alternate_history_never_falls_back_to_native (test_harness.AnalyzerTests.test_alternate_history_never_falls_back_to_native) ... FAIL
+test_cropped_boxed_table_is_invalid (test_harness.AnalyzerTests.test_cropped_boxed_table_is_invalid) ... FAIL
+test_missing_output_is_invalid (test_harness.AnalyzerTests.test_missing_output_is_invalid) ... FAIL
+test_modal_confounds_resize_verdict (test_harness.AnalyzerTests.test_modal_confounds_resize_verdict) ... FAIL
+test_terminal_padding_and_korean_cell_width (test_harness.AnalyzerTests.test_terminal_padding_and_korean_cell_width) ... FAIL
+test_visible_frozen_table_is_not_resize_pass (test_harness.AnalyzerTests.test_visible_frozen_table_is_not_resize_pass) ... FAIL
+test_wrapped_identifiers_are_reconstructed_per_cell (test_harness.AnalyzerTests.test_wrapped_identifiers_are_reconstructed_per_cell) ... FAIL
+test_child_failure_exit_is_preserved (test_harness.RunnerTests.test_child_failure_exit_is_preserved) ... FAIL
+test_fixture_env_does_not_inherit_credentials_or_repurpose_home (test_harness.RunnerTests.test_fixture_env_does_not_inherit_credentials_or_repurpose_home) ... FAIL
+test_output_cap_is_nonzero_and_bounded (test_harness.RunnerTests.test_output_cap_is_nonzero_and_bounded) ... FAIL
+test_timeout_is_nonzero_and_child_is_reaped (test_harness.RunnerTests.test_timeout_is_nonzero_and_child_is_reaped) ... FAIL
+
+======================================================================
+FAIL: test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) (filename='grok-fullscreen-42-cropped.txt')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 87, in test_actual_evidence_border_widths
+    self.assertEqual(result["border_width"], width)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 42 != 23
+
+======================================================================
+FAIL: test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) (filename='codex-inline-120.txt')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 87, in test_actual_evidence_border_widths
+    self.assertEqual(result["border_width"], width)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 120 != 118
+
+======================================================================
+FAIL: test_alternate_history_never_falls_back_to_native (test_harness.AnalyzerTests.test_alternate_history_never_falls_back_to_native)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 54, in test_alternate_history_never_falls_back_to_native
+    self.assertEqual(result["validity"], "INVALID")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'VALID' != 'INVALID'
+- VALID
++ INVALID
+? ++
+
+
+======================================================================
+FAIL: test_cropped_boxed_table_is_invalid (test_harness.AnalyzerTests.test_cropped_boxed_table_is_invalid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 59, in test_cropped_boxed_table_is_invalid
+    self.assertFalse(result["complete"])
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false
+
+======================================================================
+FAIL: test_missing_output_is_invalid (test_harness.AnalyzerTests.test_missing_output_is_invalid)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 45, in test_missing_output_is_invalid
+    self.assertEqual(analyze.analyze_case(Path(tmp), provider="codex", mode="inline", history=True)["exit_code"], 2)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 2
+
+======================================================================
+FAIL: test_modal_confounds_resize_verdict (test_harness.AnalyzerTests.test_modal_confounds_resize_verdict)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 79, in test_modal_confounds_resize_verdict
+    self.assertEqual(result["validity"], "INVALID")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'VALID' != 'INVALID'
+- VALID
++ INVALID
+? ++
+
+
+======================================================================
+FAIL: test_terminal_padding_and_korean_cell_width (test_harness.AnalyzerTests.test_terminal_padding_and_korean_cell_width)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 68, in test_terminal_padding_and_korean_cell_width
+    self.assertEqual(result["border_width"], 80)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 110 != 80
+
+======================================================================
+FAIL: test_visible_frozen_table_is_not_resize_pass (test_harness.AnalyzerTests.test_visible_frozen_table_is_not_resize_pass)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 40, in test_visible_frozen_table_is_not_resize_pass
+    self.assertEqual(result["resize"], "FAIL")
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'PASS' != 'FAIL'
+- PASS
++ FAIL
+
+
+======================================================================
+FAIL: test_wrapped_identifiers_are_reconstructed_per_cell (test_harness.AnalyzerTests.test_wrapped_identifiers_are_reconstructed_per_cell)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 64, in test_wrapped_identifiers_are_reconstructed_per_cell
+    self.assertTrue(result["semantic_complete"], result)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : {'complete': True, 'semantic_complete': False, 'border_width': 22}
+
+======================================================================
+FAIL: test_child_failure_exit_is_preserved (test_harness.RunnerTests.test_child_failure_exit_is_preserved)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 95, in test_child_failure_exit_is_preserved
+    self.assertEqual(result["exit_code"], 101)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 101
+
+======================================================================
+FAIL: test_fixture_env_does_not_inherit_credentials_or_repurpose_home (test_harness.RunnerTests.test_fixture_env_does_not_inherit_credentials_or_repurpose_home)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 116, in test_fixture_env_does_not_inherit_credentials_or_repurpose_home
+    self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 'ANTHROPIC_AUTH_TOKEN' unexpectedly found in {'HOME': '/real/home', 'PATH': '/usr/bin:/bin', 'ANTHROPIC_AUTH_TOKEN': 'secret', 'OPENAI_API_KEY': 'secret', 'XAI_API_KEY': 'secret', 'SSH_AUTH_SOCK': 'secret'}
+
+======================================================================
+FAIL: test_output_cap_is_nonzero_and_bounded (test_harness.RunnerTests.test_output_cap_is_nonzero_and_bounded)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 109, in test_output_cap_is_nonzero_and_bounded
+    self.assertNotEqual(result["exit_code"], 0)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 == 0
+
+======================================================================
+FAIL: test_timeout_is_nonzero_and_child_is_reaped (test_harness.RunnerTests.test_timeout_is_nonzero_and_child_is_reaped)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 100, in test_timeout_is_nonzero_and_child_is_reaped
+    self.assertEqual(result["exit_code"], 124)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: 0 != 124
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.191s
+
+FAILED (failures=13)

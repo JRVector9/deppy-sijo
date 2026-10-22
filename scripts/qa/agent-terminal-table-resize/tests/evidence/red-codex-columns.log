@@ -1,0 +1,27 @@
+test_actual_evidence_border_widths (test_harness.AnalyzerTests.test_actual_evidence_border_widths) ... ok
+test_alternate_history_never_falls_back_to_native (test_harness.AnalyzerTests.test_alternate_history_never_falls_back_to_native) ... ok
+test_codex_narrow_semantics_use_cell_columns (test_harness.AnalyzerTests.test_codex_narrow_semantics_use_cell_columns) ... FAIL
+test_cropped_boxed_table_is_invalid (test_harness.AnalyzerTests.test_cropped_boxed_table_is_invalid) ... ok
+test_missing_output_is_invalid (test_harness.AnalyzerTests.test_missing_output_is_invalid) ... ok
+test_modal_confounds_resize_verdict (test_harness.AnalyzerTests.test_modal_confounds_resize_verdict) ... ok
+test_terminal_padding_and_korean_cell_width (test_harness.AnalyzerTests.test_terminal_padding_and_korean_cell_width) ... ok
+test_visible_frozen_table_is_not_resize_pass (test_harness.AnalyzerTests.test_visible_frozen_table_is_not_resize_pass) ... ok
+test_wrapped_identifiers_are_reconstructed_per_cell (test_harness.AnalyzerTests.test_wrapped_identifiers_are_reconstructed_per_cell) ... ok
+test_child_failure_exit_is_preserved (test_harness.RunnerTests.test_child_failure_exit_is_preserved) ... ok
+test_fixture_env_does_not_inherit_credentials_or_repurpose_home (test_harness.RunnerTests.test_fixture_env_does_not_inherit_credentials_or_repurpose_home) ... ok
+test_output_cap_is_nonzero_and_bounded (test_harness.RunnerTests.test_output_cap_is_nonzero_and_bounded) ... ok
+test_timeout_is_nonzero_and_child_is_reaped (test_harness.RunnerTests.test_timeout_is_nonzero_and_child_is_reaped) ... ok
+
+======================================================================
+FAIL: test_codex_narrow_semantics_use_cell_columns (test_harness.AnalyzerTests.test_codex_narrow_semantics_use_cell_columns)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/deppy-table-harness-20261022/scripts/qa/agent-terminal-table-resize/tests/test_harness.py", line 75, in test_codex_narrow_semantics_use_cell_columns
+    self.assertTrue(result["semantic_complete"], result)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: False is not true : {'border_width': 40, 'complete': False, 'semantic_complete': False, 'visibility': True, 'missing_tokens': ['원문과복사내용을보존합니다.'], 'modal': None}
+
+----------------------------------------------------------------------
+Ran 13 tests in 0.162s
+
+FAILED (failures=1)

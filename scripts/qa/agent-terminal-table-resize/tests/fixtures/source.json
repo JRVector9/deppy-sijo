@@ -1,0 +1,38 @@
+{
+  "grok-minimal-80.txt": {
+    "synthetic_source": "/private/tmp/deppy-agent-table-probe-20261022/grok/minimal-verified/stage-0-80.txt",
+    "synthetic_source_sha256": "b6412386e49c2fcafc4ec8f799f11dc4a75196675c3baef6b00b78c99d359018",
+    "normalized_fixture_sha256": "4c588cb19942b2b1fbe16a4b3e6b134ec3dd643593e4c4091f2687184751f3c8",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  },
+  "grok-fullscreen-42-cropped.txt": {
+    "synthetic_source": "/private/tmp/deppy-agent-table-probe-20261022/grok/fullscreen-history/application-top-1-42.txt",
+    "synthetic_source_sha256": "66ced9f88bdb80aaf4df2391e9333b6a3c6c6ddb496bc83ad4d66e646ffbb735",
+    "normalized_fixture_sha256": "4f262fb5d147b16e7d78104d29c19d42ff59d2abb7d1d7fa86f576feb9ad4b50",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  },
+  "codex-inline-120.txt": {
+    "synthetic_source": "/private/tmp/deppy-agent-table-probe-20261022/codex/inline-history/history-2-120.txt",
+    "synthetic_source_sha256": "ac3b74112fe17b0500243c3f561baa78a4f528790ebd5621d0d1508761a893f6",
+    "normalized_fixture_sha256": "3ce786cbdf35378c477b431d3b14c635fcfe4a62684fbf16ba97953fd4c76cc1",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  },
+  "codex-inline-42.txt": {
+    "synthetic_source": "/private/tmp/deppy-agent-table-probe-20261022/codex/inline-history/history-1-42.txt",
+    "synthetic_source_sha256": "f787a4a31de175b34b6f2902e59e70966b024ef3c2d1da82429f964ee3d92fdd",
+    "normalized_fixture_sha256": "3b4bb04c827c6ba48e9114444deed09d0e056b45f7066a5a2e43dd95872d06b0",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  },
+  "claude-classic-history-80.txt": {
+    "synthetic_source": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-classic-l4dha_20/history-0-80.txt",
+    "synthetic_source_sha256": "5cea5cf811261448898763c8faaa7cc00eae4d87b4fe2c485429cbf1600a734c",
+    "normalized_fixture_sha256": "a1c6e7dfb9bf10aea50b308b42fa2867d0d4d1a698bc773256d41c366704447e",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  },
+  "claude-classic-history-120.txt": {
+    "synthetic_source": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-classic-l4dha_20/history-2-120.txt",
+    "synthetic_source_sha256": "2d801abc66e56eb52dcd9fb52671cdab71f550d8539de733a3e22945708f5efe",
+    "normalized_fixture_sha256": "3885bb5b86009fd47364e83276327d303d23e61ddf7b0ab8707e26e113eaa818",
+    "normalization": "rstrip each terminal row and final blank rows only"
+  }
+}

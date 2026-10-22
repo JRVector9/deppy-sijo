@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.25s
+     Running tests/terminal_table_resize.rs (/private/tmp/deppy-table-harness-target-20261022/debug/deps/terminal_table_resize-73b8dd13004f679f)
+
+running 3 tests
+test installed_agent_table_resize_probe ... ignored, requires an explicitly isolated CLI and synthetic transcript
+test pane_resize_reaches_foreground_pty_and_redraws_table_at_each_width ... ok
+test terminal_reflows_soft_wrapped_text_but_preserves_explicit_table_columns ... ok
+
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s

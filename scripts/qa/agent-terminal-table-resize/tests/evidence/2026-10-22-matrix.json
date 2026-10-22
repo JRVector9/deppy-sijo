@@ -1,0 +1,1003 @@
+{
+  "source_commit_at_capture": "7584ed75fdc5949647a58574369c29606a076a86",
+  "reanalysis_source_sha256": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+  "counts": {
+    "cases": 12,
+    "valid_responsive": 5,
+    "invalid": 7,
+    "resize_fail_observations": 1
+  },
+  "cases": [
+    {
+      "provider": "claude",
+      "mode": "classic",
+      "history": false,
+      "version": "2.1.305 (Claude Code)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-classic-6kifo3rs",
+      "capture_manifest_sha256": "da0f0ed1f63e52c78fcfa959943a7e005ad4c9d16f80520d8766e3ab49905f51",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "ea3ea3c08d2a9634a4651e687fcf900d410c489bce2b00f22bd7352b91ba704f",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "INVALID",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 76,
+            "valid": true
+          },
+          {
+            "border_width": null,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": false,
+            "missing_tokens": [
+              "ROW_ALPHA",
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "ready",
+              "waiting",
+              "done",
+              "한글표",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 38,
+            "valid": false
+          },
+          {
+            "border_width": 116,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 116,
+            "valid": true
+          },
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 76,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "stage-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "claude",
+      "mode": "classic",
+      "history": true,
+      "version": "2.1.305 (Claude Code)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-classic-l4dha_20",
+      "capture_manifest_sha256": "9957633926b44ef00ac721ca610d33fca163ebd028b027a26866bffb20988768",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "ea3ea3c08d2a9634a4651e687fcf900d410c489bce2b00f22bd7352b91ba704f",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "INVALID",
+        "resize": "FAIL",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-0-80.txt",
+            "expected_width": 76,
+            "valid": true
+          },
+          {
+            "border_width": null,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": false,
+            "missing_tokens": [
+              "ROW_ALPHA",
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "ready",
+              "waiting",
+              "done",
+              "한글표",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "history-1-42.txt",
+            "expected_width": 38,
+            "valid": false
+          },
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "history-2-120.txt",
+            "expected_width": 116,
+            "valid": true
+          },
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-3-80.txt",
+            "expected_width": 76,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "history-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "claude",
+      "mode": "fullscreen",
+      "history": false,
+      "version": "2.1.305 (Claude Code)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-fullscreen-dvi2jeoi",
+      "capture_manifest_sha256": "50e1b166b6038336f82cb30ae5378f8fa878ce8f18ac75448ee0330e829b44bd",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "ea3ea3c08d2a9634a4651e687fcf900d410c489bce2b00f22bd7352b91ba704f",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "INVALID",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 76,
+            "valid": true
+          },
+          {
+            "border_width": null,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": false,
+            "missing_tokens": [
+              "ROW_ALPHA",
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "ready",
+              "waiting",
+              "done",
+              "한글표",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 38,
+            "valid": false
+          },
+          {
+            "border_width": 116,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 116,
+            "valid": true
+          },
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 76,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "stage-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "claude",
+      "mode": "fullscreen",
+      "history": true,
+      "version": "2.1.305 (Claude Code)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-claude-fullscreen-k3oynhhu",
+      "capture_manifest_sha256": "2488521a02de7a781ad99c1433fa5e2b72ebd3ac8191f579f5e43d449a02f89a",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "ea3ea3c08d2a9634a4651e687fcf900d410c489bce2b00f22bd7352b91ba704f",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "INVALID",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-0-80.txt",
+            "expected_width": 76,
+            "valid": true
+          },
+          {
+            "border_width": null,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": false,
+            "missing_tokens": [
+              "ROW_ALPHA",
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "ready",
+              "waiting",
+              "done",
+              "한글표",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "application-top-1-42.txt",
+            "expected_width": 38,
+            "valid": false
+          },
+          {
+            "border_width": 116,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "application-top-2-120.txt",
+            "expected_width": 116,
+            "valid": true
+          },
+          {
+            "border_width": 76,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-3-80.txt",
+            "expected_width": 76,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "application-top-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "codex",
+      "mode": "inline",
+      "history": false,
+      "version": "WARNING: proceeding, even though we could not create PATH aliases: CODEX_HOME points to \"/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-wvcgw4qa/profile\", but that path does not exist\ncodex-cli 0.163.0",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-wvcgw4qa",
+      "capture_manifest_sha256": "4d67b8c13baf4e77eaf2e341119c7f339cb87b36a41d904b2e772517979c30d1",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 0,
+      "final_reanalysis": {
+        "validity": "VALID",
+        "visibility": "PASS",
+        "resize": "PASS",
+        "semantics": "PASS",
+        "exit_code": 0,
+        "stages": [
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 78,
+            "valid": true
+          },
+          {
+            "border_width": 40,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 40,
+            "valid": true
+          },
+          {
+            "border_width": 118,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 118,
+            "valid": true
+          },
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 78,
+            "valid": true
+          }
+        ],
+        "reasons": []
+      }
+    },
+    {
+      "provider": "codex",
+      "mode": "inline",
+      "history": true,
+      "version": "WARNING: proceeding, even though we could not create PATH aliases: CODEX_HOME points to \"/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-50gmgthc/profile\", but that path does not exist\ncodex-cli 0.163.0",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-50gmgthc",
+      "capture_manifest_sha256": "07a2312c42bd061c577e79ac60f294294f8edb77154e40fa53d482e376f73f3b",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 0,
+      "final_reanalysis": {
+        "validity": "VALID",
+        "visibility": "PASS",
+        "resize": "PASS",
+        "semantics": "PASS",
+        "exit_code": 0,
+        "stages": [
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-0-80.txt",
+            "expected_width": 78,
+            "valid": true
+          },
+          {
+            "border_width": 40,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 42,
+            "source": "history-1-42.txt",
+            "expected_width": 40,
+            "valid": true
+          },
+          {
+            "border_width": 118,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "history-2-120.txt",
+            "expected_width": 118,
+            "valid": true
+          },
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-3-80.txt",
+            "expected_width": 78,
+            "valid": true
+          }
+        ],
+        "reasons": []
+      }
+    },
+    {
+      "provider": "codex",
+      "mode": "default",
+      "history": false,
+      "version": "WARNING: proceeding, even though we could not create PATH aliases: CODEX_HOME points to \"/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-default-rs70kl58/profile\", but that path does not exist\ncodex-cli 0.163.0",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-default-rs70kl58",
+      "capture_manifest_sha256": "27ae8da597d0bfaab86a55ceac501c0286f884506da33b0e0a89a0aa37e082e2",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 0,
+      "final_reanalysis": {
+        "validity": "VALID",
+        "visibility": "PASS",
+        "resize": "PASS",
+        "semantics": "PASS",
+        "exit_code": 0,
+        "stages": [
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 78,
+            "valid": true
+          },
+          {
+            "border_width": 40,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 40,
+            "valid": true
+          },
+          {
+            "border_width": 118,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 118,
+            "valid": true
+          },
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 78,
+            "valid": true
+          }
+        ],
+        "reasons": []
+      }
+    },
+    {
+      "provider": "codex",
+      "mode": "default",
+      "history": true,
+      "version": "WARNING: proceeding, even though we could not create PATH aliases: CODEX_HOME points to \"/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-default-snl992wa/profile\", but that path does not exist\ncodex-cli 0.163.0",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-default-snl992wa",
+      "capture_manifest_sha256": "8acc6cb309f307fe7846f6b420d78241b7302d1c376d6ee39d2b68d71367b88c",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "PASS",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-0-80.txt",
+            "expected_width": 78,
+            "valid": true
+          },
+          {
+            "border_width": 40,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": true,
+            "missing_tokens": [
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "application-top-1-42.txt",
+            "expected_width": 40,
+            "valid": false
+          },
+          {
+            "border_width": 118,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "application-top-2-120.txt",
+            "expected_width": 118,
+            "valid": true
+          },
+          {
+            "border_width": 78,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-3-80.txt",
+            "expected_width": 78,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "application-top-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "grok",
+      "mode": "minimal",
+      "history": false,
+      "version": "grok 1.0.67 (2fe064390d07)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-grok-minimal-s13vhk60",
+      "capture_manifest_sha256": "2ed04a12d4d417a00f7463f35f0a431ca97c9529eaeb814e9c19e0d7a2b1b1ce",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "036a47ce2987adae04de827f7803bf0cc460bf169b640db168f18ec7acb734db",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 0,
+      "final_reanalysis": {
+        "validity": "VALID",
+        "visibility": "PASS",
+        "resize": "PASS",
+        "semantics": "PASS",
+        "exit_code": 0,
+        "stages": [
+          {
+            "border_width": 80,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 80,
+            "valid": true
+          },
+          {
+            "border_width": 42,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 42,
+            "valid": true
+          },
+          {
+            "border_width": 120,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 120,
+            "valid": true
+          },
+          {
+            "border_width": 80,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 80,
+            "valid": true
+          }
+        ],
+        "reasons": []
+      }
+    },
+    {
+      "provider": "grok",
+      "mode": "minimal",
+      "history": true,
+      "version": "grok 1.0.67 (2fe064390d07)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-grok-minimal-hvi75npo",
+      "capture_manifest_sha256": "f67f96d18fda1db4396d0f5736cf873f6191f0cff6c6c8b729a63aa10d62e5e8",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "036a47ce2987adae04de827f7803bf0cc460bf169b640db168f18ec7acb734db",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 0,
+      "final_reanalysis": {
+        "validity": "VALID",
+        "visibility": "PASS",
+        "resize": "PASS",
+        "semantics": "PASS",
+        "exit_code": 0,
+        "stages": [
+          {
+            "border_width": 80,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-0-80.txt",
+            "expected_width": 80,
+            "valid": true
+          },
+          {
+            "border_width": 42,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 42,
+            "source": "history-1-42.txt",
+            "expected_width": 42,
+            "valid": true
+          },
+          {
+            "border_width": 120,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "history-2-120.txt",
+            "expected_width": 120,
+            "valid": true
+          },
+          {
+            "border_width": 80,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "history-3-80.txt",
+            "expected_width": 80,
+            "valid": true
+          }
+        ],
+        "reasons": []
+      }
+    },
+    {
+      "provider": "grok",
+      "mode": "fullscreen",
+      "history": false,
+      "version": "grok 1.0.67 (2fe064390d07)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-grok-fullscreen-ete9ot5p",
+      "capture_manifest_sha256": "79f2e85cd4505f46a0238a591637d9b12df1d54794b50af6d691aed6754c3827",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "51c7989ef405882f6eeee357a348c7c1e887af017b722b212969455942ec6c15",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "036a47ce2987adae04de827f7803bf0cc460bf169b640db168f18ec7acb734db",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "INVALID",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 61,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-0-80.txt",
+            "expected_width": 61,
+            "valid": true
+          },
+          {
+            "border_width": null,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": false,
+            "missing_tokens": [
+              "ROW_ALPHA",
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "ready",
+              "waiting",
+              "done",
+              "한글표",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "stage-1-42.txt",
+            "expected_width": 23,
+            "valid": false
+          },
+          {
+            "border_width": 101,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "stage-2-120.txt",
+            "expected_width": 101,
+            "valid": true
+          },
+          {
+            "border_width": 61,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "stage-3-80.txt",
+            "expected_width": 61,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "stage-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    },
+    {
+      "provider": "grok",
+      "mode": "fullscreen",
+      "history": true,
+      "version": "grok 1.0.67 (2fe064390d07)",
+      "output": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-grok-fullscreen-5tl1bxwj",
+      "capture_manifest_sha256": "bd78db2cad7e2be2355e3615ba533fdec80b63715202b190ba7f41e85d7eec36",
+      "capture_source_sha256": {
+        "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+        "scripts/qa/agent-terminal-table-resize/run.py": "5ec18ea8859c0944cde905cb4f4dda6fa5543afe1f86d9a15d83d72b06e1c524",
+        "scripts/qa/agent-terminal-table-resize/analyze.py": "400a05756cb5efb4df166c800cbe0a82101f08cf6f7bd1a997b5d8a68aa0db54",
+        "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+      },
+      "binary_sha256": "036a47ce2987adae04de827f7803bf0cc460bf169b640db168f18ec7acb734db",
+      "binary_unchanged": true,
+      "probe_exit": 0,
+      "sandbox_preflight_exit": 0,
+      "captured_runner_exit": 2,
+      "final_reanalysis": {
+        "validity": "INVALID",
+        "visibility": "PASS",
+        "resize": "INVALID",
+        "semantics": "INVALID",
+        "exit_code": 2,
+        "stages": [
+          {
+            "border_width": 61,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-0-80.txt",
+            "expected_width": 61,
+            "valid": true
+          },
+          {
+            "border_width": 23,
+            "complete": false,
+            "semantic_complete": false,
+            "visibility": true,
+            "missing_tokens": [
+              "ROW_BETA",
+              "ROW_OMEGA",
+              "waiting",
+              "done",
+              "원문과복사내용을보존합니다."
+            ],
+            "modal": null,
+            "cols": 42,
+            "source": "application-top-1-42.txt",
+            "expected_width": 23,
+            "valid": false
+          },
+          {
+            "border_width": 101,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 120,
+            "source": "application-top-2-120.txt",
+            "expected_width": 101,
+            "valid": true
+          },
+          {
+            "border_width": 61,
+            "complete": true,
+            "semantic_complete": true,
+            "visibility": true,
+            "missing_tokens": [],
+            "modal": null,
+            "cols": 80,
+            "source": "application-top-3-80.txt",
+            "expected_width": 61,
+            "valid": true
+          }
+        ],
+        "reasons": [
+          "application-top-1-42.txt: cropped/missing table semantics, unsupported shape or modal"
+        ]
+      }
+    }
+  ]
+}

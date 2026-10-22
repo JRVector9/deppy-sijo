@@ -1,0 +1,153 @@
+{
+  "date": "2026-10-22",
+  "branch": "feat/agent-command-center-v2-20261020",
+  "base_commit": "1d5db6a73ef672d5aad487e0e42602c95b341cea",
+  "product_source_commit": "587f70997e443c2197decc813e46bc8848047641",
+  "release": false,
+  "source_version": "0.15.1",
+  "app_restarted": false,
+  "paid_provider_turns": 0,
+  "physical_mobile_e2e": false,
+  "commands": [
+    {
+      "command": "CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-sijo -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 3613,
+      "failed": 0,
+      "ignored": 45,
+      "log": "app-full",
+      "note": "3574 unit +39 integration; excludes1 nested child PASS"
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 cargo test --offline --locked -p agent-mcp -p deppy-core -p storage -p runtime -p web-remote -- --test-threads=1",
+      "exit_code": 0,
+      "passed": 1504,
+      "failed": 0,
+      "ignored": 16,
+      "log": "affected-packages",
+      "note": "excludes1 nested MCP child PASS; these package/web sources unchanged by later App-only corrections"
+    },
+    {
+      "command": "node web/shared/tests/command-center.browser.mjs",
+      "exit_code": 0,
+      "checks_passed": 265,
+      "log": "browser"
+    },
+    {
+      "command": "CARGO_BUILD_JOBS=2 cargo clippy --offline --locked -p deppy-sijo -p agent-mcp -p deppy-core -p storage -p runtime -p web-remote --all-targets -- -D warnings",
+      "exit_code": 0,
+      "log": "clippy"
+    },
+    {
+      "command": "cargo fmt --all --check",
+      "exit_code": 0
+    },
+    {
+      "command": "git diff --check 1d5db6a7",
+      "exit_code": 0
+    }
+  ],
+  "logs": {
+    "app-full": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/app-full.log.gz",
+      "sha256": "5d29df4adf71e7d82b486e2018a6ada6b8b97d99d388db8e57fd66f0c4180bd8",
+      "original_sha256": "1d4606e7e8daeea891cd6e30de550426a20cf7b5928b892133acb00e24a96fbb"
+    },
+    "affected-packages": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/affected-packages.log.gz",
+      "sha256": "3b1328faf74138b6dc2630cb4a90d7bae204dc6a947bb63e94b11a4370146d87",
+      "original_sha256": "1c6d08bc28401699a70788b46c8327037961c98410a29bd1678578ea4cd5da95"
+    },
+    "clippy": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/clippy.log.gz",
+      "sha256": "a74a3f44130fed01f9f64f9e96e3b4f8621166bcdca54afd1e96515eb721b385",
+      "original_sha256": "980b5a17cb4abaaabfcbd57786a5d43459962b8f262926f7d514ea37d597fdad"
+    },
+    "browser": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/browser.log.gz",
+      "sha256": "6fba7bb8d7a67403381f78cc3285c01ef554d1096b5095a7aff619565e5953b0",
+      "original_sha256": "6a202621579ff8d24c1061d406864125253f566960fdb2325f17ad8b87f2b9a7"
+    },
+    "bounds-red": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/bounds-red.log.gz",
+      "sha256": "2b44b8ea4d4f92f2e232080ca92b112cba40d602e7ed34a81fbd7384baf998da",
+      "original_sha256": "689f876ffba7695d1614082f69451ed23ab6ee8aad438f13d4f35e92fc8c7948"
+    },
+    "initial-lint-failure": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/initial-lint-failure.log.gz",
+      "sha256": "95c9e0e03b7f07c94c211e599d35f9e4fee35b4df1d67667b21d2bf77e86a51b",
+      "original_sha256": "75854b50c9152b48af576eea4e1fe6d0c132da95632d1a0711087a48cde8a30b"
+    },
+    "focused-green-intermediate": {
+      "path": "docs/qa/assets/cc-pr1-pr2-integration-20261022/focused-green-intermediate.log.gz",
+      "sha256": "47b180bbd793235154f6ad3d383956cde8ea4357360b89bddeda369467b19068",
+      "original_sha256": "7517b1346e307d96e3bd9a62fec6408b0c7abeddc797f5a2d80eac23fb2319d1"
+    }
+  },
+  "source_files": {
+    "crates/agent-mcp/src/lib.rs": "0f0579864ecc7394720a8a2ebe9e97d97ae1611f5f56c25c5f6ad399910bb0f9",
+    "crates/agent-mcp/src/main_tools.rs": "d4fb6e1649ab027c8143253fd4dc8a14f6ee71502ed3354b67b48f2482241735",
+    "crates/agent-mcp/src/protocol.rs": "85390ba9b9fceaf9105f70dc7dd118136d4c0527eb35ed635a73f5891ea90732",
+    "crates/agent-mcp/src/server.rs": "e6999aa1ad2087f364c3feadfce602b9ba72fa66cf2dbe32c7145b664db52d6d",
+    "crates/agent-mcp/src/tests.rs": "c32b3bba67ca3b23e075dd8fb43fb8d79150a04ac685026eec6b09c21be43b7d",
+    "crates/app/src/app.rs": "35c12d074b5ab821a2fcf88f12e02d3eeefc77dc95211af7d4297a3d5a36d1f0",
+    "crates/app/src/command_center_conversation.rs": "eb2c231615fed9af1ba7f3df19e85a5cf17ac90e9ef306624907daa0e0e58275",
+    "crates/app/src/command_center_host.rs": "669ba72c3a018330b197441bf41b4679a83ca15353b44672095566f1414cafb7",
+    "crates/app/src/command_center_launch.rs": "46375b440f607b4c447ef071500195dcaa8506e5f551dde232e92c974eed5dae",
+    "crates/app/src/command_center_local_close.rs": "57ddbde1378df4fb1d3a9204e30f87a47c5b084b67109ffba5131549544431d6",
+    "crates/app/src/command_center_main_host.rs": "3f41b20c243f966caf02602aa0b29df6d07cdcc248b5921aada98e92010eb3d5",
+    "crates/app/src/command_center_main_tools.rs": "97d1784507f45bb3c8e28a2831a7810b6c2942550152a6193cfe2c1e4778dfef",
+    "crates/app/src/command_center_observe.rs": "b2abb25c7fdbe448d94d6995f946142175f500fca1ff9f37c3ba477b3ea46b21",
+    "crates/app/src/command_center_server.rs": "bda3c8912829b61749eb0174b03d4a2090ece88c5852b18896a447b8c67a675b",
+    "crates/app/src/command_center_verification.rs": "d2c0db3b58b1efc0265b60d0d1d8ff64e542000b65286689deba1c6bb4bcd704",
+    "crates/app/src/ui/agent_sessions.rs": "9f53248c2b429db910ab4c7e70a36216d1369a4104e021501add002336e8eee6",
+    "crates/app/src/ui/command_center/conversation.rs": "05b7adbecb71b482e0528b03c9d743d47a69f5585a36413b0528e520c170a69d",
+    "crates/app/src/ui/command_center/main.rs": "2365368b673e6d7b732089590d6010262e64962bb919d62d87ba4946f4227665",
+    "crates/app/src/ui/command_center/mod.rs": "059c1de700486c06b4a82242a7f797c01989b10e303090e7e1d18a1f23a9f3b5",
+    "crates/app/src/ui/command_center/tests.rs": "de6541c9957279477b1c0d3a14ebaac79585613c5c791552a3cf0918770efbef",
+    "crates/app/src/ui/command_center/verification.rs": "6a1f671c5227baf3b6111cd8156b6a3ebc732e59dba2f8a37c7eb8d1cebe7cfb",
+    "crates/app/src/work_management/mod.rs": "488a3facbeb38e6dc183c0bf0acc03d383751a7123bf28b64b2216fc22f4ffaf",
+    "crates/app/src/work_management/plan.rs": "b9d8dc01cc76ac819964060fe70a9b173e076d7ebe764fa6cf0abbed75a207c4",
+    "crates/app/src/work_management/verification.rs": "8e4c37d8c69e67c09db6abeefa9a14e39a889edca5562167750e129957e3010b",
+    "crates/app/src/work_management/verification_worker.rs": "85ef4ce7cde9ff54ba12ba09e057f514e7f6e16a32edd49a7d0a20e0673d84f3",
+    "crates/app/src/work_management/verification_worker_tests.rs": "fbcbe00ee475b9ab8cdab4327cb45b51ffe94640e583b0421c46677e0ef46322",
+    "crates/core/src/work_management.rs": "dbfcce9a3513c25c091591d1b99312f77c41364127515769dcc8d9d999ed152a",
+    "crates/runtime/src/in_process.rs": "555579aa3b6eedb62465fccd3ba4bf7797c863c1ae8c407e41c0304cdc7099f1",
+    "crates/runtime/src/input_admission.rs": "1f73088f6f2f6ec2570d301721cb7acc4ea4db4f84bc2785b2c1e43849d4253d",
+    "crates/runtime/src/remote_worker.rs": "26b1b3cf5ac48cba50477b70d0c47ed2927fa22721fccbd69d5b1e08402526df",
+    "crates/storage/src/work_management.rs": "ef018c07d2e9160ff5044a635d4fb68e04b7bab8f2169c435f3b48b753d4b5e1",
+    "crates/storage/src/work_management_verification.rs": "532e976d96f7d3a1fab4432b8c19b58f4fcbf33fb31e7d970742d03662ca23a6",
+    "crates/web-remote/src/work.rs": "ee73e4bd6644355c52438f2645a06323632d69f8c4d7ee8bc4574d185eaec974",
+    "web/shared/command-center.css": "30fb60dac648a550a96344fa0cc08de46547222cf29ae4de8daeaf67cc06c1af",
+    "web/shared/command-center.js": "d8921d2a522c3eb4a1b850316bddea49cf296296ca8de14c2565572d10b933bb",
+    "web/shared/tests/command-center.browser.mjs": "7cbcb8dee4b6c2055bb8e62482d11bb0d75a9afe4d0d5f6d49f68a7c50218a39"
+  },
+  "transport_log_normalization": {
+    "readable": "docs/qa/assets/cc-transport-20261022/green.log",
+    "exact_original": "docs/qa/assets/cc-transport-20261022/green.log.gz",
+    "original_sha256": "8630cf838bc69631243b86d2297396f4478aeb2122e407bfec58ce89f8993487",
+    "change": "Removed only an extra final blank line in readable copy; exact original preserved as deterministic gzip."
+  },
+  "native_visual_evidence": [
+    "docs/qa/assets/cc-conversation-20261022/manifest.json",
+    "docs/qa/assets/cc-verification-ui-20261022/manifest.json"
+  ],
+  "boundaries": [
+    "Automatic MAIN tool registration is for newly launched local Codex MAIN only; existing sessions are not restarted.",
+    "PTY MAIN shows actual admitted inputs, observed final replies and actual tool receipts; the original terminal retains full live output.",
+    "Verification commands require explicit native review; PWA only displays evidence.",
+    "No paid/live provider turn or physical mobile E2E; no release artifact, version bump, push or main merge.",
+    "Process-group cleanup covers ordinary descendants, not deliberate new-session daemon detachment; restored Interrupted means lost observation, never rerun."
+  ],
+  "evidence_validation": {
+    "executed": true,
+    "exit_code": 0,
+    "source_hashes": 36,
+    "exact_log_archives": 7,
+    "total_passed_excluding_nested_duplicates": 5117,
+    "total_ignored": 61,
+    "browser_checks": 265,
+    "transport_original_bytes_preserved": true,
+    "note": "One-off Python hashlib/gzip/JSON/log-count assertions executed after archiving; validates records, does not rerun tests."
+  }
+}

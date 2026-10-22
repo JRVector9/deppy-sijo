@@ -72,7 +72,8 @@ pub(crate) const PROTO_MAGIC: [u8; 4] = *b"DPRT";
 /// v33: server-captured, guarded task input on scoped remote work.
 /// v34: execution-scoped, bounded read-only remote session observation.
 /// v35: read-only exact-operation launch/input reconciliation.
-pub(crate) const PROTO_VERSION: u16 = 35;
+/// v36: bounded live-mode SGR wheel appended to direct TerminalInput.
+pub(crate) const PROTO_VERSION: u16 = 36;
 
 /// delta viewport 스트리밍 기능 비트 (§3.1).
 pub(crate) const FEAT_DELTA_VIEWPORT: u32 = 1 << 0;
@@ -584,6 +585,11 @@ mod tests {
     }
 
     #[test]
+    fn application_wheel_requires_new_exact_wire_version() {
+        assert_eq!(PROTO_VERSION, 36);
+    }
+
+    #[test]
     fn protocol_version_tracks_live_scrollback_wire_variants() {
         let protocol_source = include_str!("protocol.rs");
         let command_source = include_str!("command.rs");
@@ -599,6 +605,6 @@ mod tests {
         assert!(command_source.contains("excluded_names"));
         assert!(command_source.contains("transient_args"));
         assert!(command_source.contains("relaunch_command"));
-        assert_eq!(PROTO_VERSION, 35);
+        assert_eq!(PROTO_VERSION, 36);
     }
 }

@@ -149,7 +149,7 @@ fn bounded_nul_free(value: &str, max_bytes: usize, require_nonempty: bool) -> bo
         && !value.as_bytes().contains(&0)
 }
 
-fn dimensions_are_valid(cols: u16, rows: u16) -> bool {
+pub(crate) fn dimensions_are_valid(cols: u16, rows: u16) -> bool {
     (1..=TERMINAL_DIMENSION_MAX).contains(&cols)
         && (1..=TERMINAL_DIMENSION_MAX).contains(&rows)
         && u32::from(cols)
@@ -473,7 +473,9 @@ pub(crate) fn runtime_command_retained_bytes(
         }
         RuntimeCommand::WriteInput { bytes, .. } => retained_add(&mut total, bytes.capacity())?,
         RuntimeCommand::WriteTerminalInput { input, .. } => {
-            retained_string(&mut total, input.payload())?;
+            if let Some(payload) = input.payload() {
+                retained_string(&mut total, payload)?;
+            }
         }
         RuntimeCommand::WriteInputTracked {
             bytes,
@@ -686,7 +688,9 @@ pub(crate) fn canonicalize_host_command(command: &mut RuntimeCommand) {
             *bytes = std::mem::take(bytes).into_boxed_slice().into_vec();
         }
         RuntimeCommand::WriteTerminalInput { input, .. } => {
-            canonicalize_string(input.payload_mut());
+            if let Some(payload) = input.payload_mut() {
+                canonicalize_string(payload);
+            }
         }
         RuntimeCommand::SeedRedaction { credential_ids } => {
             canonicalize_strings(credential_ids);
@@ -1517,7 +1521,7 @@ impl std::fmt::Debug for RuntimeCommand {
             RuntimeCommand::WriteTerminalInput { session, input } => f
                 .debug_struct("WriteTerminalInput")
                 .field("session", session)
-                .field("payload_len", &input.payload().len())
+                .field("payload_len", &input.payload().map_or(0, String::len))
                 .finish(),
             RuntimeCommand::SpawnShell {
                 cols,
@@ -1976,6 +1980,62 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn application_wheel_retains_no_heap_and_roundtrips_without_changing_scroll_wire() {
+        let mut command = RuntimeCommand::WriteTerminalInput {
+            session: SessionId(7),
+            input: crate::TerminalInput::Wheel {
+                cols: 80,
+                rows: 24,
+                column: 7,
+                row: 9,
+                delta: -2,
+            },
+        };
+        assert_eq!(
+            prepare_runtime_command_for_retention(&mut command)
+                .unwrap()
+                .retained_bytes(),
+            std::mem::size_of::<RuntimeCommand>()
+        );
+        let bytes = postcard::to_allocvec(&command).unwrap();
+        assert!(matches!(
+            postcard::from_bytes::<RuntimeCommand>(&bytes).unwrap(),
+            RuntimeCommand::WriteTerminalInput {
+                session: SessionId(7),
+                input: crate::TerminalInput::Wheel {
+                    cols: 80,
+                    rows: 24,
+                    column: 7,
+                    row: 9,
+                    delta: -2
+                }
+            }
+        ));
+        assert!(!format!("{command:?}").contains("column"));
+        #[allow(dead_code)]
+        #[derive(serde::Serialize)]
+        enum LegacyCommand {
+            SpawnShell,
+            SpawnAgent,
+            WriteInput,
+            Resize,
+            Scroll { session: SessionId, delta: i32 },
+        }
+        assert_eq!(
+            postcard::to_allocvec(&RuntimeCommand::Scroll {
+                session: SessionId(7),
+                delta: 3
+            })
+            .unwrap(),
+            postcard::to_allocvec(&LegacyCommand::Scroll {
+                session: SessionId(7),
+                delta: 3
+            })
+            .unwrap()
+        );
     }
 
     #[test]

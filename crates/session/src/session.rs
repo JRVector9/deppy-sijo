@@ -588,6 +588,19 @@ impl Session {
         self.backend.application_cursor()
     }
 
+    /// Live-mode application navigation, independent of native scrollback state.
+    pub fn encode_application_wheel(
+        &self,
+        cols: u16,
+        rows: u16,
+        column: u16,
+        row: u16,
+        delta: i16,
+    ) -> Option<Vec<u8>> {
+        self.backend
+            .encode_application_wheel(cols, rows, column, row, delta)
+    }
+
     /// status detector용 경량 화면 텍스트 (snapshot 미생성 — PR-12 hidden 규칙).
     /// 현재 터미널 제목(OSC 0/2). 빈 제목은 None.
     pub fn title(&self) -> Option<&str> {
@@ -1030,6 +1043,38 @@ mod tests {
             assert_eq!(after.visible_cells, before.visible_cells);
             assert!(!after.dirty_ranges.is_empty());
         }
+    }
+
+    #[test]
+    fn application_wheel_delegates_without_mutating_cells_cursor_or_native_damage() {
+        let mut session = Session::restore_archived(
+            SessionId(703),
+            SessionKind::Agent,
+            80,
+            24,
+            100,
+            Some(0),
+            &mut &b""[..],
+        );
+        session
+            .replay_ansi(&mut "\x1b[?1049h\x1b[?1003h\x1b[?1006h❯ 한글 초안".as_bytes())
+            .unwrap();
+        let before = session.input_guard_snapshot().unwrap();
+        assert_eq!(
+            session.encode_application_wheel(80, 24, 7, 9, 1),
+            Some(b"\x1b[<64;7;9M".to_vec())
+        );
+        assert_eq!(session.encode_application_wheel(120, 24, 7, 9, 1), None);
+        let after = session.input_guard_snapshot().unwrap();
+        assert_eq!(before.visible_cells, after.visible_cells);
+        assert_eq!(before.cursor, after.cursor);
+        assert_eq!(before.scroll_offset, after.scroll_offset);
+        assert!(!session.take_snapshot().unwrap().dirty_ranges.is_empty());
+        session.replay_ansi(&mut &b"\x1b[?1006l"[..]).unwrap();
+        assert_eq!(session.encode_application_wheel(80, 24, 7, 9, 1), None);
+        let (unsupported, calls) = metadata_fixture(true);
+        assert_eq!(unsupported.encode_application_wheel(80, 24, 7, 9, 1), None);
+        assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
     }
 
     struct SnapshotCountingBackend {

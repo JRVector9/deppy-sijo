@@ -1138,6 +1138,30 @@ impl TerminalBackend for AlacrittyBackend {
         self.term.mode().contains(TermMode::APP_CURSOR)
     }
 
+    fn encode_application_wheel(
+        &self,
+        cols: u16,
+        rows: u16,
+        column: u16,
+        row: u16,
+        delta: i16,
+    ) -> Option<Vec<u8>> {
+        let mode = self.term.mode();
+        if !mode.contains(TermMode::ALT_SCREEN | TermMode::SGR_MOUSE)
+            || !mode.intersects(TermMode::MOUSE_MODE)
+            || usize::from(cols) != self.term.columns()
+            || usize::from(rows) != self.term.screen_lines()
+            || !(1..=cols).contains(&column)
+            || !(1..=rows).contains(&row)
+            || !(1..=32).contains(&delta.unsigned_abs())
+        {
+            return None;
+        }
+        let button = if delta > 0 { 64 } else { 65 };
+        let event = format!("\x1b[<{button};{column};{row}M");
+        Some(event.as_bytes().repeat(usize::from(delta.unsigned_abs())))
+    }
+
     /// grid 전체(history+화면)를 truecolor SGR ANSI로 덤프한다. 새 백엔드에
     /// 그대로 feed하면 스크롤백·색·wide char가 복원된다 (압축 아카이브 왕복용).
     /// wrapped 행은 개행 없이 이어붙여 복원 시 reflow가 자연스럽다.
@@ -1566,6 +1590,84 @@ fn serialize_scrollback_bounded(
 mod tests {
     use super::*;
     use crate::backend::TerminalBackend;
+
+    #[test]
+    fn application_wheel_requires_live_alt_screen_and_negotiated_sgr_mouse() {
+        let mut backend = AlacrittyBackend::new(80, 24, 100);
+        let wheel = |backend: &AlacrittyBackend| backend.encode_application_wheel(80, 24, 7, 9, 2);
+        assert_eq!(wheel(&backend), None);
+        backend.feed(b"\x1b[?1003h\x1b[?1006h").unwrap();
+        assert_eq!(wheel(&backend), None, "main-screen mouse is not this route");
+        backend.feed(b"\x1b[?1049h").unwrap();
+        assert_eq!(
+            wheel(&backend),
+            Some(b"\x1b[<64;7;9M\x1b[<64;7;9M".to_vec())
+        );
+        backend.feed(b"\x1b[?1006l").unwrap();
+        assert_eq!(
+            wheel(&backend),
+            None,
+            "legacy mouse encoding is unsupported"
+        );
+        backend.feed(b"\x1b[?1006h\x1b[?1003l").unwrap();
+        assert_eq!(
+            wheel(&backend),
+            None,
+            "SGR alone does not request mouse events"
+        );
+        for mode in [1000, 1002, 1003] {
+            backend.feed(format!("\x1b[?{mode}h").as_bytes()).unwrap();
+            assert!(wheel(&backend).is_some(), "mouse mode {mode}");
+            backend.feed(format!("\x1b[?{mode}l").as_bytes()).unwrap();
+            assert_eq!(wheel(&backend), None);
+        }
+        backend.feed(b"\x1b[?1000h\x1b[?1049l").unwrap();
+        assert_eq!(wheel(&backend), None);
+    }
+
+    #[test]
+    fn application_wheel_rejects_stale_grid_invalid_coordinates_and_unbounded_delta() {
+        let mut backend = AlacrittyBackend::new(80, 24, 100);
+        backend.feed(b"\x1b[?1049h\x1b[?1003h\x1b[?1006h").unwrap();
+        assert_eq!(
+            backend.encode_application_wheel(80, 24, 80, 24, -1),
+            Some(b"\x1b[<65;80;24M".to_vec())
+        );
+        for (cols, rows, column, row, delta) in [
+            (120, 24, 7, 9, 1),
+            (80, 40, 7, 9, 1),
+            (80, 24, 0, 9, 1),
+            (80, 24, 81, 9, 1),
+            (80, 24, 7, 0, 1),
+            (80, 24, 7, 25, 1),
+            (80, 24, 7, 9, 0),
+            (80, 24, 7, 9, 33),
+            (80, 24, 7, 9, -33),
+            (80, 24, 7, 9, i16::MIN),
+        ] {
+            assert_eq!(
+                backend.encode_application_wheel(cols, rows, column, row, delta),
+                None
+            );
+        }
+        for delta in [-32, 32] {
+            let encoded = backend
+                .encode_application_wheel(80, 24, 7, 9, delta)
+                .unwrap();
+            let event = if delta > 0 {
+                b"\x1b[<64;7;9M"
+            } else {
+                b"\x1b[<65;7;9M"
+            };
+            assert_eq!(encoded, event.repeat(32));
+        }
+        backend.resize(120, 40).unwrap();
+        assert_eq!(backend.encode_application_wheel(80, 24, 7, 9, 1), None);
+        assert_eq!(
+            backend.encode_application_wheel(120, 40, 120, 40, 1),
+            Some(b"\x1b[<64;120;40M".to_vec())
+        );
+    }
 
     #[test]
     fn input_snapshot_normalizes_wide_cursor_without_moving_native_cursor() {

@@ -276,6 +276,20 @@ pub trait TerminalBackend {
         false
     }
 
+    /// Encode navigation only for a live alternate-screen application that negotiated
+    /// SGR mouse reporting. Coordinates are 1-based; positive delta scrolls up.
+    /// Unsupported engines must not guess keys or mutate native scrollback.
+    fn encode_application_wheel(
+        &self,
+        _cols: u16,
+        _rows: u16,
+        _column: u16,
+        _row: u16,
+        _delta: i16,
+    ) -> Option<Vec<u8>> {
+        None
+    }
+
     /// 현재 화면(스크롤 무시, 실제 grid)의 텍스트 — status detector용 경량 조회.
     /// TerminalViewportSnapshot을 만들지 않는다 (설계문서 PR-12: hidden session 규칙).
     fn screen_text(&self) -> String;

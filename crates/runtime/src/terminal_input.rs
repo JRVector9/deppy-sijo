@@ -13,6 +13,14 @@ pub enum TerminalInput {
         shift: bool,
         meta: bool,
     },
+    /// Append-only navigation; no text or key payload and no implicit submit.
+    Wheel {
+        cols: u16,
+        rows: u16,
+        column: u16,
+        row: u16,
+        delta: i16,
+    },
 }
 
 pub const DIRECT_INPUT_TEXT_BYTES_MAX: usize = 256 * 1024;
@@ -20,6 +28,7 @@ pub const DIRECT_INPUT_TEXT_BYTES_MAX: usize = 256 * 1024;
 impl TerminalInput {
     pub(crate) fn requires_current_modes(&self) -> bool {
         match self {
+            Self::Wheel { .. } => true,
             Self::Text { paste, .. } => *paste,
             Self::Key {
                 key,
@@ -37,23 +46,38 @@ impl TerminalInput {
         }
     }
 
-    pub(crate) fn payload(&self) -> &String {
+    pub(crate) fn payload(&self) -> Option<&String> {
         match self {
-            Self::Text { text, .. } => text,
-            Self::Key { key, .. } => key,
+            Self::Text { text, .. } => Some(text),
+            Self::Key { key, .. } => Some(key),
+            Self::Wheel { .. } => None,
         }
     }
 
-    pub(crate) fn payload_mut(&mut self) -> &mut String {
+    pub(crate) fn payload_mut(&mut self) -> Option<&mut String> {
         match self {
-            Self::Text { text, .. } => text,
-            Self::Key { key, .. } => key,
+            Self::Text { text, .. } => Some(text),
+            Self::Key { key, .. } => Some(key),
+            Self::Wheel { .. } => None,
         }
     }
 
-    pub(crate) fn is_valid(&self) -> bool {
+    /// Validates the same bounded command contract used by runtime retention.
+    pub fn is_valid(&self) -> bool {
         match self {
             Self::Text { text, .. } => text.len() <= DIRECT_INPUT_TEXT_BYTES_MAX,
+            Self::Wheel {
+                cols,
+                rows,
+                column,
+                row,
+                delta,
+            } => {
+                crate::command::dimensions_are_valid(*cols, *rows)
+                    && (1..=*cols).contains(column)
+                    && (1..=*rows).contains(row)
+                    && (1..=32).contains(&delta.unsigned_abs())
+            }
             Self::Key {
                 key,
                 ctrl,
@@ -73,6 +97,8 @@ impl TerminalInput {
             return None;
         }
         match self {
+            // The backend must inspect live negotiated mouse modes and grid dimensions.
+            Self::Wheel { .. } => None,
             Self::Text { text, paste } => {
                 let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
                 let cleaned: String = normalized
@@ -182,6 +208,103 @@ fn encode_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn application_wheel_validates_bounded_grid_coordinates_without_text_payload() {
+        let make = |cols, rows, column, row, delta| TerminalInput::Wheel {
+            cols,
+            rows,
+            column,
+            row,
+            delta,
+        };
+        for input in [make(80, 24, 1, 1, 1), make(80, 24, 80, 24, -32)] {
+            assert!(input.is_valid());
+            assert!(input.requires_current_modes());
+            assert!(input.payload().is_none());
+            assert!(
+                input.encode(true, true).is_none(),
+                "worker must use live backend mouse negotiation"
+            );
+        }
+        for input in [
+            make(0, 24, 1, 1, 1),
+            make(80, 0, 1, 1, 1),
+            make(501, 24, 1, 1, 1),
+            make(500, 500, 1, 1, 1),
+            make(80, 24, 0, 1, 1),
+            make(80, 24, 81, 1, 1),
+            make(80, 24, 1, 0, 1),
+            make(80, 24, 1, 25, 1),
+            make(80, 24, 1, 1, 0),
+            make(80, 24, 1, 1, 33),
+            make(80, 24, 1, 1, -33),
+            make(80, 24, 1, 1, i16::MIN),
+        ] {
+            assert!(!input.is_valid());
+        }
+    }
+
+    #[test]
+    fn application_wheel_is_append_only_and_preserves_legacy_text_key_wire() {
+        #[derive(serde::Serialize, serde::Deserialize)]
+        enum LegacyInput {
+            Text {
+                text: String,
+                paste: bool,
+            },
+            Key {
+                key: String,
+                ctrl: bool,
+                alt: bool,
+                shift: bool,
+                meta: bool,
+            },
+        }
+        for (legacy, current) in [
+            (
+                LegacyInput::Text {
+                    text: "한글 초안".into(),
+                    paste: true,
+                },
+                TerminalInput::Text {
+                    text: "한글 초안".into(),
+                    paste: true,
+                },
+            ),
+            (
+                LegacyInput::Key {
+                    key: "up".into(),
+                    ctrl: false,
+                    alt: true,
+                    shift: false,
+                    meta: false,
+                },
+                TerminalInput::Key {
+                    key: "up".into(),
+                    ctrl: false,
+                    alt: true,
+                    shift: false,
+                    meta: false,
+                },
+            ),
+        ] {
+            let bytes = postcard::to_allocvec(&legacy).unwrap();
+            assert_eq!(bytes, postcard::to_allocvec(&current).unwrap());
+            assert!(postcard::from_bytes::<TerminalInput>(&bytes).unwrap() == current);
+        }
+        let wheel = TerminalInput::Wheel {
+            cols: 80,
+            rows: 24,
+            column: 7,
+            row: 9,
+            delta: -2,
+        };
+        let bytes = postcard::to_allocvec(&wheel).unwrap();
+        assert_eq!(bytes[0], 2);
+        assert!(postcard::from_bytes::<LegacyInput>(&bytes).is_err());
+        assert!(postcard::from_bytes::<TerminalInput>(&bytes).unwrap() == wheel);
+    }
 
     #[test]
     fn direct_text_preserves_unicode_spaces_and_only_paste_controls() {

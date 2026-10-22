@@ -3178,9 +3178,9 @@ mod tests {
 
     #[test]
     fn v12_v13_peer_is_rejected_at_hello_before_event_decode() {
-        assert_eq!(PROTO_VERSION, 35);
+        assert_eq!(PROTO_VERSION, 36);
         for version in [
-            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            10, 12, 13, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
         ] {
             let old = ClientHello {
                 magic: PROTO_MAGIC,

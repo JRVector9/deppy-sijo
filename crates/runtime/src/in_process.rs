@@ -927,6 +927,16 @@ struct LazyWorkspaceRestore {
     pending_panes: Vec<persist::PaneState>,
 }
 
+/// Navigation uses ordinary PTY admission but cannot edit or submit a prompt,
+/// invalidate completion tracking, or advance its intervention sequence.
+enum InputRecord<'a> {
+    Intervention {
+        operation_id: Option<&'a str>,
+        accepted: &'a mut Option<crate::remote_input::RemoteInputAcceptance>,
+    },
+    Navigation,
+}
+
 struct Worker {
     instance_token: String,
     remote_worker: Arc<Mutex<crate::remote_worker::RemoteWorkerSlot>>,
@@ -2800,28 +2810,40 @@ impl Worker {
         operation_id: Option<&str>,
         append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
     ) -> Result<(), pty::PtyInputRejectReason> {
-        self.admit_input_batch_recording(session, parts, admission, operation_id, append, &mut None)
+        self.admit_input_batch_recording(
+            session,
+            parts,
+            admission,
+            append,
+            InputRecord::Intervention {
+                operation_id,
+                accepted: &mut None,
+            },
+        )
     }
     fn admit_input_batch_recording(
         &mut self,
         session: SessionId,
         parts: &[&[u8]],
         admission: Option<&crate::InputAdmission>,
-        operation_id: Option<&str>,
         append: impl FnMut(&mut SessionLog, &[u8]) -> anyhow::Result<u64>,
-        accepted: &mut Option<crate::remote_input::RemoteInputAcceptance>,
+        record: InputRecord<'_>,
     ) -> Result<(), pty::PtyInputRejectReason> {
         if !self.sessions.contains_key(&session) {
             return Err(pty::PtyInputRejectReason::SessionClosed);
         }
         let nonempty = parts.iter().any(|part| !part.is_empty());
-        let next_sequence = self
-            .input_sequences
-            .get(&session)
-            .copied()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or(pty::PtyInputRejectReason::AdmissionDenied)?;
+        let next_sequence = match &record {
+            InputRecord::Navigation => None,
+            InputRecord::Intervention { .. } => Some(
+                self.input_sequences
+                    .get(&session)
+                    .copied()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or(pty::PtyInputRejectReason::AdmissionDenied)?,
+            ),
+        };
         let timestamp = || {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2884,6 +2906,16 @@ impl Worker {
         // The admission lock is gone before detectors/events invoke UI wakes.
         match outcome {
             Some(pty::PtyInputEnqueueResult::Accepted) => {
+                let (next_sequence, operation_id, accepted) = match (next_sequence, record) {
+                    (
+                        Some(sequence),
+                        InputRecord::Intervention {
+                            operation_id,
+                            accepted,
+                        },
+                    ) => (sequence, operation_id, accepted),
+                    _ => return Ok(()),
+                };
                 if nonempty {
                     self.input_sequences.insert(session, next_sequence);
                     *accepted = Some(crate::remote_input::RemoteInputAcceptance {
@@ -3618,9 +3650,11 @@ impl Worker {
                         target.session,
                         &[paste.as_bytes(), b"\r"],
                         Some(&admission),
-                        Some(operation_id.as_str()),
                         SessionLog::append_redacted_output,
-                        &mut accepted,
+                        InputRecord::Intervention {
+                            operation_id: Some(operation_id.as_str()),
+                            accepted: &mut accepted,
+                        },
                     );
                     self.emit(RuntimeEvent::InputAdmitted {
                         session: target.session,
@@ -4072,7 +4106,7 @@ impl Worker {
                         self.emit(RuntimeEvent::PtyInputPressure {
                             session,
                             pressure: pty::PtyInputPressure {
-                                attempted_bytes: input.payload().len(),
+                                attempted_bytes: input.payload().map_or(0, String::len),
                                 queued_bytes: 0,
                                 queued_messages: 0,
                                 max_bytes: policy.max_bytes,
@@ -4086,10 +4120,33 @@ impl Worker {
                 let Some(active) = self.sessions.get(&session) else {
                     return;
                 };
-                if let Some(bytes) =
-                    input.encode(active.bracketed_paste(), active.application_cursor())
-                {
-                    let _ = self.admit_input(session, &bytes);
+                match &input {
+                    crate::TerminalInput::Wheel {
+                        cols,
+                        rows,
+                        column,
+                        row,
+                        delta,
+                    } => {
+                        if let Some(bytes) =
+                            active.encode_application_wheel(*cols, *rows, *column, *row, *delta)
+                        {
+                            let _ = self.admit_input_batch_recording(
+                                session,
+                                &[&bytes],
+                                None,
+                                SessionLog::append_redacted_output,
+                                InputRecord::Navigation,
+                            );
+                        }
+                    }
+                    _ => {
+                        if let Some(bytes) =
+                            input.encode(active.bracketed_paste(), active.application_cursor())
+                        {
+                            let _ = self.admit_input(session, &bytes);
+                        }
+                    }
                 }
             }
             RuntimeCommand::WriteInputTracked {
@@ -12416,6 +12473,330 @@ mod tests {
             "query must not consume native dirty ranges"
         );
         assert_eq!(still_dirty.scroll_offset, 3);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "application-wheel-input");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty raw -echo; printf '\033[?1049h\033[?1003h\033[?1006h❯ 한글 초안\r\n'; dd bs=1 count=46 2>/dev/null | od -An -tx1; sleep 30"]),
+            80, 24, 100, Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(live.pending_output_bytes() > 0);
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let wheel = |cols, column, delta| RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Wheel {
+                cols,
+                rows: 24,
+                column,
+                row: 9,
+                delta,
+            },
+        };
+        // First navigation must parse the queued mouse mode before encoding.
+        worker.handle_command(wheel(80, 7, 1));
+        assert!(
+            worker.sessions[&id]
+                .encode_application_wheel(80, 24, 7, 9, 1)
+                .is_some()
+        );
+        assert!(
+            !worker.detectors[&id].has_input_draft(),
+            "wheel is navigation, not draft text"
+        );
+        assert!(worker.input_sequences.get(&id).is_none());
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Text {
+                text: "앞".into(),
+                paste: false,
+            },
+        });
+        assert!(worker.detectors[&id].has_input_draft());
+        let before = worker.detectors[&id].status_view(None);
+        worker.handle_command(wheel(120, 7, 1)); // Valid-shaped command with a stale displayed grid.
+        worker.handle_command(wheel(80, 81, 1)); // Rejected by command admission.
+        worker.handle_command(RuntimeCommand::Scroll {
+            session: id,
+            delta: 3,
+        });
+        worker.handle_command(wheel(80, 7, 2));
+        worker.handle_command(wheel(80, 7, -1));
+        assert!(worker.detectors[&id].has_input_draft());
+        assert_eq!(worker.detectors[&id].status_view(None), before);
+        assert_eq!(worker.input_sequences.get(&id), Some(&1));
+        assert!(worker.sessions[&id].screen_text().contains("한글 초안"));
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Text {
+                text: "뒤".into(),
+                paste: false,
+            },
+        });
+        assert_eq!(
+            worker.input_sequences.get(&id),
+            Some(&2),
+            "only ordinary text changes intervention sequence"
+        );
+        let emitted: Vec<_> = events.try_iter().collect();
+        assert_eq!(
+            emitted
+                .iter()
+                .filter(|event| matches!(event, RuntimeEvent::SessionInputAccepted { .. }))
+                .count(),
+            2
+        );
+        assert!(
+            !emitted
+                .iter()
+                .any(|event| matches!(event, RuntimeEvent::SessionInputSubmitted { .. }))
+        );
+        let mut expected = b"\x1b[<64;7;9M".to_vec();
+        expected.extend_from_slice("앞".as_bytes());
+        expected.extend_from_slice(b"\x1b[<64;7;9M\x1b[<64;7;9M\x1b[<65;7;9M");
+        expected.extend_from_slice("뒤".as_bytes());
+        assert_eq!(expected.len(), 46);
+        let expected: Vec<_> = expected.iter().map(|byte| format!("{byte:02x}")).collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            let screen = worker.sessions[&id].screen_text();
+            if screen
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .windows(expected.len())
+                .any(|actual| actual.iter().zip(&expected).all(|(a, b)| a == b))
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "wheel PTY bytes missing: {screen:?}"
+            );
+            if worker.sessions[&id].pending_output_bytes() == 0 {
+                let _ = output_rx.recv_timeout(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn application_wheel_navigation_obeys_revoked_input_admission() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "application-wheel-permit");
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty raw -echo; printf 'READY\r\n'; dd bs=1 count=1 2>/dev/null | od -An -tx1; sleep 30"]),
+            80, 24, 100, Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        worker.sessions.insert(id, live);
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let permit = crate::InputPermit::new();
+        let admission = crate::InputAdmission::new(
+            permit.clone(),
+            Instant::now() + Duration::from_secs(5),
+            |_| panic!("revoked permit reached authorizer"),
+        );
+        permit.revoke();
+        assert_eq!(
+            worker.admit_input_batch_recording(
+                id,
+                &[b"\x1b[<64;7;9M"],
+                Some(&admission),
+                SessionLog::append_redacted_output,
+                InputRecord::Navigation
+            ),
+            Err(pty::PtyInputRejectReason::AdmissionDenied)
+        );
+        assert!(worker.sessions[&id].input_queue_idle());
+        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionInputAccepted { .. } | RuntimeEvent::SessionInputSubmitted { .. }
+        )));
+        assert_eq!(worker.admit_input(id, b"x"), Ok(()));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            let screen = worker.sessions[&id].screen_text();
+            if screen.split_whitespace().any(|token| token == "78") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "revoked navigation leaked into PTY: {screen:?}"
+            );
+            if worker.sessions[&id].pending_output_bytes() == 0 {
+                let _ = output_rx.recv_timeout(Duration::from_millis(20));
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn application_wheel_uses_real_pty_queue_backpressure_without_prompt_evidence() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "application-wheel-queue-full");
+        let pressures = Arc::clone(&worker.subscribers.lock().unwrap()[0].input_pressures);
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", r"stty raw -echo; printf '\033[?1049h\033[?1003h\033[?1006hREADY\r\n'; sleep 30"]),
+            80, 24, 100, Arc::new(move || { let _=output_tx.send(()); }),
+        ).unwrap();
+        output_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        let max = pty::PtyInputQueuePolicy::default().max_bytes;
+        assert_eq!(
+            worker
+                .sessions
+                .get_mut(&id)
+                .unwrap()
+                .write_input(&vec![b'x'; max]),
+            Some(pty::PtyInputEnqueueResult::Accepted)
+        );
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Wheel {
+                cols: 80,
+                rows: 24,
+                column: 7,
+                row: 9,
+                delta: 1,
+            },
+        });
+        assert!(pressures.lock().unwrap().values().any(|event| matches!(
+            event,
+            RuntimeEvent::PtyInputPressure {
+                pressure: pty::PtyInputPressure {
+                    reason: pty::PtyInputRejectReason::QueueFull,
+                    attempted_bytes: 10,
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(worker.pressured_sessions.contains(&id));
+        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!worker.detectors[&id].has_input_draft());
+        assert!(!events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionInputAccepted { .. } | RuntimeEvent::SessionInputSubmitted { .. }
+        )));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn application_wheel_mode_flood_is_bounded_and_denied_before_pty_write() {
+        let resolver = Arc::new(RecordingResolver {
+            calls: Mutex::new(Vec::new()),
+            value: None,
+        });
+        let (mut worker, events) = admission_worker(resolver, "application-wheel-flood");
+        let pressures = Arc::clone(&worker.subscribers.lock().unwrap()[0].input_pressures);
+        let id = SessionId(1);
+        let (output_tx, output_rx) = std::sync::mpsc::channel();
+        let live = Session::spawn_with_spec_and_output_wake(
+            id, session::SessionKind::Shell,
+            &spec("/bin/sh", &["-c", "stty raw -echo; dd if=/dev/zero bs=1024 count=768 2>/dev/null; dd bs=1 count=1 2>/dev/null | od -An -tx1; sleep 30"]),
+            80, 24, 100, Arc::new(move || { let _ = output_tx.send(()); }),
+        ).unwrap();
+        let total = 768 * 1024;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live.pending_output_bytes() < total {
+            output_rx
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap();
+        }
+        worker.sessions.insert(id, live);
+        worker.detectors.insert(
+            id,
+            session::StatusDetector::new(session::StatusPatterns::compile(None, None, None, None)),
+        );
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Wheel {
+                cols: 80,
+                rows: 24,
+                column: 7,
+                row: 9,
+                delta: 1,
+            },
+        });
+        assert_eq!(
+            worker.sessions[&id].pending_output_bytes(),
+            total - Session::INPUT_GUARD_OUTPUT_MAX_BYTES
+        );
+        assert!(!worker.detectors[&id].has_input_draft());
+        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(pressures.lock().unwrap().values().any(|event| matches!(
+            event,
+            RuntimeEvent::PtyInputPressure {
+                pressure: pty::PtyInputPressure {
+                    reason: pty::PtyInputRejectReason::AdmissionDenied,
+                    queued_bytes: 0,
+                    ..
+                },
+                ..
+            }
+        )));
+        assert!(!events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::SessionInputAccepted { .. } | RuntimeEvent::SessionInputSubmitted { .. }
+        )));
+        // A later ordinary key is exactly what reaches the child; no rejected wheel bytes leak.
+        worker.handle_command(RuntimeCommand::WriteTerminalInput {
+            session: id,
+            input: crate::TerminalInput::Text {
+                text: "x".into(),
+                paste: false,
+            },
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let effects = worker.collect_session_pump_effects(&[id], false, true);
+            worker.finish_session_pump_effects(effects);
+            let text = worker.sessions[&id].screen_text();
+            if text.split_whitespace().any(|token| token == "78") {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "ordinary key not captured: {text:?}"
+            );
+            if worker.sessions[&id].pending_output_bytes() == 0 {
+                let _ = output_rx.recv_timeout(Duration::from_millis(20));
+            }
+        }
     }
 
     #[test]

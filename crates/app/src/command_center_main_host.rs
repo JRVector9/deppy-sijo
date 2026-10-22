@@ -315,7 +315,15 @@ fn enqueue(
     intent: cc::Intent,
 ) -> Result<Value, String> {
     let id = id.ok_or("main_operation_id_required")?;
-    if host.main_guards.len() >= 256 || host.operations.contains_key(id) {
+    // Retain revoked authority tombstones within the host's 1024-operation replay quota.
+    if host
+        .main_guards
+        .values()
+        .filter(|guard| !guard.retired)
+        .count()
+        >= 256
+        || host.operations.contains_key(id)
+    {
         return Err("main_operation_capacity_no_effect".into());
     }
     let local_task = match &intent {
@@ -645,6 +653,301 @@ pub(super) mod tests {
             .execution_generation += 1;
         assert!(!same_main(&host, &scope));
     }
+    fn propose_main_plan(
+        host: &mut CommandCenterHost,
+        scope: &MainScope,
+        id: &str,
+    ) -> Result<Value, String> {
+        let goal_id = main_goal(&host.projects[&scope.workspace_id])
+            .unwrap()
+            .id
+            .0
+            .clone();
+        call(
+            host,
+            scope,
+            MainCall::ProposePlan {
+                goal_id,
+                config_revision: scope.config_revision,
+                json: "{}".into(),
+            },
+            Some(id),
+        )
+    }
+
+    #[test]
+    fn command_center_main_host_guard_reclaims_retired_admission_capacity() {
+        let (mut host, old_scope) = fixture();
+        for index in 0..256 {
+            let id = format!("retired-main-{index}");
+            assert_eq!(
+                propose_main_plan(&mut host, &old_scope, &id).unwrap()["status"],
+                "accepted"
+            );
+            assert_eq!(host.pending.pop_front().unwrap().0, id);
+            host.finish(
+                &id,
+                cc::ReceiptStatus::Acknowledged,
+                "completed before MAIN replacement",
+            );
+        }
+        assert_eq!(host.operations.len(), 256);
+        assert!(host.main_guards.values().all(|guard| !guard.retired));
+
+        // Reuse the real installed route with a new execution generation and MAIN launch.
+        let mut scope = old_scope.clone();
+        scope.launch_operation_id = work::OperationId::new().0;
+        scope.execution_generation += 1;
+        let mut bound = host.live[0].runtime_binding.clone().unwrap();
+        bound.execution_generation = scope.execution_generation;
+        host.live[0].runtime_binding = Some(bound.clone());
+        let previous = &host.launches[&old_scope.launch_operation_id];
+        let mut record = previous.record.clone();
+        record.operation_id =
+            work::OperationId::from_string(scope.launch_operation_id.clone()).unwrap();
+        let mut request = previous.request.clone().unwrap();
+        request.identity.operation_id = record.operation_id.clone();
+        host.launches.insert(
+            scope.launch_operation_id.clone(),
+            launch::Pending {
+                record,
+                runtime_instance: scope.runtime_instance,
+                main_binding: Some(bound),
+                generation: 0,
+                stage: launch::Stage::Done,
+                request: Some(request),
+                deadline: std::time::Instant::now(),
+                owned: None,
+                grant: None,
+            },
+        );
+        host.current_main_scopes = vec![scope.clone()];
+        host.retire_main_operations();
+        assert!(same_main(&host, &scope));
+        assert!(!same_main(&host, &old_scope));
+        assert!(host.main_guards.values().all(|guard| guard.retired));
+        assert!(!host.main_operation_current("retired-main-255"));
+
+        let result = propose_main_plan(&mut host, &scope, "replacement-main-257");
+        assert_eq!(
+            result.as_ref().map(|value| &value["status"]),
+            Ok(&json!("accepted")),
+            "256 retired MAIN guards must not consume the live admission bound: {result:?}"
+        );
+        assert_eq!(
+            host.main_guards.len(),
+            257,
+            "retain old IDs as bounded authority tombstones"
+        );
+        assert_eq!(
+            host.main_guards
+                .values()
+                .filter(|guard| !guard.retired)
+                .count(),
+            1
+        );
+        assert!(host.main_operation_current("replacement-main-257"));
+        assert!(!host.main_operation_current("retired-main-255"));
+        assert_eq!(
+            call(
+                &mut host,
+                &scope,
+                MainCall::Operation {
+                    host_operation_id: "retired-main-255".into(),
+                },
+                None
+            )
+            .unwrap()["status"],
+            "unknown",
+            "a replacement MAIN cannot read a previous scope's receipt"
+        );
+    }
+
+    #[test]
+    fn command_center_main_host_guard_keeps_256_live_admission_bound() {
+        let (mut host, scope) = fixture();
+        for index in 0..256 {
+            let id = format!("live-main-{index}");
+            propose_main_plan(&mut host, &scope, &id).unwrap();
+            assert_eq!(host.pending.pop_front().unwrap().0, id);
+        }
+        assert_eq!(
+            propose_main_plan(&mut host, &scope, "live-main-overflow"),
+            Err("main_operation_capacity_no_effect".into())
+        );
+        assert_eq!(host.main_guards.len(), 256);
+        assert_eq!(host.operations.len(), 256);
+        assert!(host.main_operation_current("live-main-0"));
+        assert!(!host.operations.contains_key("live-main-overflow"));
+    }
+
+    #[test]
+    fn command_center_main_host_guard_preserves_retired_permit_receipt_and_unknown() {
+        use runtime::{RuntimeCommandSink, RuntimeEventStream};
+        let (mut host, scope) = fixture();
+        propose_main_plan(&mut host, &scope, "completed-main").unwrap();
+        host.pending.pop_front().unwrap();
+        host.finish(
+            "completed-main",
+            cc::ReceiptStatus::Acknowledged,
+            "completed receipt",
+        );
+        let permit = host.main_guards["completed-main"].permit.clone();
+        propose_main_plan(&mut host, &scope, "unresolved-main").unwrap();
+        host.pending.pop_front().unwrap();
+
+        // Exercise the cloned permit through the public runtime admission path.
+        let root = std::env::temp_dir().join(format!("deppy-main-guard-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            std::sync::Arc::new(crate::app::AppRuntimeSecretResolver::new(
+                root.join("unused.db"),
+            )),
+            root.join("logs"),
+            secret::RedactionService::new(),
+            None,
+            Some(root.clone()),
+            vec![],
+        )
+        .unwrap();
+        let events = client.subscribe();
+        let mut command = main_spawn();
+        if let runtime::RuntimeCommand::SpawnAgent { command, .. } = &mut command {
+            *command = "/bin/cat".into();
+        }
+        client.send_command(command).unwrap();
+        let wait = |accept: &dyn Fn(&runtime::RuntimeEvent) -> bool| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                if let Some(event) = events.drain().into_iter().find(|event| accept(event)) {
+                    break event;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "owned permit fixture timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        let runtime::RuntimeEvent::AgentSpawned { session } =
+            wait(&|event| matches!(event, runtime::RuntimeEvent::AgentSpawned { .. }))
+        else {
+            unreachable!()
+        };
+        let send = |id: &str| {
+            client
+                .send_guarded_input(
+                    session,
+                    id.into(),
+                    b"bounded fixture input\n".to_vec(),
+                    runtime::InputAdmission::new(
+                        permit.clone(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(5),
+                        |write| write(),
+                    ),
+                )
+                .unwrap();
+            wait(
+                &|event| matches!(event, runtime::RuntimeEvent::InputAdmitted { operation_id, .. } if operation_id == id),
+            )
+        };
+        assert!(matches!(
+            send("before-retirement"),
+            runtime::RuntimeEvent::InputAdmitted { result: Ok(()), .. }
+        ));
+        host.current_main_scopes.clear();
+        host.retire_main_operations();
+        host.current_main_scopes.push(scope.clone());
+        assert!(same_main(&host, &scope));
+        assert!(!host.main_operation_current("completed-main"));
+        assert!(!host.main_operation_current("unresolved-main"));
+        assert!(
+            matches!(
+                send("after-retirement"),
+                runtime::RuntimeEvent::InputAdmitted {
+                    result: Err(runtime::PtyInputRejectReason::AdmissionDenied),
+                    ..
+                }
+            ),
+            "an old cloned permit must remain revoked after restoring the exact scope"
+        );
+        let receipt = call(
+            &mut host,
+            &scope,
+            MainCall::Operation {
+                host_operation_id: "completed-main".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(receipt["receipt"]["detail"], "completed receipt");
+        assert_eq!(
+            call(
+                &mut host,
+                &scope,
+                MainCall::Operation {
+                    host_operation_id: "unresolved-main".into()
+                },
+                None
+            )
+            .unwrap()["status"],
+            "pending_or_unknown"
+        );
+        assert_eq!(
+            call(
+                &mut host,
+                &scope,
+                MainCall::Operation {
+                    host_operation_id: "never-admitted".into()
+                },
+                None
+            )
+            .unwrap()["status"],
+            "unknown"
+        );
+        assert_eq!(
+            propose_main_plan(&mut host, &scope, "completed-main"),
+            Err("main_operation_capacity_no_effect".into())
+        );
+        assert!(
+            host.main_operation_current("ordinary-host-operation"),
+            "missing guards retain ordinary host authority semantics"
+        );
+        drop(client);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_center_main_host_guard_preserves_host_1024_replay_quota() {
+        let (mut host, scope) = fixture();
+        for index in 0..1024 {
+            let id = format!("host-operation-{index}");
+            host.enqueue(
+                id.clone(),
+                cc::Intent::InstallPlanJson {
+                    workspace_id: scope.workspace_id.clone(),
+                    json: "{}".into(),
+                },
+            );
+            assert_eq!(host.pending.pop_front().unwrap().0, id);
+        }
+        assert!(host.main_guards.is_empty());
+        assert_eq!(host.operations.len(), 1024);
+        assert_eq!(
+            propose_main_plan(&mut host, &scope, "host-quota-overflow"),
+            Err("busy_no_effect".into())
+        );
+        assert!(!host.operations.contains_key("host-quota-overflow"));
+        assert!(host.main_guards.is_empty());
+        assert!(
+            host.receipts
+                .iter()
+                .any(|receipt| receipt.operation_id == "host-quota-overflow"
+                    && receipt.status == cc::ReceiptStatus::Rejected)
+        );
+    }
+
     fn main_spawn() -> runtime::RuntimeCommand {
         runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some("configured-agent".into()),

@@ -10378,6 +10378,8 @@ struct AgentDetectInputSnapshot {
 }
 
 pub struct App {
+    /// Shared registered-secret corpus for Command Center services and projections.
+    command_center_redaction: secret::RedactionService,
     command_center_layout: command_center_host::layout::LayoutSwitch,
     command_center: Option<Box<command_center_host::CommandCenterHost>>,
     cloud_agent: crate::cloud_agent::CloudAgent,
@@ -17324,6 +17326,7 @@ impl App {
         let agent_sessions_secrets_snapshot =
             ui::agent_sessions::AgentSessionsSecretsSnapshot::deferred(0);
         let mut app = Self {
+            command_center_redaction: redaction.clone(),
             config,
             config_path,
             last_theme_dark: true,

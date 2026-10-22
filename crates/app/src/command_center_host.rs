@@ -14,6 +14,8 @@ use wm::repository_worker::{RepositoryJob, RepositoryResult, RepositoryWorker};
 mod approval;
 #[path = "command_center_assignment.rs"]
 mod assignment;
+#[path = "command_center_conversation.rs"]
+mod conversation;
 #[path = "command_center_devices.rs"]
 mod devices;
 #[path = "command_center_launch.rs"]
@@ -147,6 +149,8 @@ pub(super) struct CommandCenterHost {
     execution_bindings: Vec<(Capture, work::RuntimeBinding, work::AgentSelection)>,
     next_grant_epoch: u64,
     observations: observe::Observations,
+    conversations: conversation::Conversations,
+    conversation_revision: u64,
     devices: devices::Devices,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
@@ -192,6 +196,8 @@ impl CommandCenterHost {
             execution_bindings: vec![],
             next_grant_epoch: 0,
             observations: observe::Observations::new(ctx),
+            conversations: Default::default(),
+            conversation_revision: 0,
             devices: devices::Devices::new(data_dir.clone(), ctx),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
@@ -1065,7 +1071,7 @@ impl App {
                     tool_execution_restricted: false,
                 });
             let history = approval::history(p, &tasks);
-            snapshot.projects.push(cc::Project { pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.display_goal().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_agents: agents.iter().map(|a| cc::AgentOption { provider: a.provider.clone(), model: a.model.clone().unwrap_or_default(), effort: a.effort.clone().unwrap_or_default() }).collect(), available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            snapshot.projects.push(cc::Project { main_conversation:self.command_center_main_conversation(host, &main_target), pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.display_goal().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_agents: agents.iter().map(|a| cc::AgentOption { provider: a.provider.clone(), model: a.model.clone().unwrap_or_default(), effort: a.effort.clone().unwrap_or_default() }).collect(), available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),
@@ -2248,6 +2254,15 @@ impl App {
         if let Some((target, prompt, id)) = send {
             self.stage_command_center_observed_prompt(target, prompt, id);
         }
+        let conversation_revision = self
+            .agent_sessions_ui
+            .command_center_conversation_revision();
+        if let Some(host) = self.command_center.as_mut()
+            && host.conversation_revision != conversation_revision
+        {
+            host.conversation_revision = conversation_revision;
+            host.publication_dirty = true;
+        }
         let approval_revision = self.agent_sessions_ui.command_center_approvals_revision();
         if let Some(host) = self.command_center.as_mut()
             && host.approval_revision != approval_revision
@@ -2923,6 +2938,9 @@ fn finish_input_outcome(
         if let Some(assignment) = &input.dispatch {
             apply_delivery_outcome(p, assignment, outcome);
         }
+    }
+    if accepted && input.dispatch.is_none() {
+        conversation::record_user(host, &input.target, id, &input.draft);
     }
     let key = draft_key(host, &input.target).ok();
     if accepted

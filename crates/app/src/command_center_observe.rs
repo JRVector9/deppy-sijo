@@ -699,6 +699,24 @@ fn install_turn(host: &mut CommandCenterHost, turn: ObservedTurn) {
         host.status = "이전 실행의 턴 응답을 현재 작업에 적용하지 않았습니다.".into();
         return;
     }
+    if turn.state == LocalCompletionState::Completed
+        && turn.identity.attempt_id.is_none()
+        && let Some(text) = turn.text.as_ref()
+    {
+        conversation::record(
+            host,
+            &watch.route,
+            cc::ConversationEntry {
+                id: format!("answer:{}", turn.identity.operation_id.0),
+                turn_id: turn.turn_id.clone(),
+                kind: cc::ConversationEntryKind::Agent,
+                text: bounded(text, 8192),
+                tool_name: None,
+                state: None,
+                observed_at: None,
+            },
+        );
+    }
     let Some(p) = host.projects.get_mut(&watch.route.workspace_id) else {
         return;
     };

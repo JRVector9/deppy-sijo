@@ -729,6 +729,8 @@ pub struct AgentSessionsUi {
     /// Latest render generation for exact stale-action rejection.
     frame_generation: u64,
     command_center_approval_revision: u64,
+    command_center_conversation_revision: u64,
+    command_center_connection_epoch: u64,
 }
 
 impl AgentSessionsUi {
@@ -785,6 +787,8 @@ impl AgentSessionsUi {
             localized_session_errors: HashMap::new(),
             frame_generation: 0,
             command_center_approval_revision: 0,
+            command_center_conversation_revision: 0,
+            command_center_connection_epoch: 0,
         }
     }
 
@@ -900,6 +904,32 @@ impl AgentSessionsUi {
 
     pub(crate) fn command_center_approval_connected(&self) -> bool {
         self.client.is_some()
+    }
+
+    /// Runtime-owned data only. Selection, display names and DB placeholders cannot select MAIN.
+    pub(crate) fn command_center_session(
+        &self,
+        workspace_id: &str,
+        session_id: &str,
+    ) -> Option<(&AgentSession, u64)> {
+        if self.command_center_connection_epoch == 0
+            || !self.attached_threads.contains(session_id)
+            || self.persisted_placeholders.contains(session_id)
+        {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .find(|session| {
+                session.id == session_id
+                    && session.workspace_id.as_deref() == Some(workspace_id)
+                    && session.thread_id.as_ref().is_some_and(|id| !id.is_empty())
+            })
+            .map(|session| (session, self.command_center_connection_epoch))
+    }
+
+    pub(crate) fn command_center_conversation_revision(&self) -> u64 {
+        self.command_center_conversation_revision
     }
 
     /// Respond to exactly the displayed request, independently of the selected surface.
@@ -1710,6 +1740,10 @@ impl AgentSessionsUi {
                 }
             })?;
         self.transport_error = None;
+        self.command_center_connection_epoch =
+            self.command_center_connection_epoch.saturating_add(1);
+        self.command_center_conversation_revision =
+            self.command_center_conversation_revision.wrapping_add(1);
         self.client = Some(client);
         self.client_llm_override = llm_override;
         self.client_api_key_generation = api_key_generation;
@@ -3702,6 +3736,8 @@ impl AgentSessionsUi {
     }
 
     fn apply_session_event(&mut self, session_id: &str, event: AgentSessionEvent) {
+        self.command_center_conversation_revision =
+            self.command_center_conversation_revision.wrapping_add(1);
         if matches!(
             &event,
             AgentSessionEvent::ApprovalRequested { .. }

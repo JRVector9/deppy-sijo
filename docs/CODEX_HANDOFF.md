@@ -1,3 +1,10 @@
+# PR1/PR2 integration checkpoint — 2026-10-22
+
+- Root integrated main conversation DTO eec7ae68, scoped MCP f74a2557, core evidence a4c663f3, storage journal61f4b9d5, explicit canonical approval179194f8. Agents continue rendering, launch helper and real shell worker; no app launch/release/push.
+- Root adds actual MAIN projection `command_center_conversation.rs`, shared redaction clone, exact runtime-owned structured getter+connection epoch, admitted user/final observed answer hooks and publication invalidation. PTY projection explicitly identifies bounded admitted/final observations; no fake live transcript or timestamps. Scope is exact main route+incarnation+execution generation.
+- Actual root test: `CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-sijo --bin deppy-sijo command_center_main_conversation -- --test-threads=1` **2PASS**, log `/private/tmp/deppy-cc-root-conversation-20261022.log`. Two temporary unused UI warnings expected until renderer integration; not final lint success. No root RED claim for these two projection tests. Agent protocol/core/store/approval RED/GREEN recorded independently in agent notes.
+- Remaining: merge renderer replacing its None plumbing with actual projection; integrate private main-tools lifecycle/host callback; integrate worker execution/cancel/evidence UI and exact workflow application; independent review and full affected gates; update plan/report/handoff with exact source. Re-read this and previous active checkpoint after compaction.
+
 # Active implementation — Command Center follow-up PR1 + PR2, 2026-10-22
 
 - Current objective: user explicitly selected parallel implementation of PR1 main project tools/actual MAIN conversation and PR2 actual verification runner/evidence. Scope/design `docs/superpowers/specs/2026-10-22-command-center-main-tools-verification-design.md`, execution checklist `docs/superpowers/plans/2026-10-22-command-center-main-tools-verification.md`. Approved user instruction authorizes implementation; no extra design approval gate.

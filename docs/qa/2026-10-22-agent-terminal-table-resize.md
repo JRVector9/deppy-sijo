@@ -5,6 +5,14 @@
 - **Grok 실제 CLI 테스트 완료. 제품 수정 완료는 아니다.** Claude classic의 과거 출력에서 고정 너비를 재현했다. Codex는 합성 사례에서 정상 재배치되어 실제 보고 사례는 미확정이다.
 - 사용자 앱 재시작, 사용자 세션 입력·프롬프트 제출, 유료 모델 호출, 실제 자격 증명 복사, 제품 코드/버전 변경은 하지 않았다.
 
+최종 source 구현·검증 및 후속 리서치 결과는 [구현 보고서](2026-10-22-agent-terminal-table-resize-implementation.md)에 정리했다. 아래 초기 조사와 완료 판정을 구분한다.
+
+## 후속 정제 조사 정정
+
+아래 초기 조사는 당시 상태를 기록한다. 이후 [PR2 정제 조사](2026-10-22-claude-table-source-rendering.md)에서 Claude2.1.305·2.1.307의 onboarding을 닫고 explicit default/manual 상태를 확인했다. 두 버전 모두 classic 과거 표는120열에서도76열로 남고, fullscreen 과거 표는116열로 재배치된다. 따라서 모달 때문이라는 가설은 제외됐다. 원래 테스트 소유 fixture에는 auto permission metadata가 남아 있었으며, 새 비교에서는 이를 복사하지 않았다. 사용자 설정/대화에는 영향이 없다.
+
+후속 native egui→runtime→PTY 검사에서도 resize 전달 실패는 재현되지 않았다. 제품 개선은 별도 bounded application-wheel 경로로 진행하며, 입력/선택 회귀와 final validation은 [구현 계획](../superpowers/plans/2026-10-22-agent-terminal-table-resize.md) 및 최종 보고에서 구분한다. 초기 보고서의 제품 변경 없음/전체 화면 미검증은 초기 조사 시점의 설명이다.
+
 ## 실제 CLI 결과
 
 macOS에 설치된 CLI의 합성 저장 대화를 실제 Deppy `Session` → PTY → Alacritty 경로로 복원했다. 40행을 유지하며 80 → 42 → 120 → 80열로 변경했다. 외부 IP 네트워크를 sandbox로 차단하고 각 CLI의 별도 임시 설정/대화 및 가짜 키만 사용했다. GUI pane 배치/resize 큐를 포함한 앱 전체 E2E는 아니다.

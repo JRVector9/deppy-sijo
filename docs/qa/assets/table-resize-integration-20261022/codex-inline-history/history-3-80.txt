@@ -1,0 +1,256 @@
+  History filler 10: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 11: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 12: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 13: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 14: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 15: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 16: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 17: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 18: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 19: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 20: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 21: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 22: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 23: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 24: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 25: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 26: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 27: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 28: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 29: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 30: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 31: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 32: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 33: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 34: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 35: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 36: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 37: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 38: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 39: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  END_OF_HISTORY_FIXTURE
+
+
+
+› Ask Codex to do anything
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · /private/var/folders/5g/tm96jk…  ⚠ 1 warning · f2 to view
+
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/var/folders/5g/…/T/deppy-table-codex-inline-b9ad52kc/project
+
+  Tip: Use the desktop app. Run codex app to open it. It installs automatically
+  if needed.
+
+
+› Display the saved local fixture.
+
+
+• Fixture paragraph: ordinary prose should wrap at the new pane width without
+  losing words. This local fixture has no model request.
+
+   Agent        Task                                                    Status
+  ━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━
+   ROW_ALPHA    한글 표의 셀 줄바꿈과 창 너비 변경을 확인합니다.        ready
+                Local synthetic table with enough content to wrap
+                across several lines.
+  ───────────  ──────────────────────────────────────────────────────  ─────────
+   ROW_BETA     Independent session data stays intact when the pane     waiting
+                becomes narrower and wider again.
+  ───────────  ──────────────────────────────────────────────────────  ─────────
+   ROW_OMEGA    원문과 복사 내용을 보존합니다.                          done
+
+
+› Show saved offline details.
+
+
+• History filler 00: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 01: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 02: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 03: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 04: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 05: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 06: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 07: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 08: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 09: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 10: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 11: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 12: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 13: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 14: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 15: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 16: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 17: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 18: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 19: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 20: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 21: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 22: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 23: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 24: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 25: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 26: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 27: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 28: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 29: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 30: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 31: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 32: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 33: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 34: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 35: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 36: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 37: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 38: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 39: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  END_OF_HISTORY_FIXTURE
+
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · /private/var/folders/5g/tm96jk…  ⚠ 1 warning · f2 to view

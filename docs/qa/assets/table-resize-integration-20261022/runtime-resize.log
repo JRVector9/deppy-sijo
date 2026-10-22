@@ -1,0 +1,48 @@
+   Compiling getrandom v0.4.3
+   Compiling rustls v0.23.46
+   Compiling cobs v0.3.0
+   Compiling mcp-store v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/mcp-store)
+   Compiling storage-core v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/storage-core)
+   Compiling subtle v2.6.1
+   Compiling epaint v0.36.1
+   Compiling pty v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/pty)
+   Compiling crypto-common v0.2.2
+   Compiling uuid v1.26.0
+   Compiling deppy-core v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/core)
+   Compiling accesskit v0.24.1
+   Compiling secret v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/secret)
+   Compiling postcard v1.1.3
+   Compiling universal-hash v0.6.1
+   Compiling cipher v0.5.2
+   Compiling digest v0.11.3
+   Compiling aead v0.6.1
+   Compiling poly1305 v0.9.1
+   Compiling sha2 v0.11.0
+   Compiling chacha20 v0.10.1
+   Compiling egui v0.36.1
+   Compiling chacha20poly1305 v0.11.0
+   Compiling mux v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/mux)
+   Compiling audit v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/audit)
+   Compiling persist v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/persist)
+   Compiling storage v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/storage)
+   Compiling terminal v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/terminal)
+   Compiling session v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/session)
+   Compiling runtime v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 12.94s
+     Running unittests src/lib.rs (target/debug/deps/runtime-a61b6bc6c9581157)
+
+running 12 tests
+test in_process::tests::terminal_control_review_rechecks_target_expiry_after_other_restore_before_renew_or_resize ... ok
+test in_process::tests::terminal_control_review_retryable_tracked_restore_reacquire_resize_release_keeps_latest_token ... ok
+test in_process::tests::tracked_resize_worker는_실제크기_ack과_멱등_stamp를_반환한다 ... ok
+test in_process::tests::tracked_resize는_적용한_세션의_화면만_다시_보낸다 ... ok
+test protocol::tests::tracked_resize_append_preserves_legacy_command_event_and_envelope_bytes ... ok
+test remote::tests::tracked_resize_delta의_stamp가_기준선과_다르면_한번만_재동기화한다 ... ok
+test remote::tests::tracked_resize_plain_delta_왕복은_stamp를_그대로_보존한다 ... ok
+test remote::tests::tracked_resize_stamp가_달라지면_같은크기여도_keyframe이다 ... ok
+test resize::tests::tracked_resize_retry는_기존_실제적용_결과를_그대로_반환한다 ... ok
+test resize::tests::tracked_resize는_백번_owner_교체와_늦은_이전_epoch를_유계상태로_판정한다 ... ok
+test resize::tests::tracked_resize는_이전세대와_같은세대_다른크기를_거부한다 ... ok
+test resize::tests::tracked_resize의_부분실패는_같은_token으로_재적용할_수_있다 ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 417 filtered out; finished in 0.25s

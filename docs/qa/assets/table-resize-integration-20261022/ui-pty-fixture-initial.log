@@ -1,0 +1,22 @@
+   Compiling deppy-sijo v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.25s
+     Running unittests src/main.rs (target/debug/deps/deppy_sijo-6c06518f70c04fe1)
+
+running 1 test
+test ui::workspace::tests::application_wheel_native_ui_dispatch_reaches_only_negotiated_pty_without_prompt_evidence ... FAILED
+
+failures:
+
+---- ui::workspace::tests::application_wheel_native_ui_dispatch_reaches_only_negotiated_pty_without_prompt_evidence stdout ----
+
+thread 'ui::workspace::tests::application_wheel_native_ui_dispatch_reaches_only_negotiated_pty_without_prompt_evidence' (192504839) panicked at crates/app/src/ui/workspace_application_wheel_tests.rs:431:5:
+the actual pane must emit a typed wheel command: mux=Some(MuxSnapshot { tabs: [TabSnapshot { id: MuxTabId("89e39c1f-79a9-43f7-b1df-b8ab8d6c94c2"), title: "workspace.spawn.agent 1", layout: Pane(MuxPaneId("d554e6b6-134b-4801-8020-2b36958e2f33")), panes: [PaneSnapshot { id: MuxPaneId("d554e6b6-134b-4801-8020-2b36958e2f33"), session_id: Some(SessionId(1)), title: "workspace.spawn.agent 1", persistent_session_id: None }] }, TabSnapshot { id: MuxTabId("08c2a125-7275-465f-9831-f0b39196b47c"), title: "workspace.spawn.agent 2", layout: Pane(MuxPaneId("098d00e1-fa39-4639-8531-c2d90196f416")), panes: [PaneSnapshot { id: MuxPaneId("098d00e1-fa39-4639-8531-c2d90196f416"), session_id: Some(SessionId(2)), title: "workspace.spawn.agent 2", persistent_session_id: None }] }], active_tab: Some(MuxTabId("08c2a125-7275-465f-9831-f0b39196b47c")), focused_pane: Some(MuxPaneId("098d00e1-fa39-4639-8531-c2d90196f416")) }), residual=0.9949905, ctx=([0.0 12.7], Some([80.0 67.0]), true), focused=Some(MuxPaneId("098d00e1-fa39-4639-8531-c2d90196f416"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    ui::workspace::tests::application_wheel_native_ui_dispatch_reaches_only_negotiated_pty_without_prompt_evidence
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3557 filtered out; finished in 0.14s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

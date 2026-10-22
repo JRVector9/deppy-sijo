@@ -5,6 +5,8 @@
 - **과거 표 결함은 재현됐다. 자동 fullscreen 제품 변경은 적용하지 않았다.** 현재 native wheel 경로가 application mouse events를 전달하지 않아, 런처에서 모드만 바꾸면 스크롤 동작이 퇴행한다.
 - 사용자 앱·설정·대화는 변경하지 않았고 앱 실행/재시작·모델 요청·사용자 세션 입력도 하지 않았다. 소스 버전 0.15.1은 변경하지 않은 조사 빌드다.
 
+후속 [구현 및 재검토 보고서](2026-10-22-agent-terminal-table-resize-implementation.md)에서 negotiated application-wheel 경로를 추가했다. 위 native wheel 미지원 설명은 이 조사 당시 상태다. 자동 renderer 변경은 여전히 적용하지 않는다.
+
 ## 정제한 실제 CLI 결과
 
 설치된 Claude **2.1.305**와 **2.1.307**의 버전별 실제 바이너리를 직접 지정했다. 조사 도중 `/Users/jr/.local/bin/claude`가 2.1.307을 가리키므로 symlink 경로에 설치 버전이 고정됐다고 가정하지 않았다. 바이너리 경로·SHA-256·실행 인수는 각 사례의 `provenance.json`에 있다.

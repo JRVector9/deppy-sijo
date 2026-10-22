@@ -1,0 +1,243 @@
+{
+  "source_commit": "3957e2b1",
+  "branch": "feat/agent-command-center-v2-20261020",
+  "scope": "Headless native UI and isolated real CLI; no app launch/release/user input",
+  "logs": [
+    {
+      "path": "native-wheel-green.log",
+      "command": "cargo test --offline --locked -p deppy-sijo application_wheel_ -- --test-threads=1",
+      "exit_code": 0,
+      "result": "9PASS/0FAIL",
+      "original_path": "/private/tmp/deppy-table-root-wheel-green-20261022.log",
+      "original_sha256": "c8d29b8e548098460916315ff60970066c413ff390107a479c69ead6f73ecfa1",
+      "sha256": "a62043c7bb92cbf2577d53742a302b0f2f8cdb7792abc54da31fccbd44e28ecd",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "app-full.log",
+      "command": "cargo test --offline --locked -p deppy-sijo -- --test-threads=1",
+      "exit_code": 0,
+      "result": "3557PASS/0FAIL/43ignored; nested child result excluded",
+      "original_path": "/private/tmp/deppy-table-root-app-full-20261022.log",
+      "original_sha256": "4fa806c4c600288273b4389d0b5dfeb768bea8ecfeeaf588fd68bd9664092e8e",
+      "sha256": "a9ebe8cfbb73e1f4cd18a4d4bce8d1a2d8f88a71e7d2f23ac6253a70c9dde38d",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "app-clippy.log",
+      "command": "cargo clippy --offline --locked -p deppy-sijo --all-targets -- -D warnings",
+      "exit_code": 0,
+      "result": "PASS",
+      "original_path": "/private/tmp/deppy-table-root-app-clippy-20261022.log",
+      "original_sha256": "bb60c4a030540c7b8e1eec0a3d188c8966092485aeb9c25c928ba9b38bcbd8ba",
+      "sha256": "bb60c4a030540c7b8e1eec0a3d188c8966092485aeb9c25c928ba9b38bcbd8ba",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "runtime-resize.log",
+      "command": "cargo test --offline --locked -p runtime resize -- --test-threads=1",
+      "exit_code": 0,
+      "result": "12PASS/0FAIL",
+      "original_path": "/private/tmp/deppy-table-root-runtime-resize-20261022.log",
+      "original_sha256": "31b087b5a16feb9b91f22d392680a16429f4914d66573763a19e20aaa5f1ef36",
+      "sha256": "781c51e164da586df3c6183f7dfb2c47fde03d759fe79b3cd7076a583ba2517a",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "python-tests.log",
+      "command": "python3 -m unittest discover -s scripts/qa/agent-terminal-table-resize/tests -v",
+      "exit_code": 0,
+      "result": "18PASS/0FAIL",
+      "original_path": "/private/tmp/deppy-table-root-python-20261022.log",
+      "original_sha256": "d234f51ef48d0da8c26bde386539d49e1e8232e1ed9e5acb7f04547690c31d91",
+      "sha256": "d234f51ef48d0da8c26bde386539d49e1e8232e1ed9e5acb7f04547690c31d91",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "native-wheel-independent.log",
+      "command": "target/debug/deps/deppy_sijo-6c06518f70c04fe1 application_wheel_ --test-threads=1",
+      "exit_code": 0,
+      "result": "independent reviewer:9PASS/0FAIL",
+      "original_path": "/private/tmp/deppy-wheel-native-independent-review-20261022.log",
+      "original_sha256": "10b923c16cd36dd87893271036315e2f3fd647e328ee695b13c9962fe04c6cb3",
+      "sha256": "41dd842c43d344b9fcb1ce99f8620ceb1d3ed33a969427d88d99c6aff2c1bc17",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "native-resize-independent.log",
+      "command": "target/debug/deps/deppy_sijo-6c06518f70c04fe1 resize --test-threads=1",
+      "exit_code": 0,
+      "result": "independent reviewer:31PASS/0FAIL",
+      "original_path": "/private/tmp/deppy-resize-native-independent-review-20261022.log",
+      "original_sha256": "c4a74e43276ccca4abf6dffd07a2dcd4f4821f13fabad5995ebbb7b785688698",
+      "sha256": "225519cdc0a7a58dcd450ca29298051d57d9aca166d3904f0932f10d98ee7023",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "gesture-red.log",
+      "command": "cargo test -p deppy-sijo application_wheel_ -- --test-threads=1",
+      "exit_code": 101,
+      "result": "Meaningful regression: last-event cache loses retained gesture modifier",
+      "original_path": "/private/tmp/deppy-table-root-gesture-red-20261022.log",
+      "original_sha256": "53ce10b3fdcbf3db903ec02f4d835f54db03b5f5af8a9fd61ce0aab3954cfb73",
+      "sha256": "53ce10b3fdcbf3db903ec02f4d835f54db03b5f5af8a9fd61ce0aab3954cfb73",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "ui-pty-fixture-initial.log",
+      "command": "cargo test -p deppy-sijo application_wheel_native_ui_dispatch -- --test-threads=1",
+      "exit_code": 101,
+      "result": "Excluded product RED: first-frame smoothing remained below one row",
+      "original_path": "/private/tmp/deppy-table-root-wheel-debug-20261022.log",
+      "original_sha256": "b84131510b3759cdfa0cb455f808e846d0d4433d9e316ab74b36f4339ea3283c",
+      "sha256": "b84131510b3759cdfa0cb455f808e846d0d4433d9e316ab74b36f4339ea3283c",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "codex-runner.log",
+      "command": "python3 scripts/qa/agent-terminal-table-resize/run.py --provider codex --binary /Users/jr/.local/bin/codex --mode inline --history --target-dir /private/tmp/deppy-table-root-qa-target-20261022",
+      "exit_code": 0,
+      "result": "VALID; visibility/resize/semantics PASS",
+      "original_path": "/private/tmp/deppy-table-root-installed-codex-20261022.log",
+      "original_sha256": "746c8025df0696858efee33c1be90b32310a4cba925dd519c6c005175761460a",
+      "sha256": "746c8025df0696858efee33c1be90b32310a4cba925dd519c6c005175761460a",
+      "normalization": "Trailing whitespace and blank EOF only"
+    },
+    {
+      "path": "affected-full.log",
+      "command": "cargo test --offline --locked -p runtime -p session -p terminal -- --test-threads=1",
+      "exit_code": 0,
+      "result": "652PASS/0FAIL/6ignored; runtime428/session82lib+2integration/terminal140",
+      "original_path": "/private/tmp/deppy-table-root-affected-full-20261022.log",
+      "original_sha256": "e8b8706006580dd0628375536cd44112d464ec754b7c3cc64e190c821e07e1a8",
+      "sha256": "5fa9d3620e7049ea647194f99df60cefbe603a8d5f052054f4b2bce6e28e7e15",
+      "normalization": "Trailing whitespace and blank EOF only"
+    }
+  ],
+  "installed_cli_files": [
+    {
+      "path": "codex-inline-history/history-0-80.txt",
+      "sha256": "7cb3a78045b80c62ad32bc26a7c2ac0308bdec9d7674fdbff9cdb25a822ebcfc",
+      "exact_bytes": false,
+      "original_sha256": "63c3839c12ca20446d4face3d061844d1f5af4418225ae679fe659061da50f7f",
+      "raw_archive": "codex-inline-history/history-0-80.txt.raw.gz",
+      "raw_archive_sha256": "deb8b9d5c53a20af705d593bb30df1de30d61593157a659321147e0c0d681533",
+      "normalization": "Readable copy removes terminal padding/trailing whitespace and blank EOF; exact raw gzip retained"
+    },
+    {
+      "path": "codex-inline-history/history-1-42.txt",
+      "sha256": "edd4daeeceeb8f553ba856dfc072a1b5d0b2565180c513fc52b01c4920d60e30",
+      "exact_bytes": false,
+      "original_sha256": "76c1ba6f2dd0a07728c0bc84032a22076040050d7581b065c9584ce627190794",
+      "raw_archive": "codex-inline-history/history-1-42.txt.raw.gz",
+      "raw_archive_sha256": "547cc46c1667aba9beb141963e5b88fa3605ddb0f08ac1e2873ff136605252a9",
+      "normalization": "Readable copy removes terminal padding/trailing whitespace and blank EOF; exact raw gzip retained"
+    },
+    {
+      "path": "codex-inline-history/history-2-120.txt",
+      "sha256": "f234a90027c43fa96ba6ea3668e759170bf6dc190aceb4594782a3c6bbb8683a",
+      "exact_bytes": false,
+      "original_sha256": "75d0436cb395eba31268df0049c06991265c8b3f6af9d3d205adfd8445a8f1a0",
+      "raw_archive": "codex-inline-history/history-2-120.txt.raw.gz",
+      "raw_archive_sha256": "98b311e78ccdb37ad414652fbfe54a2b94d6f6be1291634f142321ff9e7f8b33",
+      "normalization": "Readable copy removes terminal padding/trailing whitespace and blank EOF; exact raw gzip retained"
+    },
+    {
+      "path": "codex-inline-history/history-3-80.txt",
+      "sha256": "9e398e7bd3042365e5cf0d43c39802575a2750dfe2c5a9ff2607d258dbbe7d00",
+      "exact_bytes": false,
+      "original_sha256": "ed868438646c12bce74bd2d627b168f1597d651c33e4677c29ec68f14063458f",
+      "raw_archive": "codex-inline-history/history-3-80.txt.raw.gz",
+      "raw_archive_sha256": "c88799c354d0320c37cdb5f31b97c5f6281629ba5f7da8c4d12ae35a5b5e04c6",
+      "normalization": "Readable copy removes terminal padding/trailing whitespace and blank EOF; exact raw gzip retained"
+    },
+    {
+      "path": "codex-inline-history/manifest.json",
+      "sha256": "5425afd9408e7ab3c066d89aa11d6ab6b423d1199034866bedb80e14bd9540c6",
+      "exact_bytes": true
+    },
+    {
+      "path": "codex-inline-history/metadata.tsv",
+      "sha256": "08e2dc3ea5bf738e5113929e9aec421143d49351be037068eb36e0bcfa178c25",
+      "exact_bytes": true
+    },
+    {
+      "path": "codex-inline-history/output.ansi.gz",
+      "sha256": "25d7acf4958ba4b16b063f9f1e7c4d48328bd07ee90c43a70a677ef5237552ec",
+      "exact_bytes": true,
+      "compression": "gzip",
+      "uncompressed_sha256": "0c94e6018e362029215373b676b0979f54dec90dc3fc79cec0018317b40069e6"
+    },
+    {
+      "path": "codex-inline-history/probe-status.tsv",
+      "sha256": "1ffd0eff399723cf47dffe74fab140342337106313d3fd33ad5214c519d7e254",
+      "exact_bytes": true
+    },
+    {
+      "path": "codex-inline-history/probe.log",
+      "sha256": "2a740b1027d39206ff444a782b682d74bedb54dbc3f3851ac2c8f0cccddd90e1",
+      "exact_bytes": false,
+      "original_sha256": "77725c475f39d8e3815634e221b4d221768426f689ac9a583f978c998774a442",
+      "raw_archive": "codex-inline-history/probe.log.raw.gz",
+      "raw_archive_sha256": "ce90e05da631cca84db0e0ec7adfaa924c5712e9407a2f8d6633ae273a66fa0f",
+      "normalization": "Readable copy removes terminal padding/trailing whitespace and blank EOF; exact raw gzip retained"
+    }
+  ],
+  "source_files": [
+    {
+      "path": "crates/app/src/ui/workspace.rs",
+      "sha256": "7d14dc27c44fb0b209bdf25d8d868ff7e4ef184f0bfa2cbd33af14de538765a3"
+    },
+    {
+      "path": "crates/app/src/ui/workspace_application_wheel_tests.rs",
+      "sha256": "5aba1bb17f0f414dd2530f0da2b9b5feea8e37dc3c585615bc0aebba371e1621"
+    },
+    {
+      "path": "crates/app/src/ui/workspace_table_resize_tests.rs",
+      "sha256": "68c63099537bb827110c1720de1e196c41464d696e3d9b067fa6e46eb3093e74"
+    },
+    {
+      "path": "crates/session/tests/terminal_table_resize.rs",
+      "sha256": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623"
+    },
+    {
+      "path": "crates/terminal/src/backend.rs",
+      "sha256": "8b84a8773e429660fb224bc6ce8201226a911eccc47652fdedb96fe3bf124860"
+    },
+    {
+      "path": "crates/terminal/src/alacritty_backend.rs",
+      "sha256": "9a134b2f7b70fa375cebec95079ff6246dca4ff18160d40a6823906947c5d5ac"
+    },
+    {
+      "path": "crates/session/src/session.rs",
+      "sha256": "99d247d77bd452ac878180f35df29eee36c00a8f99650c2ba13dd1aa0a41ace8"
+    },
+    {
+      "path": "crates/runtime/src/terminal_input.rs",
+      "sha256": "27beefefd3dd6dbaecb7547126b005dcb67ba322b18141862a1027781602912d"
+    },
+    {
+      "path": "crates/runtime/src/command.rs",
+      "sha256": "36ba3962b067d6ced5caa28caf671231e3a6308d384fe453e7d09c86eba7e7a8"
+    },
+    {
+      "path": "crates/runtime/src/in_process.rs",
+      "sha256": "acd99c9ada6e5352ee7e36b26a5cd607bca00aabc4f04351b4962fe7242d4ca6"
+    },
+    {
+      "path": "crates/runtime/src/protocol.rs",
+      "sha256": "f41c20669eb86ef27bad3425064cfc144a9086145894a15cd69a14cf4f03c9ec"
+    },
+    {
+      "path": "crates/runtime/src/remote.rs",
+      "sha256": "acd8c088a564e6cca3f77c626bccabbaa531e3e5df9dcb8e1c52ac358b3c81cd"
+    }
+  ],
+  "backend_evidence": "../application-wheel-pr2a-20261022/manifest.json",
+  "known_limits": [
+    "Claude classic old VT tables remain fixed width",
+    "Exact user Codex case unconfirmed",
+    "No physical OS clipboard/mobile/remote-device E2E"
+  ],
+  "evidence_storage": "Raw ANSI and padded viewport bytes retained in deterministic gzip; readable copies normalized with original/archive hashes"
+}

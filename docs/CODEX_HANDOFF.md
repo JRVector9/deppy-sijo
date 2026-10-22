@@ -1,4 +1,70 @@
+# Final source implementation and re-review — table resize, 2026-10-22
+
+## Current objective / disposition
+
+- User requested completion plus external research to find wrong implementation. Safe proven product/input improvements, durable harness, independent reviews and integrated gates are complete. **Do not claim the entire reported table issue fixed:** Claude classic old VT rows remain fixed width; exact user Codex failure is not reproduced. Those are explicit follow-up boundaries, not passing acceptance.
+- Integration worktree `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, branch `feat/agent-command-center-v2-20261020`, frozen product source commit **3957e2b1**. Nominal dirty `/Users/jr/Desktop/projects/deppy-sijo` and unrelated untracked xAegis review/manifest preserved. Existing rollback branch/tag preserved. No restart, release artifact/version change, distribution, paid call, user-session input, push/main merge.
+
+## Completed / modified files / design decisions
+
+- PR1 `2e442a51`: actual pane→runtime→PTY resize tests; no production resize delivery defect found. PR2 clean Claude evidence `1364e722`; PR3 durable isolated provider harness `8ca63036`; backend/runtime wheel `3a0acd5a`, assertion-only cleanup `2001a888`, evidence `5f49065f`; native UI wheel +9tests **3957e2b1**. Final docs/evidence commit follows.
+- Product files: `crates/app/src/ui/workspace.rs`, `crates/runtime/src/{command,in_process,protocol,remote,terminal_input}.rs`, `crates/session/src/session.rs`, `crates/terminal/src/{backend,alacritty_backend}.rs`. Native tests: `workspace_application_wheel_tests.rs`, `workspace_table_resize_tests.rs`; provider test/harness: `crates/session/tests/terminal_table_resize.rs`, `scripts/qa/agent-terminal-table-resize/`. Final QA report and plan link below; evidence manifests retain12current source hashes.
+- Wheel requires current alternate-screen + negotiated SGR mouse + exact grid and bounded coordinates/delta. It shares existing PTY admission/queue but uses Navigation, preserving draft/submission/completion evidence and sequence. Wire35→36 append-only; exact old35 handshake rejection tested. Native Scroll remains view-only.
+- Corrected actual trackpad modifier regression using public egui0.36.1 Start/Move-OR/End/idle state; Shift mapped X restored for native vertical scroll. Selection/drag/read-only/modal/disabled/unfocused routes remain guarded. Actual UI→tail dispatcher→worker→PTY capture passes with no prompt accepted/submitted evidence. No full mouse click/drag implementation claim.
+- Official Claude fullscreen research-preview/settings/environment/fallback and xterm Patch411 contracts rechecked. No automatic renderer force; launcher untouched. Tagged Codex0.163.0 distinguishes assistant Markdown from literal tool stdout, but that is a hypothesis for user case, not exact proof. Three independent latest-source reviewers found no additional confirmed defect after modifier fix.
+
+## Actual final tests
+
+- Root `cargo test --offline --locked -p deppy-sijo -- --test-threads=1`: **3557PASS/0FAIL/43ignored** (unit3518 +integration39; nested child1PASS excluded), log `/private/tmp/deppy-table-root-app-full-20261022.log`.
+- Root `cargo test --offline --locked -p runtime -p session -p terminal -- --test-threads=1`: **652PASS/0FAIL/6ignored** (runtime428, session82lib+2integration, terminal140), log `/private/tmp/deppy-table-root-affected-full-20261022.log`. This supersedes agent tree650PASS/5ignored for integrated coverage; agent tree lacked PR3 session integration target.
+- Root focused native wheel9PASS, runtime resize12PASS; independent final binary wheel9PASS/resize31PASS. Root strict `cargo clippy --offline --locked -p deppy-sijo --all-targets -- -D warnings`: exit0. Agent strict terminal/session/runtime all-target Clippy exit0; exact8backend source hashes verified after integration. Formatting and diff checks actually executed exit0.
+- Python18PASS. Root representative installed Codex0.163.0 inline-history runner exit0, all4stagesVALID/semanticPASS/resizePASS, border78→40→118→78. External IP denied, dummy credentials/synthetic records only. Original12-case matrix remains5VALID/PASS +7INVALID; INVALID is not PASS.
+- Evidence assertions: clean Claude24stages; backend13logs/8source hashes; final integration11logs/12source hashes/exact gzip CLI bytes allPASS. Archive `docs/qa/assets/table-resize-integration-20261022/manifest.json`; verifier checks hashes/counts, does not rerun tests.
+
+## Failed approaches / remaining work
+
+- Private egui wheel state access failed compile; corrected to public raw events. Last-event-only cache had genuine modifier regression RED; corrected before commit. The first UI→PTY fixture40px event smoothed to12.7px/residual0.995, so no whole row emitted; fixture80px fixed that timing/magnitude issue without product change. Do not call it product RED. New evidence staged diff initially failed terminal padding/CRLF; exact originals now retained as deterministic gzip, readable copies normalized, hashes updated, final check re-executed.
+- Earlier Claude fixture auto metadata correction is documented in clean investigation; new explicit default/manual cases exclude it. Truncated/card-shaped42col captures are INVALID. No physical OS clipboard/pointer, mobile/real remote-device E2E executed.
+- Follow-up A: reproduce exact affected Codex provider version/output source (assistant table vs literal tool stdout) before selecting another product fix. Follow-up B: supported user-controlled renderer capability/preference policy if changing launcher; never force preview/fallback overrides. User-authorized xAegis feature-roadmap work from preceding task remains separate and unmodified.
+
+## Reviewable result / exact next commands
+
+- Report: `docs/qa/2026-10-22-agent-terminal-table-resize-implementation.md`; plan: `docs/superpowers/plans/2026-10-22-agent-terminal-table-resize.md`.
+- `cd /Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`
+- `git status --short` (only unrelated xAegis untracked files expected after documentation commit)
+- `git diff 3957e2b1 -- crates Cargo.toml Cargo.lock` (must be empty for applicability of final source gates)
+- `python3 docs/qa/assets/table-resize-integration-20261022/verify.py`
+- `python3 docs/qa/assets/application-wheel-pr2a-20261022/verify-evidence.py`
+- `python3 docs/qa/assets/claude-table-source-20261022/assert-evidence.py`
+- Do not restart/stop/launch Deppy or deliver0.15.1 as an updated release. A future delivered build needs a version above last shipped and binary/plist verification, plus explicit current-task restart authorization for relaunch.
+
+---
+
 # Active implementation — table resize PR plan + parallel agents, 2026-10-22
+
+## Integration / corrected root cause checkpoint
+
+### Final UI integration checkpoint
+
+- Integrated backend runtime/terminal/session source as3a0acd5a (agent3670eed3), equivalent four-assertion Clippy cleanup2001a888 (e176b10c), evidence5f49065f (5ddc490d). Agent actual affected full suites650PASS/5ignored (runtime428/session82/terminal140), strict all-target terminal/session/runtime Clippy PASS. Root evidence verifier independently checked13logs/8product hashes; no new backend product edits since those hashes.
+- At this earlier checkpoint root owned uncommitted native routing + `workspace_application_wheel_tests.rs`. Initial private `i.wheel` access failed compilation and was replaced with public raw events. A genuine trackpad regression proved last-event modifier tracking wrong; Start/Move/End state now matches actual egui0.36.1. Shift retains native scrolling across smoothing and modifier release. Independent reviewers found no new reliable defect after correction.
+- Final focused native wheel command actually executed: `cargo test --offline --locked -p deppy-sijo application_wheel_ -- --test-threads=1` — **9PASS/0FAIL**, log `/private/tmp/deppy-table-root-wheel-green-20261022.log`. Includes actual egui→tail dispatcher→worker→PTY test-owned negotiated shell and exact child-byte comparison; no accepted/submitted prompt evidence. Tests also cover modifier gesture, native/alternate selection/archive/modal/disabled/unfocused sibling and bounded FIFO validation.
+- The new UI→PTY fixture initially failed because one smoothed40px event contributed12.7px, less than a complete row (residual0.995). This was a fixture timing/magnitude issue, not a product input failure. An80px event crosses a row in one frame; final passes without changing production for the fixture. Earlier red/compile logs remain under `/private/tmp/deppy-table-root-*` and are not PASS evidence.
+- Earlier pending gates completed as recorded in the final checkpoint above. No app start/stop/restart, version/release change, paid call, user-session input, push or main merge.
+
+
+- Latest steering: user requests implementation completion followed by external research/re-review and correction of wrong implementation. Two independent reviewers now compare final candidates to official xterm/Claude and Codex tagged source, read-only; no extra product edits overlap owners.
+- Root integrated PR3 as8ca63036 (agent6b0296d0) after backing up original untracked diagnostic to `/private/tmp/deppy-table-integration-backup-20261022/terminal_table_resize.rs.baseline`, SHA946989e395d2c662ec35bcf31d05fcd5da7e96a7ff8f4bbacb1e0f40c2277288. Original bytes verified before moving aside. Root executed final Python suite18PASS; log `/private/tmp/deppy-table-root-python-20261022.log`.
+- Root actual egui RED compiled after correcting missing MouseWheel.phase and nonexistent RawInput.modifiers (fixture mistakes, not product RED). Actual alternate-screen wheel emitted only native Scroll and failed expected typed input. Shift native-override baseline also failed because egui0.36.1 moves vertical wheel into X; product now recovers that axis using wheel.modifiers across smoothing frames. Root adds real egui tests for native/alt/selection/archive/disabled/modal/unfocused sibling and ordered bounded wheel queue; final GREEN pending backend integration.
+- Agent PR2a focused runtime8PASS/terminal2PASS on current API. Independent reviewer reproduced raw SGR phantom draft through old StatusDetector and confirms Navigation record avoids both draft and completion evidence mutation. Full terminal/session/runtime suites and strict lint active in own target; source feature commit requested to allow parallel native UI tests.
+
+- Root integrated reviewed PR1 as2e442a51 (actual native egui→runtime→PTY tests, no proven production resize defect) and Claude clean evidence as1364e722 (original27c3f31). Root ran evidence assertion next; agent independently executed24-stage proof. PR1 agent actually ran app resize31PASS/runtime resize12PASS/strict app all-target Clippy/fmt; root reproduction pending.
+- **Correction superseding earlier investigation:** original owned Claude fixture acquired auto permission metadata during preliminary onboarding despite intended manual selection; no model/tool turns or user settings were involved. New fresh two-record fixtures explicitly use default/manual mode with modal=false/auto=false, pinned2.1.305 and2.1.307 hashes. In both, classic historical table remains76cols at120; fullscreen historical table becomes116 and narrow42 uses cards. Korean unsent draft survives80→42→120→80; actual SGR wheel and PageUp/PageDown navigate own fullscreen history. Selection/copy and physical UI not yet tested. See `docs/qa/2026-10-22-claude-table-source-rendering.md`.
+- Claude official fullscreen docs confirm research-preview and environment/preference/crash-fallback precedence. Existing launcher/model probe has no trustworthy effective renderer capability/preference state. Root and independent reviewer agree not to force fullscreen or override saved classic/failure fallback. Product launcher stays unchanged. This is a known source-renderer limitation, not evidence that native PTY resize is broken.
+- PR2a expanded to necessary actual application-wheel support: agent owns terminal backend/Session/runtime typed bounded Wheel via existing WriteTerminalInput, current-mode drain and geometry fencing, append-only wire36. Native Scroll remains view-only. Wheel admitted through SAME PTY admission but internal Navigation record does not become draft/submission/completion evidence. Root owns egui routing/queue; selection, modifiers and read-only remain native/no-input. Agent now implementing RED/GREEN.
+- Root added actual egui wheel routing regression in `workspace_application_wheel_tests.rs`; initial run active. This test is expected to fail on old product native-only route. An initially omitted egui MouseWheel.phase field was corrected before compilation completed; not a product RED claim.
+- PR3 actual fresh Codex inline+Grok minimal history responsive; Claude classic overall invalid because narrow native query crop but80→120 measured frozen. Durable runner correctly propagates child101. Agent completing remaining modes/tests; no PASS inference from mere table visibility.
+- No restart/release/version bump/distribution/push. Source remains0.15.1 for development tests only. Remaining: implement/review/integrate wheel prerequisite, harness, reproduce final affected checks, update PR checklist and report honest remaining classic/Codex boundaries.
 
 - Latest user explicitly requests: read investigation report, report PR-level improvement plan, then implement with parallel subagents. Root reported PR1 resize delivery, PR2 Claude old-table renderer contract, PR3 reproducible provider harness; full plan `docs/superpowers/plans/2026-10-22-agent-terminal-table-resize.md`.
 - Root integration remains `/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020`, `feat/agent-command-center-v2-20261020`, base7584ed75/source0.15.1. No restart/release requested, no app launch/stop, no user-session prompts, real keys or paid calls. Existing unrelated xAegis report/manifest remain outside this change.

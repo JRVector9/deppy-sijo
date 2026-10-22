@@ -1,0 +1,130 @@
+{
+  "provider": "codex",
+  "mode": "inline",
+  "history": true,
+  "requested_binary": "/Users/jr/.local/bin/codex",
+  "resolved_binary": "/Users/jr/.codex/packages/standalone/releases/0.163.0-aarch64-apple-darwin/bin/codex",
+  "binary_sha256_before": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+  "network": "sandbox denies external IP outbound; dummy fixture auth only",
+  "fixture_root": "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-b9ad52kc",
+  "sandbox_preflight": {
+    "pid": 26600,
+    "timed_out": false,
+    "output_capped": false,
+    "exit_code": 0
+  },
+  "version": "WARNING: proceeding, even though we could not create PATH aliases: CODEX_HOME points to \"/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-b9ad52kc/profile\", but that path does not exist\ncodex-cli 0.163.0",
+  "transcript_sha256_before": "78486fd46c7b72096008a0b51209fc2fa4eccb406d9bc27bfe31c32f73fbef63",
+  "probe": "/private/tmp/deppy-table-root-qa-target-20261022/debug/deps/terminal_table_resize-73b8dd13004f679f",
+  "probe_sha256": "37b54b96a56ba4e11bc1c758b03c980fbad6180771d6c2e1b99fa7b9b31f4842",
+  "command": [
+    "/usr/bin/sandbox-exec",
+    "-f",
+    "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-b9ad52kc/offline.sb",
+    "/Users/jr/.codex/packages/standalone/releases/0.163.0-aarch64-apple-darwin/bin/codex",
+    "--no-daemon",
+    "-m",
+    "gpt-6.1-sol",
+    "-c",
+    "model_reasoning_effort=\"xhigh\"",
+    "resume",
+    "f4fdffcd-676b-4d27-bcc7-f7dd38b4ee3e",
+    "-C",
+    "/private/var/folders/5g/tm96jknx43n8r04kl5j12kvm0000gn/T/deppy-table-codex-inline-b9ad52kc/project",
+    "--no-alt-screen"
+  ],
+  "probe_result": {
+    "pid": 39107,
+    "timed_out": false,
+    "output_capped": false,
+    "exit_code": 0
+  },
+  "analysis": {
+    "validity": "VALID",
+    "visibility": "PASS",
+    "resize": "PASS",
+    "semantics": "PASS",
+    "exit_code": 0,
+    "stages": [
+      {
+        "border_width": 78,
+        "complete": true,
+        "semantic_complete": true,
+        "visibility": true,
+        "missing_tokens": [],
+        "modal": null,
+        "cols": 80,
+        "source": "history-0-80.txt",
+        "expected_width": 78,
+        "valid": true
+      },
+      {
+        "border_width": 40,
+        "complete": true,
+        "semantic_complete": true,
+        "visibility": true,
+        "missing_tokens": [],
+        "modal": null,
+        "cols": 42,
+        "source": "history-1-42.txt",
+        "expected_width": 40,
+        "valid": true
+      },
+      {
+        "border_width": 118,
+        "complete": true,
+        "semantic_complete": true,
+        "visibility": true,
+        "missing_tokens": [],
+        "modal": null,
+        "cols": 120,
+        "source": "history-2-120.txt",
+        "expected_width": 118,
+        "valid": true
+      },
+      {
+        "border_width": 78,
+        "complete": true,
+        "semantic_complete": true,
+        "visibility": true,
+        "missing_tokens": [],
+        "modal": null,
+        "cols": 80,
+        "source": "history-3-80.txt",
+        "expected_width": 78,
+        "valid": true
+      }
+    ],
+    "reasons": []
+  },
+  "transcript_sha256_after": "635df522d9c54d63ad5ce5de7b5173b1227790cc6a78afd9d2ef3a45f740c700",
+  "binary_sha256_after": "8813367285524ac798dd96d1b071aea30d58708c7226fd236cd275cf1cfdee31",
+  "source_dirty": false,
+  "source_commit": "5f49065f19705af0c116b1e57c435049077bfafe",
+  "source_sha256": {
+    "crates/session/tests/terminal_table_resize.rs": "49cf4e136574bf9e1c9bb376c810a2d60df0f11dc301a09e91656b3a4868e623",
+    "scripts/qa/agent-terminal-table-resize/run.py": "7266c53ce2a16ab5f502eb8e35a2d05fcf22885f7283d6365bcbb35c26cc566e",
+    "scripts/qa/agent-terminal-table-resize/analyze.py": "9eda8fdd493dedd1fd4fb9187974e3736230f16b336ceeb63b584345b6fd0f31",
+    "scripts/qa/agent-terminal-table-resize/fixtures.py": "8abaaa414e1eb9f012cca11385a083db23e0c270e740b3dfeae865f15dc41c5b"
+  },
+  "artifacts": {
+    "stage-0-80.txt": "4607045aa17143f4957fdf4c5ee9516df05d52a206da356ca3ba48bab1ae0bb6",
+    "metadata.tsv": "08e2dc3ea5bf738e5113929e9aec421143d49351be037068eb36e0bcfa178c25",
+    "history-1-42.txt": "76c1ba6f2dd0a07728c0bc84032a22076040050d7581b065c9584ce627190794",
+    "probe.log": "77725c475f39d8e3815634e221b4d221768426f689ac9a583f978c998774a442",
+    "stage-2-120.txt": "53f1a0dc256d0156a2bad24d49d6aee4b839054b1e84ebaa4842e048043c9061",
+    "sandbox.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "history-3-80.txt": "ed868438646c12bce74bd2d627b168f1597d651c33e4677c29ec68f14063458f",
+    "table.md": "78294fd26d0dd672c49bf1ac3b3a0dbba1476243e513dc91d9f1ff0aa2077bc8",
+    "offline.sb": "c08cc4168aeba7e210f75cb1133547e69bc307399768703a8b2e5794ae0feaef",
+    "probe-status.tsv": "1ffd0eff399723cf47dffe74fab140342337106313d3fd33ad5214c519d7e254",
+    "stage-3-80.txt": "4607045aa17143f4957fdf4c5ee9516df05d52a206da356ca3ba48bab1ae0bb6",
+    "output.ansi": "0c94e6018e362029215373b676b0979f54dec90dc3fc79cec0018317b40069e6",
+    "build.jsonl": "e5a3d118302382f2f95cbffe17045aa50549a147110f7d52e0f8b88a4a5ab1f2",
+    "stage-1-42.txt": "33cedb22766f7683455f31c8b9623aedaf2e1c665621a8ab135b396684119a0a",
+    "history-0-80.txt": "63c3839c12ca20446d4face3d061844d1f5af4418225ae679fe659061da50f7f",
+    "version.txt": "293a87d6dda66761dc60fddf868c516aff149b766be9b88b86c947fda4c943fd",
+    "history-2-120.txt": "75d0436cb395eba31268df0049c06991265c8b3f6af9d3d205adfd8445a8f1a0"
+  },
+  "exit_code": 0
+}

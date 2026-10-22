@@ -1,0 +1,55 @@
+
+running 31 tests
+test ui::cross_workspace::tests::adjacent_resize_preserves_pair_total_and_bounds ... ok
+test ui::cross_workspace::tests::adjacent_resize_rejects_invalid_pairs_without_mutation ... ok
+test ui::cross_workspace::tests::adjacent_resize_respects_maximum_width_for_both_panes ... ok
+test ui::workspace::tests::active_split_drag_defers_prior_resize_presentation_fence ... ok
+test ui::workspace::tests::automatic_resize_retries_silently_after_queue_pressure ... ok
+test ui::workspace::tests::busy_final_resize_rolls_back_and_waits_before_retrying ... ok
+test ui::workspace::tests::committed_and_final_resize_lifecycle_defer_prior_presentation_fence ... ok
+test ui::workspace::tests::composer_growth_keeps_nested_pane_sizes_and_window_resize_still_changes_them ... ok
+test ui::workspace::tests::discarded_pass_does_not_consume_final_resize_arm ... ok
+test ui::workspace::tests::exhausted_busy_final_resize_releases_prior_presentation_fence_without_hot_loop ... ok
+test ui::workspace::tests::failed_final_resize_rolls_back_and_requires_new_geometry_before_retry ... ok
+test ui::workspace::tests::failed_split_delivery_cancels_preview_and_unblocks_terminal_resize ... ok
+test ui::workspace::tests::final_resize_clears_selection_only_for_changed_grid ... ok
+test ui::workspace::tests::final_resize_keeps_stable_snapshot_until_target_viewport_settles ... ok
+test ui::workspace::tests::final_resize_promotion_clears_selection_created_while_fenced ... ok
+test ui::workspace::tests::flushed_resize_staging_reuses_its_bounded_allocation ... ok
+test ui::workspace::tests::hidden_input_cancels_active_split_drag_and_unblocks_resize ... ok
+test ui::workspace::tests::native_remote_resize_control_suppresses_geometry_retry_and_keeps_changed_desire ... ok
+test ui::workspace::tests::native_remote_resize_review_acquire_retires_completed_request_for_quiet_tokenless_restore ... ok
+test ui::workspace::tests::native_remote_resize_review_records_control_before_first_view_for_active_and_warm_sessions ... ok
+test ui::workspace::tests::newer_resize_delivery_retargets_existing_fence_without_extending_deadline ... ok
+test ui::workspace::tests::one_matching_ack_produces_at_most_one_distinct_resize_per_session ... ok
+test ui::workspace::tests::pane_drag_stable_state_does_not_enqueue_resize_until_matching_ack ... ok
+test ui::workspace::tests::pending_resize_for_same_session_is_latest_only ... ok
+test ui::workspace::tests::resize_admission은_실제_적용_전_deadline을_시작하지_않는다 ... ok
+test ui::workspace::tests::split_drag_release_while_widget_absent_cancels_preview_and_unblocks_resize ... ok
+test ui::workspace::tests::table_resize_native_geometry_runtime_pty_redraw_and_remote_restore_use_latest_target ... real resize ppp=1 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+real resize ppp=1 pane=42x20 PTY=42x20 table=40cells glyph_edges=258.28pt glyph_scale=1.0000 window=[296.7 305.3]
+real resize ppp=1 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+real resize ppp=1 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=1 pane=42x20 PTY=120x32 table=118cells glyph_edges=277.57pt glyph_scale=0.3582 window=[296.7 305.3]
+real resize ppp=1 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=1 pane=120x32 PTY=40x12 table=38cells glyph_edges=245.03pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=1 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=1 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=1 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+real resize ppp=2 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+real resize ppp=2 pane=42x20 PTY=42x20 table=40cells glyph_edges=258.28pt glyph_scale=1.0000 window=[296.7 305.3]
+real resize ppp=2 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+real resize ppp=2 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=2 pane=42x20 PTY=120x32 table=118cells glyph_edges=277.57pt glyph_scale=0.3582 window=[296.7 305.3]
+real resize ppp=2 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=2 pane=120x32 PTY=40x12 table=38cells glyph_edges=245.03pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=2 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=2 pane=120x32 PTY=120x32 table=118cells glyph_edges=774.84pt glyph_scale=1.0000 window=[813.2 459.1]
+real resize ppp=2 pane=80x24 PTY=80x24 table=78cells glyph_edges=509.94pt glyph_scale=1.0000 window=[548.3 356.6]
+ok
+test ui::workspace::tests::table_resize_rapid_drag_latest_target_survives_old_ack_and_frame_without_touching_sibling ... ok
+test ui::workspace::tests::table_resize_split_then_hidden_restore_keeps_latest_geometry_and_rejects_previous_token ... ok
+test ui::workspace::tests::terminal_final_resize_failure_releases_prior_presentation_fence ... ok
+test ui::workspace::tests::복원_열수와_무관하게_pane에_맞추고_resize_셀_상한을_지킨다 ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 3527 filtered out; finished in 1.14s

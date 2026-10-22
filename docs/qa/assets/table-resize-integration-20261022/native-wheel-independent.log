@@ -1,0 +1,13 @@
+
+running 9 tests
+test ui::workspace::tests::application_wheel_egui_disabled_surface_never_sends_input ... ok
+test ui::workspace::tests::application_wheel_egui_keeps_native_history_and_shift_selection_routes ... ok
+test ui::workspace::tests::application_wheel_egui_modal_never_sends_cli_input ... ok
+test ui::workspace::tests::application_wheel_egui_routes_alt_history_to_typed_input ... ok
+test ui::workspace::tests::application_wheel_egui_selection_and_archive_never_become_cli_input ... ok
+test ui::workspace::tests::application_wheel_egui_trackpad_retains_native_modifier_until_gesture_end ... ok
+test ui::workspace::tests::application_wheel_egui_unfocused_sibling_never_sends_cli_input ... ok
+test ui::workspace::tests::application_wheel_native_ui_dispatch_reaches_only_negotiated_pty_without_prompt_evidence ... ok
+test ui::workspace::tests::application_wheel_protocol_preserves_order_and_rejects_unbounded_input ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 3549 filtered out; finished in 0.26s

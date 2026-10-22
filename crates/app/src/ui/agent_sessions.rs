@@ -160,6 +160,19 @@ pub struct AgentSessionsDeferredAction {
     action: PanelAction,
 }
 
+impl AgentSessionsDeferredAction {
+    pub fn creation_workspace(&self) -> Option<&str> {
+        match &self.action {
+            PanelAction::Start { workspace_id, .. } => Some(workspace_id),
+            _ => None,
+        }
+    }
+
+    pub fn requests_catalog(&self) -> bool {
+        matches!(self.action, PanelAction::RefreshCatalog { .. })
+    }
+}
+
 pub struct AgentSessionsFrameInput<'a> {
     pub workspace_id: &'a str,
     pub workspace_cwd: Option<String>,
@@ -1846,6 +1859,32 @@ impl AgentSessionsUi {
             return None;
         }
         self.apply_action(deferred.action, ctx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_fixture(&self, workspace_id: &str) -> AgentSessionsDeferredAction {
+        AgentSessionsDeferredAction {
+            generation: self.frame_generation,
+            action: PanelAction::Start {
+                workspace_id: workspace_id.to_owned(),
+                prompt: "Isolated host-admission fixture".into(),
+                model: String::new(),
+                effort: String::new(),
+                skills: Vec::new(),
+                cwd: None,
+            },
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_fixture(&self) -> AgentSessionsDeferredAction {
+        AgentSessionsDeferredAction {
+            generation: self.frame_generation,
+            action: PanelAction::RefreshCatalog {
+                cwd: None,
+                force_reload: false,
+            },
+        }
     }
 
     fn request_catalogs(
@@ -4868,9 +4907,9 @@ mod tests {
     #[test]
     fn production_source_has_no_concrete_secret_or_store_edge() {
         let source = include_str!("agent_sessions.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .unwrap();
+            .split_once("\n#[cfg(test)]\nmod tests {")
+            .expect("top-level tests module")
+            .0;
         for forbidden in [
             ["storage", "::"].concat(),
             ["std::", "fs"].concat(),

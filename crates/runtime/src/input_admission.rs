@@ -112,6 +112,10 @@ impl InputAdmission {
         Instant::now() >= self.deadline
     }
 
+    pub(crate) fn remaining(&self) -> std::time::Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
     pub(crate) fn admit<T>(&self, write: impl FnOnce() -> T) -> Option<T> {
         let allowed = self.permit.0.lock().ok()?;
         if !*allowed || Instant::now() >= self.deadline {

@@ -1,0 +1,1866 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-22",
+  "scope": "Isolated investigation/source validation; not a release or app launch.",
+  "initial_final_cohort": {
+    "status": "completed_with_failures",
+    "runner_json": "/private/tmp/deppy-ssh-final-gates-20261022.json",
+    "runner_json_sha256": "33298b4eeddf4681ac6c1e417edfd2c076a56450e23829fea0cb71da7a25cf6b",
+    "source_git_head": "455f1dc77bc66fef0dbd50031f12ec50e56c8d4b",
+    "source_tree": "dirty; no exact pre-fix source digest was captured",
+    "notes": [
+      "The runner label default-app executes --no-default-features and means the legacy feature-disabled App cohort.",
+      "Three individual regressions failed across App and xtask; this cohort must not be described as GREEN.",
+      "Strict Clippy and fmt also failed; independent boundary/dependency/i18n commands passed."
+    ],
+    "gates": [
+      {
+        "name": "packaging-unit",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "scripts/tests/test_prepare_remote_host.py",
+          "scripts/tests/test_ssh_packaging.py",
+          "scripts/tests/test_remote_host_deadline.py",
+          "scripts/tests/test_package_trust.py"
+        ],
+        "exit": 0,
+        "seconds": 1.93,
+        "log": "/private/tmp/deppy-ssh-final-packaging-unit-20261022.log",
+        "log_sha256": "58580a7bedd22931bab9eb4341d5e203dd388caca59fd731c560edce9259133d",
+        "log_bytes": 112,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "shell-syntax",
+        "command": [
+          "sh",
+          "-n",
+          "scripts/build-remote-host.sh",
+          "scripts/package-macos.sh",
+          "scripts/verify-macos-package.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-final-shell-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fixture-syntax",
+        "command": [
+          "bash",
+          "-n",
+          "scripts/ssh-linux-fixture.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-final-fixture-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "exit": 1,
+        "seconds": 2.45,
+        "log": "/private/tmp/deppy-ssh-final-fmt-20261022.log",
+        "log_sha256": "d73e19fc80469109ecee5ceb232d4467e4a38725a81d770bed4b433e43e529a0",
+        "log_bytes": 946,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "workspace",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--no-fail-fast",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 101,
+        "seconds": 453.86,
+        "log": "/private/tmp/deppy-ssh-final-workspace-20261022.log",
+        "log_sha256": "324dd6a995518eab71f957b8e54ce7f49e1b899cd2b168687a5bcc1d4d3ee667",
+        "log_bytes": 594575,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.00s",
+          "test result: ok. 92 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.43s",
+          "test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.15s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 83 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.25s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.04s",
+          "test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.40s",
+          "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.36s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.04s",
+          "test result: FAILED. 3343 passed; 2 failed; 42 ignored; 0 measured; 0 filtered out; finished in 32.69s",
+          "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.66s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.86s",
+          "test result: ok. 109 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 5.84s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.88s",
+          "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.14s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 68 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.42s",
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.66s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 428 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 25.21s",
+          "test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.71s",
+          "test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.16s",
+          "test result: ok. 491 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.57s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.60s",
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 138 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.11s",
+          "test result: ok. 392 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 14.93s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.03s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: FAILED. 15 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.64s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": [
+          "ui::agent_sessions::tests::production_source_has_no_concrete_secret_or_store_edge",
+          "workspace_add::tests::github_add_dialog_stays_inside_a_narrow_window",
+          "tests::macos_package_gate는_공증_gatekeeper와_archive를검증한다"
+        ]
+      },
+      {
+        "name": "default-app",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--no-default-features",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 101,
+        "seconds": 97.24,
+        "log": "/private/tmp/deppy-ssh-final-default-app-20261022.log",
+        "log_sha256": "324c5d2fb06ea9421c25f7ca3b02ab7ad2870343c33e2a9fffc5af2b0dc1d8a1",
+        "log_bytes": 336886,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.04s",
+          "test result: FAILED. 3341 passed; 1 failed; 41 ignored; 0 measured; 0 filtered out; finished in 35.14s"
+        ],
+        "failed_tests": [
+          "ui::agent_sessions::tests::production_source_has_no_concrete_secret_or_store_edge"
+        ]
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 101,
+        "seconds": 86.74,
+        "log": "/private/tmp/deppy-ssh-final-clippy-20261022.log",
+        "log_sha256": "ebdd5bc23320df060200a3ed3eaa8b76e8a1e6eb821f1405febd6d46f8dd4366",
+        "log_bytes": 6423,
+        "suite_results": [],
+        "failed_tests": [],
+        "diagnostics": [
+          "error: method `selected_path` is never used",
+          "--> crates/app/src/ssh_workspace_add.rs:283:12",
+          "error: this let-binding has unit value",
+          "--> crates/app/src/ssh_workspace_host.rs:629:17",
+          "error: calling `as_bytes` after slicing a string",
+          "--> crates/app/src/ssh_workspace_host.rs:936:19",
+          "error: this `if` statement can be collapsed",
+          "--> crates/app/src/ssh_workspace_files.rs:372:9",
+          "error: could not compile `deppy-sijo` (bin \"deppy-sijo\") due to 4 previous errors",
+          "error: could not compile `deppy-sijo` (bin \"deppy-sijo\" test) due to 3 previous errors"
+        ]
+      },
+      {
+        "name": "boundary",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-boundary"
+        ],
+        "exit": 0,
+        "seconds": 4.31,
+        "log": "/private/tmp/deppy-ssh-final-boundary-20261022.log",
+        "log_sha256": "cd333887dd207a30a27152e1ab21f9c224e56d89e1c1666824d763e5de31a5f0",
+        "log_bytes": 236,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "deps",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-deps"
+        ],
+        "exit": 0,
+        "seconds": 0.26,
+        "log": "/private/tmp/deppy-ssh-final-deps-20261022.log",
+        "log_sha256": "dc4ed94dd1b5abc8ceffeb30c442c580cc4cc07f8ef0cc93a9dcef4d350053ba",
+        "log_bytes": 174,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "i18n",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "i18n-check"
+        ],
+        "exit": 0,
+        "seconds": 93.85,
+        "log": "/private/tmp/deppy-ssh-final-i18n-20261022.log",
+        "log_sha256": "a0fb6a8a2775b8745c34e82e3e91c75d6c50155612cdbf85cf2860f5fdb44ce7",
+        "log_bytes": 9962,
+        "suite_results": [
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": []
+      }
+    ]
+  },
+  "fixed_final_cohort": {
+    "status": "completed_with_failure",
+    "runner_json": "/private/tmp/deppy-ssh-fixed-gates-20261022.json",
+    "source_snapshot": "source-snapshots.json#fixed-cohort-before-results",
+    "observed_app_result": {
+      "passed": 3332,
+      "failed": 13,
+      "ignored": 42,
+      "status": "completed_failed_subsuite",
+      "infrastructure_cause": "crates/app/src/agent_detect.rs independent_codex_writer_uses_real_lsof_access_fields invokes the counted command runner without the existing COMMAND_TEST_LOCK; its two readers overlap another guarded test counter assertion; 12 later failures are mutex-poison cascades. Source reviewed by root/App owner and evidence owner.",
+      "correction_status": "one-line existing shared test lock applied after this cohort completed; corrected source not yet executed"
+    },
+    "runner_json_sha256": "66692612d3acdbe98cf343a13f0d876172b5dd06608dd8008d209f77fb09542f",
+    "gates": [
+      {
+        "name": "packaging-unit",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "scripts/tests/test_prepare_remote_host.py",
+          "scripts/tests/test_ssh_packaging.py",
+          "scripts/tests/test_remote_host_deadline.py",
+          "scripts/tests/test_package_trust.py"
+        ],
+        "exit": 0,
+        "seconds": 2.02,
+        "log": "/private/tmp/deppy-ssh-fixed-packaging-unit-20261022.log",
+        "log_sha256": "dac892bb628b64e4d7a1a7edca46ce2fc88e2b28dfe679f8a37164c1526e20fb",
+        "log_bytes": 112,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "shell-syntax",
+        "command": [
+          "sh",
+          "-n",
+          "scripts/build-remote-host.sh",
+          "scripts/package-macos.sh",
+          "scripts/verify-macos-package.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-fixed-shell-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fixture-syntax",
+        "command": [
+          "bash",
+          "-n",
+          "scripts/ssh-linux-fixture.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-fixed-fixture-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "exit": 0,
+        "seconds": 2.38,
+        "log": "/private/tmp/deppy-ssh-fixed-fmt-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "workspace",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--no-fail-fast",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 101,
+        "seconds": 505.05,
+        "log": "/private/tmp/deppy-ssh-fixed-workspace-20261022.log",
+        "log_sha256": "ce1524328da91b3a905fcfb117fd680853bebf0b7990e4c4ccab32c4e2aa741e",
+        "log_bytes": 596867,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.00s",
+          "test result: ok. 92 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.31s",
+          "test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.12s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 83 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.30s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.05s",
+          "test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.29s",
+          "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.85s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.04s",
+          "test result: FAILED. 3332 passed; 13 failed; 42 ignored; 0 measured; 0 filtered out; finished in 40.62s",
+          "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.45s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.98s",
+          "test result: ok. 109 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.63s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.09s",
+          "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 68 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.24s",
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.08s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.64s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 428 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 26.09s",
+          "test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.24s",
+          "test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.69s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s",
+          "test result: ok. 491 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 35.77s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.62s",
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 138 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.12s",
+          "test result: ok. 392 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 15.13s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.47s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": [
+          "agent_detect::tests::command_output_plus_one_fails_and_joins_readers",
+          "agent_detect::tests::detect_kinds도_안전망_주기가_지나면_전체_탐색한다",
+          "agent_detect::tests::detect_kinds도_휴리스틱_재탐색_주기_안이면_fast_path를_타고_전체_탐색시_시각을_갱신한다",
+          "agent_detect::tests::owner_pid_사망시_즉시_전체_탐색으로_폴백한다",
+          "agent_detect::tests::pid_재사용_감지시_전체_탐색으로_폴백한다",
+          "agent_detect::tests::repeated_bounded_commands_leave_no_reader_growth",
+          "agent_detect::tests::결정적_배치만_있으면_재탐색_주기가_지나도_30초_안전망을_그대로_쓴다",
+          "agent_detect::tests::안전망_주기가_지나면_조건_충족해도_전체_탐색한다",
+          "agent_detect::tests::오버라이드가_캐시와_다르면_전체_탐색으로_폴백한다",
+          "agent_detect::tests::캐시에_없는_세션이_있으면_detect_kinds가_전체_탐색으로_폴백한다",
+          "agent_detect::tests::혼합_배치는_재탐색_주기가_지나면_전체_탐색으로_승격_기회를_준다",
+          "agent_detect::tests::휴리스틱_owner_사망시에도_즉시_전체_탐색으로_폴백한다",
+          "agent_detect::tests::휴리스틱_바인딩도_재탐색_주기_안이면_fast_path를_탄다"
+        ]
+      },
+      {
+        "name": "default-app",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--no-default-features",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 0,
+        "seconds": 104.51,
+        "log": "/private/tmp/deppy-ssh-fixed-default-app-20261022.log",
+        "log_sha256": "690a7fd94c0d6063704802408b914c519268ec0506410943e6831d00c998b815",
+        "log_bytes": 336941,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.04s",
+          "test result: ok. 3342 passed; 0 failed; 41 ignored; 0 measured; 0 filtered out; finished in 43.21s"
+        ],
+        "failed_tests": []
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "seconds": 97.76,
+        "log": "/private/tmp/deppy-ssh-fixed-clippy-20261022.log",
+        "log_sha256": "d8a245994b1242c08d64f7d9159ac2dc569cdf7325e8626c29e72e06ef58b96c",
+        "log_bytes": 3558,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "boundary",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-boundary"
+        ],
+        "exit": 0,
+        "seconds": 5.49,
+        "log": "/private/tmp/deppy-ssh-fixed-boundary-20261022.log",
+        "log_sha256": "978d644a57a010a5dfc9948f688e8aefe2f7bda47e8b4dff75736f97c1e36b4a",
+        "log_bytes": 332,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "deps",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-deps"
+        ],
+        "exit": 0,
+        "seconds": 0.26,
+        "log": "/private/tmp/deppy-ssh-fixed-deps-20261022.log",
+        "log_sha256": "dc4ed94dd1b5abc8ceffeb30c442c580cc4cc07f8ef0cc93a9dcef4d350053ba",
+        "log_bytes": 174,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "i18n",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "i18n-check"
+        ],
+        "exit": 0,
+        "seconds": 46.3,
+        "log": "/private/tmp/deppy-ssh-fixed-i18n-20261022.log",
+        "log_sha256": "40bef798175091719ea83387b0f2e2e27c590c0a78402fc1156286caba5952e2",
+        "log_bytes": 7433,
+        "suite_results": [
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": []
+      }
+    ],
+    "notes": [
+      "The only failed command was the four-thread workspace test. App had 3332 passed, 13 failed and 42 ignored; xtask had 19 passed and no failures.",
+      "The prior source-guard, narrow GitHub popup, packaging-command, fmt and strict Clippy findings passed after correction.",
+      "No-default-features App passed with 3342 passed, 0 failed and 41 ignored.",
+      "The new failure sequence was test infrastructure: an existing real-lsof test did not use the shared COMMAND_TEST_LOCK; its two counted readers overlapped a guarded zero-count assertion and poisoned the mutex for 12 later tests. No production timeout or SSH behavior failure was observed."
+    ],
+    "source_freeze_attestation": "Root confirmed no source edits during this cohort; the test-only lock was applied only after runner62623 fully exited. A later direct digest check ran after that edit and therefore differs; see source-snapshots.json."
+  },
+  "default_exposure_cohort": {
+    "status": "completed_passed",
+    "runner_json": "/private/tmp/deppy-ssh-default-exposure-gates-20261023.json",
+    "source_snapshot": "default-exposure-frozen-before-full-result",
+    "source_sha256": "ae86f37cba63d251dab05e32c96c6687863db2d3bac4b32d3054edc343ce81fc",
+    "source_git_head": "be2cd5023d70d45442e0126cc288a74540f082d1",
+    "notes": [
+      "All seven normal-default commands completed with exit0; environment CARGO_BUILD_JOBS=2. App Cargo and package defaults are enabled. Only three policy files changed after the corrected full cohort.",
+      "Normal-default App and strict whole-workspace Clippy omit explicit --features. App3345 passed,0 failed,42 ignored; Python23 passed; package-gate4 passed; strict/fmt/boundary/deps passed.",
+      "All470 source inputs matched before/after the seven gates and owned fixture cleanup. Root independently reproduced the same completion hash. The subsequent source commit changed Git history only, not tested source bytes.",
+      "Legacy no-default-features App3342 passed,0 failed,41 ignored in the preceding corrected cohort. No release, App launch or restart occurred."
+    ],
+    "red": {
+      "status": "completed_with_failure",
+      "command": [
+        "python3",
+        "-m",
+        "unittest",
+        "scripts/tests/test_ssh_packaging.py",
+        "-v"
+      ],
+      "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+      "exit": 1,
+      "python_tests": 3,
+      "python_failures": 1,
+      "log": "/private/tmp/deppy-ssh-default-exposure-red-20261023.log",
+      "log_sha256": "448f82ecd2dc2ece102212483e1da4113be4bf7451f34c6aa3a8adc7458268f4",
+      "log_bytes": 1467,
+      "result_lines": [
+        "FAIL: test_ssh_feature_is_enabled_for_default_and_explicit_packaging (scripts.tests.test_ssh_packaging.SshPackaging.test_ssh_feature_is_enabled_for_default_and_explicit_packaging)",
+        "AssertionError: 'deppy-sijo/ssh-workspaces' not found in ['build', '--release', '--locked', '--no-default-features', '-p', 'deppy-sijo', '-p', 'mcp-proxy', '-p', 'ssh-askpass']",
+        "Ran 3 tests in 0.789s",
+        "FAILED (failures=1)"
+      ],
+      "notes": [
+        "Tests-only RED proved that default packaging omitted the SSH feature before coordinated App Cargo/package defaults were enabled."
+      ]
+    },
+    "runner_json_sha256": "020025d79434a8a6781d95736a25173a589a19522d89c5e2ecf2c044c9ec9e0c",
+    "completed_recorded_utc": "2026-10-22T15:26:52.914807+00:00",
+    "gates": [
+      {
+        "name": "packaging-unit",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "scripts/tests/test_dev_build.py",
+          "scripts/tests/test_prepare_remote_host.py",
+          "scripts/tests/test_ssh_packaging.py",
+          "scripts/tests/test_remote_host_deadline.py",
+          "scripts/tests/test_package_trust.py"
+        ],
+        "exit": 0,
+        "seconds": 3.79,
+        "log": "/private/tmp/deppy-ssh-default-exposure-packaging-unit-20261023.log",
+        "log_sha256": "94468a25c3d393e21be953f4c906824557c99454b560c8b3bcc6c9af1749a976",
+        "log_bytes": 122,
+        "suite_results": [],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        },
+        "python_tests": 23,
+        "result_lines": [
+          "Ran 23 tests in 3.739s",
+          "OK"
+        ]
+      },
+      {
+        "name": "normal-default-app",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 0,
+        "seconds": 93.61,
+        "log": "/private/tmp/deppy-ssh-default-exposure-normal-default-app-20261023.log",
+        "log_sha256": "bdccea5f53347d224c217137115c9f6ac6618ae0b2b3cd5b62373c3d2c934496",
+        "log_bytes": 336454,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.04s",
+          "test result: ok. 3345 passed; 0 failed; 42 ignored; 0 measured; 0 filtered out; finished in 31.27s"
+        ],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "seconds": 55.41,
+        "log": "/private/tmp/deppy-ssh-default-exposure-clippy-20261023.log",
+        "log_sha256": "6c6a330dcee001faad4eacabfed41786c58f2a7d3c68a7c36d3d7771115a25b2",
+        "log_bytes": 1480,
+        "suite_results": [],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      },
+      {
+        "name": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "exit": 0,
+        "seconds": 2.4,
+        "log": "/private/tmp/deppy-ssh-default-exposure-fmt-20261023.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      },
+      {
+        "name": "package-gate",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "macos_package",
+          "--",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 3.07,
+        "log": "/private/tmp/deppy-ssh-default-exposure-package-gate-20261023.log",
+        "log_sha256": "a4b6a32ae8a8a1f37d779787543b23c5d5a7e263dd6ff9337f6c01ec3e5d7f13",
+        "log_bytes": 722,
+        "suite_results": [
+          "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      },
+      {
+        "name": "boundary",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-boundary"
+        ],
+        "exit": 0,
+        "seconds": 4.06,
+        "log": "/private/tmp/deppy-ssh-default-exposure-boundary-20261023.log",
+        "log_sha256": "207731560b938be6a498d4de00e5066b420153c847460af6385a700a80279017",
+        "log_bytes": 236,
+        "suite_results": [],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      },
+      {
+        "name": "deps",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-deps"
+        ],
+        "exit": 0,
+        "seconds": 0.25,
+        "log": "/private/tmp/deppy-ssh-default-exposure-deps-20261023.log",
+        "log_sha256": "a888c42f4e1a5e3597d9607d059e766d1236a29fb4fd28a08ed214f0be66da8d",
+        "log_bytes": 174,
+        "suite_results": [],
+        "failed_tests": [],
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "environment_overrides": {
+          "CARGO_BUILD_JOBS": "2"
+        }
+      }
+    ],
+    "source_completion_digest_verified": true,
+    "final_product_commit": "8489d6532ae69ce0bd3ef035e24e5601a5b1ac8e"
+  },
+  "corrected_final_cohort": {
+    "status": "completed_passed",
+    "runner_json": "/private/tmp/deppy-ssh-corrected-gates-20261022.json",
+    "source_snapshot": "corrected-cohort-frozen-before-full-result",
+    "source_sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737",
+    "notes": [
+      "All ten commands passed on frozen corrected source; environment CARGO_BUILD_JOBS=2.",
+      "Workspace App3345 passed,0 failed,42 ignored; legacy no-default-features App3342 passed,0 failed,41 ignored. Whole-workspace Rust summaries include nested subprocess execution results and are not summed as a deduplicated test count.",
+      "Packaging/development Python23 passed; shell/fixture syntax,fmt,whole-workspace strict Clippy,boundary,dependency and i18n commands all passed.",
+      "Both final real Host/Linux and install-consent reruns passed before the completion digest. All470 selected source inputs matched the frozen before digest. Default exposure is verified separately."
+    ],
+    "runner_json_sha256": "8f81037ef1e080b6b8f0e2c54ce6181f6527257f027b2627e02b4090565ffe92",
+    "completed_recorded_utc": "2026-10-22T15:18:29.364447+00:00",
+    "gates": [
+      {
+        "name": "packaging-unit",
+        "command": [
+          "python3",
+          "-m",
+          "unittest",
+          "scripts/tests/test_dev_build.py",
+          "scripts/tests/test_prepare_remote_host.py",
+          "scripts/tests/test_ssh_packaging.py",
+          "scripts/tests/test_remote_host_deadline.py",
+          "scripts/tests/test_package_trust.py"
+        ],
+        "exit": 0,
+        "seconds": 3.33,
+        "log": "/private/tmp/deppy-ssh-corrected-packaging-unit-20261022.log",
+        "log_sha256": "600963fe4e33e4afc8a18fc267355a9395f66db80edfbc77516852ee4be117e5",
+        "log_bytes": 122,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "shell-syntax",
+        "command": [
+          "sh",
+          "-n",
+          "scripts/dev-build.sh",
+          "scripts/dev-run.sh",
+          "scripts/build-remote-host.sh",
+          "scripts/package-macos.sh",
+          "scripts/verify-macos-package.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-corrected-shell-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fixture-syntax",
+        "command": [
+          "bash",
+          "-n",
+          "scripts/ssh-linux-fixture.sh"
+        ],
+        "exit": 0,
+        "seconds": 0.0,
+        "log": "/private/tmp/deppy-ssh-corrected-fixture-syntax-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "fmt",
+        "command": [
+          "cargo",
+          "fmt",
+          "--all",
+          "--check"
+        ],
+        "exit": 0,
+        "seconds": 2.44,
+        "log": "/private/tmp/deppy-ssh-corrected-fmt-20261022.log",
+        "log_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "log_bytes": 0,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "workspace",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--no-fail-fast",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 0,
+        "seconds": 417.73,
+        "log": "/private/tmp/deppy-ssh-corrected-workspace-20261022.log",
+        "log_sha256": "070fb5cbcbb4d7217faea05a5fe18e4160620ae8d8cfbea1ba9091e49d9c6e89",
+        "log_bytes": 591381,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 92 filtered out; finished in 0.00s",
+          "test result: ok. 92 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.58s",
+          "test result: ok. 65 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.10s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 83 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.26s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.04s",
+          "test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.46s",
+          "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.80s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.04s",
+          "test result: ok. 3345 passed; 0 failed; 42 ignored; 0 measured; 0 filtered out; finished in 43.54s",
+          "test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.16s",
+          "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.61s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+          "test result: ok. 105 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.85s",
+          "test result: ok. 109 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 7.75s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s",
+          "test result: ok. 42 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s",
+          "test result: ok. 68 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 4.22s",
+          "test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 36 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.68s",
+          "test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 428 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 25.63s",
+          "test result: ok. 80 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.87s",
+          "test result: ok. 81 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.59s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.57s",
+          "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.41s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.51s",
+          "test result: ok. 491 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 30.30s",
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.67s",
+          "test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s",
+          "test result: ok. 138 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 0.13s",
+          "test result: ok. 392 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 14.86s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.04s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 4 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.03s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.45s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": []
+      },
+      {
+        "name": "default-app",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--no-default-features",
+          "--",
+          "--test-threads=4"
+        ],
+        "exit": 0,
+        "seconds": 79.43,
+        "log": "/private/tmp/deppy-ssh-corrected-default-app-20261022.log",
+        "log_sha256": "908c3be63cfa82499bca8ecbdfd4bffd25c86f0750afa9930e0420e8c39c0040",
+        "log_bytes": 336012,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.04s",
+          "test result: ok. 3342 passed; 0 failed; 41 ignored; 0 measured; 0 filtered out; finished in 32.96s"
+        ],
+        "failed_tests": []
+      },
+      {
+        "name": "clippy",
+        "command": [
+          "cargo",
+          "clippy",
+          "--offline",
+          "--locked",
+          "--workspace",
+          "--all-targets",
+          "--features",
+          "deppy-sijo/ssh-workspaces",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exit": 0,
+        "seconds": 52.67,
+        "log": "/private/tmp/deppy-ssh-corrected-clippy-20261022.log",
+        "log_sha256": "c30131a47f71560b50988d02800e47e49a91a1883554e497467f76db3c51cb75",
+        "log_bytes": 1599,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "boundary",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-boundary"
+        ],
+        "exit": 0,
+        "seconds": 4.16,
+        "log": "/private/tmp/deppy-ssh-corrected-boundary-20261022.log",
+        "log_sha256": "6186005c7e95115a9cf0476508b3d7ecc60287fec00854bfe210a30d34786d26",
+        "log_bytes": 236,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "deps",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "check-deps"
+        ],
+        "exit": 0,
+        "seconds": 0.24,
+        "log": "/private/tmp/deppy-ssh-corrected-deps-20261022.log",
+        "log_sha256": "a888c42f4e1a5e3597d9607d059e766d1236a29fb4fd28a08ed214f0be66da8d",
+        "log_bytes": 174,
+        "suite_results": [],
+        "failed_tests": []
+      },
+      {
+        "name": "i18n",
+        "command": [
+          "cargo",
+          "run",
+          "--offline",
+          "--locked",
+          "-p",
+          "xtask",
+          "--",
+          "i18n-check"
+        ],
+        "exit": 0,
+        "seconds": 48.75,
+        "log": "/private/tmp/deppy-ssh-corrected-i18n-20261022.log",
+        "log_sha256": "6ad52f409051d0029f48300ff4df5470c213f4f8dac0865bcf9754557e8e0959",
+        "log_bytes": 7433,
+        "suite_results": [
+          "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s",
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3382 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 15 filtered out; finished in 0.00s",
+          "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s"
+        ],
+        "failed_tests": []
+      }
+    ],
+    "source_completion_digest_verified": true,
+    "source_completion_sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737"
+  },
+  "compatibility_regressions": {
+    "red": {
+      "status": "completed_with_failures",
+      "recorded_utc": "2026-10-22T15:01:11.064681+00:00",
+      "notes": [
+        "Cohort filenames retain 20261022; local environment date advanced to 2026-10-23 before recording.",
+        "Valid host-certificate binding and explicit SHA256 argv tests failed; malformed primary certificate fingerprint rejection already passed.",
+        "Both real OpenSSH regressions failed: certificate metadata was absent, and configured MD5 led to the wrong prompt classification.",
+        "The two Python dev-build tests had four failed debug/release subtests: askpass companion and --locked were missing."
+      ],
+      "gates": [
+        {
+          "name": "transport-default",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "-p",
+            "ssh-askpass",
+            "--no-fail-fast"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 101,
+          "log": "/private/tmp/deppy-ssh-compat-default-red-20261022.log",
+          "log_sha256": "aeeb4f0521d781f1a43b116a1ae25a64e13147b233f1ab53617a1a30733398c6",
+          "log_bytes": 5425,
+          "suite_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: FAILED. 19 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          ],
+          "failed_tests": [
+            "certificate_diagnostic_uses_primary_host_key_not_id_or_ca_fingerprint",
+            "configured_md5_fingerprints_are_overridden_by_sha256_argv"
+          ]
+        },
+        {
+          "name": "real-openssh-loopback",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "--test",
+            "openssh_loopback",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2",
+            "DEPPY_TEST_ASKPASS": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deppy-ssh-askpass"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 101,
+          "log": "/private/tmp/deppy-ssh-compat-loopback-red-20261022.log",
+          "log_sha256": "6b159bd2e7256b09371dbf8b980e582f9edb00f7900e0a64bd3a1171af146bc6",
+          "log_bytes": 1668,
+          "suite_results": [
+            "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.23s"
+          ],
+          "failed_tests": [
+            "openssh_loopback_accepts_ca_trusted_host_certificate_and_binds_plain_key",
+            "openssh_loopback_requires_explicit_trust_and_refuses_changed_key"
+          ]
+        },
+        {
+          "name": "dev-build-argv",
+          "command": [
+            "python3",
+            "-m",
+            "unittest",
+            "scripts/tests/test_dev_build.py",
+            "-v"
+          ],
+          "environment": {},
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 1,
+          "log": "/private/tmp/deppy-ssh-dev-build-red-20261022.log",
+          "log_sha256": "d265c22c1785b7a7a284fc83978f275cfc55c06e528935ad7212008a6abc5496",
+          "log_bytes": 4000,
+          "suite_results": [
+            "Ran 2 tests in 0.483s",
+            "FAILED (failures=4)"
+          ],
+          "failed_tests": [],
+          "python_test_count": 2,
+          "python_subtest_failures": 4
+        }
+      ]
+    },
+    "green": {
+      "status": "completed_passed",
+      "executor_session": 62122,
+      "recorded_utc": "2026-10-22T15:08:54.663432+00:00",
+      "gates": [
+        {
+          "name": "transport-askpass-corrected",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "-p",
+            "ssh-askpass",
+            "--no-fail-fast"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 0,
+          "log": "/private/tmp/deppy-ssh-compat-final-unit-20261022.log",
+          "log_sha256": "504eeff5f4604aae5d7e47e86d630a1bd16d909add88e74f784bd6fc9e0d7288",
+          "log_bytes": 4685,
+          "suite_results": [
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s",
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s",
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.62s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+            "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+          ]
+        },
+        {
+          "name": "real-openssh-loopbacks-corrected",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "--test",
+            "openssh_loopback",
+            "--",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2",
+            "DEPPY_TEST_ASKPASS": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deppy-ssh-askpass"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 0,
+          "log": "/private/tmp/deppy-ssh-compat-final-loopback-20261022.log",
+          "log_sha256": "479044e1e28ac2d2b2a2e807e381c428ee2be88be04baa7f9f99cc65848b0651",
+          "log_bytes": 441,
+          "suite_results": [
+            "test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.75s"
+          ]
+        },
+        {
+          "name": "parallel-agent-detection-guard",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "deppy-sijo",
+            "--bin",
+            "deppy-sijo",
+            "--features",
+            "ssh-workspaces",
+            "agent_detect::tests",
+            "--",
+            "--test-threads=4"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 0,
+          "log": "/private/tmp/deppy-ssh-guard-parallel-green-20261022.log",
+          "log_sha256": "e12f9e767fa9596642302fd0b950fdfba68bead784aadbe3f62587a26526dfd3",
+          "log_bytes": 8352,
+          "suite_results": [
+            "test result: ok. 71 passed; 0 failed; 1 ignored; 0 measured; 3315 filtered out; finished in 0.89s"
+          ]
+        },
+        {
+          "name": "corrected-offscreen-ui",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "deppy-sijo",
+            "--bin",
+            "deppy-sijo",
+            "--features",
+            "ssh-workspaces",
+            "popup_parity_render_ssh_workspace_eight_states",
+            "--",
+            "--ignored",
+            "--nocapture"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 0,
+          "log": "/private/tmp/deppy-ssh-ui-render-corrected-20261022.log",
+          "log_sha256": "4e731c88af0908e6e1664ab6920152e86ef182febd1de95d2607ef4d70b7dd39",
+          "log_bytes": 356,
+          "suite_results": [
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 6.47s"
+          ]
+        }
+      ],
+      "notes": [
+        "Transport/askpass total28 passed; worker22 plus6 other tests; two opt-in real OpenSSH tests ignored here and executed separately below.",
+        "Both actual OpenSSH loopbacks passed with the configured MD5 and certificate LogVerbose cases.",
+        "Parallel App agent-detection suite passed71 with1 ignored under unchanged four-thread workload.",
+        "Offscreen eight-state UI test passed and produced16 PNGs. Root visually inspected final 02-host-trust-narrow and08-verified-ready: body scroll clipping, fixed footer and no viewport overflow. No physical App/display launch.",
+        "These targeted results do not establish the pending corrected whole-workspace/default-App/strict cohort."
+      ]
+    },
+    "followup_red": {
+      "status": "completed_with_failures",
+      "recorded_utc": "2026-10-22T15:05:45.829916+00:00",
+      "openssh_version_reported_by_executor": "OpenSSH_10.3p1",
+      "notes": [
+        "LogVerbose diagnostic prefixes require explicit process-local suppression to retain authenticated parser behavior. Unit and actual CA-trusted certificate loopback REDs were executed before that correction.",
+        "An actual ssh -G scratch proof selected different accounts with and without the real probe command context. The integration regression requires matching options and command context between resolution and execution. Account names are excluded from durable excerpts.",
+        "Development helper-resource coverage ran nine tests with twelve unittest failure entries; the separate unmanaged-resource refusal regression failed once. These source/build-only checks did not launch Deppy."
+      ],
+      "config_context_scratch_proof": {
+        "log": "/private/tmp/deppy-ssh-config-context-proof-20261022.log",
+        "log_sha256": "e57581d38d9f6ca91c036089a9fd67812fd903808abe1d8490de5fc404ca36bc",
+        "log_bytes": 209,
+        "observed_both_variants_exit": 0,
+        "observed_accounts_differ": true,
+        "command": "not retained in scratch result log; see reproducible config_context test command"
+      },
+      "gates": [
+        {
+          "name": "logverbose-unit",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "--test",
+            "worker",
+            "configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics",
+            "--",
+            "--exact",
+            "--nocapture"
+          ],
+          "environment": {},
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 101,
+          "log": "/private/tmp/deppy-ssh-logverbose-unit-red-20261022.log",
+          "log_sha256": "16ce934f5996426bad8db41f4da4924b26001ab03c3cbc0161bc56ae53679163",
+          "log_bytes": 927,
+          "suite_results": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 21 filtered out; finished in 0.26s"
+          ],
+          "failed_tests": [
+            "configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics"
+          ]
+        },
+        {
+          "name": "logverbose-real-certificate",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "--test",
+            "openssh_loopback",
+            "openssh_loopback_accepts_ca_trusted_host_certificate_and_binds_plain_key",
+            "--",
+            "--exact",
+            "--ignored",
+            "--test-threads=1",
+            "--nocapture"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2",
+            "DEPPY_TEST_ASKPASS": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deppy-ssh-askpass"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 101,
+          "log": "/private/tmp/deppy-ssh-logverbose-loopback-red-20261022.log",
+          "log_sha256": "187f64b269f96f274603f14d93acfc8f234aa00bf73c1838abbd3511a68c94fe",
+          "log_bytes": 1095,
+          "suite_results": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.86s"
+          ],
+          "failed_tests": [
+            "openssh_loopback_accepts_ca_trusted_host_certificate_and_binds_plain_key"
+          ]
+        },
+        {
+          "name": "config-resolution-context",
+          "command": [
+            "cargo",
+            "test",
+            "--offline",
+            "--locked",
+            "-p",
+            "ssh-transport",
+            "--test",
+            "config_context",
+            "--",
+            "--nocapture"
+          ],
+          "environment": {
+            "CARGO_BUILD_JOBS": "2"
+          },
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 101,
+          "log": "/private/tmp/deppy-ssh-config-context-red-20261022.log",
+          "log_sha256": "f66895e382e8ce463a89b501cd9e117a0b16e03c0dc54452b582bcdd07827c94",
+          "log_bytes": 1699,
+          "suite_results": [
+            "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s"
+          ],
+          "failed_tests": [
+            "config_resolution_uses_the_same_options_and_command_context_as_execution"
+          ]
+        },
+        {
+          "name": "dev-helper-resources",
+          "command": [
+            "python3",
+            "-m",
+            "unittest",
+            "scripts/tests/test_dev_build.py",
+            "-v"
+          ],
+          "environment": {},
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 1,
+          "log": "/private/tmp/deppy-ssh-dev-assets-red-20261022.log",
+          "log_sha256": "042e680d5b8935a62bac0ff9e43f01f77f91bf5fb7c7673ccbe43b01b9527731",
+          "log_bytes": 12438,
+          "suite_results": [
+            "Ran 9 tests in 1.245s",
+            "FAILED (failures=12)"
+          ],
+          "failed_tests": [],
+          "python_test_count": 9,
+          "python_failure_entries": 12
+        },
+        {
+          "name": "dev-unmanaged-resource",
+          "command": [
+            "python3",
+            "-m",
+            "unittest",
+            "scripts.tests.test_dev_build.DevBuildResources.test_refresh_refuses_unmanaged_resources",
+            "-v"
+          ],
+          "environment": {},
+          "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+          "exit": 1,
+          "log": "/private/tmp/deppy-ssh-dev-unmanaged-red-20261022.log",
+          "log_sha256": "6e6c18da3a799885f220472afddafa4d6629df0c5e542b3f3c3d5e0e3d874bc4",
+          "log_bytes": 853,
+          "suite_results": [
+            "Ran 1 test in 0.096s",
+            "FAILED (failures=1)"
+          ],
+          "failed_tests": [],
+          "python_test_count": 1,
+          "python_failure_entries": 1
+        }
+      ]
+    }
+  },
+  "environment_note": "Environment fields list explicitly reported overrides; inherited ambient variables and secrets are not captured.",
+  "development_build_green": {
+    "status": "completed_passed",
+    "records": [
+      {
+        "name": "final-dev-build-python",
+        "status": "passed",
+        "log": "/private/tmp/deppy-ssh-dev-build-final-green-20261023.log",
+        "log_sha256": "511abbb09a67bafa8857cd1a40dc0862536d1634c17ef88670a4c14aa20bff84",
+        "log_bytes": 4153,
+        "command": "auxiliary executor log retains results only; exact Python test command is rerun and recorded in corrected_final_cohort",
+        "result_lines": [
+          "Ran 23 tests in 3.212s",
+          "OK"
+        ]
+      },
+      {
+        "name": "real-sealed-dev-resource-refresh",
+        "status": "passed",
+        "log": "/private/tmp/deppy-ssh-dev-real-resources-20261023.log",
+        "log_sha256": "9f45d670d038180bd44605738d6490362f557c08316457d437b80d84faf0853f",
+        "log_bytes": 181,
+        "command": "Isolated executor proof invocation not retained in its result log; results and the final sealed-helper pair identity are preserved.",
+        "result_lines": [
+          "sealed real helper pair staged and verified: iteration 1",
+          "sealed real helper pair staged and verified: iteration 2",
+          "PASS: initial copy and managed refresh; no App/companion execution"
+        ]
+      }
+    ],
+    "notes": [
+      "Final development-build/packaging Python cohort23 passed after the missing-assets hint correction.",
+      "A separate isolated real sealed-helper pair copy and managed refresh both passed (two iterations), without executing the App or companion.",
+      "The full corrected runner includes the exact23-test Python command and source snapshot; its final result is pending."
+    ]
+  },
+  "final_linux_integration": {
+    "status": "completed_passed",
+    "runner_json": "/private/tmp/deppy-ssh-final-linux-20261023.json",
+    "runner_json_sha256": "80666e673974e1b49a92833028c6fd96b8987c428530d9ed1b0451546ad6ffe6",
+    "source_snapshot": "corrected-cohort-frozen-before-full-result",
+    "source_sha256": "917dfe6193e67ad9fb793156b759e1abd777c05457e440adc6cfd53dd9bb4737",
+    "gates": [
+      {
+        "name": "host",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--features",
+          "ssh-workspaces",
+          "ssh_linux_host_register_files_terminal_and_restart_resume",
+          "--",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 25.0,
+        "log": "/private/tmp/deppy-ssh-final-linux-host-20261023.log",
+        "environment": {
+          "CARGO_BUILD_JOBS": "2",
+          "DEPPY_SSH_FIXTURE": "/Users/jr/Desktop/projects/.deppy-ssh-linux-fixture-20261022/fixture.json",
+          "DEPPY_SSH_HELPER_ARTIFACTS": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/remote-host/0.13.0"
+        },
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "log_sha256": "bca30d4ca6cba88f2307bbf76d5b54e833407b4a2cf260f0c03a0c4201f7149c",
+        "log_bytes": 1569,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 0.88s"
+        ]
+      },
+      {
+        "name": "install",
+        "command": [
+          "cargo",
+          "test",
+          "--offline",
+          "--locked",
+          "-p",
+          "deppy-sijo",
+          "--bin",
+          "deppy-sijo",
+          "--features",
+          "ssh-workspaces",
+          "ssh_linux_host_installs_verified_helper_only_after_current_consent",
+          "--",
+          "--ignored",
+          "--test-threads=1",
+          "--nocapture"
+        ],
+        "exit": 0,
+        "seconds": 2.16,
+        "log": "/private/tmp/deppy-ssh-final-linux-install-20261023.log",
+        "environment": {
+          "CARGO_BUILD_JOBS": "2",
+          "DEPPY_SSH_FIXTURE": "/Users/jr/Desktop/projects/.deppy-ssh-linux-fixture-20261022/fixture.json",
+          "DEPPY_SSH_HELPER_ARTIFACTS": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/remote-host/0.13.0"
+        },
+        "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+        "log_sha256": "9db49cf676af635e61df9f4295709d41292d77a565ce0ee8d48003b31aa0f2b4",
+        "log_bytes": 398,
+        "suite_results": [
+          "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3386 filtered out; finished in 1.91s"
+        ]
+      }
+    ],
+    "notes": [
+      "Both actual OpenSSH/Linux opt-ins passed on corrected client source using the exact sealed static helper pair.",
+      "Root retired only the owned fixture account supervisor between isolated fixture states; no user server/keys/DB or App launch was involved.",
+      "Same frozen source digest matched before and after all ten corrected gates and these two tests."
+    ]
+  },
+  "default_feature_metadata": {
+    "command": [
+      "cargo",
+      "metadata",
+      "--offline",
+      "--locked",
+      "--no-deps",
+      "--format-version",
+      "1"
+    ],
+    "exit": 0,
+    "package": "deppy-sijo",
+    "version": "0.13.0",
+    "default_features": [
+      "ssh-workspaces"
+    ],
+    "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+    "result_json": "/private/tmp/deppy-ssh-default-metadata-20261023.json",
+    "result_json_sha256": "10994c1c631c7cf8b3818996b0a65fd94831d5904323e72e895f5b619f6c3b01",
+    "notes": [
+      "Read-only Cargo metadata ran after the seven gates; package version remains0.13.0 for source investigation, with ssh-workspaces actually selected by default."
+    ]
+  },
+  "fixture_cleanup": {
+    "status": "completed_passed",
+    "command": [
+      "bash",
+      "scripts/ssh-linux-fixture.sh",
+      "stop",
+      "/Users/jr/Desktop/projects/.deppy-ssh-linux-fixture-20261022"
+    ],
+    "cwd": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022",
+    "exit": 0,
+    "log": "/private/tmp/deppy-ssh-fixture-cleanup-20261023.log",
+    "log_sha256": "9e4535373035aa0f44c43a50945d969e30665927ed0fe18ef5516e4f7333a5bc",
+    "log_bytes": 89,
+    "result_lines": [
+      "Stopped isolated fixture in /Users/jr/Desktop/projects/.deppy-ssh-linux-fixture-20261022"
+    ],
+    "notes": [
+      "Root executed cleanup after both final Linux opt-ins completed. Only the task-owned fixture container and client/host key files were removed; no global Docker cleanup or user SSH data mutation."
+    ]
+  },
+  "final_source_provenance": {
+    "branch": "feat/ssh-workspace-20261022",
+    "product_commit": "8489d6532ae69ce0bd3ef035e24e5601a5b1ac8e",
+    "source_sha256": "ae86f37cba63d251dab05e32c96c6687863db2d3bac4b32d3054edc343ce81fc",
+    "source_version": "0.13.0",
+    "release_delivered": false,
+    "scoped_commits": [
+      {
+        "commit": "9e54d2b6ab57c87eb3da422e34d33bc4eb0d13e3",
+        "subject": "test: serialize the real lsof agent reader fixture"
+      },
+      {
+        "commit": "8467a1870bff57cdd1a6da4b18f9c86576286e2f",
+        "subject": "fix: honor OpenSSH certificates and configuration context"
+      },
+      {
+        "commit": "11b5eac17bb57f1ea580bee1450e54fa0cc96edf",
+        "subject": "feat: integrate isolated SSH workspaces with native and PWA sessions"
+      },
+      {
+        "commit": "be2cd5023d70d45442e0126cc288a74540f082d1",
+        "subject": "build: validate sealed SSH helpers for package and developer paths"
+      },
+      {
+        "commit": "8489d6532ae69ce0bd3ef035e24e5601a5b1ac8e",
+        "subject": "feat: enable verified SSH workspaces in default builds"
+      }
+    ]
+  }
+}

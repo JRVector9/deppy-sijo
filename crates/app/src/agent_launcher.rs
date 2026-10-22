@@ -720,6 +720,39 @@ pub(crate) struct DetectionSnapshot {
 }
 
 impl DetectionSnapshot {
+    /// Uses only bounded authenticated server metadata. No local executable/model discovery.
+    pub(crate) fn from_remote_agents(agents: &[deppy_remote_host::services::Agent]) -> Self {
+        let mut seen = HashSet::new();
+        let agents = agents
+            .iter()
+            .take(32)
+            .filter_map(|agent| {
+                let kind = AgentKind::ALL
+                    .into_iter()
+                    .find(|kind| kind.id() == agent.kind)?;
+                if !seen.insert(kind)
+                    || deppy_core::workspace_target::RemotePath::new(agent.executable.clone())
+                        .is_err()
+                {
+                    return None;
+                }
+                Some(DetectedAgent {
+                    kind,
+                    executable: PathBuf::from(&agent.executable),
+                    launch_path: None,
+                    models: Vec::new(),
+                    default_model: None,
+                    default_effort: None,
+                    catalog: CatalogState::default(),
+                })
+            })
+            .collect();
+        Self {
+            agents,
+            claude_default_model: None,
+            claude_default_effort: None,
+        }
+    }
     pub(crate) fn retain_failed_catalogs(&mut self, previous: &Self, now: Instant) {
         for agent in &mut self.agents {
             let Some(old) = previous.find(agent.kind) else {

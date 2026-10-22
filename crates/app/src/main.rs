@@ -65,9 +65,15 @@ mod scrollback_policy;
 // Relay 페어링 의식 상태 기계(Task 5). 설정 화면이 투영을 읽고, 데이터 평면 배선(Task 6)이
 // 기기 제시 경로를 부른다.
 mod relay_pairing;
+mod remote_bootstrap;
 mod session_aux;
 mod settings_snapshot;
 mod shortcuts;
+mod ssh_connection;
+mod ssh_resume_store;
+mod ssh_workspace_add;
+mod ssh_workspace_files;
+mod ssh_workspace_host;
 mod status_feed;
 mod tailscale;
 #[cfg(test)]
@@ -76,6 +82,7 @@ mod theme;
 mod ui;
 mod work_management;
 mod workspace_add;
+mod workspace_runtime_client;
 mod worktree;
 
 use std::path::{Path, PathBuf};

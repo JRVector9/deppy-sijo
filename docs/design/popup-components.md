@@ -6,7 +6,7 @@
 
 | 사례 | 화면 | 상태 | 코드 |
 | --- | --- | --- | --- |
-| 01 | 워크스페이스 추가 | 공용 팝업 적용 | `crates/app/src/workspace_add.rs` |
+| 01 | 워크스페이스 추가 | 공용 팝업 · 로컬/GitHub/SSH(기능 플래그) | `crates/app/src/workspace_add.rs` · `ssh_workspace_add.rs` |
 | 02 | 새 폴더 만들기 | 공용 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
 | 03 | 새 파일 만들기 | 공용 팝업 적용 | `crates/app/src/ui/file_tree.rs` |
 | 04 | 워크스페이스 이름 바꾸기 | 워크스페이스 행에서 인라인 편집 | `crates/app/src/ui/file_tree.rs` |
@@ -47,7 +47,7 @@ AI 세션 시작 런처는 기존 전용 레이아웃을 유지한다. macOS 기
 | --- | --- | --- |
 | `WindowSpec` / `window` / `fixed_window` / `window_body` | `connector-ui/src/popup/window.rs` | 중앙에서 열리는 이동·크기 조절 창, 본문 스크롤과 고정 하단 여백 |
 | `PopupSpec` / `show` / `body` | `shell.rs` | 모달 배경, 폭, 제목·설명·닫기, 고정 머리글과 스크롤 본문 |
-| `field` / `text_input` / `path_input` / `segmented_choice` | `fields.rs` | 레이블·힌트, 36pt 입력, 경로와 찾아보기 행, 두 선택지 |
+| `field` / `text_input` / `path_input` / `segmented_choice` | `fields.rs` | 레이블·힌트, 36pt 입력, 경로와 찾아보기 행, 같은 폭의 선택지 |
 | `choice_input` | `fields.rs` | 36pt 선택 입력, 공용 테두리·폰트·배경 |
 | `MaskedSecretBuffer` / `secret_input` | `fields.rs` | widget에는 마스크만 전달, 36pt/여러 행 80pt·거절한 선택 교체 원복; 초안 수명은 호출자 소유 |
 | `popover` / `popover_frame` / `body_with_max_height` | `shell.rs` | 모달과 같은 머리글·팔레트, 앵커 팝오버와 높이 제한 |
@@ -106,9 +106,12 @@ let close_requested = popup::show(ctx, popup::PopupSpec {
 ## 상호작용 규칙
 
 - 새 폴더·새 파일은 이름 입력에 바로 초점을 주고, Enter는 만들기, Esc·취소·닫기는 입력을 버린다. 파일 트리 행을 밀지 않도록 모달은 트리 레이아웃 밖에 둔다.
-- 워크스페이스 추가는 `내 폴더`/`GitHub 저장소` 선택, URL·저장 위치·폴더 이름의 초안, 복제 상태와 오류를 기존 `WorkspaceAddUi`가 관리한다. 하단의 주 동작은 선택 방식에 맞춰 바뀐다. 복제 중에는 닫기를 막고 복제 취소만 허용한다.
+- 워크스페이스 추가는 `내 폴더`/`GitHub 저장소` 선택(기본 OFF인 `ssh-workspaces` 기능 활성화 시 `SSH 서버` 포함), URL·저장 위치·폴더 이름의 초안, 복제 상태와 오류를 기존 `WorkspaceAddUi`가 관리한다. 하단의 주 동작은 선택 방식에 맞춰 바뀐다. 복제 중에는 닫기를 막고 복제 취소만 허용한다.
 - 로컬 폴더 등록은 열린 디렉터리 descriptor에서 dev/inode와 macOS 볼륨 UUID를 같은 객체 기준으로 읽어 settings worker에서 저장한다. 기존 UUID와 inode가 일치하면 장치 번호 변경을 허용한다. 과거 UUID 증명이 없는 기존 경로는 inode가 같고 현재 UUID를 읽을 수 있어도 자동 연결하지 않는다. 선택한 폴더를 사례30 공용 확인창에 표시하고, 사용자가 다시 연결을 누른 경우에만 원래 probe의 dev/inode/UUID를 worker에서 재검사한 뒤 기존 workspace에 연결한다. 다른 UUID·inode 또는 UUID 조회 불가 시 계속 거부한다. 설정의 명시적 프로젝트 경로 재연결은 같은 경로/dev/inode여도 이전 증명을 트랜잭션 안에서 교체한다.
-- 시안의 01번은 GitHub 입력 상태를 보여주는 예시다. 실제 첫 선택은 기존과 같이 `내 폴더`이며, 사용자가 GitHub를 누르면 저장소 입력으로 전환한다.
+- 시안의 01번은 GitHub 입력 상태와 SSH 진입 양식을 보여주는 예시다. SSH의 신뢰·인증·서버 준비·폴더 탐색·실패·오프라인·완료 8개 상태는 [승인 SSH 시안](../mockups/ssh-workspace-add-20261022.html)에 있다. 실제 첫 선택은 기존과 같이 `내 폴더`이며, 사용자가 GitHub를 누르면 저장소 입력으로 전환한다.
+- SSH 양식은 같은 560pt 셸, 36pt 입력, 34pt 버튼, 8pt 푸터 간격과 본문 전용 스크롤을 사용한다. SSH 주소와 연결 버튼, 접힌 연결 옵션(포트·이 Mac의 특정 키 파일), 서버 폴더, 선택 이름을 표시한다. 빈 포트는 SSH config를 따르며 원래 별칭을 보존한다. 실제 서버가 보고한 주소·폴더·설치된 에이전트만 표시한다.
+- `SshWorkspaceAddUi`는 I/O 없이 의도만 반환하고 세대·요청 ID가 일치하는 snapshot만 반영한다. 주소·포트·키 설정 변경, 방식 전환, 취소·닫기는 이전 결과와 비밀값을 폐기한다. 연결 단절은 무해한 초안과 선택 경로를 유지하지만 재연결 후 서버 재검증 전에는 추가할 수 없다. 경로는 절대 원격 경로 원문을 보존하며 로컬 파일 API에 넘기지 않는다.
+- SSH 호스트 신뢰, 암호/키 암호, 인증 확인, helper 설치는 각각 명시적 버튼으로 승인한다. 인증 확인을 호스트 신뢰로 바꾸지 않는다. 비밀 입력은 공용 마스크 버퍼를 사용하고 전송·취소·대상 변경 시 값과 위젯 상태를 정리한다. 지문 변경은 오류로 차단한다. 서버가 검증한 canonical root만 `워크스페이스 추가`를 활성화하며 성공한 등록은 호출자가 닫기·전용 런처로 연결한다.
 - URL 아래에는 지원 형식 안내를 표시한다. 하단 단축키는 생성 창에서 `Enter 만들기 · Esc 닫기`, 워크스페이스 추가에서 `Esc 닫기`다. 워크스페이스 복제는 버튼으로 시작하므로 Enter 실행이라고 표기하지 않는다.
 - 모달 UI 안에서 디스크·네트워크 작업을 시작하거나 동기 대기하지 않는다. 호출자가 의도를 받아 기존 작업 경로로 보낸다.
 - 종료·영구 삭제는 `confirmation`에 ID·제목·설명·대상(선택)·경고·확인/취소/닫기 레이블을 전달한다. `Confirm`/`Cancel`만 반환하며, 작업은 호출자가 기존 경로에서 접수한다. 대상은 세션·runtime instance·소켓 시작 식별자·삭제 대상의 원래 값을 보존한다. 영구 삭제는 큐가 실제 접수한 뒤에만 확인을 닫으며, 접수 거절 사유도 확인창 안에 표시한다.

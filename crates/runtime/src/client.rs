@@ -77,6 +77,21 @@ pub struct RuntimeEventReceiver {
 }
 
 impl RuntimeEventReceiver {
+    /// Offline execution targets have no worker and must never fall back to a local one.
+    pub fn disconnected() -> Self {
+        let (sender, events) = std::sync::mpsc::sync_channel(1);
+        drop(sender);
+        Self {
+            events,
+            pending_durable: Mutex::new(None),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            viewports: Arc::default(),
+            history_results: Arc::default(),
+            input_pressures: Arc::default(),
+            resource_usage: Arc::default(),
+        }
+    }
+
     pub(crate) fn try_recv_durable(&self) -> Result<RuntimeEvent, std::sync::mpsc::TryRecvError> {
         if let Some(event) = self
             .pending_durable

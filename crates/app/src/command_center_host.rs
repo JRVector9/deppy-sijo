@@ -754,7 +754,30 @@ fn project_snapshot(ws: &storage::WorkspaceRow) -> stored::CommandCenterSnapshot
         drafts: vec![],
     }
 }
+const SSH_COMMAND_CENTER_UNSUPPORTED: &str = "SSH 워크스페이스에서는 Command Center 실행을 아직 지원하지 않습니다. 원래 터미널을 사용해 주세요.";
+
 impl App {
+    pub(super) fn require_command_center_local_workspace(
+        &self,
+        workspace: &str,
+    ) -> Result<(), String> {
+        let local_target = matches!(
+            self.workspace_targets.get(workspace),
+            Some(WorkspaceTarget::Local { .. })
+        );
+        let local_runtime = self
+            .active
+            .id
+            .eq(workspace)
+            .then_some(&self.active)
+            .or_else(|| self.warm.get(workspace))
+            .is_none_or(|r| !r.runtime.is_remote());
+        if local_target && local_runtime {
+            Ok(())
+        } else {
+            Err(SSH_COMMAND_CENTER_UNSUPPORTED.into())
+        }
+    }
     fn refresh_command_center_routes(&self, host: &mut CommandCenterHost) {
         let old_live = host.live.clone();
         host.live = self
@@ -906,7 +929,8 @@ impl App {
             let config = &p.snapshot.config;
             let main_target = host.main_target(&ws.id, p);
             let policy = p.policy();
-            let ready = p.loaded && !p.storage_blocked && host.flight.is_none();
+            let local_execution = self.require_command_center_local_workspace(&ws.id).is_ok();
+            let ready = local_execution && p.loaded && !p.storage_blocked && host.flight.is_none();
             let configured = policy.validate_config(config).is_ok();
             let sessions: Vec<_> = host
                 .live
@@ -1156,6 +1180,29 @@ impl App {
             }
             let history = approval::history(p, &tasks);
             snapshot.projects.push(cc::Project { main_conversation:self.command_center_main_conversation(host, &main_target), pending_approvals:self.command_center_project_approvals(host,&ws.id,&mut approval_budget), create_main: if ready && configured && !launch::workspace_uncertain(&host.launches,&ws.id) && !host.launches.values().any(|l| l.record.workspace.0==ws.id && l.record.task_id.is_none() && !l.finished()) {yes()} else {no("프로젝트 실행 설정과 폴더를 먼저 준비해 주세요.")}, loaded: p.loaded, storage_retry: cc::Capability { enabled: p.storage_blocked, reason: "저장 결과를 확인하지 못했습니다. 초안을 보존한 채 저장 상태를 다시 확인합니다.".into() }, manual_plan: if ready && p.request.is_some() && planner_mode == wm::provider_adapter::PlannerMode::ManualJson { yes() } else { no("먼저 목표를 메인에게 전달해 주세요.") }, planner_prompt: p.request.as_ref().and_then(|r| r.to_prompt().ok()), id: ws.id.clone(), name: config.name.clone(), directory: config.folder.clone(), goal: p.display_goal().map(|g| bounded(&g.prompt,4096)).unwrap_or_default(), main_summary, pending_goal_id: p.pending_confirmation_goal().map(|goal| goal.0), plan_confirmation: if ready && p.pending_confirmation_goal().is_some() { yes() } else { no("검증된 배정안이 없습니다.") }, main_target: main_target.clone(), main_provider: config.main_agent.provider.clone(), main_model: config.main_agent.model.clone().unwrap_or_default(), main_effort: config.main_agent.effort.clone().unwrap_or_default(), main_input, sessions, tasks, history, config: cc::ProjectConfig { allowed_scope_roots: p.scopes.clone(), name: config.name.clone(), directory: config.folder.clone(), main_session_id: main_target.session_id, provider: config.main_agent.provider.clone(), model: config.main_agent.model.clone().unwrap_or_default(), effort: config.main_agent.effort.clone().unwrap_or_default(), worker_providers: p.allowed_agents.iter().map(|a| a.provider.clone()).collect(), parallel_limit: config.max_workers, automation: "배정 전 확인".into(), use_worktrees: config.use_worktrees, revision: config.revision.0.to_string() }, save_settings: if ready { yes() } else { no("저장 또는 불러오기가 진행 중입니다.") }, available_agents: agents.iter().map(|a| cc::AgentOption { provider: a.provider.clone(), model: a.model.clone().unwrap_or_default(), effort: a.effort.clone().unwrap_or_default() }).collect(), available_providers: providers, available_models: models, available_efforts: efforts, available_automation: vec!["배정 전 확인".into()] });
+            if !local_execution && let Some(project) = snapshot.projects.last_mut() {
+                project.create_main = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                project.main_input = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                project.save_settings = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                project.manual_plan = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                project.plan_confirmation = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                for session in &mut project.sessions {
+                    session.device = "SSH".into();
+                    session.input = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                }
+                for task in &mut project.tasks {
+                    task.create_worker = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.close_worker = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.input = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.dispatch = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.result_report = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.verify_result = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.execute_verification = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.cancel_verification = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.confirm_result = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                    task.reconcile_remote = no(SSH_COMMAND_CENTER_UNSUPPORTED);
+                }
+            }
         }
         snapshot.devices.push(cc::Device {
             id: "local".into(),
@@ -1259,6 +1306,22 @@ impl App {
             return Err(
                 "원격 제어 권한이 만료되었거나 취소되었습니다. 요청을 적용하지 않았습니다.".into(),
             );
+        }
+        let effect_workspace = match &intent {
+            cc::Intent::LoadProject { .. }
+            | cc::Intent::RetryStorage { .. }
+            | cc::Intent::DraftChanged { .. } => None,
+            cc::Intent::AllowThisComputer { workspace_id, .. }
+            | cc::Intent::ConnectExecutionDevice { workspace_id, .. }
+            | cc::Intent::GrantExecutionDevice { workspace_id, .. }
+            | cc::Intent::RevokeExecutionDevice { workspace_id, .. } => Some(workspace_id.as_str()),
+            cc::Intent::Approval { target, .. }
+            | cc::Intent::ReconcileRemote { target }
+            | cc::Intent::ObserveRemoteSession { target } => Some(target.workspace_id.as_str()),
+            _ => intent_workspace(&intent),
+        };
+        if let Some(workspace) = effect_workspace {
+            self.require_command_center_local_workspace(workspace)?;
         }
         match intent {
             cc::Intent::ExecuteVerification {
@@ -2149,6 +2212,9 @@ impl App {
                         if let Some(after) = after {
                             let main_authorized = host.main_operation_current(&after.id);
                             let authorized = main_authorized
+                                && self
+                                    .require_command_center_local_workspace(&workspace)
+                                    .is_ok()
                                 && host
                                     .remote_permits
                                     .get(&after.id)
@@ -2454,6 +2520,16 @@ impl App {
         action: ui::git_panel::GitPanelAction,
     ) {
         use ui::git_panel::{GitPanelAction as A, GitPanelIoRequest as R};
+        if matches!(
+            &action,
+            A::OpenWorktreeShell { .. } | A::InsertPath { .. } | A::RevealInFinder { .. }
+        ) && self
+            .require_command_center_local_workspace(&self.active.id)
+            .is_err()
+        {
+            self.notice_ssh_unsupported();
+            return;
+        }
         match action {
             A::Refresh => self.request_git_panel_io_at(
                 ctx,
@@ -3274,6 +3350,265 @@ mod tests {
         assert!(value["snapshot"].is_null());
         assert!(!frame.contains("newly-sensitive-old-frame"));
     }
+    fn prepared_ssh_host(app: &App, root: &Path) -> CommandCenterHost {
+        let workspace = app.active.id.clone();
+        let mut host = host();
+        app.refresh_command_center_routes(&mut host);
+        let project = host.projects.get_mut(&workspace).unwrap();
+        project.loaded = true;
+        project.snapshot.config.folder = root.to_string_lossy().into_owned();
+        project.snapshot.config.main_agent = work::AgentSelection {
+            provider: "codex".into(),
+            model: None,
+            effort: None,
+        };
+        project.snapshot.config.worker_agent = project.snapshot.config.main_agent.clone();
+        project.allowed_agents = vec![project.snapshot.config.main_agent.clone()];
+        project.scopes = vec!["src".into()];
+        project
+            .policy()
+            .validate_config(&project.snapshot.config)
+            .unwrap();
+        host
+    }
+
+    fn assert_ssh_command_center_callers_reject_before_local_work(app: &mut App, root: &Path) {
+        let workspace = app.active.id.clone();
+        let mut host = prepared_ssh_host(app, root);
+        let route = cc::RouteTarget {
+            workspace_id: workspace.clone(),
+            session_id: None,
+            task_id: None,
+        };
+        let before: Vec<_> = std::fs::read_dir(root)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        let error = app
+            .begin_command_center_launch(&mut host, "main", &workspace, None)
+            .unwrap_err();
+        assert!(error == SSH_COMMAND_CENTER_UNSUPPORTED, "{error}");
+        let error = app
+            .begin_command_center_launch(&mut host, "worker", &workspace, Some("task"))
+            .unwrap_err();
+        assert!(error == SSH_COMMAND_CENTER_UNSUPPORTED, "{error}");
+        let error = app
+            .allow_command_center_server(&mut host, "server", &workspace, "1", "controller")
+            .unwrap_err();
+        assert!(error == SSH_COMMAND_CENTER_UNSUPPORTED, "{error}");
+        let error = app
+            .begin_command_center_verification(
+                &mut host,
+                "verify",
+                route.clone(),
+                work::VerificationTarget {
+                    workspace_id: WorkspaceId(workspace.clone()),
+                    task_id: work::TaskId::new(),
+                    attempt_id: work::AttemptId::new(),
+                    result_revision: work::ResultRevision(1),
+                    source_revision: None,
+                    artifact_revision: None,
+                },
+                work::VerificationSpec {
+                    command: "touch must-not-run".into(),
+                    cwd: root.to_string_lossy().into_owned(),
+                    timeout_ms: 1000,
+                    output_limit_bytes: 1024,
+                },
+            )
+            .unwrap_err();
+        assert!(error == SSH_COMMAND_CENTER_UNSUPPORTED, "{error}");
+        for intent in [
+            cc::Intent::Submit {
+                target: route.clone(),
+                text: "must not reach local runtime".into(),
+            },
+            cc::Intent::CreateMain {
+                workspace_id: workspace.clone(),
+            },
+            cc::Intent::CreateWorker { target: route },
+        ] {
+            let error = app
+                .apply_command_center_intent(&mut host, "input", intent)
+                .unwrap_err();
+            assert!(error == SSH_COMMAND_CENTER_UNSUPPORTED, "{error}");
+        }
+        let pending = app.pending_prompt_deliveries.len();
+        app.queue_prompt_delivery(
+            workspace.clone(),
+            app.active.runtime_instance,
+            runtime::SessionId(1),
+            Arc::from("must not enqueue SSH CC input"),
+            PromptDeliveryOrigin::CommandCenter {
+                automatic: false,
+                operation_id: "input".into(),
+            },
+            PromptInputContext::ManualShell,
+        );
+        assert_eq!(app.pending_prompt_deliveries.len(), pending);
+        app.pump_command_center_launches(&mut host);
+        assert!(host.launches.is_empty());
+        assert!(
+            host.main_tools.is_none(),
+            "SSH must not register a local MAIN bridge"
+        );
+        assert!(!host.projects[&workspace].catalog_requested);
+        assert!(!host.verifications.busy());
+        assert!(host.flight.is_none());
+        assert_eq!(
+            std::fs::read_dir(root)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            before
+        );
+    }
+
+    #[test]
+    fn command_center_ssh_offline_callers_reject_before_local_work() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        assert!(app.active.runtime.is_remote());
+        assert!(!app.active.runtime.is_connected());
+        assert_ssh_command_center_callers_reject_before_local_work(&mut app, &root);
+    }
+
+    #[test]
+    fn command_center_ssh_connected_callers_reject_before_local_work() {
+        super::super::ssh_integration_tests::with_connected_ssh_app_fixture(|app, root| {
+            assert!(app.active.runtime.is_remote());
+            assert!(app.active.runtime.is_connected());
+            assert_ssh_command_center_callers_reject_before_local_work(app, root);
+        });
+    }
+
+    #[test]
+    fn command_center_ssh_catalog_never_scans_this_mac() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        let mut host = prepared_ssh_host(&app, &root);
+        app.pump_command_center_launches(&mut host);
+        assert!(!host.projects[&app.active.id].catalog_requested);
+    }
+
+    #[test]
+    fn command_center_ssh_snapshot_disables_local_execution_settings() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        let host = prepared_ssh_host(&app, &root);
+        app.command_center = Some(Box::new(host));
+        let snapshot = app.command_center_snapshot();
+        let project = snapshot
+            .projects
+            .iter()
+            .find(|p| p.id == app.active.id)
+            .unwrap();
+        assert!(!project.save_settings.enabled);
+        assert!(project.save_settings.reason == SSH_COMMAND_CENTER_UNSUPPORTED);
+        assert!(!project.create_main.enabled);
+        assert!(!project.main_input.enabled);
+    }
+
+    #[test]
+    fn command_center_ssh_remote_runtime_never_gains_authority_from_local_metadata() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        app.workspace_targets.insert(
+            app.active.id.clone(),
+            WorkspaceTarget::Local {
+                root: root.to_string_lossy().into_owned(),
+            },
+        );
+        assert_ssh_command_center_callers_reject_before_local_work(&mut app, &root);
+    }
+
+    fn assert_ssh_git_effect_rejected(app: &mut App, action: ui::git_panel::GitPanelAction) {
+        let pane = runtime::MuxPaneId::new();
+        let tab = runtime::MuxTabId::new();
+        app.active.workspace_ui.apply_warm_events(
+            &[runtime::RuntimeEvent::MuxUpdated {
+                snapshot: Arc::new(runtime::MuxSnapshot {
+                    tabs: vec![runtime::TabSnapshot {
+                        id: tab.clone(),
+                        title: "SSH fixture".into(),
+                        layout: runtime::LayoutNode::Pane(pane.clone()),
+                        panes: vec![runtime::PaneSnapshot {
+                            id: pane.clone(),
+                            session_id: Some(runtime::SessionId(9)),
+                            title: "SSH fixture".into(),
+                            persistent_session_id: None,
+                        }],
+                    }],
+                    active_tab: Some(tab),
+                    focused_pane: Some(pane),
+                }),
+            }],
+            &app.i18n,
+        );
+        assert_eq!(
+            app.active.workspace_ui.focused_session(),
+            Some(runtime::SessionId(9))
+        );
+        app.pending_app_host_action = None;
+        app.pending_workspace_controller_action = None;
+        let ctx = app.egui_ctx.clone();
+        app.apply_command_center_git_action(&ctx, action);
+        assert!(
+            app.pending_app_host_action.is_none(),
+            "SSH Git must not stage a local host action"
+        );
+        assert!(
+            app.pending_workspace_controller_action.is_none(),
+            "SSH Git must not stage direct input or shell creation"
+        );
+    }
+
+    #[test]
+    fn command_center_ssh_git_reveal_never_inspects_or_opens_same_path_on_this_mac() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        let file = root.join("local-sentinel");
+        std::fs::write(&file, "must not reveal this local file").unwrap();
+        assert_ssh_git_effect_rejected(
+            &mut app,
+            ui::git_panel::GitPanelAction::RevealInFinder { path: file },
+        );
+    }
+
+    #[test]
+    fn command_center_ssh_git_shell_never_stages_local_execution() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        assert_ssh_git_effect_rejected(
+            &mut app,
+            ui::git_panel::GitPanelAction::OpenWorktreeShell {
+                path: root.to_string_lossy().into_owned(),
+            },
+        );
+    }
+
+    #[test]
+    fn command_center_ssh_git_insert_never_bypasses_input_admission() {
+        let (mut app, root) = super::super::tests::ssh_workspace_isolated_app_fixture();
+        assert_ssh_git_effect_rejected(
+            &mut app,
+            ui::git_panel::GitPanelAction::InsertPath { path: root },
+        );
+    }
+
+    #[test]
+    fn command_center_ssh_git_connected_handler_rejects_local_effects() {
+        super::super::ssh_integration_tests::with_connected_ssh_app_fixture(|app, root| {
+            let file = root.join("local-sentinel");
+            std::fs::write(&file, "must not reveal this local file").unwrap();
+            for action in [
+                ui::git_panel::GitPanelAction::RevealInFinder { path: file },
+                ui::git_panel::GitPanelAction::OpenWorktreeShell {
+                    path: root.to_string_lossy().into_owned(),
+                },
+                ui::git_panel::GitPanelAction::InsertPath {
+                    path: root.to_owned(),
+                },
+            ] {
+                assert_ssh_git_effect_rejected(app, action);
+            }
+        });
+    }
+
     pub(super) fn host() -> CommandCenterHost {
         CommandCenterHost::new(
             std::env::temp_dir().join(format!("cc-inert-{}", uuid::Uuid::new_v4())),

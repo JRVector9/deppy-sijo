@@ -13,6 +13,7 @@ pub(super) fn verify(
     volume: Option<uuid::Uuid>,
     allow_selected_legacy_rebind: bool,
 ) -> anyhow::Result<()> {
+    super::workspace_target::require_local(conn, id)?;
     let Some(stored) = stored else {
         return Ok(());
     };
@@ -52,6 +53,7 @@ pub(super) fn record(
     anchor: WorkspaceFolderAnchor,
     volume: Option<uuid::Uuid>,
 ) -> anyhow::Result<()> {
+    super::workspace_target::require_local(conn, id)?;
     if let Some(volume) = volume {
         anyhow::ensure!(
             id.len() + path.len() + 36 <= SETTINGS_ROW_BYTES_MAX,

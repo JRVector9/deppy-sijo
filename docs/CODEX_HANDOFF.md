@@ -1,3 +1,21 @@
+# SSH 워크스페이스 구현 — 승인된 6개 PR 병렬 개발 시작 (2026-10-22)
+
+- Current objective: 사용자 `너가 제안한 순서대로 개발진행해.서브에이전트 병렬로 가능한 구간은 병렬로 개발해` 승인에 따라 아래 제안 문서의 6단계를 실제 구현한다. 이전 문서의 제품 구현 미승인 상태는 이 새 승인으로 대체된다.
+- Canonical worktree `/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022`, branch `feat/ssh-workspace-20261022`, base design `e7172135` / main `bc950e88`. nominal dirty tree와 Command Center branch, design branch 보존. 앱 stop/start/restart 권한 없음.
+- Plan: `docs/superpowers/plans/2026-10-22-ssh-workspace.md`, 순서 1→(2∥3)→4→5→6. execute-plan/TDD 적용. redundant 승인 질문 없이 승인 범위를 수행한다.
+- Workers (모두 GPT-6.1-Sol/xhigh): ssh_contracts=core/storage PR1; ssh_transport=OpenSSH/askpass PR2; ssh_remote_host=runtime/helper/bootstrap PR3. shared tree에서 파일 소유권을 나눴고 root는 App 통합/root Cargo/lock/중앙 handoff/최종 review·commit 소유. target-contracts/target-ssh/target-remote로 Cargo cache 격리.
+- Frozen DTO: WorkspaceTarget::Local {root:String}/Ssh(SshWorkspaceTarget); SSH connection_id, host, port, account, host_key_sha256, remote_workspace_id, canonical_root:RemotePath. local_root()는 SSH에서 None, storage 별도 authoritative target table, 기존 WorkspaceRow API 유지. PR2/3는 이 계약에 맞춰 병렬 개발 시작.
+- Completed PR1: typed Local/SSH target + validated serde/absolute RemotePath; separate workspace_targets migration/local sync triggers; SSH local-path/volume accessor 거부; verified host/port/account/root 중복 및 key교체 충돌; secret 없는 SshConnectionProfile 저장(기존 alias/port/identity_file 보존); typed projection count/row/aggregate 제한.
+- Modified PR1: crates/core/src/{lib.rs,workspace_target.rs}, crates/storage/src/{db.rs,lib.rs,workspace_identity.rs,workspace_target.rs}. Root가 이6파일+handoff만 단계별 commit한다. root Cargo/newSSH/helper files는 다음 단계로 남긴다.
+- Actual PR1 results: worker isolated target-contracts/jobs2 `cargo test --locked -p deppy-core -p storage workspace_target`: core5PASS/storage8PASS; `cargo test --locked -p storage workspace_`:48PASS(중복 포함); final aggregate regression1PASS. strict core/storage --all-targets Clippy -Dwarnings, scoped rustfmt, diff check exit0. RED는 table부재/corevalidation/profile/aggregate 실제 assertionFAIL 후 구현했다. closedmarker는 config파일 migration보존 증거이며 App runtime정책 test가 아니다.
+- Actual PR2 progress: ssh-transport/askpass fakefixtures 초기7개PASS(추가 cohort개발중); 설치/인증/Controller/packaging 검토미완료. PR3 SSH stream handshake/version/lease/runtime 테스트중, Linux로컬Docker engine가 있어 실제호환 gate시도중.
+- Actual root PR4 preliminary: `CARGO_BUILD_JOBS=2 cargo test --offline --locked -p deppy-remote-host --lib -- --nocapture` RED1PASS9FAIL; files/git/services stubs을 실제실패후 구현. 첫GREEN8PASS2FAIL: APFS nonUTF8fixture 생성거부 및 macOS /dev/fd read_dir NotDirectory. Unixfdopendir로 제품목록수정·Linux전용invalidUTF8fixture분리 예정. 초기 Cargo들은 중간worker source의 compile오류가 있었고 RED로 세지 않는다. 로그 /private/tmp/deppy-ssh-{services-red,services-green,files-red}-20261022.log.
+- Failed approaches: full offline metadata는 uncached cross-platform curve25519-dalek-derive 때문에 실패(SSHdeps문제아님), intendedlockdiff만 확인했다. root target APFSclone 완료. 모든 worker는 compile/test cohort중source고정하도록 조율한다.
+- Remaining: PR1 commit → PR2/3 완성·교차검토 → PR4 test보정/서비스연결 → PR5 시안·App remote runtime통합 → PR6 독립성/재접속/PWA/전체gates. 출시산출물없음/version변경없음/앱재실행없음. stage완료전 feature노출하지않는다.
+- Exact next commands: `git status --short --branch`; `git diff --stat`; `head -n 35 docs/CODEX_HANDOFF.md`; targeted Cargo는 root target / worker 전용 target 분리. Agent mailbox 결과를 실제 gate로 반영한다.
+
+---
+
 # SSH 워크스페이스 시안·PR 검토 — 작성·브라우저 검증 완료 (2026-10-22)
 
 - Current objective: 사용자가 요청한 SSH 서버 폴더 추가 시안과 PR 단위 기능 검토 보고. HTML/계획·최종 브라우저 검증 완료. 문서 변경을 별도 design 브랜치에 local commit해 보고한다. 제품 기능 구현/실서버 접속은 요청 범위가 아니다.
@@ -1794,3 +1812,12 @@ Historical completed-task records and original commands are preserved in [the pr
 ## GitGuardian 기록 오탐 처리
 
 PR230의 GitGuardian은 과거 manifest의 `worker_patches.secret` SHA256을 generic secret으로 판정했다. 실제 `/private/tmp/deppy-popup-fix-secret-20261014.patch` 파일 SHA256과 정확히 일치함을 검증했다. 작업자명과 `sha256` 필드를 분리해 메타데이터 표현만 정규화했다. 실제 credential이나 제품 변경은 없다. 기존 PR/commit을 보존하고 force push 없이 깨끗한 대체 integration branch/PR로 검사한다. 원본 manifest와 3개 digest 값은 보존된다.
+
+## SSH PR3 worker — 2026-10-22 architecture/preflight
+
+- Objective: implement headless Linux helper + SSH stdio runtime/structured RPC, independent supervisor/lease, no input replay, verified consent bootstrap. Owned runtime protocol/remote stream, remote-host supervisor, app remote_bootstrap only; root owns service modules/Cargo registry/exports/App integration.
+- Decisions: exact target+account+canonical root+verified host-key identity in bounded hello; runtime wire protocol exact match plus independent SSH envelope version; request context carries runtime/generation/request id. RPC bytes bounded4MiB; framed payload16MiB. Root service module provides JSON schema and root enforcement. Per-account supervisor uses private Unix socket; SSH bridge EOF detaches while 5min lease retains runtime; only matching runtime+lease resumes. Picker may bind '/' without spawning sessions, then reconnect to selected canonical root.
+- Preflight actually executed: `docker info --format '{{.OSType}} {{.Architecture}} {{.ServerVersion}}'` returned Linux aarch6429.5.2; local rust image is Linux arm64. Rust Linux targets not installed on macOS; no user/server SSH performed. Actual Linux compilation/runtime still pending, x86_64 gate also pending.
+- Modified so far: protocol.rs module declaration, protocol/ssh.rs handshake test-first skeleton, remote-host Cargo/lib/main manifests. Actual RED command started: `CARGO_TARGET_DIR=$PWD/target-remote CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime ssh_stream -- --nocapture` (session25696); compiling, no test result yet.
+- Remaining: verify behavioral RED, implement exact handshake and stream, supervisor/process fixture, bootstrap verifier, Linux build+runtime+fmt/clippy. No commit, app launch/restart, user data, credentials, or live SSH.
+- Next exact command: poll Cargo session25696; then same `cargo test` until executed GREEN. Root registers remote-host crate/lock and root exports. New app/helper version remains0.13.0 investigation build; release bump/package is root-owned and not yet performed.

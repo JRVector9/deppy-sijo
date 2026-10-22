@@ -11,10 +11,13 @@ pub use project_keys::{
 mod agent_attention;
 #[path = "workspace_identity.rs"]
 mod workspace_identity;
+#[path = "workspace_target.rs"]
+mod workspace_target;
 pub use agent_attention::{
     AgentAttentionEvent, AttentionEventKind, NativeTurnCompletionProof, NativeTurnProof,
     native_prompt_digest,
 };
+pub use workspace_target::{SshWorkspaceFindOrCreateResult, WorkspaceTargetRow};
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -922,6 +925,7 @@ CREATE INDEX idx_relay_devices_recency
          AND length(CAST(task_prompt_execution_stamp AS BLOB)) <= 4096));",
     // Append-only: project/environment key metadata and durable value-free GitHub delivery.
     project_keys::MIGRATION,
+    workspace_target::MIGRATION,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.
@@ -7163,7 +7167,7 @@ impl Db {
                         length(CAST(path AS BLOB)) + length(CAST(created_at AS BLOB)) +
                         length(CAST(COALESCE(path_dev, '') AS BLOB)) +
                         length(CAST(COALESCE(path_ino, '') AS BLOB)) AS row_bytes
-                 FROM workspaces WHERE path = ?1 ORDER BY created_at, id LIMIT 2
+                 FROM workspaces WHERE path = ?1 AND id IN (SELECT workspace_id FROM workspace_targets WHERE kind='local') ORDER BY created_at, id LIMIT 2
              )",
             [path],
             2,
@@ -7178,7 +7182,7 @@ impl Db {
         if existing_probe.count == 1 {
             let persisted = tx.query_row(
                 "SELECT id, name, path, created_at, path_dev, path_ino
-                 FROM workspaces WHERE path = ?1 ORDER BY created_at, id LIMIT 1",
+                 FROM workspaces WHERE path = ?1 AND id IN (SELECT workspace_id FROM workspace_targets WHERE kind='local') ORDER BY created_at, id LIMIT 1",
                 [path],
                 |row| {
                     Ok((
@@ -7376,6 +7380,7 @@ impl Db {
         new_path: &str,
         new_filesystem_anchor: WorkspaceFolderAnchor,
     ) -> anyhow::Result<WorkspaceMovedPathUpdate> {
+        workspace_target::require_local(&self.conn, workspace_id)?;
         validate_workspace_text_input(workspace_id, "id")?;
         validate_workspace_text_input(expected_old_path, "expected_path")?;
         validate_workspace_text_input(new_path, "new_path")?;
@@ -9776,6 +9781,7 @@ impl Db {
     }
 
     pub fn set_workspace_path(&self, id: &str, path: &str) -> anyhow::Result<()> {
+        workspace_target::require_local(&self.conn, id)?;
         validate_workspace_text_input(id, "id")?;
         validate_workspace_text_input(path, "path")?;
         let tx = rusqlite::Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
@@ -9820,6 +9826,7 @@ impl Db {
         path_ino: Option<i64>,
         volume: Option<uuid::Uuid>,
     ) -> anyhow::Result<SettingsWorkspaceProjectionRow> {
+        workspace_target::require_local(&self.conn, workspace_id)?;
         anyhow::ensure!(
             volume.is_none() || (path_dev.is_some() && path_ino.is_some()),
             "workspace_volume_identity_anchor_missing"
@@ -9907,6 +9914,7 @@ impl Db {
 
     /// workspace의 프로젝트 경로. 없는 id는 None, 미설정은 Some("").
     pub fn workspace_path(&self, id: &str) -> anyhow::Result<Option<String>> {
+        workspace_target::require_local(&self.conn, id)?;
         self.conn
             .query_row("SELECT path FROM workspaces WHERE id = ?1", [id], |row| {
                 row.get(0)
@@ -9923,6 +9931,7 @@ impl Db {
         dev: Option<i64>,
         ino: Option<i64>,
     ) -> anyhow::Result<()> {
+        workspace_target::require_local(&self.conn, id)?;
         validate_workspace_text_input(id, "id")?;
         anyhow::ensure!(
             dev.is_some() == ino.is_some(),
@@ -9948,6 +9957,7 @@ impl Db {
 
     /// 프로젝트 폴더 앵커(dev, ino) — 둘 다 있을 때만 Some.
     pub fn workspace_anchor(&self, id: &str) -> anyhow::Result<Option<(i64, i64)>> {
+        workspace_target::require_local(&self.conn, id)?;
         let row: Option<(Option<i64>, Option<i64>)> = self
             .conn
             .query_row(

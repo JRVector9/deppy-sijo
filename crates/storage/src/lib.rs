@@ -30,11 +30,12 @@ pub use db::{
     PersistedActivityPane, PhysicalSecretSlotLedgerRow, PhysicalSecretSlotState,
     RELAY_DEVICE_ROWS_MAX, RELAY_DISPLAY_NAME_BYTES_MAX, RELAY_PAIRING_WINDOW_SECS_MAX,
     RELAY_PENDING_DEVICE_ROWS_MAX, RelayDeviceApproval, RelayDeviceRevocation, RelayDeviceRow,
-    RelayPendingDeviceRow, RelayPendingInsert, SettingsWorkspaceProjectionRow, StatuslineRow,
-    StructuredThreadMutation, StructuredThreadRow, WORKSPACE_NOTE_MAX_BYTES,
-    WebPushSubscriptionRow, WorkspaceFindOrCreateResult, WorkspaceFolderAnchor,
-    WorkspaceMovedPathUpdate, WorkspaceRow, native_prompt_digest,
-    prepare_agent_state_job_for_retention, task_prompt_is_displayable, task_prompt_text,
+    RelayPendingDeviceRow, RelayPendingInsert, SettingsWorkspaceProjectionRow,
+    SshWorkspaceFindOrCreateResult, StatuslineRow, StructuredThreadMutation, StructuredThreadRow,
+    WORKSPACE_NOTE_MAX_BYTES, WebPushSubscriptionRow, WorkspaceFindOrCreateResult,
+    WorkspaceFolderAnchor, WorkspaceMovedPathUpdate, WorkspaceRow, WorkspaceTargetRow,
+    native_prompt_digest, prepare_agent_state_job_for_retention, task_prompt_is_displayable,
+    task_prompt_text,
 };
 pub use mcp_store::{
     MCP_PERMISSION_POINT_BYTES_MAX, MCP_SERVER_INVENTORY_BYTES_MAX, MCP_SERVER_INVENTORY_LIMIT_MAX,

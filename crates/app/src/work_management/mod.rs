@@ -15,5 +15,6 @@ pub(crate) mod remote_controller;
 pub(crate) mod remote_dispatch;
 pub(crate) mod remote_execution;
 pub(crate) mod repository_worker;
+pub(crate) mod verification;
 #[cfg(test)]
 mod tests;

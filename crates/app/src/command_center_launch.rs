@@ -1925,6 +1925,87 @@ mod tests {
     }
 
     #[test]
+    fn command_center_main_installed_templates_reuse_slot_after_retired_main_lifetimes() {
+        let mut tools =
+            super::super::main_tools::MainTools::new(secret::RedactionService::new(), || {})
+                .unwrap();
+        let profile = RemoteWorkerProfile {
+            id: "cc-3-main".into(),
+            agent: work::AgentSelection {
+                provider: "codex".into(),
+                model: Some("configured-model".into()),
+                effort: Some("xhigh".into()),
+            },
+        };
+        let templates = Templates {
+            workers: vec![],
+            main: Some((
+                profile.clone(),
+                runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: Some("configured-agent".into()),
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                    command: "/bin/sh".into(),
+                    args: vec!["--model".into(), "configured-model".into()],
+                    env_plain: vec![],
+                    env_secrets: vec![],
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                    transient_args: vec![],
+                },
+                tools.registration_slot("project-a", 7, 3).unwrap(),
+            )),
+        };
+        // Reuse the exact installed Templates; do not replace a worker grant or launch a process.
+        for generation in 1..=129 {
+            let operation = format!("main-template-{generation}");
+            tools
+                .prepare(agent_mcp::PendingMainScope {
+                    workspace_id: "project-a".into(),
+                    runtime_instance: 7,
+                    runtime_token: "runtime-a".into(),
+                    config_revision: 3,
+                    launch_operation_id: operation.clone(),
+                })
+                .unwrap();
+            let runtime::RuntimeCommand::SpawnAgent {
+                env_secrets,
+                transient_args,
+                ..
+            } = templates.prepare(&profile, None).unwrap()
+            else {
+                panic!("installed MAIN template must produce its approved SpawnAgent");
+            };
+            assert_eq!(env_secrets.len(), 1);
+            assert_eq!(transient_args.len(), 2);
+            assert!(
+                templates.prepare(&profile, None).is_err(),
+                "one credential cannot spawn twice"
+            );
+            tools
+                .activate(
+                    &operation,
+                    agent_mcp::MainScope {
+                        workspace_id: "project-a".into(),
+                        main_session_id: format!("host:main-{generation}"),
+                        runtime_instance: 7,
+                        runtime_token: "runtime-a".into(),
+                        incarnation: "incarnation-a".into(),
+                        runtime_session_id: generation,
+                        execution_generation: generation,
+                        config_revision: 3,
+                        launch_operation_id: operation.clone(),
+                    },
+                )
+                .unwrap();
+            tools.reconcile(&[], &[], &[("project-a".into(), 7, 3)]);
+        }
+    }
+
+    #[test]
     fn main_profile_capacity_includes_the_main_only_slot() {
         assert_eq!(worker_profile_limit("codex", true), 31);
         assert_eq!(worker_profile_limit("codex", false), 32);

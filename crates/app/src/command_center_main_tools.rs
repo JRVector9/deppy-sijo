@@ -203,33 +203,56 @@ impl MainTools {
         registration.active = Some(scope);
         Ok(())
     }
-    /// Called with current host-observed tuples and durable launches still awaiting their first binding.
-    pub(super) fn reconcile(&mut self, current: &[MainScope], pending_launch_ids: &[String]) {
-        for registration in self
-            .registrations
-            .values_mut()
-            .filter(|registration| !registration.revoked)
-        {
+    /// Retain current authority and installed runtime slots, not lifetime tombstones.
+    pub(super) fn reconcile(
+        &mut self,
+        current: &[MainScope],
+        pending_launch_ids: &[String],
+        current_runtime_configs: &[(String, u64, u64)],
+    ) {
+        self.registrations.retain(|_, registration| {
             let keep = match &registration.active {
                 Some(scope) => current.contains(scope),
                 None => pending_launch_ids.contains(&registration.pending.launch_operation_id),
             };
-            if !keep {
-                self.server
-                    .auth
-                    .revoke_connection(&registration.principal_id);
-                registration.revoked = true;
-                registration.credential = None;
-                let key = (
-                    registration.pending.workspace_id.clone(),
-                    registration.pending.runtime_instance,
-                    registration.pending.config_revision,
-                );
-                if let Some(slot) = self.slots.get(&key) {
-                    slot.clear(&registration.pending.launch_operation_id);
-                }
+            if keep {
+                return true;
             }
-        }
+            // Revoke before forgetting any identity or replay record. Auth removes the bearer
+            // fingerprint under its admission lock, so even already-queued requests stay invalid.
+            self.server
+                .auth
+                .revoke_connection(&registration.principal_id);
+            registration.revoked = true;
+            registration.credential = None;
+            let key = (
+                registration.pending.workspace_id.clone(),
+                registration.pending.runtime_instance,
+                registration.pending.config_revision,
+            );
+            if let Some(slot) = self.slots.get(&key) {
+                slot.clear(&registration.pending.launch_operation_id);
+            }
+            false
+        });
+        // A live principal keeps every one-time result, including unknown outcomes. A retired
+        // principal cannot authenticate again, so its entire operation namespace is unreachable.
+        self.operations.retain(|(principal_id, _), _| {
+            self.registrations
+                .values()
+                .any(|registration| &registration.principal_id == principal_id)
+        });
+        self.slots.retain(|key, _| {
+            // Installed Templates reuse this Arc for later MAINs on the same runtime/config.
+            // Obsolete tuples are detached: an old external Arc can never consume credentials
+            // from a new slot if that tuple is subsequently recreated.
+            current_runtime_configs.contains(key)
+                || self.registrations.values().any(|registration| {
+                    registration.pending.workspace_id == key.0
+                        && registration.pending.runtime_instance == key.1
+                        && registration.pending.config_revision == key.2
+                })
+        });
     }
     pub(super) fn scope(&self, request: &Request) -> Option<MainScope> {
         self.server.auth.main_scope(request)
@@ -535,6 +558,16 @@ mod tests {
         args: Value,
         callback: impl FnMut(&MainScope, MainCall, Option<&str>) -> Result<Value, String>,
     ) -> Value {
+        let (request, caller) = queue_call(tools, token, tool, args);
+        tools.handle(request, Some(current), Some(goal), callback);
+        caller.join().unwrap()
+    }
+    fn queue_call(
+        tools: &MainTools,
+        token: &str,
+        tool: &str,
+        args: Value,
+    ) -> (Request, std::thread::JoinHandle<Value>) {
         let addr = tools.server.addr;
         let token = token.to_owned();
         let tool = tool.to_owned();
@@ -559,8 +592,7 @@ mod tests {
             .requests
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
-        tools.handle(request, Some(current), Some(goal), callback);
-        caller.join().unwrap()
+        (request, caller)
     }
     #[test]
     fn command_center_main_real_http_uses_actual_host_scope_queue_and_receipts() {
@@ -793,7 +825,7 @@ mod tests {
             assert_eq!(response["code"], expected);
         }
         assert!(parse_call("cc_propose_plan",&json!({"goal_id":"goal-a","config_revision":3,"operation_id":"large","plan_json":"x".repeat(MAX_PLAN_BYTES+1)}),&current,Some("goal-a")).is_err());
-        tools.reconcile(&[], &[]);
+        tools.reconcile(&[], &[], &[]);
         assert!(
             tools
                 .server
@@ -803,12 +835,317 @@ mod tests {
         );
     }
     #[test]
+    fn command_center_main_reclaims_retired_slots_after_configured_runtime_changes() {
+        let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        let mut retired_tokens = Vec::new();
+        // Reconfigure and replace the MAIN runtime of one workspace sequentially.
+        // Applying the slot only builds its command; no app/provider process runs.
+        for revision in 1..=32_u64 {
+            let operation = format!("main-lifecycle-{revision}");
+            let mut request = pending(&operation);
+            request.config_revision = revision;
+            request.runtime_instance = 7 + revision;
+            request.runtime_token = format!("runtime-{revision}");
+            tools.prepare(request.clone()).unwrap();
+            let slot = tools
+                .registration_slot("project-a", request.runtime_instance, revision)
+                .unwrap();
+            let token = slot
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .token
+                .expose()
+                .to_owned();
+            slot.apply(&mut spawn()).unwrap();
+            let mut current = scope(&operation);
+            current.config_revision = request.config_revision;
+            current.runtime_instance = request.runtime_instance;
+            current.runtime_token = request.runtime_token;
+            tools.activate(&operation, current).unwrap();
+            assert!(
+                tools
+                    .server
+                    .auth
+                    .authenticate_principal(&format!("Bearer {token}"), agent_mcp::now())
+                    .is_some()
+            );
+            tools.reconcile(&[], &[], &[]);
+            assert_eq!(
+                tools.registrations.values().filter(|r| !r.revoked).count(),
+                0,
+                "no active MAIN registration remains after retirement"
+            );
+            assert!(slot.0.lock().unwrap().is_none());
+            retired_tokens.push(token);
+            for token in &retired_tokens {
+                assert!(
+                    tools
+                        .server
+                        .auth
+                        .authenticate_principal(&format!("Bearer {token}"), agent_mcp::now())
+                        .is_none(),
+                    "retired authority must never become valid again"
+                );
+            }
+        }
+        let mut next = pending("main-lifecycle-33");
+        next.config_revision = 33;
+        next.runtime_instance = 40;
+        next.runtime_token = "runtime-33".into();
+        let error = tools.prepare(next).err();
+        eprintln!(
+            "after 32 sequential retirements: active={} slots={} retired={} prepare33_error={error:?}",
+            tools.registrations.values().filter(|r| !r.revoked).count(),
+            tools.slots.len(),
+            tools.registrations.values().filter(|r| r.revoked).count(),
+        );
+        for token in &retired_tokens {
+            assert!(
+                tools
+                    .server
+                    .auth
+                    .authenticate_principal(&format!("Bearer {token}"), agent_mcp::now())
+                    .is_none(),
+                "new preparation must preserve all retired credential proofs"
+            );
+        }
+        assert!(
+            error.is_none(),
+            "a new MAIN must remain available with zero active registrations; got {error:?}"
+        );
+    }
+
+    #[test]
+    fn command_center_main_reclaims_retired_registrations_for_same_installed_runtime() {
+        let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        let installed_slot = tools.registration_slot("project-a", 7, 3).unwrap();
+        let mut first_retired_token = None;
+        for attempt in 0..=MAX_REGISTRATIONS {
+            let operation = format!("main-relaunch-{attempt}");
+            tools.prepare(pending(&operation)).unwrap_or_else(|error| {
+                panic!("same installed runtime must accept MAIN relaunch {attempt}: {error}")
+            });
+            if first_retired_token.is_none() {
+                first_retired_token = Some(
+                    installed_slot
+                        .0
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .unwrap()
+                        .token
+                        .expose()
+                        .to_owned(),
+                );
+            }
+            installed_slot.apply(&mut spawn()).unwrap();
+            tools.activate(&operation, scope(&operation)).unwrap();
+            tools.reconcile(&[], &[], &[("project-a".into(), 7, 3)]);
+        }
+        assert!(installed_slot.apply(&mut spawn()).is_err());
+        assert!(tools.server.auth.connections().len() <= 65);
+        assert!(
+            tools
+                .server
+                .auth
+                .authenticate_principal(
+                    &format!("Bearer {}", first_retired_token.unwrap()),
+                    agent_mcp::now()
+                )
+                .is_none(),
+            "retired bearer must stay invalid after Auth evicts its old connection metadata"
+        );
+    }
+
+    #[test]
+    fn command_center_main_reclaims_retired_operations_but_keeps_live_replay_guards() {
+        let (mut tools, current, token) = prepared("old-main");
+        tools
+            .registration_slot("project-a", 7, 3)
+            .unwrap()
+            .apply(&mut spawn())
+            .unwrap();
+        let args = |id: usize| json!({"goal_id":"goal-a","config_revision":3,"operation_id":format!("bounded-{id}"),"task_id":"task-a"});
+        for id in 0..MAX_OPERATIONS {
+            let result = invoke(
+                &mut tools,
+                &token,
+                &current,
+                "goal-a",
+                "cc_dispatch_task",
+                args(id),
+                |_, _, _| Ok(json!({"status":"accepted"})),
+            );
+            assert_eq!(result["status"], "accepted");
+        }
+        tools.reconcile(std::slice::from_ref(&current), &[], &[]);
+        let denied = invoke(
+            &mut tools,
+            &token,
+            &current,
+            "goal-a",
+            "cc_dispatch_task",
+            args(MAX_OPERATIONS),
+            |_, _, _| panic!("live operation capacity must remain bounded"),
+        );
+        assert_eq!(denied["code"], "main_operation_capacity_no_effect");
+        let replay = invoke(
+            &mut tools,
+            &token,
+            &current,
+            "goal-a",
+            "cc_dispatch_task",
+            args(0),
+            |_, _, _| panic!("live operation must not replay after reconciliation"),
+        );
+        assert_eq!(replay["status"], "accepted");
+        let mut conflict = args(0);
+        conflict["task_id"] = json!("different-task");
+        let rejected = invoke(
+            &mut tools,
+            &token,
+            &current,
+            "goal-a",
+            "cc_dispatch_task",
+            conflict,
+            |_, _, _| panic!("conflicting live operation must not run"),
+        );
+        assert_eq!(rejected["code"], "main_operation_conflict_no_effect");
+        // Obtain a real authenticated Request before retiring its principal.
+        let (stale, caller) = queue_call(&tools, &token, "cc_dispatch_task", args(MAX_OPERATIONS));
+        tools.reconcile(&[], &[], &[]);
+        tools.prepare(pending("new-main")).unwrap();
+        let next_token = tools
+            .registration_slot("project-a", 7, 3)
+            .unwrap()
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .token
+            .expose()
+            .to_owned();
+        let next = scope("new-main");
+        tools.activate("new-main", next.clone()).unwrap();
+        tools.handle(stale, Some(&next), Some("goal-a"), |_, _, _| {
+            panic!("retired queued principal must never regain authority")
+        });
+        assert_eq!(
+            caller.join().unwrap()["code"],
+            "main_scope_changed_no_effect"
+        );
+        assert!(
+            tools
+                .server
+                .auth
+                .authenticate_principal(&format!("Bearer {token}"), agent_mcp::now())
+                .is_none()
+        );
+        for id in 0..=MAX_OPERATIONS {
+            if id == MAX_OPERATIONS / 2 {
+                // Repeat one existing identity after retirement of the other principal.
+                let replay = invoke(
+                    &mut tools,
+                    &next_token,
+                    &next,
+                    "goal-a",
+                    "cc_dispatch_task",
+                    args(0),
+                    |_, _, _| panic!("new principal replay guard must remain live"),
+                );
+                assert_eq!(replay["status"], "accepted");
+            }
+            let result = invoke(
+                &mut tools,
+                &next_token,
+                &next,
+                "goal-a",
+                "cc_dispatch_task",
+                args(id),
+                |_, _, _| Ok(json!({"status":"accepted"})),
+            );
+            if id < MAX_OPERATIONS {
+                assert_eq!(
+                    result["status"], "accepted",
+                    "retired operations must not exhaust the new principal at {id}"
+                );
+            } else {
+                assert_eq!(result["code"], "main_operation_capacity_no_effect");
+            }
+        }
+    }
+
+    #[test]
+    fn command_center_main_active_and_pending_registration_capacity_remains_bounded() {
+        let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        let mut current = vec![];
+        let mut pending_ids = vec![];
+        for id in 0..32 {
+            let operation = format!("main-live-{id}");
+            let mut request = pending(&operation);
+            request.workspace_id = format!("project-{id}");
+            tools.prepare(request.clone()).unwrap();
+            if id % 2 == 0 {
+                let mut active = scope(&operation);
+                active.workspace_id = request.workspace_id;
+                tools.activate(&operation, active.clone()).unwrap();
+                current.push(active);
+            } else {
+                pending_ids.push(operation);
+            }
+        }
+        tools.reconcile(&current, &pending_ids, &[]);
+        let mut extra = pending("capacity-denied");
+        extra.workspace_id = "project-33".into();
+        assert_eq!(
+            tools.prepare(extra.clone()),
+            Err("main_registration_capacity_no_effect".into())
+        );
+        assert_eq!(tools.registrations.len(), 32);
+        tools.reconcile(&[], &[], &[]);
+        tools.prepare(extra).unwrap();
+    }
+
+    #[test]
+    fn command_center_main_obsolete_slot_clones_cannot_consume_recreated_tuple_credentials() {
+        let (mut tools, _, retired_token) = prepared("obsolete-main");
+        let obsolete_slot = tools.registration_slot("project-a", 7, 3).unwrap();
+        // Leave the first credential unconsumed to exercise retirement of a pending secret.
+        tools.reconcile(&[], &[], &[]);
+        assert!(obsolete_slot.apply(&mut spawn()).is_err());
+        tools.prepare(pending("replacement-main")).unwrap();
+        let replacement_slot = tools.registration_slot("project-a", 7, 3).unwrap();
+        assert!(!Arc::ptr_eq(&obsolete_slot.0, &replacement_slot.0));
+        assert!(obsolete_slot.apply(&mut spawn()).is_err());
+        assert!(replacement_slot.apply(&mut spawn()).is_ok());
+        assert!(replacement_slot.apply(&mut spawn()).is_err());
+        assert!(
+            tools
+                .server
+                .auth
+                .authenticate_principal(&format!("Bearer {retired_token}"), agent_mcp::now())
+                .is_none()
+        );
+        assert_eq!(
+            tools.activate("obsolete-main", scope("obsolete-main")),
+            Err("main_registration_missing".into())
+        );
+        tools
+            .activate("replacement-main", scope("replacement-main"))
+            .unwrap();
+    }
+
+    #[test]
     fn command_center_main_retiring_old_execution_preserves_new_pending_registration() {
         let (mut tools, _, _) = prepared("main-a");
         let slot = tools.registration_slot("project-a", 7, 3).unwrap();
         slot.apply(&mut spawn()).unwrap();
         tools.prepare(pending("main-b")).unwrap();
-        tools.reconcile(&[], &["main-b".into()]);
+        tools.reconcile(&[], &["main-b".into()], &[]);
         assert!(
             slot.apply(&mut spawn()).is_ok(),
             "retiring old execution must not erase a distinct new pending credential in the same slot"
@@ -1047,7 +1384,7 @@ mod tests {
             };
             let credential_id = &env_secrets[0].1;
             if retire_scope {
-                tools.reconcile(&[], &[]);
+                tools.reconcile(&[], &[], &[]);
                 assert!(resolver.resolve(credential_id).is_err());
             }
             drop(tools);

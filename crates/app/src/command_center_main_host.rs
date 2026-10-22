@@ -48,6 +48,27 @@ fn main_goal(project: &Project) -> Option<&work::Goal> {
         .map(|request| request.goal())
         .or_else(|| project.snapshot.goals.last())
 }
+fn registration_runtime_configs(
+    host: &CommandCenterHost,
+    workspace: &str,
+    runtime_instance: u64,
+) -> [Option<(String, u64, u64)>; 2] {
+    // Temporary storage/load denial revokes authority separately. Keep both the current edit
+    // and the exact installed revision: a failed save may reload the previous durable config.
+    // Replacing the installation or runtime then makes the former template genuinely obsolete.
+    [
+        host.projects.get(workspace).map(|project| {
+            (
+                workspace.to_owned(),
+                runtime_instance,
+                project.snapshot.config.revision.0,
+            )
+        }),
+        host.installed
+            .get(&runtime_instance)
+            .map(|installed| (workspace.to_owned(), runtime_instance, installed.revision.0)),
+    ]
+}
 impl CommandCenterHost {
     pub(super) fn retire_main_operations(&mut self) {
         let stale = self
@@ -372,6 +393,16 @@ impl App {
         };
         let mut current = vec![];
         let mut pending = vec![];
+        // Keep empty slots belonging to the currently installed local runtime/configuration:
+        // its launch Templates intentionally share that Arc across successive MAIN executions.
+        let current_runtime_configs = std::iter::once(&self.active)
+            .chain(self.warm.values())
+            .flat_map(|runtime| {
+                registration_runtime_configs(host, &runtime.id, runtime.runtime_instance)
+                    .into_iter()
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
         for (id, launch) in &host.launches {
             if launch.record.task_id.is_some() || launch.record.selection.provider != "codex" {
                 continue;
@@ -435,7 +466,7 @@ impl App {
                 current.push(scope);
             }
         }
-        tools.reconcile(&current, &pending);
+        tools.reconcile(&current, &pending, &current_runtime_configs);
         host.current_main_scopes = current.clone();
         host.retire_main_operations();
         // Bounded work per frame. Callbacks enqueue; never launch/re-enter Auth while locked.
@@ -608,6 +639,177 @@ pub(super) mod tests {
             .execution_generation += 1;
         assert!(!same_main(&host, &scope));
     }
+    fn main_spawn() -> runtime::RuntimeCommand {
+        runtime::RuntimeCommand::SpawnAgent {
+            agent_config_id: Some("configured-agent".into()),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 100,
+            command: "/bin/sh".into(),
+            args: vec![],
+            env_plain: vec![],
+            env_secrets: vec![],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+            transient_args: vec![],
+        }
+    }
+    #[test]
+    fn command_center_main_host_temporary_storage_block_preserves_installed_slot_for_relaunch() {
+        let (mut host, scope) = fixture();
+        let mut tools = main_tools::MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        let pending = |operation: &str| agent_mcp::PendingMainScope {
+            workspace_id: scope.workspace_id.clone(),
+            runtime_instance: scope.runtime_instance,
+            runtime_token: scope.runtime_token.clone(),
+            config_revision: scope.config_revision,
+            launch_operation_id: operation.to_owned(),
+        };
+        tools.prepare(pending(&scope.launch_operation_id)).unwrap();
+        let installed_slot = tools
+            .registration_slot(
+                &scope.workspace_id,
+                scope.runtime_instance,
+                scope.config_revision,
+            )
+            .unwrap();
+        tools
+            .activate(&scope.launch_operation_id, scope.clone())
+            .unwrap();
+        let project = host.projects.get_mut(&scope.workspace_id).unwrap();
+        project.storage_blocked = true;
+        project.loaded = false;
+        assert!(
+            !same_main(&host, &scope),
+            "temporary denial must remove execution authority"
+        );
+        // This is the exact host identity collector used by the production MAIN pump.
+        let current_configs =
+            registration_runtime_configs(&host, &scope.workspace_id, scope.runtime_instance)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+        tools.reconcile(&[], &[], &current_configs);
+        assert_eq!(
+            tools.activate(&scope.launch_operation_id, scope.clone()),
+            Err("main_registration_missing".into())
+        );
+        let project = host.projects.get_mut(&scope.workspace_id).unwrap();
+        project.storage_blocked = false;
+        project.loaded = true;
+        tools.prepare(pending("recovered-main")).unwrap();
+        let mut command = main_spawn();
+        installed_slot.apply(&mut command).unwrap();
+        assert!(installed_slot.apply(&mut command).is_err());
+    }
+
+    #[test]
+    fn command_center_main_host_keeps_installed_slot_across_failed_config_save_and_reclaims_after_reinstall()
+     {
+        let (mut host, scope) = fixture();
+        let old_revision = work::ConfigRevision(scope.config_revision);
+        let new_revision = old_revision.next().unwrap();
+        let durable = stored::StoredProject {
+            revision: stored::ProjectRevision::new(1).unwrap(),
+            snapshot: host.projects[&scope.workspace_id].snapshot.clone(),
+        };
+        host.installed.insert(
+            scope.runtime_instance,
+            launch::Installed {
+                revision: old_revision,
+                profiles: vec![],
+            },
+        );
+        let mut tools = main_tools::MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+        let pending = |operation: &str| agent_mcp::PendingMainScope {
+            workspace_id: scope.workspace_id.clone(),
+            runtime_instance: scope.runtime_instance,
+            runtime_token: scope.runtime_token.clone(),
+            config_revision: scope.config_revision,
+            launch_operation_id: operation.to_owned(),
+        };
+        tools.prepare(pending(&scope.launch_operation_id)).unwrap();
+        let installed_slot = tools
+            .registration_slot(
+                &scope.workspace_id,
+                scope.runtime_instance,
+                scope.config_revision,
+            )
+            .unwrap();
+        tools
+            .activate(&scope.launch_operation_id, scope.clone())
+            .unwrap();
+        let project = host.projects.get_mut(&scope.workspace_id).unwrap();
+        project.snapshot.config.revision = new_revision;
+        project.storage_blocked = true;
+        let configs =
+            registration_runtime_configs(&host, &scope.workspace_id, scope.runtime_instance)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+        assert!(configs.contains(&(
+            scope.workspace_id.clone(),
+            scope.runtime_instance,
+            new_revision.0
+        )));
+        assert!(configs.contains(&(
+            scope.workspace_id.clone(),
+            scope.runtime_instance,
+            old_revision.0
+        )));
+        tools.reconcile(&[], &[], &configs);
+        // Exercise the production repository-result reducer that restores the old durable config.
+        finish_project_load(
+            &mut host,
+            &scope.workspace_id,
+            None,
+            Ok(Some(Box::new(durable))),
+        );
+        assert_eq!(
+            host.projects[&scope.workspace_id].snapshot.config.revision,
+            old_revision
+        );
+        assert!(host.projects[&scope.workspace_id].loaded);
+        assert!(!host.projects[&scope.workspace_id].storage_blocked);
+        tools.prepare(pending("recovered-durable-main")).unwrap();
+        installed_slot.apply(&mut main_spawn()).unwrap();
+        // Once the runtime really installs the new configuration, no owner needs the old slot.
+        host.projects
+            .get_mut(&scope.workspace_id)
+            .unwrap()
+            .snapshot
+            .config
+            .revision = new_revision;
+        host.installed
+            .get_mut(&scope.runtime_instance)
+            .unwrap()
+            .revision = new_revision;
+        let configs =
+            registration_runtime_configs(&host, &scope.workspace_id, scope.runtime_instance)
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>();
+        assert!(!configs.contains(&(
+            scope.workspace_id.clone(),
+            scope.runtime_instance,
+            old_revision.0
+        )));
+        tools.reconcile(&[], &[], &configs);
+        // Recreating that same old tuple now uses a distinct slot; stale Templates cannot take it.
+        tools.prepare(pending("recreated-obsolete-tuple")).unwrap();
+        assert!(installed_slot.apply(&mut main_spawn()).is_err());
+        let fresh_slot = tools
+            .registration_slot(
+                &scope.workspace_id,
+                scope.runtime_instance,
+                scope.config_revision,
+            )
+            .unwrap();
+        fresh_slot.apply(&mut main_spawn()).unwrap();
+    }
+
     #[test]
     fn command_center_main_host_rejects_exited_exact_process_before_route_refresh() {
         let mut child = std::process::Command::new("/bin/sleep")

@@ -143,6 +143,54 @@ pub struct RemoteWorkerControl {
     pub(crate) wake: Option<std::thread::Thread>,
 }
 impl RemoteWorkerControl {
+    /// Host-only launch authority, installed before enqueuing the exact operation.
+    /// Entries live for this runtime's lifetime so a revoked operation cannot be rebound.
+    /// This capability is never accepted from a runtime wire command.
+    pub fn guard_operation(
+        &self,
+        operation_id: &OperationId,
+        permit: crate::InputPermit,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            id_valid(operation_id.as_str()),
+            "remote_worker_operation_invalid"
+        );
+        let mut slot = self
+            .slot
+            .lock()
+            .map_err(|_| anyhow::anyhow!("remote_worker_lock_unavailable"))?;
+        if let Some((_, previous)) = slot
+            .operation_guards
+            .iter()
+            .find(|(id, _)| id == operation_id)
+        {
+            anyhow::ensure!(
+                previous.same_permit(&permit),
+                "remote_worker_operation_guard_immutable"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            slot.operation_guards.len() < REMOTE_WORK_OPERATIONS_MAX,
+            "remote_worker_operation_guards_full"
+        );
+        anyhow::ensure!(
+            slot.host.iter().chain(&slot.retired).all(|host| {
+                !host
+                    .pending
+                    .iter()
+                    .any(|work| &work.request.identity.operation_id == operation_id)
+                    && !host
+                        .executions
+                        .iter()
+                        .any(|work| &work.target.identity.operation_id == operation_id)
+            }),
+            "remote_worker_operation_already_started"
+        );
+        slot.operation_guards.push((operation_id.clone(), permit));
+        Ok(())
+    }
+
     /// Install from a host setup worker after all filesystem/template work completes.
     pub fn configure(&self, host: Option<RemoteWorkerHost>) -> anyhow::Result<()> {
         let mut slot = self
@@ -293,6 +341,7 @@ pub struct AttemptFolderGrant {
 }
 #[derive(Default)]
 pub(crate) struct RemoteWorkerSlot {
+    pub(crate) operation_guards: Vec<(OperationId, crate::InputPermit)>,
     pub(crate) host: Option<RemoteWorkerHost>,
     pub(crate) grant_floor: u64,
     pub(crate) access: Option<crate::remote_access::ScopedRemoteAccess>,
@@ -306,6 +355,7 @@ pub(crate) enum PendingPhase {
 pub(crate) struct PendingWork {
     pub(crate) request: RemoteWorkRequest,
     pub(crate) phase: PendingPhase,
+    pub(crate) permit: Option<crate::InputPermit>,
 }
 pub(crate) enum Progress {
     Complete(RemoteWorkResult),
@@ -759,6 +809,49 @@ mod tests {
             initial_prompt: Some("controlled fixture only".into()),
         }
     }
+    #[test]
+    fn local_operation_permit_registration_is_bounded_immutable_and_not_evicted() {
+        let control = RemoteWorkerControl {
+            slot: Arc::default(),
+            wake: None,
+        };
+        let permit = crate::InputPermit::new();
+        let operation = OperationId("guarded-operation".into());
+        control.guard_operation(&operation, permit.clone()).unwrap();
+        permit.revoke();
+        control.guard_operation(&operation, permit.clone()).unwrap();
+        assert!(
+            control
+                .guard_operation(&operation, crate::InputPermit::new())
+                .is_err()
+        );
+        assert!(
+            control
+                .guard_operation(&OperationId("".into()), permit.clone())
+                .is_err()
+        );
+        for i in 1..REMOTE_WORK_OPERATIONS_MAX {
+            control
+                .guard_operation(
+                    &OperationId(format!("guard-{i}")),
+                    crate::InputPermit::new(),
+                )
+                .unwrap();
+        }
+        assert!(
+            control
+                .guard_operation(&OperationId("overflow".into()), permit.clone())
+                .is_err()
+        );
+        control.configure(None).unwrap();
+        control.guard_operation(&operation, permit).unwrap();
+        assert!(
+            control
+                .guard_operation(&operation, crate::InputPermit::new())
+                .is_err()
+        );
+    }
+
     #[test]
     fn remote_compute_readonly_launch_query_cannot_claim_or_replay_missing_work() {
         let root =
@@ -1409,6 +1502,7 @@ mod tests {
             host.pending.push(PendingWork {
                 request: request(&caps, "pending-op"),
                 phase: PendingPhase::Claim,
+                permit: None,
             });
         }
         assert!(control.configure(Some(make_host(3))).is_err());

@@ -1,4 +1,4 @@
-//! Local permission held through the actual PTY queue write, never across event wakes.
+//! Local permission held through an actual PTY write or process launch.
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -10,11 +10,26 @@ impl InputPermit {
         Self(Arc::new(Mutex::new(true)))
     }
 
-    /// After this returns, this permit can admit no further input.
+    /// After this returns, this permit can admit no further input or process launch.
     pub fn revoke(&self) {
         if let Ok(mut allowed) = self.0.lock() {
             *allowed = false;
         }
+    }
+
+    pub(crate) fn same_permit(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
+    /// Serialize revocation with an actual local effect, not just its queue admission.
+    pub(crate) fn while_current<T>(&self, effect: impl FnOnce() -> T) -> Option<T> {
+        let allowed = self.0.lock().ok()?;
+        if !*allowed {
+            return None;
+        }
+        let result = effect();
+        drop(allowed);
+        Some(result)
     }
 }
 

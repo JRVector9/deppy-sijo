@@ -3113,6 +3113,11 @@ impl Worker {
             });
             return;
         }
+        let permit = slot
+            .operation_guards
+            .iter()
+            .find(|(id, _)| id == &request.identity.operation_id)
+            .map(|(_, permit)| permit.clone());
         let Some(host) = slot.host.as_mut() else {
             self.emit(RuntimeEvent::RemoteWorkResolved {
                 identity: request.identity,
@@ -3141,12 +3146,16 @@ impl Worker {
             });
             return;
         }
-        match self.progress_remote_work(&request, host, PendingPhase::Claim) {
+        match self.progress_remote_work(&request, host, PendingPhase::Claim, permit.as_ref()) {
             Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
                 identity: request.identity,
                 result,
             }),
-            Progress::Pending(phase) => host.pending.push(PendingWork { request, phase }),
+            Progress::Pending(phase) => host.pending.push(PendingWork {
+                request,
+                phase,
+                permit,
+            }),
         }
     }
     fn poll_remote_work(&mut self) {
@@ -3180,7 +3189,12 @@ impl Worker {
             }
             let pending = std::mem::take(&mut host.pending);
             for work in pending {
-                match self.progress_remote_work(&work.request, host, work.phase) {
+                match self.progress_remote_work(
+                    &work.request,
+                    host,
+                    work.phase,
+                    work.permit.as_ref(),
+                ) {
                     Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
                         identity: work.request.identity,
                         result,
@@ -3188,6 +3202,7 @@ impl Worker {
                     Progress::Pending(phase) => host.pending.push(PendingWork {
                         request: work.request,
                         phase,
+                        permit: work.permit,
                     }),
                 }
             }
@@ -3197,7 +3212,7 @@ impl Worker {
         use crate::remote_worker::{PendingWork, Progress};
         let pending = std::mem::take(&mut host.pending);
         for work in pending {
-            match self.progress_remote_work(&work.request, host, work.phase) {
+            match self.progress_remote_work(&work.request, host, work.phase, work.permit.as_ref()) {
                 Progress::Complete(result) => self.emit(RuntimeEvent::RemoteWorkResolved {
                     identity: work.request.identity,
                     result,
@@ -3205,6 +3220,7 @@ impl Worker {
                 Progress::Pending(phase) => host.pending.push(PendingWork {
                     request: work.request,
                     phase,
+                    permit: work.permit,
                 }),
             }
         }
@@ -3215,11 +3231,10 @@ impl Worker {
         request: &crate::remote_worker::RemoteWorkRequest,
         host: &mut crate::remote_worker::RemoteWorkerHost,
         phase: crate::remote_worker::PendingPhase,
+        permit: Option<&crate::InputPermit>,
     ) -> crate::remote_worker::Progress {
+        use crate::remote_worker::RemoteWorkResult as R;
         use crate::remote_worker::{PendingPhase, Progress as P};
-        use crate::remote_worker::{
-            RemoteWorkClaim as C, RemoteWorkError as E, RemoteWorkResult as R,
-        };
         if let PendingPhase::Resolve(result) = phase {
             return match host.journal.resolve(request, &result) {
                 Ok(true) => P::Complete(result),
@@ -3227,6 +3242,28 @@ impl Worker {
                 Err(_) => P::Complete(R::ObservationUnknown),
             };
         }
+        match permit {
+            Some(permit) => permit
+                .while_current(|| self.claim_remote_work(request, host))
+                // Revocation cannot erase a previous effect. Query only: never claim/replay
+                // an unknown operation, and let a pending read yield to the runtime loop.
+                .unwrap_or_else(|| {
+                    self.remote_query_result(request, host)
+                        .map_or(P::Pending(PendingPhase::Claim), P::Complete)
+                }),
+            None => self.claim_remote_work(request, host),
+        }
+    }
+
+    fn claim_remote_work(
+        &mut self,
+        request: &crate::remote_worker::RemoteWorkRequest,
+        host: &mut crate::remote_worker::RemoteWorkerHost,
+    ) -> crate::remote_worker::Progress {
+        use crate::remote_worker::{PendingPhase, Progress as P};
+        use crate::remote_worker::{
+            RemoteWorkClaim as C, RemoteWorkError as E, RemoteWorkResult as R,
+        };
         let reject = |code| R::Rejected { code };
         let id = &request.identity;
         if id.device_id != host.config.device_id || id.workspace_id != host.config.workspace_id {
@@ -8301,6 +8338,405 @@ mod tests {
             },
             event_rx,
         )
+    }
+
+    struct LaunchPermitJournal {
+        ready: std::sync::atomic::AtomicBool,
+        resolve_ready: std::sync::atomic::AtomicBool,
+        claims: std::sync::atomic::AtomicUsize,
+        result: Mutex<Option<crate::remote_worker::RemoteWorkResult>>,
+    }
+
+    impl crate::remote_worker::RemoteWorkJournal for LaunchPermitJournal {
+        fn lookup(
+            &self,
+            _: &crate::remote_worker::RemoteWorkRequest,
+        ) -> anyhow::Result<crate::remote_worker::RemoteWorkLookup> {
+            Ok(self.result.lock().unwrap().clone().map_or(
+                crate::remote_worker::RemoteWorkLookup::Unknown,
+                crate::remote_worker::RemoteWorkLookup::Resolved,
+            ))
+        }
+
+        fn claim(
+            &self,
+            _: &crate::remote_worker::RemoteWorkRequest,
+        ) -> anyhow::Result<crate::remote_worker::RemoteWorkClaim> {
+            if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(crate::remote_worker::RemoteWorkClaim::Pending);
+            }
+            self.claims
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::remote_worker::RemoteWorkClaim::New)
+        }
+
+        fn resolve(
+            &self,
+            _: &crate::remote_worker::RemoteWorkRequest,
+            result: &crate::remote_worker::RemoteWorkResult,
+        ) -> anyhow::Result<bool> {
+            if !self.resolve_ready.load(std::sync::atomic::Ordering::SeqCst) {
+                return Ok(false);
+            }
+            *self.result.lock().unwrap() = Some(result.clone());
+            Ok(true)
+        }
+    }
+
+    struct LaunchPermitLauncher;
+
+    impl crate::remote_worker::RemoteWorkLauncher for LaunchPermitLauncher {
+        fn prepare(
+            &self,
+            _: &crate::remote_worker::RemoteWorkerProfile,
+            _: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            Ok(spawn_agent_cmd("exit 0", None, None))
+        }
+    }
+
+    struct GatedPermitLauncher {
+        entered: SyncSender<()>,
+        release: Mutex<Receiver<()>>,
+    }
+
+    impl crate::remote_worker::RemoteWorkLauncher for GatedPermitLauncher {
+        fn prepare(
+            &self,
+            profile: &crate::remote_worker::RemoteWorkerProfile,
+            prompt: Option<&str>,
+        ) -> anyhow::Result<RuntimeCommand> {
+            self.entered.send(())?;
+            self.release.lock().unwrap().recv()?;
+            LaunchPermitLauncher.prepare(profile, prompt)
+        }
+    }
+
+    fn launch_permit_fixture(
+        ready: bool,
+    ) -> (
+        Worker,
+        RuntimeEventReceiver,
+        crate::remote_worker::RemoteWorkerControl,
+        crate::remote_worker::RemoteWorkRequest,
+        Arc<LaunchPermitJournal>,
+    ) {
+        use crate::remote_worker::*;
+        use deppy_core::work_management::{AttemptId, OperationId, RuntimeIncarnationId};
+        let (mut worker, _) = admission_worker(
+            Arc::new(RecordingResolver {
+                calls: Mutex::default(),
+                value: None,
+            }),
+            "launch-permit",
+        );
+        // A real spawn emits several mux/status events before its durable receipt.
+        let (event_sender, events) = sync_channel(256);
+        let events = {
+            let mut subscribers = worker.subscribers.lock().unwrap();
+            let subscriber = &mut subscribers[0];
+            subscriber.events = event_sender;
+            RuntimeEventReceiver {
+                events,
+                pending_durable: Mutex::default(),
+                overflowed: Arc::clone(&subscriber.overflowed),
+                viewports: Arc::clone(&subscriber.viewports),
+                history_results: Arc::clone(&subscriber.history_results),
+                input_pressures: Arc::clone(&subscriber.input_pressures),
+                resource_usage: Arc::clone(&subscriber.resource_usage),
+            }
+        };
+        std::fs::create_dir_all(&worker.logs_root).unwrap();
+        let journal = Arc::new(LaunchPermitJournal {
+            ready: std::sync::atomic::AtomicBool::new(ready),
+            resolve_ready: std::sync::atomic::AtomicBool::new(true),
+            claims: std::sync::atomic::AtomicUsize::new(0),
+            result: Mutex::default(),
+        });
+        let control = RemoteWorkerControl {
+            slot: Arc::clone(&worker.remote_worker),
+            wake: None,
+        };
+        control
+            .configure(Some(
+                RemoteWorkerHost::new(
+                    RemoteWorkerConfig {
+                        device_id: "launch-permit".into(),
+                        workspace_id: deppy_core::WorkspaceId("workspace".into()),
+                        folder: worker.logs_root.clone(),
+                        grant_epoch: 1,
+                        max_workers: 2,
+                        profiles: vec![RemoteWorkerProfile {
+                            id: "fixture-profile".into(),
+                            agent: deppy_core::work_management::AgentSelection {
+                                provider: "fixture".into(),
+                                model: None,
+                                effort: None,
+                            },
+                        }],
+                    },
+                    Arc::new(LaunchPermitLauncher),
+                    journal.clone(),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        worker.inspect_remote_worker(1);
+        let capabilities = events
+            .events
+            .try_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::RemoteWorkerObserved { capabilities, .. } => capabilities,
+                _ => None,
+            })
+            .unwrap();
+        let request = RemoteWorkRequest {
+            identity: RemoteWorkIdentity {
+                device_id: capabilities.device_id,
+                workspace_id: capabilities.workspace_id,
+                attempt_id: AttemptId("permit-attempt".into()),
+                operation_id: OperationId("permit-operation".into()),
+                incarnation: RuntimeIncarnationId(worker.instance_token.clone()),
+                grant_epoch: capabilities.grant_epoch,
+                lease_epoch: capabilities.lease_epoch,
+            },
+            folder: capabilities.folder,
+            folder_anchor: capabilities.folder_anchor,
+            profile_id: "fixture-profile".into(),
+            initial_prompt: None,
+        };
+        (worker, events, control, request, journal)
+    }
+
+    #[test]
+    fn local_operation_permit_revoked_before_queue_drain_cannot_spawn() {
+        let (mut worker, events, control, request, journal) = launch_permit_fixture(true);
+        let permit = crate::InputPermit::new();
+        control
+            .guard_operation(&request.identity.operation_id, permit.clone())
+            .unwrap();
+        let (commands, receiver) = sync_channel(1);
+        worker.command_rx = receiver;
+        commands
+            .send(
+                prepare_queued_command(
+                    RuntimeCommand::SpawnRemoteWork { request },
+                    &Arc::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        permit.revoke();
+        let queued = worker.command_rx.try_recv().unwrap();
+        worker.handle_queued_command(queued);
+        assert!(
+            worker.sessions.is_empty(),
+            "revoked queued launch created a session"
+        );
+        assert_eq!(journal.claims.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(events.events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RemoteWorkResolved {
+                result: crate::remote_worker::RemoteWorkResult::ObservationUnknown,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn local_operation_permit_revoked_before_deferred_claim_cannot_spawn() {
+        let (mut worker, events, control, request, journal) = launch_permit_fixture(false);
+        let permit = crate::InputPermit::new();
+        control
+            .guard_operation(&request.identity.operation_id, permit.clone())
+            .unwrap();
+        worker.handle_queued_command(
+            prepare_queued_command(RuntimeCommand::SpawnRemoteWork { request }, &Arc::default())
+                .unwrap(),
+        );
+        assert!(worker.sessions.is_empty());
+        assert_eq!(
+            control
+                .slot
+                .lock()
+                .unwrap()
+                .host
+                .as_ref()
+                .unwrap()
+                .pending
+                .len(),
+            1
+        );
+        permit.revoke();
+        journal
+            .ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        worker.poll_remote_work();
+        assert!(
+            worker.sessions.is_empty(),
+            "revoked deferred claim created a session"
+        );
+        assert_eq!(journal.claims.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(events.events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RemoteWorkResolved {
+                result: crate::remote_worker::RemoteWorkResult::ObservationUnknown,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn local_operation_permit_revocation_preserves_prior_launch_receipt() {
+        use crate::remote_worker::RemoteWorkResult;
+        let (mut worker, events, control, request, journal) = launch_permit_fixture(true);
+        let permit = crate::InputPermit::new();
+        control
+            .guard_operation(&request.identity.operation_id, permit.clone())
+            .unwrap();
+        worker.handle_queued_command(
+            prepare_queued_command(
+                RuntimeCommand::SpawnRemoteWork {
+                    request: request.clone(),
+                },
+                &Arc::default(),
+            )
+            .unwrap(),
+        );
+        let original = events
+            .events
+            .try_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::RemoteWorkResolved { result, .. } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert!(matches!(original, RemoteWorkResult::Launched { .. }));
+        permit.revoke();
+        worker.handle_queued_command(
+            prepare_queued_command(RuntimeCommand::SpawnRemoteWork { request }, &Arc::default())
+                .unwrap(),
+        );
+        let repeated = events
+            .events
+            .try_iter()
+            .find_map(|event| match event {
+                RuntimeEvent::RemoteWorkResolved { result, .. } => Some(result),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            repeated, original,
+            "revocation must not deny an effect already recorded"
+        );
+        assert_eq!(worker.sessions.len(), 1);
+        assert_eq!(journal.claims.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_operation_permit_revoke_waits_through_admitted_process_launch() {
+        let (mut worker, _events, control, request, journal) = launch_permit_fixture(true);
+        let (entered, preparing) = sync_channel(1);
+        let (release, released) = sync_channel(1);
+        control.slot.lock().unwrap().host.as_mut().unwrap().launcher =
+            Arc::new(GatedPermitLauncher {
+                entered,
+                release: Mutex::new(released),
+            });
+        let permit = crate::InputPermit::new();
+        control
+            .guard_operation(&request.identity.operation_id, permit.clone())
+            .unwrap();
+        let (revoking, revoke_started) = sync_channel(1);
+        let (revoked, revoke_done) = sync_channel(1);
+        let revoke = std::thread::spawn(move || {
+            preparing.recv_timeout(Duration::from_secs(5)).unwrap();
+            revoking.send(()).unwrap();
+            permit.revoke();
+            let _ = revoked.send(());
+        });
+        let release_launch = std::thread::spawn(move || {
+            revoke_started.recv_timeout(Duration::from_secs(5)).unwrap();
+            let early = revoke_done.recv_timeout(Duration::from_millis(50));
+            release.send(()).unwrap();
+            early
+        });
+        worker.handle_command(RuntimeCommand::SpawnRemoteWork { request });
+        let early = release_launch.join().unwrap();
+        revoke.join().unwrap();
+        assert!(
+            matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)),
+            "revocation returned while the previously admitted process launch was still pending"
+        );
+        assert_eq!(worker.sessions.len(), 1);
+        assert_eq!(journal.claims.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_operation_permit_revocation_preserves_pending_result_commit() {
+        let (mut worker, events, control, request, journal) = launch_permit_fixture(true);
+        let permit = crate::InputPermit::new();
+        control
+            .guard_operation(&request.identity.operation_id, permit.clone())
+            .unwrap();
+        journal
+            .resolve_ready
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        worker.handle_command(RuntimeCommand::SpawnRemoteWork { request });
+        assert_eq!(worker.sessions.len(), 1);
+        assert!(
+            !events
+                .events
+                .try_iter()
+                .any(|event| matches!(event, RuntimeEvent::RemoteWorkResolved { .. }))
+        );
+        permit.revoke();
+        journal
+            .resolve_ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        worker.poll_remote_work();
+        assert!(events.events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RemoteWorkResolved {
+                result: crate::remote_worker::RemoteWorkResult::Launched { .. },
+                ..
+            }
+        )));
+        assert_eq!(worker.sessions.len(), 1);
+        assert_eq!(journal.claims.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn local_operation_permit_does_not_block_unguarded_work_and_rejects_late_registration() {
+        let (mut worker, events, control, request, journal) = launch_permit_fixture(false);
+        let unrelated = crate::InputPermit::new();
+        unrelated.revoke();
+        control
+            .guard_operation(
+                &deppy_core::work_management::OperationId("unrelated".into()),
+                unrelated,
+            )
+            .unwrap();
+        worker.handle_command(RuntimeCommand::SpawnRemoteWork {
+            request: request.clone(),
+        });
+        assert!(
+            control
+                .guard_operation(&request.identity.operation_id, crate::InputPermit::new())
+                .is_err()
+        );
+        journal
+            .ready
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        worker.poll_remote_work();
+        assert_eq!(worker.sessions.len(), 1);
+        assert!(events.events.try_iter().any(|event| matches!(
+            event,
+            RuntimeEvent::RemoteWorkResolved {
+                result: crate::remote_worker::RemoteWorkResult::Launched { .. },
+                ..
+            }
+        )));
     }
 
     #[test]

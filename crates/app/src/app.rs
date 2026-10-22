@@ -6633,8 +6633,53 @@ impl ui::agent_sessions::CodexAppServerHost for AppCodexAppServerHost {
     }
 }
 
-/// Production runtime port: logical metadata IDs are resolved through the current SQLite pointer
-/// to one validated physical keyring slot. There is deliberately no logical-ID fallback.
+const EPHEMERAL_MAIN_CREDENTIAL_PREFIX: &str = "command-center-main-ephemeral:";
+const MAX_EPHEMERAL_MAIN_CREDENTIALS: usize = 256;
+
+fn ephemeral_main_credentials()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<String, secret::SecretString>> {
+    static CREDENTIALS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, secret::SecretString>>,
+    > = std::sync::OnceLock::new();
+    CREDENTIALS.get_or_init(Default::default)
+}
+
+/// An in-memory, one-use runtime credential reference. Registration retirement revokes it even
+/// when a queued command still holds the opaque ID. No credential is stored in a command or DB.
+struct EphemeralMainCredential {
+    id: String,
+}
+
+impl EphemeralMainCredential {
+    fn register(value: secret::SecretString) -> anyhow::Result<Self> {
+        let mut credentials = ephemeral_main_credentials()
+            .lock()
+            .map_err(|_| anyhow::anyhow!("runtime_ephemeral_secret_unavailable"))?;
+        anyhow::ensure!(
+            credentials.len() < MAX_EPHEMERAL_MAIN_CREDENTIALS,
+            "runtime_ephemeral_secret_capacity"
+        );
+        let id = format!("{EPHEMERAL_MAIN_CREDENTIAL_PREFIX}{}", uuid::Uuid::new_v4());
+        credentials.insert(id.clone(), value);
+        Ok(Self { id })
+    }
+
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl Drop for EphemeralMainCredential {
+    fn drop(&mut self) {
+        if let Ok(mut credentials) = ephemeral_main_credentials().lock() {
+            credentials.remove(&self.id);
+        }
+    }
+}
+
+/// Production runtime port: ephemeral MAIN references resolve once from memory; logical metadata
+/// IDs resolve through the current SQLite pointer to one validated physical keyring slot.
+/// Unknown ephemeral references never fall back to SQLite or the keyring.
 struct AppRuntimeSecretResolver {
     db_path: PathBuf,
     db: std::sync::Mutex<Option<Db>>,
@@ -6660,6 +6705,14 @@ impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
         &self,
         logical_credential_id: &str,
     ) -> anyhow::Result<(runtime::RuntimeSecret, Option<String>)> {
+        if logical_credential_id.starts_with(EPHEMERAL_MAIN_CREDENTIAL_PREFIX) {
+            let value = ephemeral_main_credentials()
+                .lock()
+                .map_err(|_| anyhow::anyhow!("runtime_ephemeral_secret_unavailable"))?
+                .remove(logical_credential_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime_ephemeral_secret_missing"))?;
+            return Ok((runtime::RuntimeSecret::new(value.into_string()), None));
+        }
         let logical = secret::LogicalCredentialId::new(logical_credential_id.to_owned())
             .map_err(|_| anyhow::anyhow!("runtime_secret_logical_id_invalid"))?;
         let mut db = self

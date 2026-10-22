@@ -13,6 +13,8 @@ const TOKEN_ENV: &str = "DEPPY_CC_MAIN_TOKEN";
 struct LaunchCredential {
     launch_operation_id: String,
     endpoint: String,
+    credential_id: String,
+    #[cfg(test)]
     token: secret::SecretString,
 }
 /// A stable, empty slot can be installed before a MAIN exists. Each credential is consumed once.
@@ -21,7 +23,7 @@ pub(super) struct MainRegistration(Arc<Mutex<Option<LaunchCredential>>>);
 impl MainRegistration {
     pub(super) fn apply(&self, command: &mut runtime::RuntimeCommand) -> anyhow::Result<()> {
         let runtime::RuntimeCommand::SpawnAgent {
-            args,
+            transient_args,
             env_plain,
             env_secrets,
             ..
@@ -35,7 +37,7 @@ impl MainRegistration {
             .map_err(|_| anyhow::anyhow!("main_registration_unavailable"))?
             .take()
             .ok_or_else(|| anyhow::anyhow!("main_registration_already_consumed"))?;
-        args.extend([
+        transient_args.extend([
             "-c".into(),
             format!(
                 "mcp_servers.deppy_command_center={{url={},bearer_token_env_var=\"{TOKEN_ENV}\",enabled=true}}",
@@ -44,7 +46,7 @@ impl MainRegistration {
         ]);
         env_plain.retain(|(name, _)| name != TOKEN_ENV);
         env_secrets.retain(|(name, _)| name != TOKEN_ENV);
-        env_secrets.push((TOKEN_ENV.into(), credential.token.expose().into()));
+        env_secrets.push((TOKEN_ENV.into(), credential.credential_id));
         Ok(())
     }
     fn clear(&self, launch_operation_id: &str) {
@@ -63,6 +65,7 @@ struct Registration {
     pending: PendingMainScope,
     active: Option<MainScope>,
     revoked: bool,
+    credential: Option<crate::app::EphemeralMainCredential>,
 }
 struct Operation {
     tool: String,
@@ -151,9 +154,20 @@ impl MainTools {
             .auth
             .mint_pending_main_connection(pending.clone(), agent_mcp::now())
             .ok_or("main_registration_unavailable")?;
+        let credential = match crate::app::EphemeralMainCredential::register(
+            secret::SecretString::new(token.to_string()),
+        ) {
+            Ok(credential) => credential,
+            Err(_) => {
+                self.server.auth.revoke_connection(&principal.id);
+                return Err("main_registration_unavailable_no_effect".into());
+            }
+        };
         *cell = Some(LaunchCredential {
             launch_operation_id: pending.launch_operation_id.clone(),
             endpoint: format!("http://{}/mcp", self.server.addr),
+            credential_id: credential.id().to_owned(),
+            #[cfg(test)]
             token: secret::SecretString::new(token.to_string()),
         });
         self.registrations.insert(
@@ -163,6 +177,7 @@ impl MainTools {
                 pending,
                 active: None,
                 revoked: false,
+                credential: Some(credential),
             },
         );
         Ok(())
@@ -204,6 +219,7 @@ impl MainTools {
                     .auth
                     .revoke_connection(&registration.principal_id);
                 registration.revoked = true;
+                registration.credential = None;
                 let key = (
                     registration.pending.workspace_id.clone(),
                     registration.pending.runtime_instance,
@@ -322,23 +338,35 @@ fn bounded_response(
     {
         return Err("main_response_too_large_no_effect".into());
     }
-    fn redact(value: &mut Value, redaction: &secret::RedactionSnapshot) {
+    fn redact(value: &mut Value, redaction: &secret::RedactionService, fragment: bool) {
         match value {
-            Value::String(text) => *text = redaction.redact_wrapped_text(text),
+            Value::String(text) => {
+                *text = if fragment {
+                    redaction.redact_wrapped_fragment(text)
+                } else {
+                    redaction.redact_wrapped_text(text)
+                };
+            }
             Value::Array(values) => {
                 for value in values {
-                    redact(value, redaction);
+                    redact(value, redaction, fragment);
                 }
             }
             Value::Object(values) => {
-                for value in values.values_mut() {
-                    redact(value, redaction);
+                for (key, value) in values {
+                    // These host display fields may already be clipped. Protocol identities and
+                    // statuses must retain exact semantics, including one-character overlaps.
+                    redact(
+                        value,
+                        redaction,
+                        matches!(key.as_str(), "title" | "prompt" | "detail"),
+                    );
                 }
             }
             _ => {}
         }
     }
-    redact(&mut value, &redaction.snapshot());
+    redact(&mut value, redaction, false);
     if serde_json::to_vec(&value)
         .map_err(|_| "main_response_too_large_no_effect")?
         .len()
@@ -635,6 +663,7 @@ mod tests {
         assert!(slot.apply(&mut spawn()).is_err());
         let runtime::RuntimeCommand::SpawnAgent {
             args,
+            transient_args,
             env_plain,
             env_secrets,
             ..
@@ -642,12 +671,21 @@ mod tests {
         else {
             unreachable!()
         };
-        assert_eq!(&args[..2], &["--model", "configured-model"]);
-        assert_eq!(args.len(), 4);
-        assert!(args[3].starts_with("mcp_servers.deppy_command_center={url=\"http://127.0.0.1:"));
+        assert_eq!(args, ["--model", "configured-model"]);
+        assert_eq!(transient_args.len(), 2);
+        assert_eq!(transient_args[0], "-c");
+        assert!(
+            transient_args[1]
+                .starts_with("mcp_servers.deppy_command_center={url=\"http://127.0.0.1:")
+        );
         assert_eq!(env_plain, vec![("KEEP".into(), "configured".into())]);
         assert_eq!(env_secrets.len(), 1);
         assert_eq!(env_secrets[0].0, TOKEN_ENV);
+        assert!(
+            env_secrets[0]
+                .1
+                .starts_with(crate::app::EPHEMERAL_MAIN_CREDENTIAL_PREFIX)
+        );
         assert!(!args.iter().any(|arg| arg.contains(&env_secrets[0].1)));
     }
     #[test]
@@ -841,5 +879,181 @@ mod tests {
             |_, _, _| Ok(json!({"text":format!("credential={token}")})),
         );
         assert!(!response.to_string().contains(&token));
+    }
+
+    #[test]
+    fn command_center_main_response_masks_secrets_clipped_by_host_metadata_caps() {
+        let redaction = secret::RedactionService::new();
+        let credential = "secret-unfinished-crossing-metadata-boundary";
+        redaction.register(&secret::SecretString::new(credential.into()));
+        for cap in [512, 4096] {
+            let prefix = "description ".repeat(cap / 12 + 1);
+            let prefix = &prefix[..cap - 17];
+            let clipped = format!("{prefix}{credential}")[..cap].to_owned();
+            assert!(clipped.ends_with("secret-unfinished"));
+            let result = bounded_response(
+                json!({"status":"success","host_operation_id":"yes","nested":[{"detail":clipped}]}),
+                &redaction,
+            )
+            .unwrap();
+            assert_eq!(result["status"], "success");
+            assert_eq!(result["host_operation_id"], "yes");
+            assert!(
+                !result.to_string().contains("secret-unfinished"),
+                "host metadata leaked a credential prefix at cap {cap}"
+            );
+        }
+    }
+    #[test]
+    fn command_center_main_registered_launch_uses_production_resolver_and_owned_child_env() {
+        use runtime::{RuntimeCommandSink, RuntimeEventStream, RuntimeSecretResolver};
+        use sha2::Digest;
+        let root =
+            std::env::temp_dir().join(format!("deppy-main-ephemeral-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let redaction = secret::RedactionService::new();
+        let mut tools = MainTools::new(redaction.clone(), || {}).unwrap();
+        tools.prepare(pending("owned-env")).unwrap();
+        let registration = tools.registration_slot("project-a", 7, 3).unwrap();
+        let token = registration
+            .0
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .token
+            .expose()
+            .to_owned();
+        let output = root.join("child-env.sha256");
+        let script = format!(
+            "test -n \"${TOKEN_ENV}\" && printf '%s' \"${TOKEN_ENV}\" | /usr/bin/shasum -a 256 > '{}'",
+            output.to_string_lossy().replace('\'', "'\\''")
+        );
+        let mut command = spawn();
+        if let runtime::RuntimeCommand::SpawnAgent {
+            args,
+            env_plain,
+            env_secrets,
+            ..
+        } = &mut command
+        {
+            *args = vec!["-c".into(), script];
+            env_plain.clear();
+            env_secrets.clear();
+        }
+        registration.apply(&mut command).unwrap();
+        let serialized = serde_json::to_string(&command).unwrap();
+        let credential_id = match &command {
+            runtime::RuntimeCommand::SpawnAgent { env_secrets, .. } => env_secrets[0].1.clone(),
+            _ => unreachable!(),
+        };
+        let db_path = root.join("must-not-create.db");
+        let resolver = Arc::new(crate::app::AppRuntimeSecretResolver::new(db_path.clone()));
+        let client = runtime::InProcessRuntimeClient::try_new_with_resolver(
+            5,
+            resolver.clone(),
+            root.join("logs"),
+            redaction,
+            None,
+            Some(root.clone()),
+            vec![],
+        )
+        .unwrap();
+        let events = client.subscribe();
+        client.send_command(command).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let spawned = loop {
+            if let Some(event) = events.drain().into_iter().find(|event| {
+                matches!(
+                    event,
+                    runtime::RuntimeEvent::AgentSpawned { .. }
+                        | runtime::RuntimeEvent::SpawnFailed { .. }
+                )
+            }) {
+                break event;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned fixture did not report spawn outcome"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if let runtime::RuntimeEvent::SpawnFailed { message, .. } = spawned {
+            panic!(
+                "registered MAIN could not resolve its credential through the production runtime resolver: {message:?}"
+            );
+        }
+        while !output.exists()
+            || std::fs::read_to_string(&output)
+                .unwrap_or_default()
+                .trim()
+                .is_empty()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "owned child did not capture its environment digest"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let actual = std::fs::read_to_string(&output).unwrap();
+        let expected = sha2::Sha256::digest(token.as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        assert_eq!(actual.split_whitespace().next(), Some(expected.as_str()));
+        assert!(
+            !serialized.contains(&token),
+            "raw bearer entered command serialization"
+        );
+        assert!(
+            resolver.resolve(&credential_id).is_err(),
+            "one-use credential resolved twice"
+        );
+        assert!(
+            resolver.db.lock().unwrap().is_none(),
+            "ephemeral reference opened the repository"
+        );
+        assert!(
+            !db_path.exists(),
+            "ephemeral credential resolution touched SQLite"
+        );
+        drop(client);
+        drop(tools);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn command_center_main_ephemeral_credential_retires_without_repository_fallback() {
+        use runtime::RuntimeSecretResolver;
+        let db_path =
+            std::env::temp_dir().join(format!("must-not-create-{}.db", uuid::Uuid::new_v4()));
+        let resolver = crate::app::AppRuntimeSecretResolver::new(db_path.clone());
+        assert!(
+            resolver
+                .resolve(&format!(
+                    "{}unknown",
+                    crate::app::EPHEMERAL_MAIN_CREDENTIAL_PREFIX
+                ))
+                .is_err()
+        );
+        for retire_scope in [true, false] {
+            let mut tools = MainTools::new(secret::RedactionService::new(), || {}).unwrap();
+            tools.prepare(pending("retired-credential")).unwrap();
+            let slot = tools.registration_slot("project-a", 7, 3).unwrap();
+            let mut command = spawn();
+            slot.apply(&mut command).unwrap();
+            let runtime::RuntimeCommand::SpawnAgent { env_secrets, .. } = command else {
+                unreachable!()
+            };
+            let credential_id = &env_secrets[0].1;
+            if retire_scope {
+                tools.reconcile(&[], &[]);
+                assert!(resolver.resolve(credential_id).is_err());
+            }
+            drop(tools);
+            assert!(resolver.resolve(credential_id).is_err());
+        }
+        assert!(resolver.db.lock().unwrap().is_none());
+        assert!(!db_path.exists());
     }
 }

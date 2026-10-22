@@ -10,6 +10,7 @@ mod layout;
 mod main;
 mod server;
 mod settings;
+mod verification;
 mod workers;
 
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,10 @@ use std::collections::BTreeMap;
 
 pub use conversation::{
     ConversationActivityState, ConversationEntry, ConversationEntryKind, MainConversation,
+};
+pub use deppy_core::work_management::{
+    CommandVerificationEvidence, CommandVerificationOutcome, VerificationId, VerificationSpec,
+    VerificationTarget,
 };
 pub use devices::{
     AssignmentChoice, ExecutionCandidate, ExecutionProfile, ExecutionSetup,
@@ -150,6 +155,14 @@ pub struct RemoteTerminal {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default)]
+    pub verification_target: Option<VerificationTarget>,
+    #[serde(default)]
+    pub command_verification: Option<CommandVerificationEvidence>,
+    #[serde(default)]
+    pub execute_verification: Capability,
+    #[serde(default)]
+    pub cancel_verification: Capability,
     #[serde(skip)]
     pub reconcile_remote: Capability,
     #[serde(default)]
@@ -330,6 +343,18 @@ impl Default for Snapshot {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Intent {
     #[serde(skip)]
+    ExecuteVerification {
+        target: RouteTarget,
+        expected: VerificationTarget,
+        spec: VerificationSpec,
+    },
+    #[serde(skip)]
+    CancelVerification {
+        target: RouteTarget,
+        expected: VerificationTarget,
+        verification_id: VerificationId,
+    },
+    #[serde(skip)]
     ReconcileRemote {
         target: RouteTarget,
     },
@@ -484,6 +509,7 @@ pub struct UiState {
     pub aux_tab: Option<DetailTab>,
     result_reports: BTreeMap<RouteTarget, String>,
     verification_reports: BTreeMap<RouteTarget, String>,
+    command_verification_drafts: BTreeMap<String, VerificationSpec>,
     task_workers: BTreeMap<String, Option<String>>,
     plan_json: BTreeMap<String, String>,
     active_workspace: Option<String>,

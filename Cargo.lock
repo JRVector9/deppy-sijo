@@ -1229,6 +1229,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "deppy-remote-host"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "postcard",
+ "runtime",
+ "secret",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "uuid",
+]
+
+[[package]]
 name = "deppy-sijo"
 version = "0.13.0"
 dependencies = [

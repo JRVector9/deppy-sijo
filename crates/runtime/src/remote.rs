@@ -52,6 +52,8 @@ use crate::protocol::{
 use crate::tls_identity::TlsIdentity;
 
 mod liveness;
+pub mod ssh_stream;
+pub use ssh_stream::*;
 
 /// 이벤트 pump 폴링 주기 — worker의 output batch와 별개인 전송 주기.
 const PUMP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);

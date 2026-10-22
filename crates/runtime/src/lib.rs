@@ -72,6 +72,12 @@ pub use pty::{
     PtyInputRejectReason,
 };
 pub use remote::{RemoteRuntimeClient, RemoteRuntimeServer, TofuOutcome};
+pub use remote::{
+    SSH_FRAME_BYTES_MAX, SSH_RPC_BYTES_MAX, SshClientHello, SshHandshakeError, SshRequestContext,
+    SshResume, SshRpcExecutor, SshRpcHandler, SshRpcReply, SshRuntimeClient, SshServerConfig,
+    SshServerHello, SshTargetIdentity, read_ssh_frame, serve_ssh_stream,
+    serve_ssh_stream_with_rpc_executor, write_ssh_frame, write_ssh_handshake_rejection,
+};
 pub use resource_monitor::{
     ProcessResourceMonitor, ProcessResourceMonitorConfig, ProcessResourceSnapshot,
     SessionResourceTarget, SessionResourceUsage,

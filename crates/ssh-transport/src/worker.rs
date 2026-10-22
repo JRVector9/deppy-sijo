@@ -6,7 +6,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{DirBuilderExt, PermissionsExt},
+            fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
             net::{UnixListener, UnixStream},
             process::CommandExt,
         },
@@ -124,7 +124,11 @@ impl Drop for OwnedChild {
         let _ = self.0.wait();
     }
 }
-fn base_command(options: &SshLaunchOptions, resolve: bool) -> Command {
+fn base_command(
+    options: &SshLaunchOptions,
+    resolve: bool,
+    diagnostics: Option<&std::path::Path>,
+) -> Command {
     let mut cmd = Command::new(&options.ssh_program);
     cmd.process_group(0).env("LC_ALL", "C").env("LANG", "C");
     if resolve {
@@ -172,6 +176,9 @@ fn base_command(options: &SshLaunchOptions, resolve: bool) -> Command {
             "ForkAfterAuthentication=no",
         ]);
     }
+    if let Some(path) = diagnostics {
+        cmd.arg("-E").arg(path);
+    }
     if let Some(port) = options.port.or(options.destination.port) {
         cmd.arg("-p").arg(port.to_string());
     }
@@ -193,7 +200,7 @@ fn resolve(
     deadline: Instant,
 ) -> Result<ResolvedIdentity, FailureKind> {
     let mut child = OwnedChild(
-        base_command(options, true)
+        base_command(options, true, None)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -288,10 +295,26 @@ impl PrivateBroker {
         }
         result
     }
+    fn diagnostics(&self) -> io::Result<(File, PathBuf)> {
+        let path = self.root.join("diagnostics");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        if unsafe { libc::mkfifo(name.as_ptr(), 0o600) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // A FIFO bounds diagnostics in kernel memory and never retains a raw log on disk.
+        // Open the reader before SSH opens its -E writer so neither side blocks spawning.
+        let reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        Ok((reader, path))
+    }
 }
 impl Drop for PrivateBroker {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.root.join("askpass"));
+        let _ = fs::remove_file(self.root.join("diagnostics"));
         let _ = fs::remove_dir(&self.root);
     }
 }
@@ -551,7 +574,8 @@ fn run_inner(
         SshEvent::Resolved(resolve(options, cancelled, deadline)?),
     )?;
     let broker = PrivateBroker::new().map_err(|_| FailureKind::Io)?;
-    let mut command = base_command(options, false);
+    let (mut diagnostics, diagnostic_path) = broker.diagnostics().map_err(|_| FailureKind::Io)?;
+    let mut command = base_command(options, false, Some(&diagnostic_path));
     command
         .env("SSH_ASKPASS", &options.askpass_program)
         .env("SSH_ASKPASS_REQUIRE", "force")
@@ -583,6 +607,7 @@ fn run_inner(
     let mut ready = false;
     let mut stdout_eof = false;
     let mut stdout_closed_at: Option<Instant> = None;
+    let mut stdin_broken_at: Option<Instant> = None;
     loop {
         if cancelled.load(Ordering::Acquire) {
             return Err(FailureKind::Cancelled);
@@ -598,9 +623,18 @@ fn run_inner(
             &replies,
             options.connect_timeout,
         )?;
-        // Drain diagnostics before stdout: OpenSSH's authenticated command marker fixes the final destination key.
+        // Server banners and remote stderr are untrusted and may imitate SSH debug
+        // lines. Drain them independently; only OpenSSH's private -E stream proves a peer.
         for _ in 0..8 {
             match stderr.read(&mut read_buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return Err(FailureKind::Io),
+            }
+        }
+        for _ in 0..8 {
+            match diagnostics.read(&mut read_buffer) {
                 Ok(0) => break,
                 Ok(n) => diagnostic.observe(&read_buffer[..n], events)?,
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -673,6 +707,15 @@ fn run_inner(
                     }
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    // A short helper can close stdin before OpenSSH publishes its exit
+                    // status. Keep draining its output/status boundedly instead of
+                    // replacing a meaningful remote exit (such as missing-helper127).
+                    stdin.take();
+                    write_pending = None;
+                    write_stalled = None;
+                    stdin_broken_at = Some(Instant::now());
+                }
                 Err(_) => return Err(FailureKind::Io),
             }
         }
@@ -690,6 +733,9 @@ fn run_inner(
             && stdout_closed_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(250))
         {
             return Err(FailureKind::Timeout);
+        }
+        if stdin_broken_at.is_some_and(|at| at.elapsed() >= Duration::from_millis(250)) {
+            return Err(FailureKind::Io);
         }
         thread::sleep(TICK);
     }

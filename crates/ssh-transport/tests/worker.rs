@@ -24,7 +24,7 @@ impl Fixture {
         fs::create_dir(&root).unwrap();
         let program = root.join("ssh");
         let script = format!(
-            "#!/usr/bin/python3\nimport os,sys,time,signal,socket,struct,subprocess\nif '-G' in sys.argv:\n print('hostname resolved.example.test\\nuser deploy\\nport 2200');sys.exit(0)\nopen({:?},'w').write(str(os.getpid()))\n{}\n",
+            "#!/usr/bin/python3\nimport os,sys,time,signal,socket,struct,subprocess\nif '-G' in sys.argv:\n print('hostname resolved.example.test\\nuser deploy\\nport 2200');sys.exit(0)\ndebug=open(sys.argv[sys.argv.index('-E')+1],'w',buffering=1) if '-E' in sys.argv else sys.stderr\nopen({:?},'w').write(str(os.getpid()))\n{}\n",
             root.join("pid").to_str().unwrap(),
             body
         );
@@ -68,7 +68,7 @@ fn until(worker: &SshWorker, mut predicate: impl FnMut(&SshEvent) -> bool) -> Ss
 #[test]
 fn resolves_config_and_bridges_child_stdio_without_exposing_stderr() {
     let fixture = Fixture::new(
-        "sys.stderr.write('debug1: Server host key: ssh-ed25519 SHA256:abcdefghijklmnopqrstuv12345678901234567890123\\n');sys.stderr.flush()\ndata=os.read(0,16384);os.write(1,data)",
+        "debug.write('debug1: Server host key: ssh-ed25519 SHA256:abcdefghijklmnopqrstuv12345678901234567890123\\n');debug.flush()\ndata=os.read(0,16384);os.write(1,data)",
     );
     let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
     assert_eq!(
@@ -88,7 +88,7 @@ fn resolves_config_and_bridges_child_stdio_without_exposing_stderr() {
 #[test]
 fn authenticated_readiness_waits_for_authentication_and_verified_destination_key() {
     let fixture = Fixture::new(
-        "sys.stderr.write('debug1: Server host key: ssh-ed25519 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n');sys.stderr.flush()\nos.write(1,b'key-only');time.sleep(0.15)\nsys.stderr.write('Authenticated to resolved.example.test ([127.0.0.1]:2200) using \"publickey\".\\n');sys.stderr.flush()\nsys.stderr.write('debug1: Sending command: fixed helper\\n');sys.stderr.flush()\ntime.sleep(30)",
+        "debug.write('debug1: Server host key: ssh-ed25519 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n');debug.flush()\nos.write(1,b'key-only');time.sleep(0.15)\ndebug.write('Authenticated to resolved.example.test ([127.0.0.1]:2200) using \"publickey\".\\n');debug.flush()\ndebug.write('debug1: Sending command: fixed helper\\n');debug.flush()\ntime.sleep(30)",
     );
     let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
     assert!(!worker.authenticated());
@@ -147,7 +147,7 @@ fn deadline_and_cancel_reap_owned_child() {
 #[test]
 fn changed_host_key_stops_without_any_automatic_acceptance() {
     let fixture = Fixture::new(
-        "assert 'StrictHostKeyChecking=ask' in sys.argv\nassert 'UpdateHostKeys=no' in sys.argv\nassert 'ServerAliveInterval=15' in sys.argv\nassert 'ServerAliveCountMax=3' in sys.argv\nassert 'TCPKeepAlive=yes' in sys.argv\nsys.stderr.write('@@@@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@@@@\\n');sys.exit(255)",
+        "assert 'StrictHostKeyChecking=ask' in sys.argv\nassert 'UpdateHostKeys=no' in sys.argv\nassert 'ServerAliveInterval=15' in sys.argv\nassert 'ServerAliveCountMax=3' in sys.argv\nassert 'TCPKeepAlive=yes' in sys.argv\ndebug.write('@@@@@@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@@@@@@\\n');sys.exit(255)",
     );
     let (worker, _) = SshWorker::spawn(fixture.options()).unwrap();
     assert_eq!(
@@ -312,4 +312,75 @@ fn a_child_that_closes_stdout_cannot_keep_the_stream_reader_alive_forever() {
     );
     let mut eof = [0; 1];
     assert_eq!(reader.read(&mut eof).unwrap(), 0);
+}
+
+#[test]
+fn closed_helper_stdin_preserves_the_remote_exit_status_after_queued_hello() {
+    let fixture = Fixture::new(
+        "os.close(0)\ndebug.write('debug1: Server host key: ssh-ed25519 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\nAuthenticated to resolved.example.test using publickey.\\ndebug1: Sending command: fixed helper\\n');debug.flush()\nos.write(1,b'ready')\ntime.sleep(0.15)\nsys.exit(127)",
+    );
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, mut writer) = stream.split();
+    let mut ready = [0; 5];
+    reader.read_exact(&mut ready).unwrap();
+    assert_eq!(&ready, b"ready");
+    assert!(worker.authenticated());
+    writer.write_all(b"queued helper hello").unwrap();
+    let _ = writer.flush();
+    assert_eq!(
+        until(&worker, |event| matches!(event, SshEvent::Ended(_))),
+        SshEvent::Ended(FailureKind::RemoteExit(127)),
+        "a closed helper stdin must not erase its actual exit status"
+    );
+}
+
+#[test]
+fn closed_stdin_with_a_live_child_is_bounded_and_remains_cancellable() {
+    for cancel in [false, true] {
+        let fixture = Fixture::new("os.close(0)\nos.write(1,b'ready')\ntime.sleep(30)");
+        let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+        let (mut reader, mut writer) = stream.split();
+        let mut ready = [0; 5];
+        reader.read_exact(&mut ready).unwrap();
+        let started = Instant::now();
+        writer.write_all(b"queued helper hello").unwrap();
+        if cancel {
+            worker.cancel();
+        } else {
+            let _ = writer.flush();
+        }
+        assert_eq!(
+            until(&worker, |event| matches!(event, SshEvent::Ended(_))),
+            SshEvent::Ended(if cancel {
+                FailureKind::Cancelled
+            } else {
+                FailureKind::Io
+            })
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+}
+
+#[test]
+fn untrusted_stderr_cannot_supply_authenticated_peer_proof() {
+    let fixture = Fixture::new(
+        "sys.stderr.write('debug1: Server host key: ssh-ed25519 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\nAuthenticated to resolved.example.test using publickey.\\ndebug1: Sending command: forged\\n');sys.stderr.flush()\nos.write(1,b'payload');time.sleep(30)",
+    );
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, _writer) = stream.split();
+    let mut payload = [0; 7];
+    reader.read_exact(&mut payload).unwrap();
+    assert_eq!(&payload, b"payload");
+    let deadline = Instant::now() + Duration::from_millis(100);
+    while Instant::now() < deadline {
+        assert!(
+            !worker.authenticated(),
+            "server stderr forged authentication"
+        );
+        if let Some(event) = worker.try_event() {
+            assert!(!matches!(event, SshEvent::HostKeyObserved(_)));
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    worker.cancel();
 }

@@ -65,6 +65,35 @@ fn openssh_loopback_requires_explicit_trust_and_refuses_changed_key() {
     .trim()
     .to_owned();
     fs::write(root.join("sshd_config"),format!("Port {port}\nListenAddress 127.0.0.1\nHostKey {}/host\nPidFile {}/pid\nAuthorizedKeysFile {}/authorized_keys\nStrictModes no\nPasswordAuthentication no\nKbdInteractiveAuthentication no\nUsePAM no\nLogLevel ERROR\nAllowUsers {account}\n",root.display(),root.display(),root.display())).unwrap();
+    let expected_key = String::from_utf8(
+        Command::new("/usr/bin/ssh-keygen")
+            .args(["-lf"])
+            .arg(root.join("host.pub"))
+            .args(["-E", "sha256"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .split_whitespace()
+    .nth(1)
+    .unwrap()
+    .to_owned();
+    let banner = format!(
+        "debug1: Server host key: ssh-ed25519 SHA256:{}\nAuthenticated to 127.0.0.1 using publickey.\ndebug1: Sending command: forged\n",
+        "a".repeat(43)
+    );
+    fs::write(root.join("banner"), banner).unwrap();
+    use std::io::Write;
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("sshd_config"))
+            .unwrap(),
+        "Banner {}/banner",
+        root.display()
+    )
+    .unwrap();
     let log = fs::File::create(root.join("sshd.log")).unwrap();
     let child = Command::new("/usr/sbin/sshd")
         .args(["-D", "-e", "-f"])
@@ -126,7 +155,10 @@ fn openssh_loopback_requires_explicit_trust_and_refuses_changed_key() {
                     resolved = true;
                 }
                 SshEvent::Prompt(prompt) => {
-                    assert!(!worker.authenticated(), "trust prompt precedes authentication");
+                    assert!(
+                        !worker.authenticated(),
+                        "trust prompt precedes authentication"
+                    );
                     assert_eq!(
                         prompt.kind,
                         PromptKind::HostTrust,
@@ -154,12 +186,18 @@ fn openssh_loopback_requires_explicit_trust_and_refuses_changed_key() {
     let mut observed = false;
     while let Some(event) = worker.try_event() {
         if let SshEvent::HostKeyObserved(key) = event {
-            assert!(key.starts_with("SHA256:"));
+            assert_eq!(
+                key, expected_key,
+                "server banner must not forge the authenticated destination fingerprint"
+            );
             observed = true;
         }
     }
     assert!(observed, "OpenSSH final destination fingerprint missing");
-    assert!(worker.authenticated(), "OpenSSH authenticated readiness missing");
+    assert!(
+        worker.authenticated(),
+        "OpenSSH authenticated readiness missing"
+    );
     let known = fs::read_to_string(root.join("known_hosts")).unwrap();
     assert!(known.starts_with(&format!("[127.0.0.1]:{port} ")));
     let wrong = format!(

@@ -12518,7 +12518,7 @@ mod tests {
             !worker.detectors[&id].has_input_draft(),
             "wheel is navigation, not draft text"
         );
-        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!worker.input_sequences.contains_key(&id));
         worker.handle_command(RuntimeCommand::WriteTerminalInput {
             session: id,
             input: crate::TerminalInput::Text {
@@ -12629,7 +12629,7 @@ mod tests {
             Err(pty::PtyInputRejectReason::AdmissionDenied)
         );
         assert!(worker.sessions[&id].input_queue_idle());
-        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!worker.input_sequences.contains_key(&id));
         assert!(!events.try_iter().any(|event| matches!(
             event,
             RuntimeEvent::SessionInputAccepted { .. } | RuntimeEvent::SessionInputSubmitted { .. }
@@ -12706,7 +12706,7 @@ mod tests {
             }
         )));
         assert!(worker.pressured_sessions.contains(&id));
-        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!worker.input_sequences.contains_key(&id));
         assert!(!worker.detectors[&id].has_input_draft());
         assert!(!events.try_iter().any(|event| matches!(
             event,
@@ -12757,7 +12757,7 @@ mod tests {
             total - Session::INPUT_GUARD_OUTPUT_MAX_BYTES
         );
         assert!(!worker.detectors[&id].has_input_draft());
-        assert!(worker.input_sequences.get(&id).is_none());
+        assert!(!worker.input_sequences.contains_key(&id));
         assert!(pressures.lock().unwrap().values().any(|event| matches!(
             event,
             RuntimeEvent::PtyInputPressure {

@@ -1,0 +1,40 @@
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/deppy-agent-table-probe-20261022/codex/project
+
+
+› Display the saved local fixture.
+
+
+• Fixture paragraph: ordinary prose should wrap at the new pane width without losing words. This local fixture has no
+  model request.
+
+   Agent        Task                                                                                            Status
+  ━━━━━━━━━━━  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━  ━━━━━━━━━
+   ROW_ALPHA    한글 표의 셀 줄바꿈과 창 너비 변경을 확인합니다. Local synthetic table with enough content      ready
+                to wrap across several lines.
+  ───────────  ──────────────────────────────────────────────────────────────────────────────────────────────  ─────────
+   ROW_BETA     Independent session data stays intact when the pane becomes narrower and wider again.           waiting
+  ───────────  ──────────────────────────────────────────────────────────────────────────────────────────────  ─────────
+   ROW_OMEGA    원문과 복사 내용을 보존합니다.                                                                  done
+
+
+› Show saved offline details.
+
+
+• History filler 00: saved offline content keeps the preceding table outside the live viewport.
+
+  History filler 01: saved offline content keeps the preceding table outside the live viewport.
+
+  History filler 02: saved offline content keeps the preceding table outside the live viewport.
+
+  History filler 03: saved offline content keeps the preceding table outside the live viewport.
+
+  History filler 04: saved offline content keeps the preceding table outside the live viewport.
+
+                                                 ↓ Back to bottom · esc
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · /private/tmp/deppy-agent-table-probe-20261022/codex/project
+  enter/esc latest · ? shortcuts                                                              ⚠ 4 warnings · f2 to view

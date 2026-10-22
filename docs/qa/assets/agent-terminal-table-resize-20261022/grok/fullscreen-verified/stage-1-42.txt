@@ -1,0 +1,39 @@
+
+  /p/t/d/grok… 1.4K / 500K │ [Dashboard]
+
+
+     ❯ Display the saved      10:28 AM
+       local fixture.
+
+                     ▲
+     ├────┼─────────┼──────┤
+     │ RO │ Indepen │ wait │
+     │ W_ │ dent    │ ing  │
+     │ BE │ session │      │
+     │ TA │ data    │      │
+     │    │ stays   │      │
+     │    │ intact  │      │
+     │    │ when    │      │
+     │    │ the     │      │
+     │    │ pane    │      │
+     │    │ becomes │      │             █
+     │    │ narrowe │      │             █
+     │    │ r       │      │             █
+     │    │ and     │      │             █
+     │    │ wider   │      │             █
+     │    │ again.  │      │             █
+     ├────┼─────────┼──────┤             █
+     │ RO │ 원문과  │ done │             █
+     │ W_ │ 복사    │      │             █
+     │ OM │ 내용을  │      │             █
+     │ EG │ 보존합  │      │             █
+     │ A  │ 니다.   │      │             █
+     └────┴─────────┴──────┘             █
+     ◇ table   [Copy TSV]                █
+                                         █
+
+  ╭────────────────────────────────────╮
+  │ ❯                                  │
+  ╰───────────────── Grok 4.6 (xhigh) ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

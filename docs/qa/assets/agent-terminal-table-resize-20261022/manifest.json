@@ -1,0 +1,460 @@
+{
+  "base_commit": "7584ed75fdc5949647a58574369c29606a076a86",
+  "versions": {
+    "claude": "2.1.305",
+    "codex": "0.163.0",
+    "grok": "1.0.67 (2fe064390d07)"
+  },
+  "scope": "Synthetic resumed conversations through actual Session/PTY/Alacritty; not running Deppy pane UI or real model turns. External IP networking denied. Trailing screen padding and final empty rows removed in archived text. Original viewport dimensions remain in metadata.tsv. Probe PASS means fixture visible; responsiveness determined by the separate measurements.",
+  "measurements": [
+    {
+      "provider": "grok",
+      "case": "minimal-verified",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        80,
+        80
+      ],
+      "expected_observation": 80,
+      "responsive": true,
+      "file": "grok/minimal-verified/stage-0-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-verified",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        42,
+        42
+      ],
+      "expected_observation": 42,
+      "responsive": true,
+      "file": "grok/minimal-verified/stage-1-42.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-verified",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        120,
+        120
+      ],
+      "expected_observation": 120,
+      "responsive": true,
+      "file": "grok/minimal-verified/stage-2-120.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-verified",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        80,
+        80
+      ],
+      "expected_observation": 80,
+      "responsive": true,
+      "file": "grok/minimal-verified/stage-3-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-verified",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        61,
+        61
+      ],
+      "expected_observation": 61,
+      "responsive": true,
+      "file": "grok/fullscreen-verified/stage-0-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-verified",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        23
+      ],
+      "expected_observation": 23,
+      "responsive": true,
+      "file": "grok/fullscreen-verified/stage-1-42.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-verified",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        101,
+        101
+      ],
+      "expected_observation": 101,
+      "responsive": true,
+      "file": "grok/fullscreen-verified/stage-2-120.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-verified",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        61,
+        61
+      ],
+      "expected_observation": 61,
+      "responsive": true,
+      "file": "grok/fullscreen-verified/stage-3-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-history",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        80,
+        80
+      ],
+      "expected_observation": 80,
+      "responsive": true,
+      "file": "grok/minimal-history/history-0-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-history",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        42,
+        42
+      ],
+      "expected_observation": 42,
+      "responsive": true,
+      "file": "grok/minimal-history/history-1-42.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-history",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        120,
+        120
+      ],
+      "expected_observation": 120,
+      "responsive": true,
+      "file": "grok/minimal-history/history-2-120.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "minimal-history",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        80,
+        80
+      ],
+      "expected_observation": 80,
+      "responsive": true,
+      "file": "grok/minimal-history/history-3-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-history",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        61,
+        61
+      ],
+      "expected_observation": 61,
+      "responsive": true,
+      "file": "grok/fullscreen-history/application-top-0-80.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-history",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        23
+      ],
+      "expected_observation": 23,
+      "responsive": true,
+      "file": "grok/fullscreen-history/application-top-1-42.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-history",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        101,
+        101
+      ],
+      "expected_observation": 101,
+      "responsive": true,
+      "file": "grok/fullscreen-history/application-top-2-120.txt"
+    },
+    {
+      "provider": "grok",
+      "case": "fullscreen-history",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        61,
+        61
+      ],
+      "expected_observation": 61,
+      "responsive": true,
+      "file": "grok/fullscreen-history/application-top-3-80.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        76,
+        76
+      ],
+      "expected_observation": 76,
+      "responsive": true,
+      "file": "claude/classic/stage-0-80.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [],
+      "expected_observation": null,
+      "responsive": null,
+      "file": "claude/classic/stage-1-42.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        116,
+        116
+      ],
+      "expected_observation": 116,
+      "responsive": true,
+      "file": "claude/classic/stage-2-120.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        76,
+        76
+      ],
+      "expected_observation": 76,
+      "responsive": true,
+      "file": "claude/classic/stage-3-80.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic-history",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        76,
+        76
+      ],
+      "expected_observation": 76,
+      "responsive": true,
+      "file": "claude/classic-history/history-0-80.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic-history",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [],
+      "expected_observation": null,
+      "responsive": null,
+      "file": "claude/classic-history/history-1-42.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic-history",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        76,
+        76
+      ],
+      "expected_observation": 76,
+      "responsive": false,
+      "file": "claude/classic-history/history-2-120.txt"
+    },
+    {
+      "provider": "claude",
+      "case": "classic-history",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        76
+      ],
+      "expected_observation": 76,
+      "responsive": true,
+      "file": "claude/classic-history/history-3-80.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "inline-history",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        78
+      ],
+      "expected_observation": 78,
+      "responsive": true,
+      "file": "codex/inline-history/history-0-80.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "inline-history",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        40
+      ],
+      "expected_observation": 40,
+      "responsive": true,
+      "file": "codex/inline-history/history-1-42.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "inline-history",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        118
+      ],
+      "expected_observation": 118,
+      "responsive": true,
+      "file": "codex/inline-history/history-2-120.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "inline-history",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        78
+      ],
+      "expected_observation": 78,
+      "responsive": true,
+      "file": "codex/inline-history/history-3-80.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "default-history-nav",
+      "stage": 0,
+      "terminal_cols": 80,
+      "table_widths": [
+        78
+      ],
+      "expected_observation": 78,
+      "responsive": true,
+      "file": "codex/default-history-nav/application-top-0-80.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "default-history-nav",
+      "stage": 1,
+      "terminal_cols": 42,
+      "table_widths": [
+        40
+      ],
+      "expected_observation": 40,
+      "responsive": true,
+      "file": "codex/default-history-nav/application-top-1-42.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "default-history-nav",
+      "stage": 2,
+      "terminal_cols": 120,
+      "table_widths": [
+        118
+      ],
+      "expected_observation": 118,
+      "responsive": true,
+      "file": "codex/default-history-nav/application-top-2-120.txt"
+    },
+    {
+      "provider": "codex",
+      "case": "default-history-nav",
+      "stage": 3,
+      "terminal_cols": 80,
+      "table_widths": [
+        78
+      ],
+      "expected_observation": 78,
+      "responsive": true,
+      "file": "codex/default-history-nav/application-top-3-80.txt"
+    }
+  ],
+  "sha256": {
+    "grok/fullscreen-history/application-top-1-42.txt": "4f262fb5d147b16e7d78104d29c19d42ff59d2abb7d1d7fa86f576feb9ad4b50",
+    "grok/fullscreen-history/application-top-2-120.txt": "a479ac5c21d081ca91796d9d1379bab46003dd3edb845107756a0ac9f9f183e7",
+    "grok/fullscreen-history/application-top-3-80.txt": "a1372f131f902b7fc6d4e8762b2667594209856e7b1d1ca98a5d8b401aea58f5",
+    "grok/fullscreen-history/metadata.tsv": "54931d1b0cad2a529b9cc3bfa34ca4f1dfd0362fdc8e890060291cc86b255ae5",
+    "grok/fullscreen-history/probe.log": "f7a4e1604b6087e70d4e75abd1e28b0d2a416c6cfc9ef06f6df49a01bb917f54",
+    "grok/fullscreen-history/application-top-0-80.txt": "a1372f131f902b7fc6d4e8762b2667594209856e7b1d1ca98a5d8b401aea58f5",
+    "grok/minimal-verified/stage-0-80.txt": "4c588cb19942b2b1fbe16a4b3e6b134ec3dd643593e4c4091f2687184751f3c8",
+    "grok/minimal-verified/metadata.tsv": "78a4a52dad7be94f2b9ffedfa8c04613343a8730c64f8e04b2a1017a1b12095b",
+    "grok/minimal-verified/probe.log": "5c7563feeb6f863f6efbb37133974e5a4dd36deb5d7fe7715f7a7c2940300964",
+    "grok/minimal-verified/stage-2-120.txt": "5d606539b89a639605e9dc2f01bb697f3d29dc593e5e4a2831bdf941b573102d",
+    "grok/minimal-verified/stage-3-80.txt": "7eb9512261038c601378d249b00884f0db8aa84e76bf3a59587cf770ec1fe353",
+    "grok/minimal-verified/stage-1-42.txt": "0b711971ff9fe6d2cd3d325010c51ea72d33af54779e6bd32678fb5f86c740c1",
+    "grok/minimal-history/metadata.tsv": "d9d29d4e59ecaeef56ac4a3f123c96040daa4634e3cf263765250e0f5301b57e",
+    "grok/minimal-history/history-1-42.txt": "9186cbbc4359d4edbfbc273bda4fcac4e9fc6edccf82d6a089083a943433a8bd",
+    "grok/minimal-history/probe.log": "fe1ac8738483c9d28a3758eb167c13e5ffa5ce767c5ecad5efb69841bbc02784",
+    "grok/minimal-history/history-3-80.txt": "cf91857b1e8101297da0af33eedf8078f131513d20eb650c4003feff8250df66",
+    "grok/minimal-history/history-0-80.txt": "8ac47ed378c4fff9ade7f53a13693f4f4b64ae3c08a91a6e148ca6ac5d908ea4",
+    "grok/minimal-history/history-2-120.txt": "eaaa329141fadc6f83f8d01e5a9a78180a969e7eff6327b97aafb6f43d544efd",
+    "grok/fullscreen-verified/stage-0-80.txt": "34ace96d19823d473bca844e53968455abd930635b8669184ca3dbef9226f7e8",
+    "grok/fullscreen-verified/metadata.tsv": "fef77794553ee8de3b5f2a4c0ab244096cbd4a3d19599b2aa57a791acc1a40ec",
+    "grok/fullscreen-verified/probe.log": "7aae0ce5543c4e6504c5831b4636b4b8814377a10801f5aadfeba8b3599804a0",
+    "grok/fullscreen-verified/stage-2-120.txt": "9c95dc79d5672962f9ed74a0dcdc583f6a2a55788d286c4dc7235b8173dfa70a",
+    "grok/fullscreen-verified/stage-3-80.txt": "34ace96d19823d473bca844e53968455abd930635b8669184ca3dbef9226f7e8",
+    "grok/fullscreen-verified/stage-1-42.txt": "48b1f142c70d7d005af0263aff792aa9d17384763f1338a430fed31aaf69b9af",
+    "codex/default-history-nav/application-top-1-42.txt": "38d385f8b58e512c20fc9553c30bbcd2ea0b15e02e0f039cc4b91d9be4a4308c",
+    "codex/default-history-nav/application-top-2-120.txt": "9c8d706d127fa038e61e4f50f244a0da4949d961208a26cd997f4a603acbc257",
+    "codex/default-history-nav/application-top-3-80.txt": "73a3ab7e4c0528a069d7b37bcbbde3ea2cb78724ae94821aa889b2c5b46f425f",
+    "codex/default-history-nav/metadata.tsv": "ac1978c2a361acd709262bedad675fc205d877ec96529c68f5fc318869c53602",
+    "codex/default-history-nav/probe.log": "0c7f72710118ecd67c02fe1a4e2581fdc3fb42e226e2f631d2c14e5825564ee6",
+    "codex/default-history-nav/application-top-0-80.txt": "73a3ab7e4c0528a069d7b37bcbbde3ea2cb78724ae94821aa889b2c5b46f425f",
+    "codex/inline-history/metadata.tsv": "2a3e3f2297d985b6e0a19b84001961cb7e242982f866d642858295ac217758c0",
+    "codex/inline-history/history-1-42.txt": "3b4bb04c827c6ba48e9114444deed09d0e056b45f7066a5a2e43dd95872d06b0",
+    "codex/inline-history/probe.log": "bf74964de5b9d25cede5c9bc54350fdaca41b1ec8edbac90fa2a920731b777a3",
+    "codex/inline-history/history-3-80.txt": "234748907c00e4fb73bc2de1d893ae2d1bf7401b0ed8dcbc6a9d970fe3a5bdad",
+    "codex/inline-history/history-0-80.txt": "b43246f734b0c3ee4e2252e7ee2bbda980d0365b2530e915f7bee848a55fbea5",
+    "codex/inline-history/history-2-120.txt": "3ce786cbdf35378c477b431d3b14c635fcfe4a62684fbf16ba97953fd4c76cc1",
+    "claude/classic/stage-0-80.txt": "7ee261b2aba43bb0b40412c9da4f890b42686f6c8e411926e8e3c73c62c71e0c",
+    "claude/classic/metadata.tsv": "785d5ddccd7ae385f95a86fe3c934068a11c09098c6b36fd41fed47dd1cf220c",
+    "claude/classic/probe.log": "2a740b1027d39206ff444a782b682d74bedb54dbc3f3851ac2c8f0cccddd90e1",
+    "claude/classic/stage-2-120.txt": "efb99567c8af13e9be77cd6b49329505b1adfe1191ed5cd1951a8fb9c9b747a2",
+    "claude/classic/stage-3-80.txt": "7ee261b2aba43bb0b40412c9da4f890b42686f6c8e411926e8e3c73c62c71e0c",
+    "claude/classic/stage-1-42.txt": "26730f9a4974ef9ae6f3414915cbe97405e4a47262334b25cda658a10ec60cfa",
+    "claude/classic-history/metadata.tsv": "b058cfbeb6fe4636ebd3877fd41e956c9d930c5f0a3ed153138763d5b05f76fd",
+    "claude/classic-history/history-1-42.txt": "b2f92ff12cb60f0c0dd192cfb905e2c59a73116b4847f05cf698e8aeb9eff89d",
+    "claude/classic-history/probe.log": "bf74964de5b9d25cede5c9bc54350fdaca41b1ec8edbac90fa2a920731b777a3",
+    "claude/classic-history/history-3-80.txt": "5c974b5ecf037399443741b3d82f357252c09846f9c1848d9d9295b7aad2ec59",
+    "claude/classic-history/history-0-80.txt": "1997f91d45211f64c636cb3fc707fec7473804b98524e607ccad13fb7f70c5ce",
+    "claude/classic-history/history-2-120.txt": "c0959b1674fd1b3ac5887ade55c7d9a6bd41edd3e69f5b1d75d2a2227ecb86f2"
+  }
+}

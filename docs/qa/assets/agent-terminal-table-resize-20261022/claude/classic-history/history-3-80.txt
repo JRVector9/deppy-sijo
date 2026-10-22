@@ -1,0 +1,254 @@
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_BETA  │ Independent session data stays intact when the     │ waiting │
+  │           │ pane becomes narrower and wider again.             │         │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_OMEGA │ 원문과 복사 내용을 보존합니다.                     │ done    │
+  └───────────┴────────────────────────────────────────────────────┴─────────┘
+
+❯ Show saved offline details.
+
+⏺ History filler 00: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 01: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 02: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 03: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 04: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 05: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 06: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 07: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 08: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 09: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 10: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 11: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 12: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 13: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 14: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 15: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 16: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 17: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 18: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 19: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 20: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 21: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 22: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 23: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 24: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 25: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 26: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 27: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 28: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 29: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 30: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 31: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 32: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 33: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 34: saved offline content keeps the preceding table outside the
+  live viewport.
+  live viewport.
+
+  History filler 22: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 23: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 24: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 25: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 26: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 27: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 28: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 29: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 30: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 31: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 32: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 33: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+
+  History filler 34: saved offline content
+  keeps the preceding table outside the
+  live viewport.
+  History filler 26: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 27: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 28: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 29: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 30: saved offline content keeps the preceding table outside the
+ live viewport.
+
+  History filler 31: saved offline content keeps the preceding table outside the
+ live viewport.
+  History filler 20: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 21: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 22: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 23: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 24: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 25: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 26: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 27: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 28: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 29: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 30: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 31: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 32: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 33: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 34: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 35: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 36: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 37: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 38: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  History filler 39: saved offline content keeps the preceding table outside the
+  live viewport.
+
+  END_OF_HISTORY_FIXTURE
+
+────────────────────────────────────────────────────────────────────────────────
+ Make auto mode your default permission mode?
+
+   Auto mode lets Claude handle permission prompts automatically. Claude
+   checks each tool call for risky actions and prompt injection before
+   executing, runs the ones it assesses as lower-risk, and blocks the rest.
+
+     Yes, set auto mode as my default permission mode
+   ❯ No, keep manual mode

@@ -1,0 +1,39 @@
+
+  /p/t/d/grok… 1.4K / 500K │ [Dashboard]
+
+                                         █
+     ❯ Display the saved      10:31 AM   █
+       local fixture.                    █
+
+
+     Fixture paragraph:       10:31 AM
+     ordinary prose should
+     wrap at the new pane
+     width without losing
+     words. This local
+     fixture has no model
+     request.
+
+     ┌────┬─────────┬──────┐
+     │ Ag │ Task    │ Stat │
+     │ en │         │ us   │
+     │ t  │         │      │
+     ├────┼─────────┼──────┤
+     │ RO │ 한글    │ read │
+     │ W_ │ 표의 셀 │ y    │
+     │ AL │ 줄바꿈  │      │
+     │ PH │ 과      │      │
+     │ A  │ 창 너비 │      │
+     │    │ 변경을  │      │
+     │    │ 확인합  │      │
+     │    │ 니다.   │      │
+     │    │ Local   │      │
+     │    │ synthet │      │
+     │    │ ic      │      │
+     │    │ table   │      │
+                     ▼
+  ╭────────────────────────────────────╮
+  │ ❯                                  │
+  ╰───────────────── Grok 4.6 (xhigh) ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

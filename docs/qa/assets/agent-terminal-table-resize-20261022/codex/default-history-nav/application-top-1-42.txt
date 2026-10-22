@@ -1,0 +1,40 @@
+
+  >_ OpenAI Codex (v0.163.0)
+     /private/tmp/…/codex/project
+
+
+› Display the saved local fixture.
+
+
+• Fixture paragraph: ordinary prose should
+  wrap at the new pane width without
+  losing words. This local fixture has no
+  model request.
+
+   Agent        Task              Status
+  ━━━━━━━━━━━  ━━━━━━━━━━━━━━━━  ━━━━━━━━━
+   ROW_ALPHA    한글 표의 셀      ready
+                줄바꿈과 창 너
+                비 변경을 확인
+                합니다. Local
+                synthetic
+                table with
+                enough content
+                to wrap across
+                several lines.
+  ───────────  ────────────────  ─────────
+   ROW_BETA     Independent       waiting
+                session data
+                stays intact
+                when the pane
+                becomes
+                narrower and
+                wider again.
+  ───────────  ────────────────  ─────────
+   ROW_OMEGA    원문과 복사 내    done
+          ↓ Back to bottom · esc
+
+› Ask Codex to do anything
+
+  GPT-6.1-Sol xhigh · /private/tmp/deppy-…
+  enter/esc latest               ⚠ 4 · f2

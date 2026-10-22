@@ -1,0 +1,32 @@
+ ▐▛███▛█   Claude Code v2.1.305
+▝▜██████▀  Opus 4.6 · API Usage Billing
+ ▝▝   ▝▝   /private/tmp/deppy-agent-table-probe-20261022/claude/project
+
+
+❯ Display the saved local fixture.
+
+⏺ Fixture paragraph: ordinary prose should wrap at the new pane width without
+  losing words. This local fixture has no model request.
+
+  ┌───────────┬────────────────────────────────────────────────────┬─────────┐
+  │   Agent   │                        Task                        │ Status  │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │           │ 한글 표의 셀 줄바꿈과 창 너비 변경을 확인합니다.   │         │
+  │ ROW_ALPHA │ Local synthetic table with enough content to wrap  │ ready   │
+  │           │ across several lines.                              │         │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_BETA  │ Independent session data stays intact when the     │ waiting │
+  │           │ pane becomes narrower and wider again.             │         │
+  ├───────────┼────────────────────────────────────────────────────┼─────────┤
+  │ ROW_OMEGA │ 원문과 복사 내용을 보존합니다.                     │ done    │
+  └───────────┴────────────────────────────────────────────────────┴─────────┘
+
+────────────────────────────────────────────────────────────────────────────────
+ Make auto mode your default permission mode?
+
+   Auto mode lets Claude handle permission prompts automatically. Claude
+   checks each tool call for risky actions and prompt injection before
+   executing, runs the ones it assesses as lower-risk, and blocks the rest.
+
+     Yes, set auto mode as my default permission mode
+   ❯ No, keep manual mode

@@ -1,0 +1,39 @@
+
+  /p/t/d/grok/project                                                                        1.4K / 500K │ [Dashboard]
+
+
+     ❯ Display the saved local fixture.                                                                     10:28 AM
+
+
+     Fixture paragraph: ordinary prose should wrap at the new pane width without losing words. This local   10:28 AM
+     fixture has no model request.
+
+     ┌─────────┬───────────────────────────────────────────────────────────────────────────────┬─────────┐
+     │ Agent   │ Task                                                                          │ Status  │
+     ├─────────┼───────────────────────────────────────────────────────────────────────────────┼─────────┤
+     │ ROW_    │ 한글 표의 셀 줄바꿈과 창 너비 변경을 확인합니다. Local synthetic table with   │ ready   │
+     │ ALPHA   │ enough content to wrap across several lines.                                  │         │
+     ├─────────┼───────────────────────────────────────────────────────────────────────────────┼─────────┤
+     │ ROW_    │ Independent session data stays intact when the pane becomes narrower and      │ waiting │
+     │ BETA    │ wider again.                                                                  │         │
+     ├─────────┼───────────────────────────────────────────────────────────────────────────────┼─────────┤
+     │ ROW_    │ 원문과 복사 내용을 보존합니다.                                                │ done    │
+     │ OMEGA   │                                                                               │         │
+     └─────────┴───────────────────────────────────────────────────────────────────────────────┴─────────┘
+     ◇ table   [Copy TSV]   [Copy CSV]   [Copy Markdown]
+
+
+
+
+
+
+
+
+
+
+
+  ╭──────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ ❯                                                                                                                │
+  ╰─────────────────────────────────────────────────────────────────────────────────────────────── Grok 4.6 (xhigh) ─╯
+
+  Shift+Tab:mode  │  Ctrl+x:shortcuts

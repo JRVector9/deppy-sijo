@@ -1,3 +1,19 @@
+# SSH 워크스페이스 시안·PR 검토 — 작성·브라우저 검증 완료 (2026-10-22)
+
+- Current objective: 사용자가 요청한 SSH 서버 폴더 추가 시안과 PR 단위 기능 검토 보고. HTML/계획·최종 브라우저 검증 완료. 문서 변경을 별도 design 브랜치에 local commit해 보고한다. 제품 기능 구현/실서버 접속은 요청 범위가 아니다.
+- Worktree `/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-design-20261022`, branch `design/ssh-workspace-20261022`, base/main `bc950e88`. nominal dirty tree, main 수정, Command Center 브랜치 보존.
+- Completed investigation: `workspace_add.rs:505` source는 Local/GitHub뿐. Git SSH URL은 로컬 clone용. `WorkspaceRow.path`/볼륨 증명은 로컬 경로 기준. App `WorkspaceRuntime`은 concrete InProcessRuntimeClient. RemoteRuntimeClient/Server/framing/TLS 기반은 있지만 App의 SSH target·bootstrap·원격 파일/Git 서비스는 추가 필요하다.
+- Deliverables: `docs/mockups/ssh-workspace-add-20261022.html` 단일 파일(외부 의존 없음), `docs/superpowers/plans/2026-10-22-ssh-workspace.md`, 이 handoff. 제품 Rust/Cargo/version/사용자 데이터 수정 없음.
+- Design: 기존 팝업560pt·입력36pt·버튼34pt·radius3pt, viewport 높이에 맞춘 body scroll/고정 footer. 주소 입력→연결→서버 폴더 선택→추가; 첫 지문 확인/추가 인증/helper 설치 동의/실패/오프라인/완료 총8개 예시 상태. 기본 옵션은 접어 간결화한다. 표시된 서버·폴더·에이전트는 모두 예시 데이터이며 실제 작업이 아니다.
+- Implementation recommendation: OpenSSH 설정·키·host trust 활용 + headless remote helper. PR 1 target/DB, PR 2 SSH 인증·취소, PR 3 Linux helper/runtime, PR 4 원격 파일/Git, PR 5 UI/세션 통합, PR 6 재접속·PWA·독립성·release 검증. 순서 1→(2∥3)→4→5→6. helper Linux 실제 빌드·실행 호환성 및 supervisor/lease로 세션 유지하는 동작은 구현 gate이며 검증됐다고 주장하지 않는다.
+- Actual checks: inline script `node --check /private/tmp/deppy-ssh-design-inline-20261022.js` exit0; `git diff --check` exit0; 계획 PR6개 및 placeholder 없음 확인. Safari에서 query `?qa=1` artifact-only harness 최초 및 double-click 교정 후 30PASS/0FAIL. 주소 무효화/late response/인증 마스크/취소초안/탭/폴더/6개PR/36·34px/1280·768·390px 폭 검증. native Safari 더블클릭으로 xAegis/src·docs·tests 목록 진입과 현재 폴더 선택/추가 활성도 별도 확인했다. footer가 실제 낮은 창에서 잘리는 것을 screenshot에서 발견해 viewport 상대 max-height로 수정했다. 높이3개 검사를 추가한 최종 Safari 실행은 **33PASS/0FAIL**(CUA native AX에서 실제 확인). 제품 테스트로 확대하지 않는다.
+- Browser visibility: 실제 Chrome에 기본 시안 open·screenshot 확인. 사용자 Chrome 창 변경 중 자동입력 guard를 만나 이후 검증은 별도 Safari 탭에서 진행했다. 실제 제품 App stop/launch/restart/SSH/설치/파일 변경/외부 PR/push 없음.
+- Failed approaches fixed: repo에 impeccable context script가 없어 installed absolute path 사용(PRODUCT 확인). Chrome browser provider 미노출로 native CUA 사용; 사용자 active Chrome guard 이후 Safari로 분리. 초기 JS template 괄호 typo는 node syntax check로 발견·수정했고, folder click 전체 rerender가 double-click target을 바꿀 가능성은 기존 DOM selection만 갱신하도록 수정 및 실제 gesture 검증. artifact-only 문제를 제품 결함으로 보고하지 않는다.
+- Sources: 공식 OpenSSH ssh_config 및 VS Code Remote SSH 문서를 실제 조회했다. 링크/소스 위치/기존 구현과 신규 설계의 구분은 HTML과 계획에 포함한다.
+- Remaining: 이번 요청의 시안·조사·계획 작업은 완료. 다음 실행자는 `git status --short`; `git log -1 --oneline`; `git show --stat HEAD`로 문서 commit을 확인한다. HTML을 브라우저로 열면 화면/검토 두 탭을 볼 수 있고 `?qa=1`은 예시 데이터 전용 self-check다. 제품 구현·서버 연결·앱 재실행은 이번 요청에서 시작하지 않는다.
+
+---
+
 # 워크스페이스 비선택 우클릭 종료 — 구현·검증 완료 (2026-10-22)
 
 - Current objective: main에서 선택하지 않은 사이드바 워크스페이스를 hover/우클릭해 해당 워크스페이스 종료 메뉴를 사용하도록 수정 완료. 아래 세 파일을 local main에 커밋했으며 사용자 보고를 마무리한다.

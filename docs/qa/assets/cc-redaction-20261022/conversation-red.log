@@ -1,0 +1,41 @@
+warning: variable does not need to be mutable
+   --> crates/app/src/command_center_verification.rs:695:13
+    |
+695 |         let mut store = stored::CommandCenterStore::open(&dir).unwrap();
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `deppy-sijo` (bin "deppy-sijo" test) generated 1 warning (run `cargo fix --bin "deppy-sijo" -p deppy-sijo --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.30s
+     Running unittests src/main.rs (/private/tmp/deppy-cc-conversation-target-20261022/debug/deps/deppy_sijo-6c06518f70c04fe1)
+
+running 4 tests
+test app::command_center_host::conversation::tests::command_center_main_conversation_late_secret_registration_masks_cached_fragments ... FAILED
+test app::command_center_host::conversation::tests::command_center_main_conversation_redacts_complete_source_before_display_limits ... FAILED
+test app::command_center_host::conversation::tests::command_center_main_conversation_replacement_and_duplicate_are_exact ... ok
+test app::command_center_host::conversation::tests::command_center_main_conversation_structured_hides_reasoning_and_uses_actual_items ... ok
+
+failures:
+
+---- app::command_center_host::conversation::tests::command_center_main_conversation_late_secret_registration_masks_cached_fragments stdout ----
+
+thread 'app::command_center_host::conversation::tests::command_center_main_conversation_late_secret_registration_masks_cached_fragments' (194885814) panicked at crates/app/src/command_center_conversation.rs:320:13:
+retired=false
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- app::command_center_host::conversation::tests::command_center_main_conversation_redacts_complete_source_before_display_limits stdout ----
+
+thread 'app::command_center_host::conversation::tests::command_center_main_conversation_redacts_complete_source_before_display_limits' (194885823) panicked at crates/app/src/command_center_conversation.rs:285:13:
+userMessage/content/8192 exposes a clipped secret prefix
+
+
+failures:
+    app::command_center_host::conversation::tests::command_center_main_conversation_late_secret_registration_masks_cached_fragments
+    app::command_center_host::conversation::tests::command_center_main_conversation_redacts_complete_source_before_display_limits
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 3602 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

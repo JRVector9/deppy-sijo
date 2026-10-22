@@ -1,0 +1,35 @@
+{
+  "scope": "MAIN complete-source/fragment redaction and cached publication corpus invalidation",
+  "root_integrated_baseline": "1e25f40b",
+  "local_dependency_baselines_do_not_cherry_pick": [
+    "14611dc4e3bb41d8eafb917e9c1d3298647ef301",
+    "c138a90d"
+  ],
+  "test_results": {
+    "conversation_red": {
+      "exit_code": 101,
+      "passed": 2,
+      "failed": 2
+    },
+    "publication_red": {
+      "exit_code": 101,
+      "passed": 0,
+      "failed": 1
+    },
+    "command_center_green": {
+      "exit_code": 0,
+      "passed": 178,
+      "failed": 0,
+      "ignored": 3,
+      "duration_seconds": 18.29
+    }
+  },
+  "sha256": {
+    "crates/app/src/command_center_conversation.rs": "eb2c231615fed9af1ba7f3df19e85a5cf17ac90e9ef306624907daa0e0e58275",
+    "crates/app/src/command_center_host.rs": "4188a974e9c6fb0f492bb95007b34770d928fd97790c7d29f18f9f18b086ad5b",
+    "docs/qa/assets/cc-redaction-20261022/conversation-red.log": "d90f82b9063f650bd617ca0eda90521acb18c1fe47385db2466034846cfd7681",
+    "docs/qa/assets/cc-redaction-20261022/publication-red.log": "8777005196f8ffabc051662a678d697fe8041257cc7bdb19889b9f4c60b57f53",
+    "docs/qa/assets/cc-redaction-20261022/command-center-green.log": "005cfdc38588205b9d97f67527e57c606b20be26e9da4dfaa1bb03d95745d3e7"
+  },
+  "log_normalization": "Removed one empty final line from command-center-green.log for git diff whitespace checks; all command output content retained."
+}

@@ -1,0 +1,199 @@
+   Compiling deppy-sijo v0.15.1 (/private/tmp/deppy-cc-conversation-20261022/crates/app)
+warning: variable does not need to be mutable
+   --> crates/app/src/command_center_verification.rs:695:13
+    |
+695 |         let mut store = stored::CommandCenterStore::open(&dir).unwrap();
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `deppy-sijo` (bin "deppy-sijo" test) generated 1 warning (run `cargo fix --bin "deppy-sijo" -p deppy-sijo --tests` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 34.13s
+     Running unittests src/main.rs (/private/tmp/deppy-cc-conversation-target-20261022/debug/deps/deppy_sijo-6c06518f70c04fe1)
+
+running 181 tests
+test app::command_center_host::approval::tests::command_center_history_keeps_latest_chronological_events_and_exact_attempt_routes ... ok
+test app::command_center_host::approval::tests::history_kind_projection_preserves_explicit_categories_and_legacy_unknowns ... ok
+test app::command_center_host::assignment::tests::assignment_cannot_retarget_an_executing_attempt ... ok
+test app::command_center_host::assignment::tests::assignment_changes_only_reviewed_definition_and_requires_current_revision ... ok
+test app::command_center_host::assignment::tests::configuration_reconfirmation_preserves_completed_and_productive_attempts ... ok
+test app::command_center_host::assignment::tests::confirming_a_second_goal_keeps_the_first_goal_dispatchable ... ok
+test app::command_center_host::assignment::tests::explicit_unstarted_assignment_edit_discards_only_its_old_review_evidence ... ok
+test app::command_center_host::assignment::tests::persisted_unstarted_review_survives_lost_volatile_proposal ... ok
+test app::command_center_host::assignment::tests::reconfirmation_rejects_changed_definitions_and_current_policy_expansion ... ok
+test app::command_center_host::assignment::tests::restored_unknown_outbox_stays_unreplayed_after_reconfirmation ... ok
+test app::command_center_host::assignment::tests::sqlite_restored_queued_goal_offers_explicit_reconfirmation ... ok
+test app::command_center_host::conversation::tests::command_center_main_conversation_late_secret_registration_masks_cached_fragments ... ok
+test app::command_center_host::conversation::tests::command_center_main_conversation_redacts_complete_source_before_display_limits ... ok
+test app::command_center_host::conversation::tests::command_center_main_conversation_replacement_and_duplicate_are_exact ... ok
+test app::command_center_host::conversation::tests::command_center_main_conversation_structured_hides_reasoning_and_uses_actual_items ... ok
+test app::command_center_host::devices::tests::connected_workspace_polling_is_fair_and_excludes_offline_registry_rows ... ok
+test app::command_center_host::devices::tests::delayed_or_cross_project_device_response_does_not_consume_another_request ... ok
+test app::command_center_host::devices::tests::disconnected_registered_device_remains_revocable_without_execution_permission ... ok
+test app::command_center_host::devices::tests::infrastructure_failure_keeps_exact_native_device_and_candidate_correlation ... ok
+test app::command_center_host::launch::tests::immutable_launch_template_preserves_configuration_and_never_accepts_task_text ... ok
+test app::command_center_host::launch::tests::launch_ack_requires_exact_runtime_operation_attempt_and_grant ... ok
+test app::command_center_host::launch::tests::main_profile_capacity_includes_the_main_only_slot ... ok
+test app::command_center_host::launch::tests::main_profile_selection_never_substitutes_main_credentials_for_worker_profile ... ok
+test app::command_center_host::launch::tests::worktree_callback_cannot_substitute_task_attempt_config_or_project ... ok
+test app::command_center_host::launch::tests::worktree_failure_never_claims_unknown_cli_or_blocks_independent_work ... ok
+test app::command_center_host::launch::tests::zero_generation_or_lost_launch_reply_stays_unknown_and_blocks_new_launches ... ok
+test app::command_center_host::layout::tests::explicit_opt_in_can_return_to_original_and_reopen_without_restart ... ok
+test app::command_center_host::layout::tests::original_layout_is_the_default_and_unknown_flags_do_not_enable_it ... ok
+test app::command_center_host::local_close::tests::local_close_receipt_is_exact_runtime_and_owner_and_preserves_completed_result ... ok
+test app::command_center_host::local_close::tests::local_owned_route_does_not_authorize_a_replacement_attempt_or_manual_session ... ok
+test app::command_center_host::local_close::tests::local_unknown_close_cannot_be_replaced_with_a_new_kill_operation ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_authority_rejects_rebound_main_and_changed_goal_permanently ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_cannot_activate_different_spawn_in_same_incarnation ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_project_read_bounds_full_scope_values ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_project_read_is_compact_and_dispatch_needs_confirmation ... ok
+test app::command_center_host::main_tools::tests::command_center_main_oversized_mutation_reply_remains_unknown_without_replay ... ok
+test app::command_center_host::main_tools::tests::command_center_main_read_scope_and_secret_redaction_are_enforced ... ok
+test app::command_center_host::main_tools::tests::command_center_main_real_http_one_time_operation_replay_and_lookup ... ok
+test app::command_center_host::main_tools::tests::command_center_main_real_http_uses_actual_host_scope_queue_and_receipts ... ok
+test app::command_center_host::main_tools::tests::command_center_main_registration_consumes_only_one_secret_spawn ... ok
+test app::command_center_host::main_tools::tests::command_center_main_rejects_stale_goal_config_cross_project_and_large_plans ... ok
+test app::command_center_host::main_tools::tests::command_center_main_response_limit_applies_after_redaction_expansion ... ok
+test app::command_center_host::main_tools::tests::command_center_main_retiring_old_execution_preserves_new_pending_registration ... ok
+test app::command_center_host::observe::tests::deferred_local_input_rechecks_attempt_before_actual_send ... ok
+test app::command_center_host::observe::tests::final_response_current_binding_is_derived_from_host_not_the_job_copy ... ok
+test app::command_center_host::observe::tests::native_identity_timeout_is_known_unsent_and_frees_dispatch_capacity ... ok
+test app::command_center_host::observe::tests::owned_launch_fresh_observation_is_one_shot_and_exact_capture_bound ... ok
+test app::command_center_host::observe::tests::rollback_keeps_pending_observation_or_final_reader_reaping_active ... ok
+test app::command_center_host::observe::tests::same_pane_replacement_or_new_current_attempt_cannot_receive_old_final_text ... ok
+test app::command_center_host::observe::tests::stale_completed_text_only_loses_observation_for_the_same_current_attempt ... ok
+test app::command_center_host::remote::reconcile::storage_tests::delayed_storage_load_never_merges_receipt_into_changed_assignment_or_binding ... ok
+test app::command_center_host::remote::reconcile::storage_tests::delayed_storage_load_preserves_actual_rejection_without_rearming_failed_attempt ... ok
+test app::command_center_host::remote::reconcile::storage_tests::delayed_storage_load_preserves_exact_admission_after_receipt_save_failure ... ok
+test app::command_center_host::remote::reconcile::storage_tests::receipt_query_blocks_only_its_workspace_reload_until_reply ... ok
+test app::command_center_host::remote::reconcile::storage_tests::receipt_query_cannot_enter_while_workspace_load_or_storage_recovery_is_pending ... ok
+test app::command_center_host::remote::reconcile::tests::closed_recovered_idle_does_not_hide_the_next_recovered_worker ... ok
+test app::command_center_host::remote::reconcile::tests::query_requires_original_lease_and_unknown_reply_preserves_unknown_without_replay ... ok
+test app::command_center_host::remote::reconcile::tests::recovered_idle_blocks_a_stale_native_new_launch_at_the_host_guard ... ok
+test app::command_center_host::remote::reconcile::tests::recovered_input_requires_original_operation_and_actual_sequence_without_claiming_started ... ok
+test app::command_center_host::remote::reconcile::tests::recovered_launch_only_installs_owned_idle_binding_and_never_rearms_initial_prompt ... ok
+test app::command_center_host::remote::reconcile::tests::restart_without_retained_original_request_does_not_fabricate_recovery_authority ... ok
+test app::command_center_host::remote::sessions::tests::actual_followup_admission_preserves_newer_draft_and_never_starts_task ... ok
+test app::command_center_host::remote::sessions::tests::close_of_active_execution_records_observation_lost_without_claiming_completion ... ok
+test app::command_center_host::remote::sessions::tests::config_change_blocks_old_input_but_keeps_exact_owned_worker_close_available ... ok
+test app::command_center_host::remote::sessions::tests::exact_close_cannot_terminate_replacement_attempt_and_preserves_verified_result ... ok
+test app::command_center_host::remote::sessions::tests::public_remote_view_is_actual_scoped_text_and_utf8_budgeted ... ok
+test app::command_center_host::remote::sessions::tests::read_only_failure_does_not_claim_an_unsent_input_is_uncertain ... ok
+test app::command_center_host::remote::sessions::tests::readonly_watch_requires_original_view_permit_and_never_changes_native_navigation ... ok
+test app::command_center_host::remote::sessions::tests::viewport_wrong_lease_never_consumes_another_exact_query ... ok
+test app::command_center_host::remote::tests::config_effect_fence_blocks_deferred_effect_after_revision_is_retired ... ok
+test app::command_center_host::remote::tests::known_rejection_releases_attempt_while_lost_input_receipt_retains_uncertainty ... ok
+test app::command_center_host::remote::tests::launch_reply_requires_exact_lease_and_never_reapplies_after_transition ... ok
+test app::command_center_host::remote::tests::queued_remote_handoff_cannot_target_replaced_or_manually_completed_attempt ... ok
+test app::command_center_host::remote::tests::remote_admission_requires_actual_input_acceptance_and_never_claims_provider_running ... ok
+test app::command_center_host::remote::tests::remote_launch_correlation_never_aliases_workspace_attempt_operation_profile_or_folder ... ok
+test app::command_center_host::remote::tests::remote_route_is_opaque_and_matches_only_current_attempt_binding ... ok
+test app::command_center_host::remote::tests::restored_remote_launch_claim_never_replays_or_loses_terminal_history_after_thirty_two ... ok
+test app::command_center_host::routes::tests::independent_targets_in_the_same_workspace_have_different_handles ... ok
+test app::command_center_host::routes::tests::repaint_and_reordering_preserve_unchanged_execution_handle ... ok
+test app::command_center_host::routes::tests::replaced_execution_retires_old_handle_even_when_pane_is_the_same ... ok
+test app::command_center_host::server::tests::native_server_configuration_and_secret_copy_controls_never_cross_web_wire ... ok
+test app::command_center_host::server::tests::server_connection_copy_requires_known_current_grant_without_pending_change ... ok
+test app::command_center_host::server::tests::server_grant_completion_requires_exact_pending_operation_and_mapping ... ok
+test app::command_center_host::server::tests::server_grant_epoch_survives_restarts_and_rejects_corruption ... ok
+test app::command_center_host::tests::active_cwd_cannot_be_lent_to_a_warm_workspace_with_the_same_session_number ... ok
+test app::command_center_host::tests::admission_is_not_a_provider_turn_start_or_success ... ok
+test app::command_center_host::tests::admission_only_clears_the_same_target_and_unchanged_draft ... ok
+test app::command_center_host::tests::agent_choice_lists_show_each_provider_once_without_losing_model_effort_options ... ok
+test app::command_center_host::tests::bounded_project_load_evicts_only_clean_inactive_and_preserves_pending_work ... ok
+test app::command_center_host::tests::cache_eviction_preserves_retryable_work_and_every_pending_effect_owner ... ok
+test app::command_center_host::tests::command_center_redaction_change_clears_cached_frame_when_replacement_cannot_publish ... ok
+test app::command_center_host::tests::command_center_redaction_corpus_change_republishes_without_work_events ... ok
+test app::command_center_host::tests::completed_launch_history_does_not_limit_a_valid_sixty_four_task_project_to_thirty_two ... ok
+test app::command_center_host::tests::composer_host_preserves_local_draft_during_load_and_storage_recovery ... ok
+test app::command_center_host::tests::composer_host_stale_task_draft_cannot_overwrite_current_task_text ... ok
+test app::command_center_host::tests::composer_host_unbound_draft_remains_addressable_after_exact_main_binding ... ok
+test app::command_center_host::tests::composer_late_ack_preserves_same_text_after_new_edits ... ok
+test app::command_center_host::tests::composer_load_capacity_conflict_preserves_local_draft_and_blocks_storage_until_retry ... ok
+test app::command_center_host::tests::composer_load_does_not_overwrite_a_newer_ui_edit_waiting_for_host_processing ... ok
+test app::command_center_host::tests::corrupt_launch_marker_blocks_project_instead_of_losing_dedup_history ... ok
+test app::command_center_host::tests::delayed_saved_assignment_cannot_send_after_result_or_attempt_replacement ... ok
+test app::command_center_host::tests::four_independently_persisted_completed_projects_can_admit_a_fifth ... ok
+test app::command_center_host::tests::frequent_draft_changes_coalesce_without_consuming_operation_capacity ... ok
+test app::command_center_host::tests::history_kind_follows_actual_event_variants_through_storage_and_projection ... ok
+test app::command_center_host::tests::known_rejection_frees_attempt_capacity_while_unknown_never_retries ... ok
+test app::command_center_host::tests::manual_report_is_bound_to_the_displayed_attempt_and_requires_separate_verification ... ok
+test app::command_center_host::tests::native_dto_encodes_through_the_actual_permission_filtered_web_boundary ... ok
+test app::command_center_host::tests::operation_payload_and_unknown_receipt_cannot_be_replayed_after_receipt_eviction ... ok
+test app::command_center_host::tests::rejected_partial_settings_edit_preserves_original_project_on_full_draft_capacity ... ok
+test app::command_center_host::tests::restore_preserves_durable_result_review_and_invalidates_only_active_observation ... ok
+test app::command_center_host::tests::restored_launch_before_attempt_commit_is_unknown_and_never_replayed ... ok
+test app::command_center_host::tests::same_folder_handles_macos_unicode_and_lexical_components_without_symlink_claims ... ok
+test app::command_center_host::tests::saved_revision_ack_does_not_replace_newer_text_or_dirty_generation ... ok
+test app::command_center_host::tests::terminal_admission_receipt_cannot_be_downgraded_by_a_late_rejection ... ok
+test app::command_center_host::tests::two_distinct_project_load_operations_never_leave_an_unreceipted_waiter ... ok
+test app::command_center_host::verification::tests::command_center_verification_completed_result_is_read_only_and_native_intents_reject_wire ... ok
+test app::command_center_host::verification::tests::command_center_verification_real_shell_durable_evidence_requires_separate_final_confirmation ... ok
+test app::command_center_host::verification::tests::command_center_verification_stale_config_folder_spec_and_cancel_never_mark_passed ... ok
+test codex_app_server::tests::command_center_approval_pipe_backpressure_returns_without_stopping_transport ... ok
+test codex_app_server::tests::command_center_approval_real_provider_parser_preserves_supported_scope_and_fences_variants ... ok
+test codex_app_server::tests::command_center_approval_worker_fences_owner_turn_content_and_revocation_at_write ... ok
+test ui::agent_sessions::tests::command_center_approval_keeps_multiple_exact_requests_without_selecting_another_session ... ok
+test ui::agent_sessions::tests::command_center_approval_projects_real_requests_for_exact_owner_only ... ok
+test ui::agent_sessions::tests::command_center_approval_rejects_stale_handle_and_other_workspace_before_transport ... ok
+test ui::agent_sessions::tests::command_center_conversation_source_requires_exact_runtime_owned_session ... ok
+test ui::command_center::composer::tests::composer_canonically_identical_binding_drafts_do_not_offer_duplicate_alternate ... ok
+test ui::command_center::composer::tests::composer_collision_keeps_prebind_draft_visible_and_can_restore_session_draft ... ok
+test ui::command_center::composer::tests::composer_confirmed_save_rebases_newer_picker_edits_without_sending ... ok
+test ui::command_center::composer::tests::composer_explicit_binding_save_and_cancel_never_send_draft ... ok
+test ui::command_center::composer::tests::composer_footer_paints_caption_at_left_edge_with_approved_type_and_vector_arrow ... ok
+test ui::command_center::composer::tests::composer_main_binding_keeps_same_project_draft_without_sending ... ok
+test ui::command_center::composer::tests::composer_snapshot_binding_while_picker_open_keeps_newest_typed_draft ... ok
+test ui::command_center::composer::tests::composer_text_editor_matches_approved_focus_heights ... ok
+test ui::command_center::composer::tests::composer_unavailable_execution_still_edits_but_cannot_submit_or_fall_back ... ok
+test ui::command_center::composer::tests::composer_unbound_accepts_typing_and_enter_opens_selection_without_submit ... ok
+test ui::command_center::devices::tests::invalid_or_concurrent_native_setup_preserves_secret_and_request_fence ... ok
+test ui::command_center::devices::tests::native_device_token_is_one_shot_and_exact_request_bound ... ok
+test ui::command_center::devices::tests::native_pairing_controls_are_absent_from_serialized_snapshot_and_intents ... ok
+test ui::command_center::tests::actual_send_button_retains_draft_and_exact_target ... ok
+test ui::command_center::tests::approved_assignment_density_and_owner_column_are_visible ... ok
+test ui::command_center::tests::approved_desktop_geometry_and_narrow_drawers ... ok
+test ui::command_center::tests::command_center_render_evidence ... ignored, offscreen GPU evidence; never starts the app
+test ui::command_center::tests::command_verification_cancel_identifies_only_the_current_running_evidence ... ok
+test ui::command_center::tests::command_verification_displays_exact_app_execution_evidence ... ok
+test ui::command_center::tests::command_verification_new_result_and_source_never_reuse_a_reviewed_old_command ... ok
+test ui::command_center::tests::command_verification_rejects_stale_attempt_result_and_remote_execution_intents ... ok
+test ui::command_center::tests::command_verification_render_evidence ... ignored, offscreen GPU verification evidence; never starts the app
+test ui::command_center::tests::command_verification_requires_explicit_execute_for_exact_result_and_literal_spec ... ok
+test ui::command_center::tests::composer_focus_does_not_move_the_content_origin_or_change_target_drafts ... ok
+test ui::command_center::tests::composer_target_stays_left_and_send_stays_at_right_edge ... ok
+test ui::command_center::tests::composing_enter_never_submits_and_overlimit_draft_is_preserved ... ok
+test ui::command_center::tests::headless_width_theme_font_matrix_preserves_readable_content_and_drawer_bounds ... ok
+test ui::command_center::tests::history_filters_use_only_stored_categories_and_preserve_unknown_records_in_all ... ok
+test ui::command_center::tests::main_conversation_bounds_latest_entries_and_utf8_before_rendering ... ok
+test ui::command_center::tests::main_conversation_never_renders_a_previous_main_or_foreign_workspace ... ok
+test ui::command_center::tests::main_conversation_render_evidence ... ignored, offscreen GPU conversation evidence; never starts the app
+test ui::command_center::tests::main_conversation_renders_bound_user_agent_and_real_tool_activity ... ok
+test ui::command_center::tests::manual_result_and_verification_controls_capture_exact_displayed_attempt_and_revision ... ok
+test ui::command_center::tests::mobile_primary_tabs_keep_font_scale_and_scroll_to_each_destination ... ok
+test ui::command_center::tests::monitor_actions_keep_full_click_height_and_exact_worker_target ... ok
+test ui::command_center::tests::monitor_filter_does_not_leak_a_different_workspace ... ok
+test ui::command_center::tests::old_project_snapshot_without_pending_approvals_remains_readable ... ok
+test ui::command_center::tests::overflow_content_clips_without_covering_light_content_with_a_gradient ... ok
+test ui::command_center::tests::pending_structured_approval_uses_exact_request_and_host_capability ... ok
+test ui::command_center::tests::plan_review_assignment_picker_emits_exact_native_profile_and_revision ... ok
+test ui::command_center::tests::populated_history_keeps_columns_full_width_and_opens_the_exact_recorded_task ... ok
+test ui::command_center::tests::project_navigation_deduplicates_bound_sessions_and_opens_exact_independent_session ... ok
+test ui::command_center::tests::project_settings_button_stays_inside_header_at_large_font_scale ... ok
+test ui::command_center::tests::removing_an_earlier_session_preserves_keyboard_activation_target ... ok
+test ui::command_center::tests::rollback_is_a_visible_native_button_at_mobile_width ... ok
+test ui::command_center::tests::secondary_content_keeps_left_edges_compact_facts_and_full_width_task_routes ... ok
+test ui::command_center::tests::settings_agent_change_releases_binding_without_executing_or_sending ... ok
+test ui::command_center::tests::settings_default_keeps_advanced_scope_collapsed_and_agent_fields_inline ... ok
+test ui::command_center::tests::settings_fields_follow_approved_width_and_touch_height ... ok
+test ui::command_center::tests::settings_save_confirmation_rebases_newer_edits_only_for_its_own_saved_config ... ok
+test ui::command_center::tests::snapshot_and_exact_target_intents_roundtrip_without_ui_state ... ok
+test ui::command_center::tests::task_native_aux_and_terminal_preserve_detail_header_and_composer ... ok
+test ui::command_center::tests::task_work_tab_includes_submitted_result_and_has_four_destinations ... ok
+test ui::command_center::tests::terminal_view_exposes_native_slot_separate_from_composer ... ok
+test ui::command_center::tests::verification_failed_retry_uses_host_capability_and_exact_task ... ok
+test ui::command_center::tests::worker_drawer_header_and_footer_remain_visible_with_many_workers ... ok
+
+test result: ok. 178 passed; 0 failed; 3 ignored; 0 measured; 3426 filtered out; finished in 18.29s

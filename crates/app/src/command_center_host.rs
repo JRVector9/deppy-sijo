@@ -161,6 +161,7 @@ pub(super) struct CommandCenterHost {
     observations: observe::Observations,
     conversations: conversation::Conversations,
     conversation_revision: u64,
+    redaction_revision: u64,
     devices: devices::Devices,
     pending: VecDeque<(String, cc::Intent)>,
     inputs: BTreeMap<String, Input>,
@@ -212,6 +213,7 @@ impl CommandCenterHost {
             observations: observe::Observations::new(ctx),
             conversations: Default::default(),
             conversation_revision: 0,
+            redaction_revision: 0,
             devices: devices::Devices::new(data_dir.clone(), ctx),
             pending: VecDeque::new(),
             inputs: BTreeMap::new(),
@@ -233,6 +235,31 @@ impl CommandCenterHost {
     pub(super) fn retry_publication(&mut self) {
         self.publication_failed = false;
         self.publication_dirty = true;
+    }
+    fn refresh_publication_revisions(
+        &mut self,
+        conversation: u64,
+        approval: (u64, bool),
+        redaction: &secret::RedactionService,
+    ) -> bool {
+        if self.conversation_revision != conversation {
+            self.conversation_revision = conversation;
+            self.publication_dirty = true;
+        }
+        if self.approval_revision != approval {
+            self.approval_revision = approval;
+            self.publication_dirty = true;
+        }
+        // Snapshot prunes grace-expired patterns as well as observing new registrations.
+        // Retain this pre-projection revision: a change during rebuilding invalidates the next
+        // pump too, rather than consuming a revision that the projection did not fully observe.
+        let revision = redaction.snapshot().revision();
+        let changed = self.redaction_revision != revision;
+        if changed {
+            self.redaction_revision = revision;
+            self.publication_dirty = true;
+        }
+        changed
     }
     fn finish(&mut self, id: &str, status: cc::ReceiptStatus, detail: impl Into<String>) {
         let detail = detail.into();
@@ -431,6 +458,19 @@ fn bounded(text: &str, bytes: usize) -> String {
         end -= 1;
     }
     text[..end].to_owned()
+}
+fn publish_work_projection(
+    core: &web_remote::session_core::SessionCore,
+    projection: Result<serde_json::Value, ()>,
+    redaction_changed: bool,
+) -> Result<(), ()> {
+    let result = projection.and_then(|value| core.publish_work_snapshot(value).map_err(|_| ()));
+    if result.is_err() && redaction_changed {
+        // A previously safe cached frame may now contain a newly registered secret. If a new
+        // frame cannot encode, clear the remote projection instead of retaining that old frame.
+        let _ = core.publish_work_snapshot(serde_json::Value::Null);
+    }
+    result
 }
 fn preserve_known_delivery_receipts(
     loaded: &mut stored::CommandCenterSnapshot,
@@ -2300,19 +2340,16 @@ impl App {
         let conversation_revision = self
             .agent_sessions_ui
             .command_center_conversation_revision();
-        if let Some(host) = self.command_center.as_mut()
-            && host.conversation_revision != conversation_revision
-        {
-            host.conversation_revision = conversation_revision;
-            host.publication_dirty = true;
-        }
         let approval_revision = self.agent_sessions_ui.command_center_approvals_revision();
-        if let Some(host) = self.command_center.as_mut()
-            && host.approval_revision != approval_revision
-        {
-            host.approval_revision = approval_revision;
-            host.publication_dirty = true;
-        }
+        let redaction_changed = if let Some(host) = self.command_center.as_mut() {
+            host.refresh_publication_revisions(
+                conversation_revision,
+                approval_revision,
+                &self.command_center_redaction,
+            )
+        } else {
+            false
+        };
         let generations: Vec<_> = self
             .command_center
             .as_ref()
@@ -2349,9 +2386,11 @@ impl App {
                         }
                     }
                 }
-                serde_json::to_value(remote)
-                    .map_err(|_| ())
-                    .and_then(|value| core.publish_work_snapshot(value).map_err(|_| ()))
+                publish_work_projection(
+                    core,
+                    serde_json::to_value(remote).map_err(|_| ()),
+                    redaction_changed,
+                )
             } else {
                 Ok(())
             };
@@ -3157,6 +3196,84 @@ fn work_state(state: work::WorkState) -> cc::TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn command_center_redaction_corpus_change_republishes_without_work_events() {
+        let redaction = secret::RedactionService::new();
+        let credential = secret::SecretString::new("late-corpus-credential-0123456789".into());
+        let mut host = host();
+        let core = web_remote::session_core::SessionCore::spawn(None);
+        let permissions = web_remote::relay::contract::RelayPermissions::new(true, true, true);
+        let projection = |text: String| serde_json::json!({"projects":[{"id":"w","main_conversation":{"target":{"workspace_id":"w","session_id":"main","task_id":null},"generation":"exact","entries":[{"id":"real-item","kind":"agent","text":text}]}}]});
+        host.refresh_publication_revisions(7, (3, true), &redaction);
+        core.publish_work_snapshot(projection(credential.expose().to_owned()))
+            .unwrap();
+        let (version, _) = core
+            .dashboard()
+            .work_snapshot_for_permissions(0, permissions)
+            .unwrap();
+        host.publication_dirty = false;
+        host.published = true;
+        host.refresh_publication_revisions(7, (3, true), &redaction);
+        assert!(
+            !host.publication_dirty,
+            "unchanged corpus and work do not re-encode"
+        );
+        redaction.register(&credential);
+        host.refresh_publication_revisions(7, (3, true), &redaction);
+        if host.publication_dirty {
+            core.publish_work_snapshot(projection(
+                redaction.redact_wrapped_text(credential.expose()),
+            ))
+            .unwrap();
+        }
+        let (_, frame) = core
+            .dashboard()
+            .work_snapshot_for_permissions(version, permissions)
+            .expect(
+                "late registration must refresh the real cached remote frame without work events",
+            );
+        assert!(!frame.contains(credential.expose()));
+        assert!(frame.contains("[REDACTED]"));
+        let lease = redaction
+            .acquire_rotating(&secret::SecretString::new(
+                "rotating-corpus-value-123".into(),
+            ))
+            .unwrap();
+        host.refresh_publication_revisions(7, (3, true), &redaction);
+        host.publication_dirty = false;
+        drop(lease);
+        host.refresh_publication_revisions(7, (3, true), &redaction);
+        assert!(
+            host.publication_dirty,
+            "lease retirement also invalidates projection"
+        );
+    }
+    #[test]
+    fn command_center_redaction_change_clears_cached_frame_when_replacement_cannot_publish() {
+        let core = web_remote::session_core::SessionCore::spawn(None);
+        let permissions = web_remote::relay::contract::RelayPermissions::new(true, true, true);
+        let old = serde_json::json!({"projects":[],"status":"newly-sensitive-old-frame"});
+        core.publish_work_snapshot(old.clone()).unwrap();
+        let (version, _) = core
+            .dashboard()
+            .work_snapshot_for_permissions(0, permissions)
+            .unwrap();
+        let invalid = serde_json::json!({"unexpected_field":"cannot publish"});
+        assert!(publish_work_projection(&core, Ok(invalid.clone()), false).is_err());
+        assert!(
+            core.dashboard()
+                .work_snapshot_for_permissions(version, permissions)
+                .is_none()
+        );
+        assert!(publish_work_projection(&core, Ok(invalid), true).is_err());
+        let (_, frame) = core
+            .dashboard()
+            .work_snapshot_for_permissions(version, permissions)
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+        assert!(value["snapshot"].is_null());
+        assert!(!frame.contains("newly-sensitive-old-frame"));
+    }
     pub(super) fn host() -> CommandCenterHost {
         CommandCenterHost::new(
             std::env::temp_dir().join(format!("cc-inert-{}", uuid::Uuid::new_v4())),

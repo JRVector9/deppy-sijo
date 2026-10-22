@@ -83,6 +83,7 @@ fn structured(
     epoch: u64,
     redaction: &secret::RedactionService,
 ) -> cc::MainConversation {
+    let mut truncated = session.items.len() > 100;
     let entries = session
         .items
         .iter()
@@ -97,24 +98,27 @@ fn structured(
                 | AgentItemKind::FileChange => cc::ConversationEntryKind::Tool,
                 _ => return None,
             };
+            // Items are bounded by AgentSession. Redact that complete available source before
+            // display clipping; fragment matching also protects a still-streaming item boundary.
+            let summary = redaction.redact_wrapped_fragment(&item.summary);
+            let output = redaction.redact_wrapped_fragment(&item.output);
             let text = if item.output.is_empty() {
-                bounded(&item.summary, 8192)
+                truncated |= summary.len() > 8192;
+                bounded(&summary, 8192)
             } else if kind == cc::ConversationEntryKind::Tool {
-                format!(
-                    "{}\n{}",
-                    bounded(&item.summary, 2048),
-                    bounded(&item.output, 6144)
-                )
+                truncated |= summary.len() > 2048 || output.len() > 6144;
+                format!("{}\n{}", bounded(&summary, 2048), bounded(&output, 6144))
             } else {
-                bounded(&item.output, 8192)
+                truncated |= output.len() > 8192;
+                bounded(&output, 8192)
             };
             Some(cc::ConversationEntry {
                 id: item.id.clone(),
                 turn_id: None,
                 kind,
-                text: redaction.redact_wrapped_text(&text),
+                text,
                 tool_name: (kind == cc::ConversationEntryKind::Tool)
-                    .then(|| redaction.redact_wrapped_text(&bounded(&item.summary, 256))),
+                    .then(|| bounded(&summary, 256)),
                 state: if kind == cc::ConversationEntryKind::Tool {
                     Some(match item.status.as_deref() {
                         Some("inProgress" | "running") => cc::ConversationActivityState::Running,
@@ -141,10 +145,22 @@ fn structured(
             session.thread_id.as_deref().unwrap_or_default()
         ),
         entries,
-        truncated: session.items.len() > 100,
+        truncated,
         status: "실제 App Server 대화와 도구 기록입니다.".into(),
     }
     .bounded()
+}
+
+fn redact_cached(conversation: &mut cc::MainConversation, redaction: &secret::RedactionService) {
+    for entry in &mut conversation.entries {
+        // Cache retention may already have clipped a secret before it was registered. Never
+        // treat these bounded fragments as complete strings when the corpus changes later.
+        entry.text = redaction.redact_wrapped_fragment(&entry.text);
+        entry.tool_name = entry
+            .tool_name
+            .as_deref()
+            .map(|text| redaction.redact_wrapped_fragment(text));
+    }
 }
 
 impl App {
@@ -172,11 +188,7 @@ impl App {
         let generation = generation(host, target)?;
         let mut conversation = host.conversations.0.get(&target.workspace_id).filter(|c| c.target == *target && c.generation == generation).cloned()
             .unwrap_or_else(|| cc::MainConversation { target: target.clone(), generation, status: "현재 실행에서 확인된 입력·응답을 기다립니다. 이전 대화와 실시간 출력은 원래 세션에서 확인해 주세요.".into(), ..Default::default() });
-        for entry in &mut conversation.entries {
-            entry.text = self
-                .command_center_redaction
-                .redact_wrapped_text(&entry.text);
-        }
+        redact_cached(&mut conversation, &self.command_center_redaction);
         Some(conversation.bounded())
     }
 }
@@ -248,5 +260,85 @@ mod tests {
             actual.entries[2].state,
             Some(cc::ConversationActivityState::Completed)
         );
+    }
+
+    #[test]
+    fn command_center_main_conversation_redacts_complete_source_before_display_limits() {
+        use crate::agent_session::AgentSessionEvent;
+        let redaction = secret::RedactionService::new();
+        let credential = secret::SecretString::new("boundary-credential-0123456789abcdef".into());
+        redaction.register(&credential);
+        for (kind, field, limit) in [
+            ("userMessage", "content", 8192),
+            ("agentMessage", "text", 8192),
+            ("commandExecution", "command", 2048),
+            ("commandExecution", "aggregatedOutput", 6144),
+            ("commandExecution", "command", 256),
+        ] {
+            let mut value = serde_json::json!({"id":"actual-item","type":kind,"command":"printf actual","aggregatedOutput":"actual output"});
+            let source = format!(
+                "{}{} safe ending",
+                "x".repeat(limit - 8),
+                credential.expose()
+            );
+            value[field] = if field == "content" {
+                serde_json::json!([{"type":"inputText","text":source}])
+            } else {
+                serde_json::json!(source)
+            };
+            let mut session = AgentSession::new("s".into(), "original".into(), None);
+            session.apply(AgentSessionEvent::ItemCompleted {
+                item: crate::agent_session::AgentItem::from_codex(&value).unwrap(),
+            });
+            let projected = structured(&session, &target(), 7, &redaction);
+            let visible = serde_json::to_string(&projected).unwrap();
+            assert!(
+                !visible.contains(&credential.expose()[..8]),
+                "{kind}/{field}/{limit} exposes a clipped secret prefix"
+            );
+            assert_eq!(projected.entries[0].id, "actual-item");
+            assert!(projected.entries[0].text.len() <= 8 * 1024);
+        }
+    }
+
+    #[test]
+    fn command_center_main_conversation_late_secret_registration_masks_cached_fragments() {
+        let redaction = secret::RedactionService::new();
+        let credential = secret::SecretString::new("rotated-credential-0123456789abcdef".into());
+        let mut cache = Conversations::default();
+        cache.record(
+            &target(),
+            "exact-generation",
+            entry(
+                "actual-item",
+                &format!("{}{}", "x".repeat(8192 - 8), credential.expose()),
+            ),
+        );
+        let original = cache.0["w"].clone();
+        assert!(
+            original.entries[0]
+                .text
+                .ends_with(&credential.expose()[..8])
+        );
+        let mut lease = Some(redaction.acquire_rotating(&credential).unwrap());
+        for retired in [false, true] {
+            if retired {
+                drop(lease.take());
+            }
+            let mut visible = original.clone();
+            redact_cached(&mut visible, &redaction);
+            assert!(
+                !visible.entries[0].text.contains(&credential.expose()[..8]),
+                "retired={retired}"
+            );
+            assert_eq!(visible.entries[0].id, original.entries[0].id);
+            assert_eq!(visible.generation, original.generation);
+            assert_eq!(visible.target, original.target);
+            assert!(
+                cache.0["w"].entries[0]
+                    .text
+                    .ends_with(&credential.expose()[..8])
+            );
+        }
     }
 }

@@ -58,7 +58,8 @@ work_id!(
     SubmissionId,
     OperationId,
     EventId,
-    RuntimeIncarnationId
+    RuntimeIncarnationId,
+    VerificationId
 );
 
 macro_rules! revision {
@@ -181,6 +182,190 @@ pub struct TaskResult {
     #[serde(deserialize_with = "deserialize_optional_title")]
     pub artifact_revision: Option<String>,
     pub verification: VerificationState,
+}
+
+pub const VERIFICATION_COMMAND_MAX_BYTES: usize = 16 * 1024;
+pub const VERIFICATION_OUTPUT_MAX_BYTES: usize = 32 * 1024;
+pub const VERIFICATION_TIMEOUT_MAX_MS: u64 = 10 * 60 * 1000;
+
+/// Exact result identity. `source_revision` is a provider/source identifier, not necessarily Git.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationTarget {
+    pub workspace_id: WorkspaceId,
+    pub task_id: TaskId,
+    pub attempt_id: AttemptId,
+    pub result_revision: ResultRevision,
+    pub source_revision: Option<String>,
+    pub artifact_revision: Option<String>,
+}
+
+/// The literal shell command the user reviewed. No executable command comes from a plan response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VerificationSpec {
+    pub command: String,
+    pub cwd: String,
+    pub timeout_ms: u64,
+    /// Independent cap for each of stdout and stderr, after secret redaction.
+    pub output_limit_bytes: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandVerificationOutcome {
+    Running,
+    Passed,
+    NonzeroExit,
+    SpawnFailed,
+    TimedOut,
+    Cancelled,
+    Interrupted,
+    IoFailed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandVerificationEvidence {
+    pub id: VerificationId,
+    pub target: VerificationTarget,
+    pub spec: VerificationSpec,
+    pub started_at_ms: u64,
+    pub ended_at_ms: Option<u64>,
+    pub outcome: CommandVerificationOutcome,
+    pub exit_code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualVerificationEvidence {
+    pub id: VerificationId,
+    pub target: VerificationTarget,
+    pub recorded_at_ms: u64,
+    pub passed: bool,
+    pub evidence: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "origin", content = "evidence", rename_all = "snake_case")]
+pub enum VerificationEvidence {
+    AppLocal(CommandVerificationEvidence),
+    UserManual(ManualVerificationEvidence),
+}
+
+impl VerificationSpec {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        bounded(
+            "verification command",
+            &self.command,
+            VERIFICATION_COMMAND_MAX_BYTES,
+            false,
+        )?;
+        bounded("verification cwd", &self.cwd, WORK_FOLDER_MAX_BYTES, false)?;
+        if self.command.contains('\0')
+            || self.cwd.contains('\0')
+            || !std::path::Path::new(&self.cwd).is_absolute()
+            || !(1..=VERIFICATION_TIMEOUT_MAX_MS).contains(&self.timeout_ms)
+            || !(1..=VERIFICATION_OUTPUT_MAX_BYTES as u32).contains(&self.output_limit_bytes)
+        {
+            return Err(ValidationError(
+                "invalid verification process limits or cwd".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl VerificationTarget {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        for id in [&self.workspace_id.0, &self.task_id.0, &self.attempt_id.0] {
+            validate_id(id)?;
+        }
+        ResultRevision::new(self.result_revision.0)?;
+        for value in [&self.source_revision, &self.artifact_revision]
+            .into_iter()
+            .flatten()
+        {
+            bounded("verification source", value, WORK_TITLE_MAX_BYTES, false)?;
+        }
+        Ok(())
+    }
+}
+
+impl CommandVerificationEvidence {
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        validate_id(&self.id.0)?;
+        self.target.validate()?;
+        self.spec.validate()?;
+        for output in [&self.stdout, &self.stderr] {
+            bounded(
+                "verification output",
+                output,
+                self.spec.output_limit_bytes as usize,
+                true,
+            )?;
+        }
+        if let Some(error) = &self.error {
+            bounded("verification error", error, WORK_EVENT_MAX_BYTES, true)?;
+        }
+        let running = self.outcome == CommandVerificationOutcome::Running;
+        if self.started_at_ms == 0
+            || running != self.ended_at_ms.is_none()
+            || self.ended_at_ms.is_some_and(|end| end < self.started_at_ms)
+            || (self.outcome == CommandVerificationOutcome::Passed && self.exit_code != Some(0))
+            || (self.outcome == CommandVerificationOutcome::NonzeroExit
+                && self.exit_code == Some(0))
+            || (running
+                && (self.exit_code.is_some()
+                    || !self.stdout.is_empty()
+                    || !self.stderr.is_empty()
+                    || self.error.is_some()))
+        {
+            return Err(ValidationError(
+                "inconsistent verification outcome/timestamps".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl VerificationEvidence {
+    pub fn id(&self) -> &VerificationId {
+        match self {
+            Self::AppLocal(e) => &e.id,
+            Self::UserManual(e) => &e.id,
+        }
+    }
+    pub fn target(&self) -> &VerificationTarget {
+        match self {
+            Self::AppLocal(e) => &e.target,
+            Self::UserManual(e) => &e.target,
+        }
+    }
+    pub fn validate(&self) -> Result<(), ValidationError> {
+        match self {
+            Self::AppLocal(e) => e.validate(),
+            Self::UserManual(e) => {
+                validate_id(&e.id.0)?;
+                e.target.validate()?;
+                bounded(
+                    "manual verification evidence",
+                    &e.evidence,
+                    WORK_EVENT_MAX_BYTES,
+                    false,
+                )?;
+                if e.recorded_at_ms == 0 {
+                    return Err(ValidationError("missing manual evidence time".into()));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -601,6 +786,121 @@ pub fn validate_input(text: &str) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn verification_evidence() -> CommandVerificationEvidence {
+        CommandVerificationEvidence {
+            id: VerificationId::new(),
+            target: VerificationTarget {
+                workspace_id: WorkspaceId("workspace".into()),
+                task_id: TaskId::new(),
+                attempt_id: AttemptId::new(),
+                result_revision: ResultRevision(1),
+                source_revision: Some("provider-turn-id".into()),
+                artifact_revision: None,
+            },
+            spec: VerificationSpec {
+                command: "printf ok".into(),
+                cwd: "/tmp".into(),
+                timeout_ms: 100,
+                output_limit_bytes: 1024,
+            },
+            started_at_ms: 10,
+            ended_at_ms: Some(11),
+            outcome: CommandVerificationOutcome::Passed,
+            exit_code: Some(0),
+            stdout: "ok".into(),
+            stderr: String::new(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn verification_evidence_rejects_inconsistent_and_oversized_records() {
+        let valid = verification_evidence();
+        assert!(valid.validate().is_ok());
+        for invalid in [
+            CommandVerificationEvidence {
+                target: VerificationTarget {
+                    result_revision: ResultRevision(0),
+                    ..valid.target.clone()
+                },
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                ended_at_ms: None,
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                ended_at_ms: Some(9),
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                exit_code: Some(1),
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                stdout: "x".repeat(1025),
+                ..valid.clone()
+            },
+            CommandVerificationEvidence {
+                outcome: CommandVerificationOutcome::Running,
+                ..valid.clone()
+            },
+        ] {
+            assert!(
+                invalid.validate().is_err(),
+                "accepted inconsistent evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn verification_spec_rejects_unbounded_or_nonliteral_process_inputs() {
+        let spec = VerificationSpec {
+            command: "printf ok".into(),
+            cwd: "/tmp".into(),
+            timeout_ms: 100,
+            output_limit_bytes: 1024,
+        };
+        assert!(spec.validate().is_ok());
+        for invalid in [
+            VerificationSpec {
+                command: " ".into(),
+                ..spec.clone()
+            },
+            VerificationSpec {
+                command: "echo\0oops".into(),
+                ..spec.clone()
+            },
+            VerificationSpec {
+                cwd: "relative".into(),
+                ..spec.clone()
+            },
+            VerificationSpec {
+                timeout_ms: 0,
+                ..spec.clone()
+            },
+            VerificationSpec {
+                timeout_ms: VERIFICATION_TIMEOUT_MAX_MS + 1,
+                ..spec.clone()
+            },
+            VerificationSpec {
+                output_limit_bytes: 0,
+                ..spec.clone()
+            },
+            VerificationSpec {
+                output_limit_bytes: VERIFICATION_OUTPUT_MAX_BYTES as u32 + 1,
+                ..spec.clone()
+            },
+        ] {
+            assert!(
+                invalid.validate().is_err(),
+                "accepted invalid spec: {invalid:?}"
+            );
+        }
+    }
 
     #[test]
     fn work_management_input_rejects_utf8_bytes_without_mutation() {

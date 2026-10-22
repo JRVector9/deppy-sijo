@@ -1,0 +1,35 @@
+{
+  "completed_at": 1792700898.043256,
+  "source_commit": "06db5a9e566a85ab8fc1baf92259ba167d2572f2",
+  "source_manifest_sha256": "7a75e72d3069edb2b1915f40f5713b2a6d2258e3cd79fbbc782fa503861e9a92",
+  "required_green_labels": [
+    "integrated-workspace-final-pass",
+    "integrated-clippy-final",
+    "integrated-fmt-final",
+    "integrated-boundary-green",
+    "integrated-deps",
+    "integrated-i18n",
+    "browser-command-center",
+    "integrated-python",
+    "settings-native-render"
+  ],
+  "workspace_counts": {
+    "passed": 6405,
+    "failed": 0,
+    "ignored": 76
+  },
+  "workspace_harnesses": 95,
+  "nested_child_summaries_excluded": 3,
+  "jobs": 2,
+  "version": "0.15.1",
+  "release": false,
+  "app_restart": false,
+  "push": false,
+  "main_moved": false,
+  "reuse_note": "Boundary/deps/i18n/browser/Python/native gates preceded the last host/PID fixture follow-ups; their directly tested paths and corresponding source remained unchanged except byte-identical fixture relocation. Final whole workspace, strict Clippy and fmt executed after the last source change. Focused runs overlap; do not add their counts.",
+  "limits": [
+    "76 default ignored cases were not run by final workspace gate; one explicit native renderer and an independent265-check browser harness ran separately.",
+    "No physical-phone or live user SSH-server E2E; no Linux helper pair rebuild/seal/install or release artifact.",
+    "CC remote execution is explicitly unsupported; Remote/Offline are denied local fallback. Existing remote terminal/files/Git RPC routes are preserved."
+  ]
+}

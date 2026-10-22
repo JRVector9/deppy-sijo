@@ -1,0 +1,31 @@
+{
+  "label": "ui-i18n",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "connector-ui",
+    "-p",
+    "i18n",
+    "--",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 48.16,
+  "summaries": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 34 filtered out; finished in 0.06s",
+    "test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s",
+    "test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.07s",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s",
+    "test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+  ],
+  "log_sha256": "389b1ac1d421e167cfb327276dad90694c36a95e25382854f0a4f73ddde334c8",
+  "raw_log_gzip": "ui-i18n.log.gz",
+  "readable_log_sha256": "9b0d83bfa36594b51d117ad656640f6535404a86f41594ec435dc8dbf6ae9a19",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

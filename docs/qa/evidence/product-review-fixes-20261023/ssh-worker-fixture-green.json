@@ -1,0 +1,27 @@
+{
+  "label": "ssh-worker-fixture-green",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "ssh-transport",
+    "--test",
+    "worker",
+    "--",
+    "--test-threads=4"
+  ],
+  "exit": 0,
+  "seconds": 5.8,
+  "summaries": [
+    "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s"
+  ],
+  "log_sha256": "5a2748a167eb2d676fc4d10fe6af7855fdc00c421662e69220e4fdcb130cd02d",
+  "raw_log_gzip": "ssh-worker-fixture-green.log.gz",
+  "readable_log_sha256": "b23a155bbfb905486a4395003021c74b10397fc6f742744e5914c8490dec02ee",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

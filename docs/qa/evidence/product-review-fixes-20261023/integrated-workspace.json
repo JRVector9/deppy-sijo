@@ -1,0 +1,25 @@
+{
+  "label": "integrated-workspace",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "--workspace",
+    "--",
+    "--test-threads=4"
+  ],
+  "exit": 101,
+  "seconds": 174.3,
+  "summaries": [
+    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 96 filtered out; finished in 0.00s",
+    "test result: FAILED. 95 passed; 1 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.36s"
+  ],
+  "log_sha256": "9863146a1d5d041e65b0cf3556e3f1258bef9b423e78e910dc41d75e9c7cdb9b",
+  "raw_log_gzip": "integrated-workspace.log.gz",
+  "readable_log_sha256": "9863146a1d5d041e65b0cf3556e3f1258bef9b423e78e910dc41d75e9c7cdb9b",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

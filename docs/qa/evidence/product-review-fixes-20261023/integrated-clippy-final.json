@@ -1,0 +1,24 @@
+{
+  "label": "integrated-clippy-final",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "clippy",
+    "--offline",
+    "--locked",
+    "--workspace",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "exit": 0,
+  "seconds": 0.79,
+  "summaries": [],
+  "log_sha256": "978ee6f98bd44fb418e5f891296294ae85893a9f5d6fd2408cff85819d6aa1df",
+  "raw_log_gzip": "integrated-clippy-final.log.gz",
+  "readable_log_sha256": "978ee6f98bd44fb418e5f891296294ae85893a9f5d6fd2408cff85819d6aa1df",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

@@ -1,0 +1,124 @@
+   Compiling agent-mcp v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/agent-mcp)
+   Compiling deppy-sijo v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app)
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/agents.rs:583:23
+    |
+583 |         connector_ui::paint_text_edit_focus(ui, &arguments);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials/modern.rs:250:27
+    |
+250 |             connector_ui::paint_text_edit_focus(ui, &response);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials/modern.rs:261:23
+    |
+261 |         connector_ui::paint_text_edit_focus(ui, &name_response);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials/modern.rs:272:23
+    |
+272 |         connector_ui::paint_text_edit_focus(ui, &binding_response);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials/modern.rs:288:23
+    |
+288 |         connector_ui::paint_text_edit_focus(ui, &response);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials.rs:823:39
+    |
+823 |                         connector_ui::paint_text_edit_focus(ui, &response);
+    |                                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials.rs:868:27
+    |
+868 |             connector_ui::paint_text_edit_focus(ui, &provider_response);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials.rs:878:27
+    |
+878 |             connector_ui::paint_text_edit_focus(ui, &name_response);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials.rs:890:27
+    |
+890 |             connector_ui::paint_text_edit_focus(ui, &binding_response);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/credentials.rs:901:27
+    |
+901 |             connector_ui::paint_text_edit_focus(ui, &response);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/env_profiles/modern.rs:178:23
+    |
+178 |         connector_ui::paint_text_edit_focus(ui, &key_response);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/env_profiles/modern.rs:188:23
+    |
+188 |         connector_ui::paint_text_edit_focus(ui, &response);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/env_profiles/modern.rs:306:27
+    |
+306 |             connector_ui::paint_text_edit_focus(ui, &source);
+    |                           ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/env_profiles.rs:589:31
+    |
+589 |                 connector_ui::paint_text_edit_focus(ui, &source);
+    |                               ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+    --> crates/app/src/ui/env_profiles.rs:1252:23
+     |
+1252 |         connector_ui::paint_text_edit_focus(ui, &key_response);
+     |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+    --> crates/app/src/ui/env_profiles.rs:1261:23
+     |
+1261 |         connector_ui::paint_text_edit_focus(ui, &response);
+     |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/environment.rs:348:23
+    |
+348 |         connector_ui::paint_text_edit_focus(ui, &search);
+    |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/settings.rs:659:19
+    |
+659 |     connector_ui::paint_text_edit_focus(ui, &response);
+    |                   ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+   --> crates/app/src/ui/settings.rs:691:19
+    |
+691 |     connector_ui::paint_text_edit_focus(ui, &search);
+    |                   ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+error[E0425]: cannot find function `paint_text_edit_focus` in crate `connector_ui`
+    --> crates/app/src/ui/settings.rs:2980:23
+     |
+2980 |         connector_ui::paint_text_edit_focus(ui, &search);
+     |                       ^^^^^^^^^^^^^^^^^^^^^ not found in `connector_ui`
+
+For more information about this error, try `rustc --explain E0425`.
+error: could not compile `deppy-sijo` (bin "deppy-sijo" test) due to 20 previous errors

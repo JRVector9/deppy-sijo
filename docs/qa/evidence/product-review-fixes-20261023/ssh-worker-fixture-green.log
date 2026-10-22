@@ -1,0 +1,29 @@
+   Compiling ssh-transport v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/ssh-transport)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.57s
+     Running tests/worker.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/worker-77e701e9c6f851ee)
+
+running 22 tests
+test a_nonzero_ssh_process_exit_is_not_a_successful_probe ... ok
+test authenticated_readiness_waits_for_authentication_and_verified_destination_key ... ok
+test a_stalled_stream_consumer_has_a_bounded_backpressure_deadline ... ok
+test a_child_that_closes_stdout_cannot_keep_the_stream_reader_alive_forever ... ok
+test authentication_confirmation_is_distinct_from_host_trust ... ok
+test authentication_replies_are_ephemeral_and_never_put_in_child_argv ... ok
+test certificate_diagnostic_uses_primary_host_key_not_id_or_ca_fingerprint ... ok
+test changed_host_key_stops_without_any_automatic_acceptance ... ok
+test bounded_output_queue_still_allows_prompt_cancellation ... ok
+test configured_md5_fingerprints_are_overridden_by_sha256_argv ... ok
+test closed_helper_stdin_preserves_the_remote_exit_status_after_queued_hello ... ok
+test failing_ssh_config_resolution_cannot_supply_an_identity ... ok
+test configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics ... ok
+test helper_command_rejects_shell_syntax_versions ... ok
+test healthy_idle_ssh_stream_does_not_expire_at_the_io_backpressure_deadline ... ok
+test malformed_certificate_primary_fingerprint_cannot_fall_back_to_id_or_ca ... ok
+test closed_stdin_with_a_live_child_is_bounded_and_remains_cancellable ... ok
+test resolves_config_and_bridges_child_stdio_without_exposing_stderr ... ok
+test secret_text_cannot_approve_host_trust_and_cancel_reclaims_socket ... ok
+test stream_flush_waits_until_queued_bytes_reach_the_child_pipe ... ok
+test untrusted_stderr_cannot_supply_authenticated_peer_proof ... ok
+test deadline_and_cancel_reap_owned_child ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.39s

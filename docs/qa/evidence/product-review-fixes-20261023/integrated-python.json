@@ -1,0 +1,22 @@
+{
+  "label": "integrated-python",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "-",
+  "jobs": 2,
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "scripts.tests.test_prepare_remote_host",
+    "scripts.tests.test_dev_build",
+    "scripts.tests.test_ssh_packaging",
+    "scripts.tests.test_remote_host_deadline"
+  ],
+  "exit": 0,
+  "seconds": 3.28,
+  "summaries": [],
+  "log_sha256": "6769e40f6f3b9a8d5d3fcef2c1f9a82a39e3118d4045014d4960fcca31edf8b4",
+  "raw_log_gzip": "integrated-python.log.gz",
+  "readable_log_sha256": "6769e40f6f3b9a8d5d3fcef2c1f9a82a39e3118d4045014d4960fcca31edf8b4",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

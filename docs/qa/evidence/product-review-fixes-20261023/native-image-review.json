@@ -1,0 +1,28 @@
+{
+  "actual_renderer_cases": [
+    "/private/tmp/deppy-product-settings-images-20261023/settings-General-Dark-narrow.png",
+    "/private/tmp/deppy-product-settings-images-20261023/settings-Agents-Light.png",
+    "/private/tmp/deppy-product-cloud-images-20261023/native-one-screen-1000-Dark.png",
+    "/private/tmp/deppy-product-cloud-images-20261023/native-one-screen-410-Light.png"
+  ],
+  "root_visually_inspected": true,
+  "notes": "General narrow and agents light settings; cloud dark1000/light410; narrow permission table uses bounded internal horizontal scrolling. Synthetic fixtures, not live app screenshots.",
+  "files": [
+    {
+      "path": "docs/qa/evidence/product-review-fixes-20261023/native-images/settings-General-Dark-narrow.png",
+      "sha256": "c439110fcae389d0eb1e0b58b3a63267387c8b97d3d0e0c6c65a0a363c98c6cf"
+    },
+    {
+      "path": "docs/qa/evidence/product-review-fixes-20261023/native-images/settings-Agents-Light.png",
+      "sha256": "7812d9472cb2dd2fea56d58f3c97ce6e57f409ea21e4491499cae8c6785802a9"
+    },
+    {
+      "path": "docs/qa/evidence/product-review-fixes-20261023/native-images/native-one-screen-1000-Dark.png",
+      "sha256": "5e9674597a54a3df1a44d160a6313c68c8ac7ad31d417b0d5bf6d887b827e79c"
+    },
+    {
+      "path": "docs/qa/evidence/product-review-fixes-20261023/native-images/native-one-screen-410-Light.png",
+      "sha256": "472b3b19beda1a258c1471cd4322cc57a228741733c534a71e605871cf302800"
+    }
+  ]
+}

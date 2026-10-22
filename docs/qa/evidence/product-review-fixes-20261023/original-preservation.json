@@ -1,0 +1,24 @@
+{
+  "checked_at": 1792699198.731688,
+  "sources": {
+    "settings": {
+      "files_checked": 914,
+      "changed_files": [],
+      "head_unchanged": true
+    },
+    "ssh": {
+      "files_checked": 957,
+      "changed_files": [],
+      "head_unchanged": true
+    },
+    "cc": {
+      "files_checked": 1023,
+      "changed_files": [],
+      "head_unchanged": true
+    }
+  },
+  "original_refs": {
+    "count": 301,
+    "changed": []
+  }
+}

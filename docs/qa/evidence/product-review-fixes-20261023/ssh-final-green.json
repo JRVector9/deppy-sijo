@@ -1,0 +1,29 @@
+{
+  "label": "ssh-final-green",
+  "cwd": "/private/tmp/deppy-cc-ssh-integrate-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_ssh_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 12.46,
+  "summaries": [
+    "test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 3687 filtered out; finished in 0.36s"
+  ],
+  "log_sha256": "3d0446ed669b6b7d645a08365dbb0df303021ed691adc6ec1525e225c943f80d",
+  "raw_log_gzip": "ssh-final-green.log.gz",
+  "readable_log_sha256": "e3c10ea15ef885141a1c6ab10019717e70204f59ad067f44b4398588b2ddfc39",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

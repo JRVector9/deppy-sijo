@@ -1,0 +1,13 @@
+   Compiling xtask v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/xtask)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.17s
+     Running `/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/xtask check-boundary`
+VIOLATION: crates/app/src/ui/workspace_application_wheel_tests.rs:343: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs: production syntax boundary violation: 'secret::' (leaf UI must not access the secret crate)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:209: boundary violation: 'RuntimeClient' (leaf UI must return protocol intents instead of owning a runtime client)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:234: boundary violation: 'RuntimeClient' (leaf UI must return protocol intents instead of owning a runtime client)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:261: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:542: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:559: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:585: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+VIOLATION: crates/app/src/ui/workspace_table_resize_tests.rs:604: boundary violation: 'send_command(' (leaf UI must not execute runtime protocol commands directly)
+Error: check-boundary 실패: 9건

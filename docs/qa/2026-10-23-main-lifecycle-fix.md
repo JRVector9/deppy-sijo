@@ -69,3 +69,29 @@ cat /Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/evidence/
 ```
 
 Source is frozen and root owns integration. Do not run Cargo independently or copy the whole sibling files over SSH changes; root merges the isolated hunks.
+
+## Additional host admission lifetime defect — RED/GREEN complete
+
+- Root's integrated-source review found a separate downstream cap in `main_host::enqueue`: it rejects when `host.main_guards.len() >= 256`. `retire_main_operations` revokes the permit and marks the guard retired but retains it. Thus 256 retired operations can reject a new, valid MAIN's first mutation even after the `MainTools` lifecycle correction above. This is separate from the documented, intentional append-only `host.operations` lifetime replay quota of 1,024 operations.
+- Root approved a minimal design: count only non-retired guards against the 256 live-authority admission bound. Keep retired guards as tombstones, including their revoked permits, scope/tool metadata, completed receipts and pending/unknown query behavior. Removing a guard would be unsafe because `main_operation_current` deliberately permits ordinary host operations with no MAIN guard. Every guard is created only after its ID enters the existing append-only operations map, so retaining tombstones is bounded by that map's existing 1,024-operation quota.
+- Helper `propose_main_plan` and four `command_center_main_host_guard_` tests in `command_center_main_host.rs` cover actual `call(ProposePlan)` admission256, a replacement route execution/MAIN launch and call257; unchanged live256 denial; a real private `/bin/cat` PTY proving the cloned old permit succeeds before retirement and reports `AdmissionDenied` after retirement; completed receipt, pending/unknown, unknown-ID and replay semantics; and the intentional host1,024 quota through real `host.enqueue` calls. No guard map is fabricated.
+- Root actual RED: **3PASS/1FAIL**, exit101/32.79s. Only retired256→replacement MAIN call257 failed with `main_operation_capacity_no_effect`; all three controls passed, including real PTY admission revocation. This worker independently read `main-host-guard-red.json`; log SHA256 `5b62d27860defbfdc2b3f5379cfe0d70d0319e41c8c42a4a5649dc8e1b6d30e6`. Evidence is in the canonical root `docs/qa/evidence/product-review-fixes-20261023/main-host-guard-red.{json,log}`.
+- After this actual RED, root authorized the minimal product condition change: `main_host::enqueue` now counts only `!guard.retired` against256. The existing operation-ID collision check remains. No guard deletion, authority predicate, retirement/permit, receipt, or operations-map logic changed. Individual-file rustfmt and `git diff --check` executed, exit0.
+- Root actual integrated GREEN ran the full `command_center_main_` filter: **32PASS/0FAIL**, exit0/26.52s (tests7.51s). This includes all prior28 lifecycle/security regressions plus the four new host admission controls. This worker independently read `main-host-guard-green.json`; log SHA256 `d945ba0542e29d5c1c27aa2be5f34bd7a07a820fc202440b8d1ccd536a88ec32`. Evidence: canonical root `docs/qa/evidence/product-review-fixes-20261023/main-host-guard-green.{json,log}`. Root confirmed its host source differs from this worker only by the independent SSH local fence, which this agent did not overwrite.
+- Isolated extraction artifacts: tests `/private/tmp/deppy-main-host-guard-red-20261023.patch`, product condition `/private/tmp/deppy-main-host-guard-product-20261023.patch`. Root must merge only those isolated hunks to preserve independent SSH edits in the integrated file.
+- `host.installed` also retains old runtime keys, but it has no length-based admission rejection. Its metadata lifetime is separate from this confirmed 256-guard denial and is outside this minimal admission correction. No claim is made that this phase reclaims that map.
+- Source and this QA section are frozen. Worker implementation is complete; root owns the remaining final workspace/Clippy gates and integration. No full-workspace or Clippy result is claimed here.
+
+Actual host RED command (root executed with jobs2 and the target recorded in the JSON):
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo test --offline --locked -p deppy-sijo --bin deppy-sijo command_center_main_host_guard_ -- --nocapture --test-threads=1
+```
+
+Actual integrated MAIN GREEN command:
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo test --offline --locked -p deppy-sijo --bin deppy-sijo command_center_main_ -- --nocapture --test-threads=1
+```

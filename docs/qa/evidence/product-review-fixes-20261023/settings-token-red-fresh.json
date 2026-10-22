@@ -1,0 +1,29 @@
+{
+  "label": "settings-token-red-fresh",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "settings_token_lifecycle_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 101,
+  "seconds": 60.68,
+  "summaries": [
+    "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 3647 filtered out; finished in 0.20s"
+  ],
+  "log_sha256": "5d8b3a5594f27614fd7eea1e6793226515302b95528f77804d27ffe05dbf1e18",
+  "raw_log_gzip": "settings-token-red-fresh.log.gz",
+  "readable_log_sha256": "5f6145126eecf72a6aa6d6c1d0739f15e4241469c719f8e398d78b4d94988de9",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

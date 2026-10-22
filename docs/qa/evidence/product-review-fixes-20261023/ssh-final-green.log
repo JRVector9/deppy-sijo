@@ -1,0 +1,17 @@
+   Compiling deppy-sijo v0.15.1 (/private/tmp/deppy-cc-ssh-integrate-20261023/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 9.89s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_sijo-cb28fcc838a7e0ff)
+
+running 10 tests
+test app::command_center_host::tests::command_center_ssh_catalog_never_scans_this_mac ... ok
+test app::command_center_host::tests::command_center_ssh_connected_callers_reject_before_local_work ... ok
+test app::command_center_host::tests::command_center_ssh_git_connected_handler_rejects_local_effects ... ok
+test app::command_center_host::tests::command_center_ssh_git_insert_never_bypasses_input_admission ... ok
+test app::command_center_host::tests::command_center_ssh_git_reveal_never_inspects_or_opens_same_path_on_this_mac ... ok
+test app::command_center_host::tests::command_center_ssh_git_shell_never_stages_local_execution ... ok
+test app::command_center_host::tests::command_center_ssh_offline_callers_reject_before_local_work ... ok
+test app::command_center_host::tests::command_center_ssh_remote_runtime_never_gains_authority_from_local_metadata ... ok
+test app::command_center_host::tests::command_center_ssh_snapshot_disables_local_execution_settings ... ok
+test app::command_center_host::verification::tests::command_center_ssh_manual_evidence_rejects_changed_workspace_target ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 3687 filtered out; finished in 0.36s

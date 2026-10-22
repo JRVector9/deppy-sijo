@@ -1,0 +1,27 @@
+{
+  "label": "ssh-compat-behavior-red",
+  "cwd": "/private/tmp/deppy-cc-ssh-integrate-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_ssh_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 101,
+  "seconds": 19.07,
+  "summaries": [],
+  "log_sha256": "a67e1011524f0584a0f6415c33315db612c5efbc01654c8fc7fe99ba14ebb512",
+  "raw_log_gzip": "ssh-compat-behavior-red.log.gz",
+  "readable_log_sha256": "a67e1011524f0584a0f6415c33315db612c5efbc01654c8fc7fe99ba14ebb512",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

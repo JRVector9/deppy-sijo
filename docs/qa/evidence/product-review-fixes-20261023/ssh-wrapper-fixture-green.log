@@ -1,0 +1,23 @@
+   Compiling deppy-core v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/core)
+   Compiling connector-ui v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/connector-ui)
+   Compiling audit v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/audit)
+   Compiling mux v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/mux)
+   Compiling persist v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/persist)
+   Compiling session v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/session)
+   Compiling storage v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/storage)
+   Compiling mcp v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/mcp)
+   Compiling runtime v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/runtime)
+   Compiling web-remote v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/web-remote)
+   Compiling agent-mcp v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/agent-mcp)
+   Compiling deppy-remote-host v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/remote-host)
+   Compiling connector-service v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/connector-service)
+   Compiling deppy-sijo v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 29s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_sijo-cb28fcc838a7e0ff)
+
+running 3 tests
+test workspace_runtime_client::tests::offline_ssh_has_no_local_fallback_and_preserves_unadmitted_commands ... ok
+test workspace_runtime_client::tests::local_client_retains_instance_and_routes_snapshot_events_without_spawning_a_shell ... ok
+test workspace_runtime_client::remote_tests::remote_wrapper_delegates_runtime_but_rejects_local_inspection_and_automatic_input ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 3735 filtered out; finished in 0.03s

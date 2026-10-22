@@ -1,0 +1,115 @@
+{
+  "paths": [
+    {
+      "path": "crates/app/src/app.rs",
+      "sha256": "c3d83b8ad6581a340609bfce436982099d439b84fff95fb3119aa9d9918c191a"
+    },
+    {
+      "path": "crates/app/src/cloud_agent.rs",
+      "sha256": "38aa665e1a2040906553b6c4c793cf910c1d07c93b96fe93f05f8b7636eb6c75"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/access.rs",
+      "sha256": "aa8aff85d5d747757657e10b865b7a8ad99e2287d3f32bd10a03771bfe9ce2bc"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui.rs",
+      "sha256": "a0b00ad1337562f6e9519305a5c29ee410d847f4f098ce0a889c8aafa64d20a8"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/connections.rs",
+      "sha256": "84b55061a044e9b3e0da2a42553442891a7c76f65797ccc5bffc4b6f88d330e4"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/layout.rs",
+      "sha256": "f3438617ec2cf75129598db419b441e6dcacc994a0338797427e901b13c2ba6b"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/management_tests.rs",
+      "sha256": "06104f20e534aceff2b9a93dbdf1dcb6a99350d2c3fde8132f0932c147b70f75"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/permissions.rs",
+      "sha256": "98fb17bc85f0bba9d2b94b7cc6cc5d7659ee216e36b4a8522e5e7a647d0f092d"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/redesign_tests.rs",
+      "sha256": "d73cbe7301535597bfc10efdcfd2acbafa277f0a2814f997bad2b658f75e810b"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/settings.rs",
+      "sha256": "9128d2dcea1d34694cc5d2b9a32e09eac7f6ed9cf3b64796b46508c9dcdac59a"
+    },
+    {
+      "path": "crates/app/src/ui/activity.rs",
+      "sha256": "ad5cd75baabd70609777e30e6257d4feb95390e98ef91a02a4085144da451485"
+    },
+    {
+      "path": "crates/app/src/ui/agents.rs",
+      "sha256": "25ea5016d7bc06e8ebc48fec4ea5ec0f067a42345c1a70453094cefb660cb30a"
+    },
+    {
+      "path": "crates/app/src/ui/credentials.rs",
+      "sha256": "40c6050d4d7de8bd8e895beef7fa2aa9f8121c3648b498b734d558f8d58c8357"
+    },
+    {
+      "path": "crates/app/src/ui/credentials/modern.rs",
+      "sha256": "c0f6bf06d469cef2d8d2379e0209d2ba2f80c35edc9d80572bbe3116068349f9"
+    },
+    {
+      "path": "crates/app/src/ui/env_profiles.rs",
+      "sha256": "f26076946dcb2c802c55c4f38382ca1dc76d7484d8b42d392d1a15bc41a38808"
+    },
+    {
+      "path": "crates/app/src/ui/env_profiles/modern.rs",
+      "sha256": "8bd44029445ce1fcabcb11b6fa7b7fdab519a626ac4191b29ee93085e1e2a8a3"
+    },
+    {
+      "path": "crates/app/src/ui/environment.rs",
+      "sha256": "20e9cb042e85b432b25c4b408991591ee0981704ad14fbb5db93d47764ab60be"
+    },
+    {
+      "path": "crates/app/src/ui/settings.rs",
+      "sha256": "da203b324d9270ce3b31d73de60542705dcf03165b6f4360d0bcf52a4b6c775b"
+    },
+    {
+      "path": "crates/connector-ui/src/lib.rs",
+      "sha256": "a7cd0343a4af31411516a477237953332e8b3cece3c930c533a94e47ffadaf49"
+    },
+    {
+      "path": "crates/i18n/locales/en-US/messages.txt",
+      "sha256": "c9b7fb76cf18e3499d196c1def3eb7b2c12091e03f1fbf63efe12633743fca72"
+    },
+    {
+      "path": "crates/i18n/locales/ja-JP/messages.txt",
+      "sha256": "bbbaef4b92675980222566f287b4c813cdbc38231ac97c8732eb4d6ee9d9d430"
+    },
+    {
+      "path": "crates/i18n/locales/ko-KR/messages.txt",
+      "sha256": "1da22b04ff215292262991c3839cb488384fe70947da792ddd20dad33e1080ec"
+    },
+    {
+      "path": "crates/i18n/locales/zh-Hans/messages.txt",
+      "sha256": "fce6d0a43743b5d18404db27d0b9e1f7d65498e403d0c1aa2b03fd98cdf86bc5"
+    },
+    {
+      "path": "crates/i18n/locales/zh-Hant/messages.txt",
+      "sha256": "a994174e96625da8098b2ffba79bf05c2ca9466553e116b5f8f8314cd8ec0745"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/one_screen.rs",
+      "sha256": "f32e3201749896999b8f55179a1a51fe46c858565e9458483e2f22ced7ed5bcc"
+    },
+    {
+      "path": "crates/app/src/cloud_agent/ui/one_screen_tests.rs",
+      "sha256": "76670bf795a4f62fe7364defd692ae5df9c9ea2db7a3c32ee95e6324a8cc6530"
+    },
+    {
+      "path": "crates/app/src/ui/settings/design_rule_tests.rs",
+      "sha256": "7bed2cbce013308d952771a495e13694378f3e8b05d03fba7855ff1b2cca77f1"
+    }
+  ],
+  "copied_files": 27,
+  "source_worker": "/private/tmp/deppy-settings-integrate-20261023",
+  "original_dirty_tree_read_only": true
+}

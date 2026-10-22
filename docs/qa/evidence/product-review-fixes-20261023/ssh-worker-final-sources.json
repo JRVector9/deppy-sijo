@@ -1,0 +1,30 @@
+[
+  {
+    "path": "crates/app/src/command_center_host.rs",
+    "sha256": "b390e5a87b3efed831755454e1ceecb7ad32e5d1ca7819d1d59239e0d7126a7c"
+  },
+  {
+    "path": "crates/app/src/command_center_launch.rs",
+    "sha256": "04378168e8555996158b8e28c2cd572cd56cc0a4b900b064add79c3b3c7983a3"
+  },
+  {
+    "path": "crates/app/src/command_center_main_host.rs",
+    "sha256": "5916c3e6d07bd7ceb7b96c7a1ff78afa18b71f11ce4449962b1160acc3094ecd"
+  },
+  {
+    "path": "crates/app/src/command_center_observe.rs",
+    "sha256": "90a61c501b57c8ba02def15262233a50e7d16b8d959e5174adfec348e0143ede"
+  },
+  {
+    "path": "crates/app/src/command_center_server.rs",
+    "sha256": "3b9385ee3fe3136a3c581426024d29d8e7d40f9456092f8f240a3632be6fe834"
+  },
+  {
+    "path": "crates/app/src/command_center_verification.rs",
+    "sha256": "5898a1c945b028a41c8ee9caa3569ea69ba0923db30c53ae75ab304bc3b8e780"
+  },
+  {
+    "path": "crates/app/src/workspace_runtime_client.rs",
+    "sha256": "4277cdb97cea2072827c9b7537c3de1b774e9f3475694a1dc37a4aab0cfd675d"
+  }
+]

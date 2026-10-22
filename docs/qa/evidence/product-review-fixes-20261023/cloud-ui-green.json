@@ -1,0 +1,30 @@
+{
+  "label": "cloud-ui-green",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "env",
+    "DEPPY_CLOUD_ONE_SCREEN_IMAGES=/private/tmp/deppy-product-cloud-images-20261023",
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "cloud_agent::",
+    "--",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 29.62,
+  "summaries": [
+    "test result: ok. 229 passed; 0 failed; 3 ignored; 0 measured; 3425 filtered out; finished in 29.28s"
+  ],
+  "log_sha256": "1799e7ccf33978ecb39f0442d35b75d585faf87dce2d8ce4eb08fe180836aef6",
+  "raw_log_gzip": "cloud-ui-green.log.gz",
+  "readable_log_sha256": "1f1e7863d4196154a605c01fc2ddbc23104baaa387579595d8d0f448d568b7ed",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

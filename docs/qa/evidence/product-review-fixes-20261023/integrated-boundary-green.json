@@ -1,0 +1,23 @@
+{
+  "label": "integrated-boundary-green",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "run",
+    "--offline",
+    "--locked",
+    "-p",
+    "xtask",
+    "--",
+    "check-boundary"
+  ],
+  "exit": 0,
+  "seconds": 4.37,
+  "summaries": [],
+  "log_sha256": "e4ac3c07ea9261b9fbc0e49e5786f977e083165b8f1de6ab4bec46ff9ca956a5",
+  "raw_log_gzip": "integrated-boundary-green.log.gz",
+  "readable_log_sha256": "e4ac3c07ea9261b9fbc0e49e5786f977e083165b8f1de6ab4bec46ff9ca956a5",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

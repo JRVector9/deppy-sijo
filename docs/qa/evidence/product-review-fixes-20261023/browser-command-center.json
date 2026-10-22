@@ -1,0 +1,17 @@
+{
+  "label": "browser-command-center",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "-",
+  "jobs": 2,
+  "argv": [
+    "node",
+    "web/shared/tests/command-center.browser.mjs"
+  ],
+  "exit": 0,
+  "seconds": 11.26,
+  "summaries": [],
+  "log_sha256": "6a202621579ff8d24c1061d406864125253f566960fdb2325f17ad8b87f2b9a7",
+  "raw_log_gzip": "browser-command-center.log.gz",
+  "readable_log_sha256": "6a202621579ff8d24c1061d406864125253f566960fdb2325f17ad8b87f2b9a7",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

@@ -1,0 +1,488 @@
+{
+  "label": "integrated-workspace-final-pass",
+  "method": "Last summary for each Cargo Running/Doc-tests harness; nested child summaries excluded. Counts overlap focused runs and must not be added to them.",
+  "harnesses": {
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/agent_mcp-9a9fc5d8753f841d)": {
+      "passed": 96,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/audit-50b7e918241237f2)": {
+      "passed": 65,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/auth-b25c358cb4eb3d52)": {
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_contract-b2a58437e6d6f398)": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_service-5d6fc36431e5e033)": {
+      "passed": 83,
+      "failed": 0,
+      "ignored": 2
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_ui-ec94996f3c232722)": {
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_core-a6a6be18c2f9512f)": {
+      "passed": 27,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_remote_host-c199e8a3595a9620)": {
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_remote_host-6195cf6a1e8b04e0)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/supervisor.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/supervisor-786e2de1ab8e0ea6)": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_sijo-664f4680de53a761)": {
+      "passed": 3696,
+      "failed": 0,
+      "ignored": 46
+    },
+    "Running tests/agent_state_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/agent_state_boundary-7b64381feb86bd9b)": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/alloc_phys_footprint_release.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/alloc_phys_footprint_release-dd3392d1c44b45bc)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/dotenv_launch_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/dotenv_launch_boundary-290db0b08cbfebdb)": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/lazy_bounded_worker.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/lazy_bounded_worker-2928e0a482b90c76)": {
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/logging_policy.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/logging_policy-5704ee453c74f0c4)": {
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/scrollback_rss_end_to_end.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/scrollback_rss_end_to_end-e72df6411c299d54)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/http_client-ea40c8b9a9dd4369)": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/i18n-8d0e0108b33f4b7e)": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mcp-3d5fd39495429169)": {
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_mcp_proxy-7ff2b832893afa81)": {
+      "passed": 109,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/hook_task_prompt.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/hook_task_prompt-215211b16ca82e56)": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mcp_store-fa358e9dd4b1ab42)": {
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mux-b9e2e1a0f0d905b2)": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/persist-5f15342b0d358347)": {
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/platform-46f79e663cbe1432)": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/pty-440339f2c3a8d631)": {
+      "passed": 70,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_protocol-1cc594e0e2d7dea9)": {
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/relay_wire_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_wire_vectors-c40f0a14c150031b)": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_server-f9066d974a7cf58f)": {
+      "passed": 36,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_server-7d6e0646b890167b)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/deploy_manifests.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deploy_manifests-bd7c061310db4cd6)": {
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/shutdown.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/shutdown-04294db95a4c0f01)": {
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/transport_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/transport_contract-b739bef900d45b77)": {
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/runtime-9f591b1c6b5b6f2c)": {
+      "passed": 456,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/secret-d71c3a49cc742fdf)": {
+      "passed": 80,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/session-80e403a5f8aefe9a)": {
+      "passed": 82,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/terminal_table_resize.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/terminal_table_resize-b8d3d35626705ad7)": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/ssh_askpass-e96dcce6bddc4137)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_ssh_askpass-ea20c85d3541641e)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/companion.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/companion-978897d83ba82db7)": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/protocol.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/protocol-5898a1af4b3f72d0)": {
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/ssh_transport-d4621e03dd92ad93)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/config_context.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/config_context-3ce3b202ab717f49)": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/destination.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/destination-1533c64ce0310b8a)": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/openssh_loopback.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/openssh_loopback-7ee00374f3c555cc)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    "Running tests/worker.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/worker-690deac97ac6ac56)": {
+      "passed": 22,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/storage-4b787858a1b705c9)": {
+      "passed": 523,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/background_agent_lifecycle.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/background_agent_lifecycle-ad3b95757db52c3a)": {
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/storage_core-b15b2aee5436451c)": {
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/terminal-8703f641cd494247)": {
+      "passed": 140,
+      "failed": 0,
+      "ignored": 4
+    },
+    "Running unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/web_remote-4a4c0e8411828020)": {
+      "passed": 408,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/chrome_support_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/chrome_support_contract-a792beaa2a3a50c7)": {
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/cloud_results_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/cloud_results_chrome-8dc94553d551c447)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/command_center_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/command_center_chrome-beb52eeb8cc2d560)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/mobile_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mobile_shell_chrome-106f91ee98a650a4)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/mobile_usability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mobile_usability_chrome-651e542b36c18499)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/pwa_unified_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/pwa_unified_chrome-88b3f234b677f3b3)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2
+    },
+    "Running tests/relay_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_shell_chrome-3e12b287eda03f1e)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/relay_shell_deploy.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_shell_deploy-805291ab092e4ef9)": {
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/relay_webcrypto_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_webcrypto_vectors-80351e46b65b10b4)": {
+      "passed": 4,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/transport_independence.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/transport_independence-93562efce7f8f1f6)": {
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Running tests/viewer_core_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_core_chrome-9e6a6f6a3715ab5f)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/viewer_grapheme_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_grapheme_chrome-9aa8b1d16b750b04)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/viewer_history_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_history_chrome-13d3c8e337db8d58)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/viewer_readability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_readability_chrome-e186a2cfc73ff1aa)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running tests/viewer_reading_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_reading_chrome-8a46fb956c3b3616)": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1
+    },
+    "Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/xtask-d6952ff5c64bab94)": {
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests agent_mcp": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests audit": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests auth": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests connector_contract": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests connector_service": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests connector_ui": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests deppy_core": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests deppy_remote_host": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests http_client": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests i18n": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests mcp": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests mcp_store": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests mux": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests persist": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests platform": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests pty": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests relay_protocol": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests relay_server": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests runtime": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests secret": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests session": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests ssh_askpass": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests ssh_transport": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests storage": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests storage_core": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests terminal": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    },
+    "Doc-tests web_remote": {
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0
+    }
+  },
+  "totals": {
+    "passed": 6405,
+    "failed": 0,
+    "ignored": 76
+  },
+  "nested_summaries_excluded": 3,
+  "harness_count": 95
+}

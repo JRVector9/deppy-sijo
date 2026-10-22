@@ -1,0 +1,29 @@
+{
+  "label": "ssh-git-manual-red",
+  "cwd": "/private/tmp/deppy-cc-ssh-integrate-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_ssh_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 101,
+  "seconds": 26.19,
+  "summaries": [
+    "test result: FAILED. 5 passed; 5 failed; 0 ignored; 0 measured; 3687 filtered out; finished in 0.38s"
+  ],
+  "log_sha256": "9adfffb3a640581377cddd746fc64b54c58f69838e10166a81f5aae6e8ac7d5e",
+  "raw_log_gzip": "ssh-git-manual-red.log.gz",
+  "readable_log_sha256": "235ffdac71a5f7388271a0e735e12ffdcd43a6a4dfc14d4b645270d7f5225b2f",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

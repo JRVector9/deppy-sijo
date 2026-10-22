@@ -1,0 +1,4 @@
+{
+  "crates/app/src/cloud_agent.rs": "201cad5556e0da23a2ca4e58de3457fea165ae513050c991affea93abb60ac0b",
+  "crates/app/src/keychain_startup_tests.rs": "5aa726f9d5d58dbf595511ce026115d0d8c09686fb0136658daed6912b0e1055"
+}

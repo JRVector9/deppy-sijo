@@ -1,0 +1,23 @@
+{
+  "label": "integrated-deps",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "run",
+    "--offline",
+    "--locked",
+    "-p",
+    "xtask",
+    "--",
+    "check-deps"
+  ],
+  "exit": 0,
+  "seconds": 0.25,
+  "summaries": [],
+  "log_sha256": "067dff86f373b69bf945e770cb82780e0dba47c10376dc9c48f8604b6d1dc7a2",
+  "raw_log_gzip": "integrated-deps.log.gz",
+  "readable_log_sha256": "067dff86f373b69bf945e770cb82780e0dba47c10376dc9c48f8604b6d1dc7a2",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

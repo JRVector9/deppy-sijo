@@ -1,0 +1,29 @@
+{
+  "label": "main-lifecycle-green-integrated",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_main_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 36.98,
+  "summaries": [
+    "test result: ok. 28 passed; 0 failed; 0 ignored; 0 measured; 3629 filtered out; finished in 6.67s"
+  ],
+  "log_sha256": "edea2d30aeb8b391ea009aa955b9ec4e9e67501a0b2c204d1a68829ca673007d",
+  "raw_log_gzip": "main-lifecycle-green-integrated.log.gz",
+  "readable_log_sha256": "3055d7b97abb0ca39add7ad66b261033d1c3ce1e2b504a44ae473e16a275cf24",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

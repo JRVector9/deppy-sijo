@@ -1,0 +1,27 @@
+{
+  "label": "main-lifecycle-green",
+  "cwd": "/private/tmp/deppy-main-lifecycle-fix-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_main_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 101,
+  "seconds": 5.94,
+  "summaries": [],
+  "log_sha256": "0f238e89b16780b73e55e45e7537985d65d87fdf2b41e660fc6c25262a74039f",
+  "raw_log_gzip": "main-lifecycle-green.log.gz",
+  "readable_log_sha256": "0f238e89b16780b73e55e45e7537985d65d87fdf2b41e660fc6c25262a74039f",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

@@ -1,0 +1,38 @@
+   Compiling ring v0.17.14
+   Compiling rustls v0.23.46
+   Compiling rustls-webpki v0.103.15
+   Compiling rcgen v0.14.10
+   Compiling ureq v3.4.0
+   Compiling runtime v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/runtime)
+   Compiling http-client v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/http-client)
+   Compiling tungstenite v0.30.0
+   Compiling mcp v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/mcp)
+   Compiling web-remote v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/web-remote)
+   Compiling auth v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/auth)
+   Compiling agent-mcp v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/agent-mcp)
+   Compiling connector-service v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/connector-service)
+   Compiling deppy-remote-host v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/remote-host)
+   Compiling deppy-sijo v0.15.1 (/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 30.44s
+     Running unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_sijo-cb28fcc838a7e0ff)
+
+running 4 tests
+test app::command_center_host::main_host::tests::command_center_main_host_guard_keeps_256_live_admission_bound ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_guard_preserves_host_1024_replay_quota ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_guard_preserves_retired_permit_receipt_and_unknown ... ok
+test app::command_center_host::main_host::tests::command_center_main_host_guard_reclaims_retired_admission_capacity ...
+thread 'app::command_center_host::main_host::tests::command_center_main_host_guard_reclaims_retired_admission_capacity' (212247834) panicked at crates/app/src/command_center_main_host.rs:724:9:
+assertion `left == right` failed: 256 retired MAIN guards must not consume the live admission bound: Err("main_operation_capacity_no_effect")
+  left: Err("main_operation_capacity_no_effect")
+ right: Ok(String("accepted"))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    app::command_center_host::main_host::tests::command_center_main_host_guard_reclaims_retired_admission_capacity
+
+test result: FAILED. 3 passed; 1 failed; 0 ignored; 0 measured; 3738 filtered out; finished in 0.13s
+
+error: test failed, to rerun pass `-p deppy-sijo --bin deppy-sijo`

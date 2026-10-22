@@ -1,0 +1,21 @@
+{
+  "label": "ssh-python-packaging",
+  "cwd": "/private/tmp/deppy-cc-ssh-integrate-20261023",
+  "target": "-",
+  "jobs": 2,
+  "argv": [
+    "python3",
+    "-m",
+    "unittest",
+    "scripts.tests.test_prepare_remote_host",
+    "scripts.tests.test_dev_build",
+    "scripts.tests.test_ssh_packaging"
+  ],
+  "exit": 0,
+  "seconds": 3.08,
+  "summaries": [],
+  "log_sha256": "6174639a039cd58a3c01771b3a991ea371cc7622b4ff842e4c26f3ffcdba3b79",
+  "raw_log_gzip": "ssh-python-packaging.log.gz",
+  "readable_log_sha256": "6174639a039cd58a3c01771b3a991ea371cc7622b4ff842e4c26f3ffcdba3b79",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

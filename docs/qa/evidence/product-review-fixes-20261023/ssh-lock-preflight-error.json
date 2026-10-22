@@ -1,0 +1,21 @@
+{
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_ssh_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "cwd": "/private/tmp/deppy-cc-ssh-integrate-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "exit": 101,
+  "seconds": 0.34
+}

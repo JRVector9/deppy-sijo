@@ -1,0 +1,29 @@
+{
+  "label": "main-host-guard-green",
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "target": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target",
+  "jobs": 2,
+  "argv": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "command_center_main_",
+    "--",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "exit": 0,
+  "seconds": 26.52,
+  "summaries": [
+    "test result: ok. 32 passed; 0 failed; 0 ignored; 0 measured; 3710 filtered out; finished in 7.51s"
+  ],
+  "log_sha256": "d945ba0542e29d5c1c27aa2be5f34bd7a07a820fc202440b8d1ccd536a88ec32",
+  "raw_log_gzip": "main-host-guard-green.log.gz",
+  "readable_log_sha256": "eef38cc705a9a1042e2f64952cb78b4fed2d044287c38057b5fe3f27c78526ba",
+  "readable_log_normalization": "Trailing whitespace/EOF blank rows normalized; exact original bytes retained in raw_log_gzip."
+}

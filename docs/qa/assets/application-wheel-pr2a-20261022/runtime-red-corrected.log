@@ -1,0 +1,35 @@
+   Compiling runtime v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.80s
+     Running unittests src/lib.rs (/private/tmp/deppy-table-claude-target-20261022/debug/deps/runtime-a61b6bc6c9581157)
+
+running 6 tests
+test command::tests::application_wheel_retains_no_heap_and_roundtrips_without_changing_scroll_wire ... ok
+test in_process::tests::application_wheel_mode_flood_is_bounded_and_denied_before_pty_write ... ok
+test in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft ... FAILED
+test protocol::tests::application_wheel_requires_new_exact_wire_version ... FAILED
+test terminal_input::tests::application_wheel_is_append_only_and_preserves_legacy_text_key_wire ... ok
+test terminal_input::tests::application_wheel_validates_bounded_grid_coordinates_without_text_payload ... ok
+
+failures:
+
+---- in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft stdout ----
+
+thread 'in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft' (192074495) panicked at crates/runtime/src/in_process.rs:12472:13:
+wheel PTY bytes missing: "❯ 한글 초안                                                                     \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                \n                                                                                "
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- protocol::tests::application_wheel_requires_new_exact_wire_version stdout ----
+
+thread 'protocol::tests::application_wheel_requires_new_exact_wire_version' (192077082) panicked at crates/runtime/src/protocol.rs:588:9:
+assertion `left == right` failed
+  left: 35
+ right: 36
+
+
+failures:
+    in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft
+    protocol::tests::application_wheel_requires_new_exact_wire_version
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 421 filtered out; finished in 5.10s
+
+error: test failed, to rerun pass `-p runtime --lib`

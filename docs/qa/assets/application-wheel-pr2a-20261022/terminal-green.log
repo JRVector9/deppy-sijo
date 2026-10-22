@@ -1,0 +1,9 @@
+   Compiling terminal v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/terminal)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.73s
+     Running unittests src/lib.rs (/private/tmp/deppy-table-claude-target-20261022/debug/deps/terminal-a281aa4c2886c849)
+
+running 2 tests
+test alacritty_backend::tests::application_wheel_rejects_stale_grid_invalid_coordinates_and_unbounded_delta ... ok
+test alacritty_backend::tests::application_wheel_requires_live_alt_screen_and_negotiated_sgr_mouse ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 142 filtered out; finished in 0.00s

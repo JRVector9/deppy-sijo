@@ -1,0 +1,15 @@
+   Compiling runtime v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/runtime)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.40s
+     Running unittests src/lib.rs (/private/tmp/deppy-table-claude-target-20261022/debug/deps/runtime-a61b6bc6c9581157)
+
+running 8 tests
+test command::tests::application_wheel_retains_no_heap_and_roundtrips_without_changing_scroll_wire ... ok
+test in_process::tests::application_wheel_mode_flood_is_bounded_and_denied_before_pty_write ... ok
+test in_process::tests::application_wheel_navigation_obeys_revoked_input_admission ... ok
+test in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft ... ok
+test in_process::tests::application_wheel_uses_real_pty_queue_backpressure_without_prompt_evidence ... ok
+test protocol::tests::application_wheel_requires_new_exact_wire_version ... ok
+test terminal_input::tests::application_wheel_is_append_only_and_preserves_legacy_text_key_wire ... ok
+test terminal_input::tests::application_wheel_validates_bounded_grid_coordinates_without_text_payload ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 421 filtered out; finished in 0.19s

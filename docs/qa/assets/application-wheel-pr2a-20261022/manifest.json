@@ -1,0 +1,204 @@
+{
+  "objective": "Bounded negotiated application wheel as navigation through ordinary PTY admission",
+  "product_commit": "3670eed3a87fb5c7bb2907c5cd17575efc76ce45",
+  "test_cleanup_commit": "e176b10c4de63d86927be76c04b1fbafac1d3d5d",
+  "previous_source_rendering_evidence_commit": "27c3f31ecbc36c97d3d75a2ffb346afe9bce2c7d",
+  "worktree": "/private/tmp/deppy-table-claude-20261022",
+  "target": "/private/tmp/deppy-table-claude-target-20261022",
+  "source_files": [
+    {
+      "path": "crates/terminal/src/backend.rs",
+      "sha256": "8b84a8773e429660fb224bc6ce8201226a911eccc47652fdedb96fe3bf124860"
+    },
+    {
+      "path": "crates/terminal/src/alacritty_backend.rs",
+      "sha256": "9a134b2f7b70fa375cebec95079ff6246dca4ff18160d40a6823906947c5d5ac"
+    },
+    {
+      "path": "crates/session/src/session.rs",
+      "sha256": "99d247d77bd452ac878180f35df29eee36c00a8f99650c2ba13dd1aa0a41ace8"
+    },
+    {
+      "path": "crates/runtime/src/terminal_input.rs",
+      "sha256": "27beefefd3dd6dbaecb7547126b005dcb67ba322b18141862a1027781602912d"
+    },
+    {
+      "path": "crates/runtime/src/command.rs",
+      "sha256": "36ba3962b067d6ced5caa28caf671231e3a6308d384fe453e7d09c86eba7e7a8"
+    },
+    {
+      "path": "crates/runtime/src/in_process.rs",
+      "sha256": "acd99c9ada6e5352ee7e36b26a5cd607bca00aabc4f04351b4962fe7242d4ca6"
+    },
+    {
+      "path": "crates/runtime/src/protocol.rs",
+      "sha256": "f41c20669eb86ef27bad3425064cfc144a9086145894a15cd69a14cf4f03c9ec"
+    },
+    {
+      "path": "crates/runtime/src/remote.rs",
+      "sha256": "acd8c088a564e6cca3f77c626bccabbaa531e3e5df9dcb8e1c52ac358b3c81cd"
+    }
+  ],
+  "gates": [
+    {
+      "log": "terminal-red.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p terminal application_wheel -- --test-threads=1",
+      "exit_code": 101,
+      "source_stage": "Safe-default backend plus RED tests before implementation",
+      "raw_capture_path": "/private/tmp/deppy-wheel-terminal-red-20261022.log",
+      "raw_capture_sha256": "e0de2883e2d2f5e486f0cb9eea1e28e5e5c3e645ab986f225f32700a23ca8173",
+      "archived_sha256": "e0de2883e2d2f5e486f0cb9eea1e28e5e5c3e645ab986f225f32700a23ca8173",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "terminal-green.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p terminal application_wheel -- --test-threads=1",
+      "exit_code": 0,
+      "source_stage": "Backend implementation before final runtime changes",
+      "raw_capture_path": "/private/tmp/deppy-wheel-terminal-green-20261022.log",
+      "raw_capture_sha256": "509d4ab2e25794437b29252e93852cb368b422fdda5de843d1a148a194e63f58",
+      "archived_sha256": "1cf3db0234465eeeca1545854f5a5f06cfbf7ad06a85d2eb662a109509e36684",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "runtime-red-fixture-error.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime application_wheel -- --test-threads=1",
+      "exit_code": 101,
+      "source_stage": "Excluded regression proof: incorrect non-raw Rust shell escape caused fixture failure",
+      "raw_capture_path": "/private/tmp/deppy-wheel-runtime-red-20261022.log",
+      "raw_capture_sha256": "0d318d85ecc18d57ac9e8c13e8553c77c9daaad74aca5d8e303381827a6a781a",
+      "archived_sha256": "0d318d85ecc18d57ac9e8c13e8553c77c9daaad74aca5d8e303381827a6a781a",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "runtime-red-corrected.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime application_wheel -- --test-threads=1",
+      "exit_code": 101,
+      "source_stage": "Corrected fixture before Navigation dispatch and protocol bump",
+      "raw_capture_path": "/private/tmp/deppy-wheel-runtime-red-corrected-20261022.log",
+      "raw_capture_sha256": "ec03925d60f22d4d5fb5cdfef879fcde938216c023d6b344515c0840f9ac588a",
+      "archived_sha256": "ec03925d60f22d4d5fb5cdfef879fcde938216c023d6b344515c0840f9ac588a",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "runtime-green-expanded.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime application_wheel -- --test-threads=1",
+      "exit_code": 0,
+      "source_stage": "Expanded candidate before protocol companion assertion correction",
+      "raw_capture_path": "/private/tmp/deppy-wheel-runtime-green-expanded-20261022.log",
+      "raw_capture_sha256": "9793ad9820cc426fe5358d892161bb9f5fa1982e62f765fd265fbe38c9300e8b",
+      "archived_sha256": "34396206a580da9049832f6c68895608fdadd13b60e68d43a5c5765440011f9d",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "affected-suites-initial.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p terminal -p session -p runtime -- --test-threads=1",
+      "exit_code": 101,
+      "source_stage": "Candidate before remote hello test expected-version correction; terminal/session were not reached",
+      "raw_capture_path": "/private/tmp/deppy-wheel-affected-suites-20261022.log",
+      "raw_capture_sha256": "b32d5fe377363f50ea8246714e42d61820d9adee8efda752e041e74016eedf22",
+      "archived_sha256": "b32d5fe377363f50ea8246714e42d61820d9adee8efda752e041e74016eedf22",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "hello-green.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime v12_v13_peer_is_rejected_at_hello_before_event_decode -- --test-threads=1",
+      "exit_code": 0,
+      "source_stage": "Candidate content committed as 3670eed3",
+      "raw_capture_path": "/private/tmp/deppy-wheel-hello-green-20261022.log",
+      "raw_capture_sha256": "2664bf33cdb14d7a5f8619fd5ae075ca9ee3a95169f47b8795203bbd3ace170b",
+      "archived_sha256": "88dc4f5d6273923e11eb94d6092a33215f9c28d5cd39d50a73eadfd2ec4fc1fa",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "affected-suites-final.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p terminal -p session -p runtime -- --test-threads=1",
+      "exit_code": 0,
+      "source_stage": "3670eed3",
+      "raw_capture_path": "/private/tmp/deppy-wheel-affected-suites-final-20261022.log",
+      "raw_capture_sha256": "d552b8bade24be04f3e4f43d3637d710de6577c52ab6b2fa57c1439d44c0713f",
+      "archived_sha256": "1b5e8d5fbc62150658717846aa3d1df6869316fd068a4d6c1f78d32d685dc2b8",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "runtime-final-focused.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo test --offline --locked -p runtime application_wheel -- --test-threads=1",
+      "exit_code": 0,
+      "source_stage": "Candidate content committed as e176b10c; four test assertions changed only",
+      "raw_capture_path": "/private/tmp/deppy-wheel-runtime-final-focused-20261022.log",
+      "raw_capture_sha256": "7ecc0c720175819706ec5b0b5b21ce3bbd90db6a8c6b87648099e12ddd1432f7",
+      "archived_sha256": "4522bf0736c5cd8abcaf2dfef35905d6242cd6ae2b1ee4361a321bfbdcd55bec",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "clippy-initial.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo clippy --offline --locked -p terminal -p session -p runtime --all-targets -- -D warnings",
+      "exit_code": 101,
+      "source_stage": "3670eed3; four new test-only unnecessary_get_then_check errors",
+      "raw_capture_path": "/private/tmp/deppy-wheel-clippy-20261022.log",
+      "raw_capture_sha256": "6b75ed1ecc10abde39fa6f8080546509d6ecec92be4dfe474d40690ae387ca35",
+      "archived_sha256": "6b75ed1ecc10abde39fa6f8080546509d6ecec92be4dfe474d40690ae387ca35",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "clippy-final.log",
+      "command": "CARGO_TARGET_DIR=/private/tmp/deppy-table-claude-target-20261022 CARGO_BUILD_JOBS=2 cargo clippy --offline --locked -p terminal -p session -p runtime --all-targets -- -D warnings",
+      "exit_code": 0,
+      "source_stage": "e176b10c",
+      "raw_capture_path": "/private/tmp/deppy-wheel-clippy-final-20261022.log",
+      "raw_capture_sha256": "bd0eee1c3efac68570b6a6e0aab8fb5400b463808dcdc18ba6db7c04c79ce11e",
+      "archived_sha256": "bd0eee1c3efac68570b6a6e0aab8fb5400b463808dcdc18ba6db7c04c79ce11e",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "fmt.log",
+      "command": "cargo fmt --all -- --check",
+      "exit_code": 0,
+      "source_stage": "e176b10c",
+      "raw_capture_path": "/private/tmp/deppy-wheel-fmt-final-20261022.log",
+      "raw_capture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    },
+    {
+      "log": "diff-check.log",
+      "command": "git diff --check",
+      "exit_code": 0,
+      "source_stage": "e176b10c plus untracked QA note; repeat cached diff check before evidence commit",
+      "raw_capture_path": "/private/tmp/deppy-wheel-diff-check-final-20261022.log",
+      "raw_capture_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "archived_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "normalization": "Removed trailing whitespace and blank EOF lines only"
+    }
+  ],
+  "full_suite_results": {
+    "source_commit": "3670eed3",
+    "runtime": {
+      "passed": 428,
+      "failed": 0,
+      "ignored": 1
+    },
+    "session": {
+      "passed": 82,
+      "failed": 0,
+      "ignored": 0
+    },
+    "terminal": {
+      "passed": 140,
+      "failed": 0,
+      "ignored": 4
+    },
+    "doctest_targets": {
+      "runtime": 0,
+      "session": 0,
+      "terminal": 0
+    }
+  },
+  "limits": [
+    "No Deppy launch/restart or release artifact",
+    "No user session/configuration/credentials or paid model API used",
+    "No renderer default/launcher change",
+    "Native UI integration belongs to root",
+    "Revoked InputPermit test exercises shared admission helper; Wheel does not introduce a new remote producer"
+  ]
+}

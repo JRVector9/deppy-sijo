@@ -1,0 +1,174 @@
+   Compiling libc v0.2.189
+   Compiling syn v2.0.119
+   Compiling getrandom v0.4.3
+   Compiling rand_core v0.10.1
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.9
+   Compiling cc v1.2.65
+   Compiling once_cell v1.21.4
+   Compiling typenum v1.20.1
+   Compiling bytemuck_derive v1.10.2
+   Compiling hybrid-array v0.4.13
+   Compiling crypto-common v0.2.2
+   Compiling bytemuck v1.25.0
+   Compiling uuid v1.26.0
+   Compiling thiserror-impl v2.0.18
+   Compiling vcpkg v0.2.15
+   Compiling pkg-config v0.3.33
+   Compiling thiserror v2.0.18
+   Compiling libsqlite3-sys v0.38.2
+   Compiling errno v0.3.14
+   Compiling font-types v0.12.4
+   Compiling color v0.3.3
+   Compiling block-buffer v0.12.1
+   Compiling core-foundation-sys v0.8.7
+   Compiling peniko v0.6.1
+   Compiling read-fonts v0.41.0
+   Compiling parking_lot_core v0.9.12
+   Compiling hashlink v0.12.0
+   Compiling inout v0.2.2
+   Compiling ring v0.17.14
+   Compiling tracing-core v0.1.36
+   Compiling tracing-attributes v0.1.31
+   Compiling cmov v0.5.4
+   Compiling fallible-streaming-iterator v0.1.9
+   Compiling cfg_aliases v0.1.1
+   Compiling pin-project-lite v0.2.17
+   Compiling fallible-iterator v0.3.0
+   Compiling thiserror v1.0.69
+   Compiling rusqlite v0.40.2
+   Compiling tracing v0.1.44
+   Compiling vello_common v0.1.0
+   Compiling nix v0.28.0
+   Compiling ctutils v0.4.2
+   Compiling parking_lot v0.12.5
+   Compiling rustix v1.1.4
+   Compiling core-foundation v0.10.1
+   Compiling security-framework-sys v2.17.0
+   Compiling deppy-core v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/core)
+   Compiling thiserror-impl v1.0.69
+   Compiling regex-syntax v0.8.11
+   Compiling objc2 v0.6.4
+   Compiling regex-automata v0.4.18
+   Compiling security-framework v3.7.0
+   Compiling ahash v0.8.12
+   Compiling vello_cpu v0.1.0
+   Compiling universal-hash v0.6.1
+   Compiling skrifa v0.44.0
+   Compiling harfrust v0.12.0
+   Compiling cipher v0.5.2
+   Compiling signal-hook-registry v1.4.8
+   Compiling keyring-core v1.0.0
+   Compiling getrandom v0.2.17
+   Compiling crc32fast v1.5.0
+   Compiling const-oid v0.10.2
+   Compiling objc2-encode v4.1.0
+   Compiling zeroize v1.9.0
+   Compiling untrusted v0.9.0
+   Compiling epaint v0.36.1
+   Compiling rustls-pki-types v1.15.1
+   Compiling digest v0.11.3
+   Compiling apple-native-keyring-store v1.0.2
+   Compiling signal-hook v0.4.4
+   Compiling chacha20 v0.10.1
+   Compiling poly1305 v0.9.1
+   Compiling filedescriptor v0.8.3
+   Compiling polling v3.11.0
+   Compiling rustix-openpty v0.2.0
+   Compiling aead v0.6.1
+   Compiling accesskit v0.24.1
+   Compiling serial2 v0.2.37
+   Compiling cpufeatures v0.3.0
+   Compiling num-conv v0.2.2
+   Compiling shell-words v1.1.1
+   Compiling adler2 v2.0.1
+   Compiling downcast-rs v1.2.1
+   Compiling powerfmt v0.2.0
+   Compiling time-core v0.1.9
+   Compiling deranged v0.5.8
+   Compiling simd-adler32 v0.3.9
+   Compiling miniz_oxide v0.9.1
+   Compiling time v0.3.53
+   Compiling alacritty_terminal v0.26.0 (/private/tmp/deppy-table-claude-20261022/third_party/alacritty_terminal-0.26.0)
+   Compiling portable-pty v0.9.0 (/private/tmp/deppy-table-claude-20261022/third_party/portable-pty-0.9.0)
+   Compiling sha2 v0.11.0
+   Compiling egui v0.36.1
+   Compiling chacha20poly1305 v0.11.0
+   Compiling secret v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/secret)
+   Compiling objc2-foundation v0.3.2
+   Compiling mux v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/mux)
+   Compiling fs2 v0.4.3
+   Compiling base64 v0.23.1
+   Compiling rustls v0.23.46
+   Compiling pem v4.0.0
+   Compiling terminal v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/terminal)
+   Compiling persist v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/persist)
+   Compiling pty v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/pty)
+   Compiling flate2 v1.1.10
+   Compiling audit v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/audit)
+   Compiling yasna v0.6.0
+   Compiling rustls-webpki v0.103.15
+   Compiling regex v1.13.1
+   Compiling mcp-store v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/mcp-store)
+   Compiling storage-core v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/storage-core)
+   Compiling cobs v0.3.0
+   Compiling subtle v2.6.1
+   Compiling postcard v1.1.3
+   Compiling storage v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/storage)
+   Compiling session v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/session)
+   Compiling rcgen v0.14.10
+   Compiling runtime v0.15.1 (/private/tmp/deppy-table-claude-20261022/crates/runtime)
+warning: variants `SpawnShell`, `SpawnAgent`, `WriteInput`, and `Resize` are never constructed
+    --> crates/runtime/src/command.rs:1997:13
+     |
+1996 |         enum LegacyCommand {
+     |              ------------- variants in this enum
+1997 |             SpawnShell,
+     |             ^^^^^^^^^^
+1998 |             SpawnAgent,
+     |             ^^^^^^^^^^
+1999 |             WriteInput,
+     |             ^^^^^^^^^^
+2000 |             Resize,
+     |             ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `runtime` (lib test) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 36.20s
+     Running unittests src/lib.rs (/private/tmp/deppy-table-claude-target-20261022/debug/deps/runtime-a61b6bc6c9581157)
+
+running 6 tests
+test command::tests::application_wheel_retains_no_heap_and_roundtrips_without_changing_scroll_wire ... ok
+test in_process::tests::application_wheel_mode_flood_is_bounded_and_denied_before_pty_write ... ok
+test in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft ... FAILED
+test protocol::tests::application_wheel_requires_new_exact_wire_version ... FAILED
+test terminal_input::tests::application_wheel_is_append_only_and_preserves_legacy_text_key_wire ... ok
+test terminal_input::tests::application_wheel_validates_bounded_grid_coordinates_without_text_payload ... ok
+
+failures:
+
+---- in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft stdout ----
+
+thread 'in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft' (192047991) panicked at crates/runtime/src/in_process.rs:12432:11:
+called `Result::unwrap()` on an `Err` value: 셸 실행 실패: /bin/sh
+
+Caused by:
+    nul byte found in provided data
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- protocol::tests::application_wheel_requires_new_exact_wire_version stdout ----
+
+thread 'protocol::tests::application_wheel_requires_new_exact_wire_version' (192047992) panicked at crates/runtime/src/protocol.rs:588:9:
+assertion `left == right` failed
+  left: 35
+ right: 36
+
+
+failures:
+    in_process::tests::application_wheel_refreshes_live_modes_without_submitting_or_intervening_in_draft
+    protocol::tests::application_wheel_requires_new_exact_wire_version
+
+test result: FAILED. 4 passed; 2 failed; 0 ignored; 0 measured; 421 filtered out; finished in 0.09s
+
+error: test failed, to rerun pass `-p runtime --lib`

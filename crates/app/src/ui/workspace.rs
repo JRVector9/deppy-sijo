@@ -11090,6 +11090,8 @@ fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) ->
 
 #[cfg(test)]
 mod tests {
+    include!("workspace_table_resize_tests.rs");
+
     #[test]
     fn pr2_selected_text_keeps_captured_owner_and_bounded_no_submit_intent() {
         let mut ui = super::WorkspaceUi::new();

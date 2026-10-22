@@ -126,6 +126,7 @@ fn openssh_loopback_requires_explicit_trust_and_refuses_changed_key() {
                     resolved = true;
                 }
                 SshEvent::Prompt(prompt) => {
+                    assert!(!worker.authenticated(), "trust prompt precedes authentication");
                     assert_eq!(
                         prompt.kind,
                         PromptKind::HostTrust,
@@ -158,6 +159,7 @@ fn openssh_loopback_requires_explicit_trust_and_refuses_changed_key() {
         }
     }
     assert!(observed, "OpenSSH final destination fingerprint missing");
+    assert!(worker.authenticated(), "OpenSSH authenticated readiness missing");
     let known = fs::read_to_string(root.join("known_hosts")).unwrap();
     assert!(known.starts_with(&format!("[127.0.0.1]:{port} ")));
     let wrong = format!(

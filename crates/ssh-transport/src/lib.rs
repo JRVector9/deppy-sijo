@@ -170,10 +170,16 @@ pub enum PromptReply {
 }
 pub struct SshWorker {
     cancelled: Arc<AtomicBool>,
+    authenticated: Arc<AtomicBool>,
     events: Receiver<SshEvent>,
     replies: SyncSender<(u64, PromptReply)>,
 }
 impl SshWorker {
+    /// Whether this worker reached authenticated remote command startup.
+    /// Historical readiness; callers must also consume terminal events before starting a protocol.
+    pub fn authenticated(&self) -> bool {
+        self.authenticated.load(Ordering::Acquire)
+    }
     /// Only validates/spawns a Rust thread here; process/filesystem/DNS/SSH I/O happens on that thread.
     pub fn spawn(options: SshLaunchOptions) -> io::Result<(Self, SshStream)> {
         worker::spawn(options)

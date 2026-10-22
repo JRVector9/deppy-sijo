@@ -36,13 +36,15 @@ pub(super) fn spawn(options: SshLaunchOptions) -> io::Result<(SshWorker, SshStre
     let (incoming_tx, incoming) = sync_channel(QUEUE_CAP);
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = cancelled.clone();
+    let authenticated = Arc::new(AtomicBool::new(false));
+    let worker_authenticated = authenticated.clone();
     let timeout = options.io_timeout;
     thread::Builder::new()
         .name("deppy-ssh".into())
         .spawn(move || {
             let result = run(
                 &options,
-                &worker_cancelled,
+                (&worker_cancelled, &worker_authenticated),
                 &events_tx,
                 replies_rx,
                 outgoing,
@@ -54,6 +56,7 @@ pub(super) fn spawn(options: SshLaunchOptions) -> io::Result<(SshWorker, SshStre
     Ok((
         SshWorker {
             cancelled: cancelled.clone(),
+            authenticated,
             events,
             replies,
         },
@@ -460,6 +463,7 @@ struct Diagnostic {
     line: Vec<u8>,
     candidate_key: Option<String>,
     sent_key: bool,
+    saw_authenticated: bool,
     failure: Option<FailureKind>,
 }
 impl Diagnostic {
@@ -467,6 +471,12 @@ impl Diagnostic {
         for byte in bytes {
             if *byte == b'\n' {
                 let line = String::from_utf8_lossy(&self.line);
+                if !self.sent_key
+                    && line.starts_with("Authenticated to ")
+                    && line.contains(" using ")
+                {
+                    self.saw_authenticated = true;
+                }
                 if !self.sent_key && line.contains("REMOTE HOST IDENTIFICATION HAS CHANGED") {
                     self.failure = Some(FailureKind::HostKeyMismatch);
                 } else if !self.sent_key
@@ -515,25 +525,26 @@ impl Drop for Diagnostic {
 }
 fn run(
     options: &SshLaunchOptions,
-    cancelled: &AtomicBool,
+    state: (&AtomicBool, &AtomicBool),
     events: &SyncSender<SshEvent>,
     replies: Receiver<(u64, PromptReply)>,
     outgoing: Receiver<Outbound>,
     incoming: SyncSender<Vec<u8>>,
 ) -> FailureKind {
-    match run_inner(options, cancelled, events, replies, outgoing, incoming) {
+    match run_inner(options, state, events, replies, outgoing, incoming) {
         Ok(()) => FailureKind::Exit,
         Err(failure) => failure,
     }
 }
 fn run_inner(
     options: &SshLaunchOptions,
-    cancelled: &AtomicBool,
+    state: (&AtomicBool, &AtomicBool),
     events: &SyncSender<SshEvent>,
     replies: Receiver<(u64, PromptReply)>,
     outgoing: Receiver<Outbound>,
     incoming: SyncSender<Vec<u8>>,
 ) -> Result<(), FailureKind> {
+    let (cancelled, authenticated) = state;
     let deadline = Instant::now() + options.connect_timeout;
     emit(
         events,
@@ -598,6 +609,10 @@ fn run_inner(
         }
         if let Some(failure) = &diagnostic.failure {
             return Err(failure.clone());
+        }
+        if diagnostic.sent_key && diagnostic.saw_authenticated {
+            authenticated.store(true, Ordering::Release);
+            ready = true;
         }
         if let Some(bytes) = read_pending.take() {
             match incoming.try_send(bytes) {

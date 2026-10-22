@@ -86,6 +86,31 @@ fn resolves_config_and_bridges_child_stdio_without_exposing_stderr() {
     assert_eq!(&got, b"binary\0payload");
 }
 #[test]
+fn authenticated_readiness_waits_for_authentication_and_verified_destination_key() {
+    let fixture = Fixture::new(
+        "sys.stderr.write('debug1: Server host key: ssh-ed25519 SHA256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n');sys.stderr.flush()\nos.write(1,b'key-only');time.sleep(0.15)\nsys.stderr.write('Authenticated to resolved.example.test ([127.0.0.1]:2200) using \"publickey\".\\n');sys.stderr.flush()\nsys.stderr.write('debug1: Sending command: fixed helper\\n');sys.stderr.flush()\ntime.sleep(30)",
+    );
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    assert!(!worker.authenticated());
+    let (mut reader, _writer) = stream.split();
+    let mut marker = [0; 8];
+    reader.read_exact(&mut marker).unwrap();
+    assert_eq!(&marker, b"key-only");
+    assert!(
+        !worker.authenticated(),
+        "host key observation is not authentication"
+    );
+    until(&worker, |event| {
+        matches!(event, SshEvent::HostKeyObserved(_))
+    });
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !worker.authenticated() {
+        assert!(Instant::now() < deadline, "authenticated readiness missing");
+        thread::sleep(Duration::from_millis(2));
+    }
+    worker.cancel();
+}
+#[test]
 fn deadline_and_cancel_reap_owned_child() {
     for timeout in [false, true] {
         let fixture = Fixture::new("time.sleep(30)");

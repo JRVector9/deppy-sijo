@@ -116,3 +116,51 @@ and runtime, update the central handoff, and create the intended scoped commit.
 Next commands: run the verification block above from the feature worktree, then
 root-owned full app tests after UI/runtime module integration. Preserve default-off
 `ssh-workspaces` until the complete end-to-end gates pass.
+
+## Authentication readiness and app adapter follow-up
+
+The host must defer the 5s helper protocol handshake until SSH authentication
+finishes. `SshWorker::authenticated()` is a nonblocking historical readiness bit;
+it is set only after the bounded diagnostic parser sees authenticated login and
+the final destination key at remote command startup. Drain terminal events first.
+The fake worker assertion ran RED (readiness absent), then GREEN. An initial
+fixture had an invalid 45-character fingerprint and was corrected to 43; that
+fixture failure is not counted as product RED. The existing real loopback proof
+now also asserts false readiness at host trust and true readiness after login.
+
+Actual follow-up verification: normal transport/askpass **20 PASS**, explicit
+isolated real OpenSSH **1 PASS**, strict two-crate all-target clippy exit 0.
+Commands are the same verification commands above. No user server or app launch.
+
+`workspace_runtime_client.rs` is the app-owned Local/Remote/Offline adapter.
+Offline construction never creates a local runtime. Commands fail Disconnected,
+owned requests remain recoverable and subscriptions are already disconnected.
+Remote inspection/output-reply APIs fail with explicit typed unsupported errors;
+explicit guarded input delegates, automatic/tracked input is rejected by runtime.
+Remote shutdown calls the public nonblocking `disconnect(&self)`; it never asks
+the helper to terminate remote sessions. The initial offline/local behavioral
+tests ran RED, then three tests ran GREEN against the actual runtime rlib. The
+third uses the real SSH runtime over a local UnixStream fixture without any PTY,
+shell or credential. This direct rustc harness is not a full App Cargo gate.
+
+The direct harness links runtime plus its matching anyhow/uuid/secret rlibs from
+`target-remote/debug/deps`; dependency hashes come from Cargo fingerprint files
+to avoid mixing different feature builds. An earlier stale runtime artifact
+lacked the newly added disconnect method; `cargo build --locked -p runtime --lib`
+in the runtime worker's target refreshed the normal rlib before the successful
+test. An initial mismatched secret dependency was a harness setup error, not RED.
+
+Remaining worker scope is the pure remote file/Git adapter and explicit remote
+document revision. The root owns the central handoff and App dispatch wiring.
+
+The explicit document revision is now a Copy enum: local metadata remains in the
+Local variant; Remote stores a scope digest and the helper's metadata/content
+digest. Local save rejects a remote revision before touching a local path. The
+new behavioral assertion ran RED (Conflict instead of TargetMismatch), then
+GREEN. A direct harness includes the real document_io.rs and lazy_worker.rs and
+links cached uuid/tracing/libc/egui/egui_kittest rlibs. All document tests ran:
+**17 PASS / 3 pre-existing ignored measurement tests**. The first harness lacked
+egui dependencies and was corrected before RED; compile failure is not RED.
+
+Provider stubs and five tests are frozen for the root-owned App Cargo RED run.
+No provider implementation has been claimed tested yet.

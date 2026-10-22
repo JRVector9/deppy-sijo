@@ -1322,23 +1322,40 @@ mod deadline_tests {
 
     #[test]
     fn untrusted_cleanup_length_cannot_consume_beyond_byte_cap() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let mut body = vec![b'x'; MAX_UNREAD_REQUEST_BYTES];
-        body.push(b'z');
-        client.write_all(&body).unwrap();
-        let (mut stream, _) = listener.accept().unwrap();
-        close_response(
-            &mut stream,
-            usize::MAX,
-            Instant::now() + Duration::from_secs(1),
-        );
-        stream
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
-        let mut remaining = [0];
-        stream.read_exact(&mut remaining).unwrap();
-        assert_eq!(remaining, [b'z']);
+        for declared_remaining in [usize::MAX, 7] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let body_len = 2 * MAX_UNREAD_REQUEST_BYTES;
+            let (release, wait_for_release) = std::sync::mpsc::channel();
+            let writer = thread::spawn(move || {
+                let mut client = TcpStream::connect(addr).unwrap();
+                client.write_all(&vec![b'x'; body_len]).unwrap();
+                // Keep the read half alive until the server installs its inspection timeout.
+                // macOS can reject setsockopt after both TCP write halves have closed.
+                wait_for_release
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
+                client.shutdown(Shutdown::Write).unwrap();
+            });
+            let (mut stream, _) = listener.accept().unwrap();
+            close_response(
+                &mut stream,
+                declared_remaining,
+                Instant::now() + Duration::from_secs(1),
+            );
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            release.send(()).unwrap();
+            let mut remaining = Vec::new();
+            stream.read_to_end(&mut remaining).unwrap();
+            assert_eq!(
+                remaining.len(),
+                body_len - declared_remaining.min(MAX_UNREAD_REQUEST_BYTES)
+            );
+            assert!(remaining.iter().all(|byte| *byte == b'x'));
+            writer.join().unwrap();
+        }
     }
 
     #[test]

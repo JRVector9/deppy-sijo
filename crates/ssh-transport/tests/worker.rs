@@ -110,6 +110,86 @@ fn authenticated_readiness_waits_for_authentication_and_verified_destination_key
     }
     worker.cancel();
 }
+
+#[test]
+fn certificate_diagnostic_uses_primary_host_key_not_id_or_ca_fingerprint() {
+    let host_key = format!("SHA256:{}", "a".repeat(43));
+    let fixture = Fixture::new(&format!(
+        "debug.write('debug1: Server host certificate: ssh-ed25519-cert-v01@openssh.com {host_key}, serial 42 ID \\\"fixture SHA256:{}\\\" CA ssh-ed25519 SHA256:{} valid from 2026-01-01 to 2027-01-01\\nAuthenticated to resolved.example.test using publickey.\\ndebug1: Sending command: fixed helper\\n');debug.flush()\nos.write(1,b'done')",
+        "b".repeat(43),
+        "c".repeat(43),
+    ));
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, _writer) = stream.split();
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output, "done");
+    assert_eq!(
+        until(&worker, |event| matches!(
+            event,
+            SshEvent::HostKeyObserved(_) | SshEvent::Ended(_)
+        )),
+        SshEvent::HostKeyObserved(host_key),
+        "a trusted certificate diagnostic must bind the plain host key, not its ID or CA"
+    );
+    assert!(worker.authenticated());
+}
+
+#[test]
+fn malformed_certificate_primary_fingerprint_cannot_fall_back_to_id_or_ca() {
+    let fixture = Fixture::new(&format!(
+        "debug.write('debug1: Server host certificate: ssh-ed25519-cert-v01@openssh.com SHA256:short, serial 42 ID \\\"fixture SHA256:{}\\\" CA ssh-ed25519 SHA256:{} valid from 2026-01-01 to 2027-01-01\\nAuthenticated to resolved.example.test using publickey.\\ndebug1: Sending command: fixed helper\\n');debug.flush()\nos.write(1,b'done')",
+        "b".repeat(43),
+        "c".repeat(43),
+    ));
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, _writer) = stream.split();
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    loop {
+        match until(&worker, |_| true) {
+            SshEvent::HostKeyObserved(_) => {
+                panic!("malformed primary key accepted an ID/CA fingerprint")
+            }
+            SshEvent::Ended(reason) => {
+                assert_eq!(reason, FailureKind::Exit);
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(!worker.authenticated());
+}
+
+#[test]
+fn configured_md5_fingerprints_are_overridden_by_sha256_argv() {
+    let fixture =
+        Fixture::new("assert 'FingerprintHash=sha256' in sys.argv\nos.write(1,b'sha256-selected')");
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, _writer) = stream.split();
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output, "sha256-selected");
+    assert_eq!(
+        until(&worker, |event| matches!(event, SshEvent::Ended(_))),
+        SshEvent::Ended(FailureKind::Exit)
+    );
+}
+
+#[test]
+fn configured_verbose_log_prefixes_are_disabled_for_trusted_diagnostics() {
+    let fixture =
+        Fixture::new("assert 'LogVerbose=none' in sys.argv\nos.write(1,b'stable-diagnostics')");
+    let (worker, stream) = SshWorker::spawn(fixture.options()).unwrap();
+    let (mut reader, _writer) = stream.split();
+    let mut output = String::new();
+    reader.read_to_string(&mut output).unwrap();
+    assert_eq!(output, "stable-diagnostics");
+    assert_eq!(
+        until(&worker, |event| matches!(event, SshEvent::Ended(_))),
+        SshEvent::Ended(FailureKind::Exit)
+    );
+}
 #[test]
 fn deadline_and_cancel_reap_owned_child() {
     for timeout in [false, true] {

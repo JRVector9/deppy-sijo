@@ -133,49 +133,52 @@ fn base_command(
     cmd.process_group(0).env("LC_ALL", "C").env("LANG", "C");
     if resolve {
         cmd.arg("-G");
-    } else {
-        cmd.args([
-            "-T",
-            "-o",
-            "StrictHostKeyChecking=ask",
-            "-o",
-            "UpdateHostKeys=no",
-            "-o",
-            "VerifyHostKeyDNS=no",
-            "-o",
-            "ControlMaster=no",
-            "-o",
-            "ControlPath=none",
-            "-o",
-            "ControlPersist=no",
-            "-o",
-            "ServerAliveInterval=15",
-            "-o",
-            "ServerAliveCountMax=3",
-            "-o",
-            "TCPKeepAlive=yes",
-            "-o",
-            "ForwardAgent=no",
-            "-o",
-            "ClearAllForwardings=yes",
-            "-o",
-            "LogLevel=DEBUG1",
-            "-o",
-            "BatchMode=no",
-            "-o",
-            "PermitLocalCommand=no",
-            "-o",
-            "RequestTTY=no",
-            "-o",
-            "RemoteCommand=none",
-            "-o",
-            "SessionType=default",
-            "-o",
-            "StdinNull=no",
-            "-o",
-            "ForkAfterAuthentication=no",
-        ]);
     }
+    cmd.args([
+        "-T",
+        "-o",
+        "StrictHostKeyChecking=ask",
+        "-o",
+        "FingerprintHash=sha256",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "VerifyHostKeyDNS=no",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-o",
+        "TCPKeepAlive=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "LogLevel=DEBUG1",
+        "-o",
+        "LogVerbose=none",
+        "-o",
+        "BatchMode=no",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "RequestTTY=no",
+        "-o",
+        "RemoteCommand=none",
+        "-o",
+        "SessionType=default",
+        "-o",
+        "StdinNull=no",
+        "-o",
+        "ForkAfterAuthentication=no",
+    ]);
     if let Some(path) = diagnostics {
         cmd.arg("-E").arg(path);
     }
@@ -189,9 +192,7 @@ fn base_command(
         cmd.arg("-i").arg(identity);
     }
     cmd.arg("--").arg(&options.destination.host);
-    if !resolve {
-        cmd.arg(options.command.script());
-    }
+    cmd.arg(options.command.script());
     cmd
 }
 fn resolve(
@@ -513,12 +514,31 @@ impl Diagnostic {
                 {
                     self.failure = Some(FailureKind::Authentication);
                 }
-                if !self.sent_key && line.starts_with("debug1: Server host key:") {
-                    self.candidate_key = line
+                let host_key = line
+                    .strip_prefix("debug1: Server host key: ")
+                    .map(|fields| (fields, false))
+                    .or_else(|| {
+                        line.strip_prefix("debug1: Server host certificate: ")
+                            .map(|fields| (fields, true))
+                    });
+                if !self.sent_key
+                    && let Some((fields, certificate)) = host_key
+                {
+                    // The first certificate fingerprint is the plain host key. Later fields
+                    // include the certificate ID and CA fingerprint, neither of which identifies it.
+                    self.candidate_key = fields
                         .split_whitespace()
-                        .find(|s| s.starts_with("SHA256:"))
+                        .nth(1)
+                        .and_then(|field| {
+                            if certificate {
+                                field.strip_suffix(',')
+                            } else {
+                                Some(field)
+                            }
+                        })
                         .filter(|s| {
-                            s.len() == 50
+                            s.starts_with("SHA256:")
+                                && s.len() == 50
                                 && s[7..]
                                     .bytes()
                                     .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))

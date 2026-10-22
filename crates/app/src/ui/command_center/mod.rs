@@ -4,6 +4,7 @@
 //! The host validates every returned target again before executing an intent.
 
 mod composer;
+mod conversation;
 mod devices;
 mod layout;
 mod main;
@@ -14,6 +15,9 @@ mod workers;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use conversation::{
+    ConversationActivityState, ConversationEntry, ConversationEntryKind, MainConversation,
+};
 pub use devices::{
     AssignmentChoice, ExecutionCandidate, ExecutionProfile, ExecutionSetup,
     NativeDeviceSetupRequest,
@@ -221,6 +225,8 @@ pub struct ProjectConfig {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Project {
+    #[serde(default)]
+    pub main_conversation: Option<MainConversation>,
     #[serde(default)]
     pub available_agents: Vec<AgentOption>,
     #[serde(default)]

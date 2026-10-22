@@ -62,6 +62,7 @@ pub(crate) struct InstallRequest {
     pub grant_epoch: u64,
     pub scrollback: usize,
     pub hooks: bool,
+    pub main_tools: Option<super::main_tools::MainRegistration>,
 }
 pub(crate) enum SettingsResult {
     ServerCopy {
@@ -238,7 +239,7 @@ pub(crate) fn execute(db: &Db, request: SettingsRequest) -> SettingsResult {
                 let folder = std::fs::canonicalize(&request.config.folder)?;
                 let folder = folder.to_str().context("server_folder_encoding")?.to_owned();
                 request.control.configure(Some(host))?;
-                Ok(Some(super::server::Prepared { profiles: host_profiles(&request.config, &request.agents), folder, epoch: request.grant_epoch }))
+                Ok(Some(super::server::Prepared { profiles: host_profiles(&request.config, &request.agents, request.main_tools.is_some()), folder, epoch: request.grant_epoch }))
             })().map_err(|_| "선택한 프로젝트의 실행 환경을 허용하지 못했습니다. 실행 중인 작업과 에이전트 설정을 확인해 주세요.".into());
             SettingsResult::ServerConfigured {
                 operation_id: request.operation_id,
@@ -388,7 +389,14 @@ fn catalog(detected: &crate::agent_launcher::DetectionSnapshot) -> Catalog {
         root: None,
     }
 }
-struct Templates(Vec<(RemoteWorkerProfile, runtime::RuntimeCommand)>);
+struct Templates {
+    workers: Vec<(RemoteWorkerProfile, runtime::RuntimeCommand)>,
+    main: Option<(
+        RemoteWorkerProfile,
+        runtime::RuntimeCommand,
+        super::main_tools::MainRegistration,
+    )>,
+}
 impl RemoteWorkLauncher for Templates {
     fn prepare(
         &self,
@@ -399,13 +407,35 @@ impl RemoteWorkLauncher for Templates {
             initial_prompt.is_none(),
             "command_center_requires_idle_launch"
         );
-        self.0
+        if let Some((approved, command, registration)) = &self.main
+            && approved == profile
+        {
+            let mut command = command.clone();
+            registration.apply(&mut command)?;
+            return Ok(command);
+        }
+        self.workers
             .iter()
             .find(|(approved, _)| approved == profile)
             .map(|(_, command)| command.clone())
             .ok_or_else(|| anyhow::anyhow!("command_center_profile_changed"))
     }
 }
+fn main_profile_id(revision: work::ConfigRevision) -> String {
+    format!("cc-{}-main", revision.0)
+}
+fn select_profile<'a>(
+    profiles: &'a [RemoteWorkerProfile],
+    agent: &work::AgentSelection,
+    main: bool,
+    revision: work::ConfigRevision,
+) -> Option<&'a RemoteWorkerProfile> {
+    let main_id = main_profile_id(revision);
+    profiles
+        .iter()
+        .find(|profile| &profile.agent == agent && (profile.id == main_id) == main)
+}
+
 fn install(db: &Db, request: &InstallRequest) -> anyhow::Result<Vec<RemoteWorkerProfile>> {
     let host = prepare_host(
         db,
@@ -414,7 +444,11 @@ fn install(db: &Db, request: &InstallRequest) -> anyhow::Result<Vec<RemoteWorker
         request.config.workspace_id.clone(),
     )?;
     request.control.configure(Some(host))?;
-    Ok(host_profiles(&request.config, &request.agents))
+    Ok(host_profiles(
+        &request.config,
+        &request.agents,
+        request.main_tools.is_some(),
+    ))
 }
 fn prepare_host(
     db: &Db,
@@ -495,10 +529,27 @@ fn prepare_host(
         };
         templates.push((profile, command));
     }
-    let profiles = templates
-        .iter()
-        .map(|(profile, _)| profile.clone())
-        .collect();
+    let main = if let Some(registration) = &request.main_tools {
+        anyhow::ensure!(
+            request.config.main_agent.provider == "codex",
+            "main_tools_provider_unsupported"
+        );
+        let (_, command) = templates
+            .iter()
+            .find(|(profile, _)| profile.agent == request.config.main_agent)
+            .context("main_tools_main_template_missing")?;
+        Some((
+            RemoteWorkerProfile {
+                id: main_profile_id(request.config.revision),
+                agent: request.config.main_agent.clone(),
+            },
+            command.clone(),
+            registration.clone(),
+        ))
+    } else {
+        None
+    };
+    let profiles = host_profiles(&request.config, &request.agents, main.is_some());
     let wake = request.wake.clone();
     let journal = Arc::new(
         crate::work_management::remote_execution::AsyncRemoteJournal::new(
@@ -519,7 +570,10 @@ fn prepare_host(
             max_workers: request.config.max_workers,
             profiles,
         },
-        Arc::new(Templates(templates)),
+        Arc::new(Templates {
+            workers: templates,
+            main,
+        }),
         journal,
     )?;
     Ok(host)
@@ -527,15 +581,23 @@ fn prepare_host(
 fn host_profiles(
     config: &work::ProjectConfig,
     agents: &[work::AgentSelection],
+    main_tools: bool,
 ) -> Vec<RemoteWorkerProfile> {
-    agents
+    let mut profiles: Vec<_> = agents
         .iter()
         .enumerate()
         .map(|(index, agent)| RemoteWorkerProfile {
             id: format!("cc-{}-{index}", config.revision.0),
             agent: agent.clone(),
         })
-        .collect()
+        .collect();
+    if main_tools && config.main_agent.provider == "codex" {
+        profiles.push(RemoteWorkerProfile {
+            id: main_profile_id(config.revision),
+            agent: config.main_agent.clone(),
+        });
+    }
+    profiles
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -745,6 +807,13 @@ impl App {
                 "동시에 준비할 수 있는 새 실행은 32개입니다. 현재 응답을 기다려 주세요.".into(),
             );
         }
+        if host
+            .projects
+            .get(workspace)
+            .is_some_and(|p| p.snapshot.config.main_agent.provider == "codex")
+        {
+            self.ensure_command_center_main_tools(host)?;
+        }
         let runtime = self
             .active
             .id
@@ -821,6 +890,18 @@ impl App {
             folder: p.snapshot.config.folder.clone(),
             phase: Phase::Preparing,
         };
+        if record.task_id.is_none() && record.selection.provider == "codex" {
+            host.main_tools
+                .as_mut()
+                .ok_or("메인 관리 도구를 준비하지 못했습니다.")?
+                .prepare(agent_mcp::PendingMainScope {
+                    workspace_id: workspace.into(),
+                    runtime_instance: runtime.runtime_instance,
+                    runtime_token: runtime.runtime.instance_token().into(),
+                    config_revision: record.config_revision.0,
+                    launch_operation_id: id.into(),
+                })?;
+        }
         save_record(p, &record)?;
         let generation = p.generation;
         host.save(workspace, None, None)?;
@@ -1208,6 +1289,19 @@ impl App {
                                 grant_epoch: host.next_grant_epoch,
                                 scrollback: self.config.terminal.scrollback_lines as usize,
                                 hooks: self.config.ui.agent_status_hooks,
+                                main_tools: if p.snapshot.config.main_agent.provider == "codex" {
+                                    host.main_tools.as_mut().and_then(|tools| {
+                                        tools
+                                            .registration_slot(
+                                                &workspace,
+                                                runtime.runtime_instance,
+                                                p.snapshot.config.revision.0,
+                                            )
+                                            .ok()
+                                    })
+                                } else {
+                                    None
+                                },
                             };
                             if self.queue_global_settings_action(
                                 &workspace,
@@ -1427,11 +1521,21 @@ impl App {
                                     .iter()
                                     .any(|p| p.agent == pending.record.selection)
                         }) {
-                            let profile = cap
-                                .profiles
-                                .iter()
-                                .find(|p| p.agent == pending.record.selection)
-                                .unwrap();
+                            let Some(profile) = select_profile(
+                                &cap.profiles,
+                                &pending.record.selection,
+                                pending.record.task_id.is_none()
+                                    && pending.record.selection.provider == "codex",
+                                pending.record.config_revision,
+                            ) else {
+                                pending.record.phase = Phase::Rejected;
+                                pending.stage = Stage::Done;
+                                host.reject(
+                                    &id,
+                                    "현재 메인·워커 전용 실행 프로필을 확인하지 못했습니다.",
+                                );
+                                continue;
+                            };
                             let request = runtime::remote_worker::RemoteWorkRequest {
                                 identity: runtime::remote_worker::RemoteWorkIdentity {
                                     device_id: cap.device_id.clone(),
@@ -1743,24 +1847,27 @@ mod tests {
             id: "config-7-profile-1".into(),
             agent,
         };
-        let templates = Templates(vec![(
-            profile.clone(),
-            runtime::RuntimeCommand::SpawnAgent {
-                agent_config_id: Some("configured-agent".into()),
-                cols: 80,
-                rows: 24,
-                scrollback_lines: 1000,
-                command: "/bin/sh".into(),
-                args: vec!["--model".into(), "configured-model".into()],
-                env_plain: vec![("CONFIG".into(), "configured-env".into())],
-                env_secrets: vec![("FIXTURE_SECRET".into(), "fixture-value".into())],
-                waiting_regex: None,
-                approval_regex: None,
-                error_regex: None,
-                done_regex: None,
-                transient_args: vec![],
-            },
-        )]);
+        let templates = Templates {
+            workers: vec![(
+                profile.clone(),
+                runtime::RuntimeCommand::SpawnAgent {
+                    agent_config_id: Some("configured-agent".into()),
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 1000,
+                    command: "/bin/sh".into(),
+                    args: vec!["--model".into(), "configured-model".into()],
+                    env_plain: vec![("CONFIG".into(), "configured-env".into())],
+                    env_secrets: vec![("FIXTURE_SECRET".into(), "fixture-value".into())],
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                    transient_args: vec![],
+                },
+            )],
+            main: None,
+        };
         assert!(
             templates
                 .prepare(&profile, Some("task text must wait for durable attempt"))
@@ -1783,5 +1890,33 @@ mod tests {
         assert_eq!(env_plain[0].1, "configured-env");
         assert_eq!(env_secrets.len(), 1);
         assert!(transient_args.is_empty());
+    }
+
+    #[test]
+    fn main_profile_selection_never_substitutes_main_credentials_for_worker_profile() {
+        let agent = work::AgentSelection {
+            provider: "codex".into(),
+            model: None,
+            effort: None,
+        };
+        let worker = RemoteWorkerProfile {
+            id: "cc-3-0".into(),
+            agent: agent.clone(),
+        };
+        let main = RemoteWorkerProfile {
+            id: "cc-3-main".into(),
+            agent: agent.clone(),
+        };
+        let profiles = vec![main.clone(), worker.clone()];
+        assert_eq!(
+            select_profile(&profiles, &agent, false, work::ConfigRevision(3)),
+            Some(&worker)
+        );
+        assert_eq!(
+            select_profile(&profiles, &agent, true, work::ConfigRevision(3)),
+            Some(&main)
+        );
+        assert!(select_profile(&[worker], &agent, true, work::ConfigRevision(3)).is_none());
+        assert!(select_profile(&[main], &agent, false, work::ConfigRevision(3)).is_none());
     }
 }

@@ -13,6 +13,7 @@ fn safe_error_code(error: &str) -> &str {
         | "main_operation_capacity_no_effect"
         | "main_operation_unknown_do_not_retry"
         | "main_response_too_large_no_effect"
+        | "main_response_too_large_unknown"
         | "main_plan_rejected_no_effect"
         | "main_dispatch_rejected_no_effect"
         | "completion_native_proof_unsupported"

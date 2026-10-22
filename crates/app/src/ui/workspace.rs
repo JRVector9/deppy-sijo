@@ -312,6 +312,10 @@ fn workspace_protocol_kind(command: &RuntimeCommand) -> &'static str {
     match command {
         RuntimeCommand::SpawnShell { .. } => "spawn_shell",
         RuntimeCommand::WriteInput { .. } => "write_input",
+        RuntimeCommand::WriteTerminalInput {
+            input: runtime::TerminalInput::Wheel { .. },
+            ..
+        } => "application_wheel",
         RuntimeCommand::Resize { .. } | RuntimeCommand::ResizeTracked { .. } => "resize",
         RuntimeCommand::Scroll { .. } => "scroll",
         RuntimeCommand::SplitPane { .. } => "split_pane",
@@ -337,6 +341,10 @@ pub(crate) fn terminal_protocol_command(command: &RuntimeCommand) -> bool {
     matches!(
         command,
         RuntimeCommand::WriteInput { .. }
+            | RuntimeCommand::WriteTerminalInput {
+                input: runtime::TerminalInput::Wheel { .. },
+                ..
+            }
             | RuntimeCommand::FocusPane { .. }
             | RuntimeCommand::Resize { .. }
             | RuntimeCommand::ResizeTracked { .. }
@@ -387,6 +395,16 @@ fn workspace_protocol_command_is_valid(
         RuntimeCommand::Scroll { .. }
         | RuntimeCommand::ScrollToBottom { .. }
         | RuntimeCommand::ExtractLastOutput { .. } => Ok(()),
+        RuntimeCommand::WriteTerminalInput {
+            input: input @ runtime::TerminalInput::Wheel { .. },
+            ..
+        } => {
+            if input.is_valid() {
+                Ok(())
+            } else {
+                Err(WorkspaceProtocolErrorCode::InvalidCommand)
+            }
+        }
         RuntimeCommand::WriteInput { bytes, .. } => {
             if bytes.len() <= WORKSPACE_PROTOCOL_INPUT_MAX_BYTES {
                 Ok(())
@@ -2027,6 +2045,9 @@ pub struct WorkspaceUi {
     sent_sizes: HashMap<SessionId, (u16, u16)>,
     /// 트랙패드 미세 스크롤 누적 (focused pane 기준)
     scroll_residual: f32,
+    /// Physical gesture state, including modifier release during trackpad movement.
+    wheel_modifiers: egui::Modifiers,
+    wheel_in_touch: bool,
     /// 드래그 선택 오토스크롤 행 누적 — 경계 초과 속도(행/초)×dt의 소수부 보관 (T4)
     drag_autoscroll_residual: f32,
     /// 이번 프레임에 명령을 보냈다 — 응답 이벤트 폴링을 위해 repaint 예약
@@ -3137,6 +3158,8 @@ impl WorkspaceUi {
             resize_owner: [1; 16],
             sent_sizes: HashMap::new(),
             scroll_residual: 0.0,
+            wheel_modifiers: egui::Modifiers::NONE,
+            wheel_in_touch: false,
             drag_autoscroll_residual: 0.0,
             command_sent: false,
             last_focused_pane: None,
@@ -5795,6 +5818,39 @@ impl WorkspaceUi {
         self.suppress_copy_request |= copy;
     }
 
+    /// Observe the physical gesture before pane hover/ownership checks, so a gesture that
+    /// starts over the sidebar keeps its native override when the pointer enters a pane.
+    /// This matches egui's public Start/Move/End contract without accessing private wheel state.
+    fn prepare_wheel_gesture(&mut self, ctx: &egui::Context) {
+        ctx.input(|input| {
+            for event in &input.raw.events {
+                if let egui::Event::MouseWheel {
+                    phase, modifiers, ..
+                } = event
+                {
+                    match phase {
+                        egui::TouchPhase::Start => {
+                            self.wheel_in_touch = true;
+                            self.wheel_modifiers = *modifiers;
+                        }
+                        egui::TouchPhase::Move if self.wheel_in_touch => {
+                            self.wheel_modifiers |= *modifiers;
+                        }
+                        egui::TouchPhase::Move => self.wheel_modifiers = *modifiers,
+                        egui::TouchPhase::End | egui::TouchPhase::Cancel => {
+                            self.wheel_in_touch = false;
+                            self.wheel_modifiers = egui::Modifiers::NONE;
+                        }
+                    }
+                }
+            }
+            if !input.is_scrolling() {
+                self.wheel_in_touch = false;
+                self.wheel_modifiers = egui::Modifiers::NONE;
+            }
+        });
+    }
+
     fn prepare_frame(
         &mut self,
         ctx: &egui::Context,
@@ -5873,6 +5929,7 @@ impl WorkspaceUi {
         drain_native_input: impl FnOnce() -> crate::native_key_monitor::NativeKeyDownBatch,
     ) {
         self.frame_counters = renderer_egui::RenderCounters::default();
+        self.prepare_wheel_gesture(ctx);
         self.terminal_focus_claimed = false;
         self.set_prepared_attached_input_owner(attached_input_owner, ctx.cumulative_pass_nr());
         // AppKit local monitor는 winit/egui가 IME 처리 중 숨길 수 있는 원본 key-down을
@@ -8702,30 +8759,63 @@ impl WorkspaceUi {
             }
         }
 
-        // 마우스 휠 → 스크롤백 (focused pane만 — 비활성 pane은 Viewport가
-        // push되지 않아(14.4) 스크롤해도 화면이 안 바뀐다)
+        // Native history is a view operation. Alternate-screen CLI history instead needs
+        // negotiated mouse input, encoded by the worker against live modes and geometry.
         if input_enabled && surface_focused && !over_scroll_bottom && output.response.hovered() {
-            let scroll_y = ui.input(|i| i.smooth_scroll_delta.y);
+            let delta = ui.input(|i| i.smooth_scroll_delta);
+            let modifiers = self.wheel_modifiers;
+            // egui maps Shift+vertical wheel to X. Recover that axis for the explicit
+            // native-selection override, including the smoothing frames after the event.
+            let scroll_y = if modifiers.shift {
+                delta.x + delta.y
+            } else {
+                delta.y
+            };
             self.scroll_residual += scroll_y / output.cell_size.y;
             let whole_rows = self.scroll_residual.trunc() as i32;
             if whole_rows != 0 {
                 self.scroll_residual -= whole_rows as f32;
-                // 드래그 중이면 선택을 보존한 채 스크롤한다 — 한 화면을 넘는 범위를 휠로
-                // 이어 잡을 수 있어야 한다(`wheel_scroll_keeps_selection` 참고). 선택
-                // 앵커는 아래 `dragged()` 분기가 스냅샷 도착 시 `shift_selection_cell`로
-                // 보정하므로, 여기서는 해제만 피하면 된다.
-                let keep = wheel_scroll_keeps_selection(
-                    output.response.dragged(),
-                    self.selection.is_some_and(|(s, _, _)| s == session),
-                );
-                let command = RuntimeCommand::Scroll {
-                    session,
-                    delta: whole_rows,
-                };
-                if keep {
-                    self.send_keep_selection(command);
+                let selecting = self.selection.is_some_and(|(s, _, _)| s == session);
+                let dragging = output.response.dragged();
+                if snapshot.is_alt_screen
+                    && !restored_readonly
+                    && !any_blocking_window_visible
+                    && !modifiers.any()
+                    && !dragging
+                    && !selecting
+                    && let Some(pos) = output.response.hover_pos()
+                {
+                    let column = ((pos.x - output.origin.x) / output.cell_size.x)
+                        .floor()
+                        .clamp(0.0, snapshot.cols.saturating_sub(1) as f32)
+                        as u16
+                        + 1;
+                    let row = ((pos.y - output.origin.y) / output.cell_size.y)
+                        .floor()
+                        .clamp(0.0, snapshot.rows.saturating_sub(1) as f32)
+                        as u16
+                        + 1;
+                    self.send(RuntimeCommand::WriteTerminalInput {
+                        session,
+                        input: runtime::TerminalInput::Wheel {
+                            cols: snapshot.cols,
+                            rows: snapshot.rows,
+                            column,
+                            row,
+                            delta: whole_rows.clamp(-32, 32) as i16,
+                        },
+                    });
                 } else {
-                    self.send(command);
+                    let keep = wheel_scroll_keeps_selection(dragging, selecting);
+                    let command = RuntimeCommand::Scroll {
+                        session,
+                        delta: whole_rows,
+                    };
+                    if keep {
+                        self.send_keep_selection(command);
+                    } else {
+                        self.send(command);
+                    }
                 }
             }
         }
@@ -9786,7 +9876,8 @@ impl WorkspaceUi {
         // 예외: 드래그 오토스크롤의 Scroll은 send_keep_selection으로 보낸다 — 이 해제와
         // 정면 충돌해 첫 스크롤 직후 선택·오토스크롤이 함께 죽었다(감사 A3 버그 #1).
         let touched = match &command {
-            RuntimeCommand::WriteInput { session, .. } => Some(*session),
+            RuntimeCommand::WriteInput { session, .. }
+            | RuntimeCommand::WriteTerminalInput { session, .. } => Some(*session),
             RuntimeCommand::Scroll { session, .. } => Some(*session),
             _ => None,
         };
@@ -11091,6 +11182,7 @@ fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) ->
 #[cfg(test)]
 mod tests {
     include!("workspace_table_resize_tests.rs");
+    include!("workspace_application_wheel_tests.rs");
 
     #[test]
     fn pr2_selected_text_keeps_captured_owner_and_bounded_no_submit_intent() {

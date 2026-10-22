@@ -6,7 +6,9 @@ pub use completion::{
     CompletionPermit, CompletionReceipt, CompletionScope, DeferredTransport,
     MAX_COMPLETION_EVENT_BYTES, MAX_COMPLETION_RECEIPTS, MAX_COMPLETION_WATCHES,
 };
+mod main_tools;
 mod management;
+pub use main_tools::{MainScope, PendingMainScope, is_main_tool, main_tools};
 mod oauth;
 mod principal;
 mod protocol;

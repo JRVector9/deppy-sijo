@@ -41,6 +41,11 @@ struct Credential {
 struct ManualAccess {
     principal: Principal,
     _lease: secret::RedactionLease,
+    main: Option<MainAccess>,
+}
+struct MainAccess {
+    pending: crate::PendingMainScope,
+    scope: Option<crate::MainScope>,
 }
 #[derive(Default)]
 struct CallBudget {
@@ -236,9 +241,97 @@ impl Auth {
             ManualAccess {
                 principal: principal.clone(),
                 _lease: lease,
+                main: None,
             },
         );
         Some((principal, token))
+    }
+    /// Trusted local issuance; existing shared/OAuth connections cannot be promoted.
+    /// Pending credentials permit discovery, but cannot read project data or invoke tools.
+    pub fn mint_pending_main_connection(
+        &self,
+        pending: crate::PendingMainScope,
+        time: u64,
+    ) -> Option<(Principal, Zeroizing<String>)> {
+        if !pending.valid() {
+            return None;
+        }
+        let mut c = self.0.lock().ok()?;
+        c.manual
+            .retain(|_, access| time < access.principal.expires_at);
+        if time >= c.expires || c.manual.len() >= 32 || !make_registry_room(&mut c, time) {
+            return None;
+        }
+        let token = make_token();
+        let secret = secret::SecretString::new(token.to_string());
+        let lease = c.redaction.acquire_execution_lease(&[&secret]).ok()?;
+        let principal = Principal {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "Command Center MAIN".into(),
+            auth_kind: AuthKind::ManualBearer,
+            input_scope: false,
+            authenticated_at: time,
+            expires_at: c.expires,
+        };
+        c.connections
+            .insert(principal.id.clone(), ConnectionInfo::new(principal.clone()));
+        c.manual.insert(
+            crate::oauth::hash(&token),
+            ManualAccess {
+                principal: principal.clone(),
+                _lease: lease,
+                main: Some(MainAccess {
+                    pending,
+                    scope: None,
+                }),
+            },
+        );
+        Some((principal, token))
+    }
+    /// Bind once after observing the exact created MAIN execution. Never rebind.
+    pub fn activate_main_connection(&self, connection_id: &str, scope: crate::MainScope) -> bool {
+        let mut c = self.0.lock().unwrap();
+        if now() >= c.expires
+            || c.connections
+                .get(connection_id)
+                .is_none_or(|info| info.state == ConnectionState::Revoked)
+        {
+            return false;
+        }
+        let Some(main) = c
+            .manual
+            .values_mut()
+            .find(|access| access.principal.id == connection_id)
+            .and_then(|access| access.main.as_mut())
+        else {
+            return false;
+        };
+        if !main.pending.accepts(&scope) || main.scope.as_ref().is_some_and(|old| old != &scope) {
+            return false;
+        }
+        main.scope = Some(scope);
+        true
+    }
+    fn is_main_connection(&self, access_key: Option<&str>) -> bool {
+        access_key.is_some_and(|key| {
+            self.0
+                .lock()
+                .unwrap()
+                .manual
+                .get(key)
+                .is_some_and(|access| access.main.is_some())
+        })
+    }
+    pub fn main_scope(&self, request: &Request) -> Option<crate::MainScope> {
+        if !request.live(self) {
+            return None;
+        }
+        let c = self.0.lock().ok()?;
+        let access = c.manual.get(request.access_key.as_deref()?)?;
+        if access.principal.id != request.principal.id {
+            return None;
+        }
+        access.main.as_ref()?.scope.clone()
     }
     fn observe_initialize(&self, id: &str) {
         if let Some(info) = self.0.lock().unwrap().connections.get_mut(id) {
@@ -948,10 +1041,22 @@ fn process(
             } else {
                 "2025-11-25"
             };
-            json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"Deppy","version":env!("CARGO_PKG_VERSION")},"instructions":"Operate only explicitly shared sessions. Always deliver your own final answer with notify. Never automatically retry an unknown input outcome with a different operation_id. With owner-enabled local completion, supported submit:true calls return their final result on the original SSE request. Configure an adequate long request timeout; heartbeat comments do not reset client deadlines. Resume only that original stream with MCP-Session-Id and Last-Event-ID. A socket write is not confirmation that an agent read the result."})
+            let mut result = json!({"protocolVersion":version,"capabilities":{"tools":{"listChanged":false}},"serverInfo":{"name":"Deppy","version":env!("CARGO_PKG_VERSION")},"instructions":"Operate only explicitly shared sessions. Always deliver your own final answer with notify. Never automatically retry an unknown input outcome with a different operation_id. With owner-enabled local completion, supported submit:true calls return their final result on the original SSE request. Configure an adequate long request timeout; heartbeat comments do not reset client deadlines. Resume only that original stream with MCP-Session-Id and Last-Event-ID. A socket write is not confirmation that an agent read the result."});
+            if auth.is_main_connection(access_key.as_deref()) {
+                result["instructions"] = json!(
+                    "Use cc_get_project first to read this MAIN execution's project and current goal/configuration. cc_propose_plan only proposes a plan for user confirmation; cc_dispatch_task retains all confirmed-plan, dependency, scope, capacity and delivery gates. Never confirm a plan or invent verification. Operations are one-time: inspect cc_get_operation after an uncertain outcome; never automatically replay with a new operation_id. No global or shared terminal authority is granted."
+                );
+            }
+            result
         }
         "ping" => json!({}),
-        "tools/list" => crate::tools(),
+        "tools/list" => {
+            if auth.is_main_connection(access_key.as_deref()) {
+                crate::main_tools()
+            } else {
+                crate::tools()
+            }
+        }
         "tools/call" => {
             let Some(tool) = v["params"]["name"].as_str().filter(|s| {
                 matches!(
@@ -970,10 +1075,30 @@ fn process(
                         | "get_operation"
                         | "acquire_control"
                         | "release_control"
-                )
+                ) || crate::is_main_tool(s)
             }) else {
                 return rpc_error(id, -32602, "unknown_tool");
             };
+            let is_main = auth.is_main_connection(access_key.as_deref());
+            if crate::is_main_tool(tool) && !is_main {
+                return tool_response(id, Err("main_scope_required_no_effect".into()));
+            }
+            if is_main && !crate::is_main_tool(tool) {
+                return tool_response(id, Err("main_tool_not_allowed_no_effect".into()));
+            }
+            if is_main
+                && auth
+                    .0
+                    .lock()
+                    .unwrap()
+                    .manual
+                    .get(access_key.as_deref().unwrap())
+                    .and_then(|access| access.main.as_ref())
+                    .and_then(|main| main.scope.as_ref())
+                    .is_none()
+            {
+                return tool_response(id, Err("main_scope_pending_no_effect".into()));
+            }
             let args = v["params"].get("arguments").cloned().unwrap_or(json!({}));
             if !args.is_object() {
                 return rpc_error(id, -32602, "invalid_arguments");
@@ -986,6 +1111,9 @@ fn process(
                     | "get_run"
                     | "list_runs"
                     | "get_operation"
+                    | "cc_get_project"
+                    | "cc_get_task"
+                    | "cc_get_operation"
             );
             if !auth.begin_call(&principal.id, poll, epoch) {
                 metadata.headers.push(("Retry-After".into(), "1".into()));

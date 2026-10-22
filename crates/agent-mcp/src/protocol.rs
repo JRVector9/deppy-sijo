@@ -4,6 +4,17 @@ use serde_json::{Value, json};
 fn safe_error_code(error: &str) -> &str {
     match error {
         "busy_no_effect"
+        | "main_scope_required_no_effect"
+        | "main_scope_pending_no_effect"
+        | "main_scope_changed_no_effect"
+        | "main_tool_not_allowed_no_effect"
+        | "main_goal_changed_no_effect"
+        | "main_operation_conflict_no_effect"
+        | "main_operation_capacity_no_effect"
+        | "main_operation_unknown_do_not_retry"
+        | "main_response_too_large_no_effect"
+        | "main_plan_rejected_no_effect"
+        | "main_dispatch_rejected_no_effect"
         | "completion_native_proof_unsupported"
         | "completion_invalid_scope"
         | "completion_target_busy"

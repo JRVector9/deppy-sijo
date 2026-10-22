@@ -1,5 +1,169 @@
 use super::*;
 
+#[test]
+fn command_center_tools_reject_shared_credentials_before_queue_admission() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let token = server.auth.token_for_user();
+    let (status, body) = http_call_addr(
+        server.addr,
+        &token,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"cc_get_project","arguments":{}}}),
+    );
+    assert_eq!(status, 200);
+    let body: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["result"]["isError"], true);
+    let payload: Value =
+        serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(payload["code"], "main_scope_required_no_effect");
+    assert!(server.requests.try_recv().is_err());
+}
+
+fn pending_main_scope() -> PendingMainScope {
+    PendingMainScope {
+        workspace_id: "project-a".into(),
+        runtime_instance: 7,
+        runtime_token: "runtime-a".into(),
+        config_revision: 3,
+        launch_operation_id: "launch-main-a".into(),
+    }
+}
+fn active_main_scope() -> MainScope {
+    MainScope {
+        workspace_id: "project-a".into(),
+        main_session_id: "host:route-a".into(),
+        runtime_instance: 7,
+        runtime_token: "runtime-a".into(),
+        incarnation: "runtime-incarnation-a".into(),
+        runtime_session_id: 11,
+        execution_generation: 13,
+        config_revision: 3,
+        launch_operation_id: "launch-main-a".into(),
+    }
+}
+
+#[test]
+fn command_center_main_initialization_describes_only_authorized_workflow() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let (_, token) = server
+        .auth
+        .mint_pending_main_connection(pending_main_scope(), now())
+        .unwrap();
+    let (_, body) = http_call_addr(
+        server.addr,
+        &token,
+        json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25"}}),
+    );
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let instructions = body["result"]["instructions"].as_str().unwrap();
+    assert!(instructions.contains("cc_get_project"), "{instructions}");
+    assert!(
+        !instructions.contains("notify"),
+        "main cannot call shared-session notify"
+    );
+}
+
+#[test]
+fn command_center_main_discovery_and_pending_gate_are_separate_from_cloud() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let (_, token) = server
+        .auth
+        .mint_pending_main_connection(pending_main_scope(), now())
+        .unwrap();
+    let (_, body) = http_call_addr(
+        server.addr,
+        &token,
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+    );
+    let body: Value = serde_json::from_str(&body).unwrap();
+    let tools = body["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 5);
+    assert!(
+        tools
+            .iter()
+            .all(|tool| tool["name"].as_str().is_some_and(is_main_tool))
+    );
+    for (tool, expected) in [
+        ("cc_get_project", "main_scope_pending_no_effect"),
+        ("list_sessions", "main_tool_not_allowed_no_effect"),
+    ] {
+        let (_, body) = http_call_addr(
+            server.addr,
+            &token,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":tool,"arguments":{}}}),
+        );
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let payload: Value =
+            serde_json::from_str(body["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(payload["code"], expected);
+        assert!(server.requests.try_recv().is_err());
+    }
+}
+
+#[test]
+fn command_center_activation_is_exact_one_time_and_queued_revocation_is_live() {
+    let server = Server::start(0, "", || {}).unwrap();
+    let (principal, token) = server
+        .auth
+        .mint_pending_main_connection(pending_main_scope(), now())
+        .unwrap();
+    let scope = active_main_scope();
+    for field in 0..5 {
+        let mut stale = scope.clone();
+        match field {
+            0 => stale.workspace_id = "other-project".into(),
+            1 => stale.runtime_instance += 1,
+            2 => stale.runtime_token = "other-runtime".into(),
+            3 => stale.config_revision += 1,
+            _ => stale.launch_operation_id = "other-launch".into(),
+        }
+        assert!(!server.auth.activate_main_connection(&principal.id, stale));
+    }
+    assert!(
+        !server
+            .auth
+            .activate_main_connection(LEGACY_CONNECTION_ID, scope.clone())
+    );
+    assert!(
+        server
+            .auth
+            .activate_main_connection(&principal.id, scope.clone())
+    );
+    for field in 0..4 {
+        let mut stale = scope.clone();
+        match field {
+            0 => stale.main_session_id = "replacement-route".into(),
+            1 => stale.runtime_session_id += 1,
+            2 => stale.incarnation = "replacement-runtime".into(),
+            _ => stale.execution_generation += 1,
+        }
+        assert!(!server.auth.activate_main_connection(&principal.id, stale));
+    }
+    let addr = server.addr;
+    let caller = std::thread::spawn(move || {
+        http_call_addr(
+            addr,
+            &token,
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cc_get_project","arguments":{}}}),
+        )
+    });
+    let request = server
+        .requests
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(server.auth.main_scope(&request), Some(scope));
+    assert!(!request.input_scope);
+    assert!(server.auth.revoke_connection(&principal.id));
+    assert!(
+        server.auth.main_scope(&request).is_none(),
+        "queue admission cannot preserve revoked authorization"
+    );
+    request
+        .reply
+        .send(Err("main_scope_changed_no_effect".into()))
+        .unwrap();
+    assert_eq!(caller.join().unwrap().0, 200);
+}
+
 pub(super) fn completion_http(
     server: &Server,
     token: &str,

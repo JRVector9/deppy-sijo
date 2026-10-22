@@ -1,0 +1,14 @@
+{
+  "crates/app/src/ui/command_center/mod.rs": "059c1de700486c06b4a82242a7f797c01989b10e303090e7e1d18a1f23a9f3b5",
+  "crates/app/src/ui/command_center/conversation.rs": "05b7adbecb71b482e0528b03c9d743d47a69f5585a36413b0528e520c170a69d",
+  "crates/app/src/ui/command_center/main.rs": "2365368b673e6d7b732089590d6010262e64962bb919d62d87ba4946f4227665",
+  "crates/app/src/ui/command_center/verification.rs": "6a1f671c5227baf3b6111cd8156b6a3ebc732e59dba2f8a37c7eb8d1cebe7cfb",
+  "crates/app/src/ui/command_center/tests.rs": "de6541c9957279477b1c0d3a14ebaac79585613c5c791552a3cf0918770efbef",
+  "web/shared/command-center.js": "d8921d2a522c3eb4a1b850316bddea49cf296296ca8de14c2565572d10b933bb",
+  "web/shared/command-center.css": "30fb60dac648a550a96344fa0cc08de46547222cf29ae4de8daeaf67cc06c1af",
+  "web/shared/tests/command-center.browser.mjs": "7cbcb8dee4b6c2055bb8e62482d11bb0d75a9afe4d0d5f6d49f68a7c50218a39",
+  "docs/qa/assets/cc-verification-ui-20261022/verification-1440.png": "b760eef1b491c1852192b51a6730b52a70162be067f7093d0bcd07e98dfca544",
+  "docs/qa/assets/cc-verification-ui-20261022/verification-1440.snapshot.json": "43322d7fdf889f2327098e3df5d1025b7d98e8871c57ea75424ddba00b81f8bb",
+  "docs/qa/assets/cc-verification-ui-20261022/verification-390.png": "81a21c7c7fe83ffc01fabe01b007d40218b0c971ef59e0b1a287b732cd6d434f",
+  "docs/qa/assets/cc-verification-ui-20261022/verification-390.snapshot.json": "43322d7fdf889f2327098e3df5d1025b7d98e8871c57ea75424ddba00b81f8bb"
+}

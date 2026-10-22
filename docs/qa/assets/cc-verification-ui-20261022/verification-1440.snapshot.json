@@ -1,0 +1,334 @@
+{
+  "receipts": [],
+  "projects": [
+    {
+      "main_conversation": null,
+      "available_agents": [],
+      "pending_approvals": [],
+      "create_main": {
+        "enabled": false,
+        "reason": ""
+      },
+      "loaded": false,
+      "storage_retry": {
+        "enabled": false,
+        "reason": ""
+      },
+      "manual_plan": {
+        "enabled": false,
+        "reason": ""
+      },
+      "planner_prompt": null,
+      "id": "project-a",
+      "name": "프로젝트 A",
+      "directory": "/projects/a",
+      "goal": "목표를 구현하고 독립 리뷰와 검증 결과를 모아 주세요.",
+      "main_summary": "수정 범위와 완료 조건을 확인했습니다. 각 작업의 실제 진행과 결과를 확인합니다.",
+      "pending_goal_id": null,
+      "plan_confirmation": {
+        "enabled": false,
+        "reason": ""
+      },
+      "main_target": {
+        "workspace_id": "project-a",
+        "session_id": "opaque-pane-a",
+        "task_id": null
+      },
+      "main_provider": "Codex",
+      "main_model": "model from host",
+      "main_effort": "xhigh",
+      "main_input": {
+        "enabled": true,
+        "reason": ""
+      },
+      "sessions": [],
+      "tasks": [
+        {
+          "verification_target": {
+            "workspace_id": "project-a",
+            "task_id": "task-a",
+            "attempt_id": "attempt-7",
+            "result_revision": 3,
+            "source_revision": "provider-source-3",
+            "artifact_revision": "artifact-3"
+          },
+          "command_verification": {
+            "id": "verification-7",
+            "target": {
+              "workspace_id": "project-a",
+              "task_id": "task-a",
+              "attempt_id": "attempt-7",
+              "result_revision": 3,
+              "source_revision": "provider-source-3",
+              "artifact_revision": "artifact-3"
+            },
+            "spec": {
+              "command": "printf 'actual verification'",
+              "cwd": "/projects/a/.worktrees/task-a",
+              "timeout_ms": 60000,
+              "output_limit_bytes": 32768
+            },
+            "started_at_ms": 1000,
+            "ended_at_ms": 1300,
+            "outcome": "passed",
+            "exit_code": 0,
+            "stdout": "실제 stdout",
+            "stderr": "실제 stderr",
+            "stdout_truncated": false,
+            "stderr_truncated": true,
+            "error": null
+          },
+          "execute_verification": {
+            "enabled": true,
+            "reason": ""
+          },
+          "cancel_verification": {
+            "enabled": false,
+            "reason": "실행 중인 검증 없음"
+          },
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": "attempt-7",
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-a",
+            "task_id": "task-a"
+          },
+          "title": "구현 작업",
+          "role": "구현",
+          "scope": "이 작업에 지정한 파일과 수정 범위",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Codex",
+          "device": "이 Mac",
+          "directory": "/projects/a/.worktrees/task-a",
+          "state": "result_submitted",
+          "activity": "호스트가 관측해 제공한 실제 진행 내용",
+          "observed_at": "14:21",
+          "result": "실제 제출 결과",
+          "result_revision": "3",
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        },
+        {
+          "verification_target": null,
+          "command_verification": null,
+          "execute_verification": {
+            "enabled": false,
+            "reason": ""
+          },
+          "cancel_verification": {
+            "enabled": false,
+            "reason": ""
+          },
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": null,
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-b",
+            "task_id": "task-b"
+          },
+          "title": "리뷰 작업",
+          "role": "리뷰",
+          "scope": "이 작업에 지정한 파일과 수정 범위",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Codex",
+          "device": "이 Mac",
+          "directory": "/projects/a/.worktrees/task-b",
+          "state": "awaiting_user_confirmation",
+          "activity": "호스트가 관측해 제공한 실제 진행 내용",
+          "observed_at": "14:21",
+          "result": null,
+          "result_revision": null,
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        },
+        {
+          "verification_target": null,
+          "command_verification": null,
+          "execute_verification": {
+            "enabled": false,
+            "reason": ""
+          },
+          "cancel_verification": {
+            "enabled": false,
+            "reason": ""
+          },
+          "remote_terminal": null,
+          "close_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "create_worker": {
+            "enabled": false,
+            "reason": ""
+          },
+          "attempt_id": null,
+          "result_report": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verify_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "verification": "",
+          "eligible_sessions": [],
+          "terminal_session_id": null,
+          "target": {
+            "workspace_id": "project-a",
+            "session_id": "exact-task-c",
+            "task_id": "task-c"
+          },
+          "title": "검증 작업",
+          "role": "검증",
+          "scope": "이 작업에 지정한 파일과 수정 범위",
+          "acceptance_criteria": "근거와 실행한 검증 결과 제출",
+          "provider": "Codex",
+          "device": "이 Mac",
+          "directory": "/projects/a/.worktrees/task-c",
+          "state": "waiting_approval",
+          "activity": "호스트가 관측해 제공한 실제 진행 내용",
+          "observed_at": "14:21",
+          "result": null,
+          "result_revision": null,
+          "approval": null,
+          "input": {
+            "enabled": true,
+            "reason": ""
+          },
+          "terminal": {
+            "enabled": true,
+            "reason": ""
+          },
+          "git": {
+            "enabled": false,
+            "reason": ""
+          },
+          "confirm_result": {
+            "enabled": false,
+            "reason": ""
+          },
+          "dispatch": {
+            "enabled": false,
+            "reason": ""
+          }
+        }
+      ],
+      "history": [],
+      "config": {
+        "allowed_scope_roots": [],
+        "name": "프로젝트 A",
+        "directory": "/projects/a",
+        "main_session_id": null,
+        "provider": "",
+        "model": "",
+        "effort": "",
+        "worker_providers": [
+          "Codex",
+          "Claude"
+        ],
+        "parallel_limit": 3,
+        "automation": "배정 전 확인",
+        "use_worktrees": true,
+        "revision": ""
+      },
+      "save_settings": {
+        "enabled": false,
+        "reason": ""
+      },
+      "available_providers": [],
+      "available_models": [],
+      "available_efforts": [],
+      "available_automation": []
+    }
+  ],
+  "selected_workspace_id": "project-a",
+  "devices": [],
+  "dark_mode": true,
+  "font_scale": 1.0,
+  "labels": {},
+  "add_project": {
+    "enabled": false,
+    "reason": ""
+  },
+  "manage_devices": {
+    "enabled": false,
+    "reason": ""
+  },
+  "status": "로컬 snapshot · 실행 상태는 관측된 근거만 표시"
+}

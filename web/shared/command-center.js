@@ -19,17 +19,23 @@ function boundedConversationText(value, limit) {
 }
 function mainConversation(p) {
   const source = p.main_conversation, target = p.main_target;
-  if (!source || !target?.session_id || target.workspace_id !== p.id || target.task_id != null || routeKey(source.target) !== routeKey(target) || !str(source.generation).trim()) return null;
+  if (!source || !target?.session_id || target.workspace_id !== p.id || target.task_id != null || routeKey(source.target) !== routeKey(target) || !str(source.generation).trim() || boundedConversationText(source.generation, 4096) !== source.generation) return null;
   const supplied = list(source.entries), entries = []; let budget = CONVERSATION_TOTAL, truncated = source.truncated === true || supplied.length > CONVERSATION_ENTRIES;
   for (const entry of supplied.slice(-CONVERSATION_ENTRIES).reverse()) {
     if (!['user', 'agent', 'tool'].includes(entry?.kind)) continue;
+    if (!str(entry.id) || boundedConversationText(entry.id, 1024) !== entry.id || entry.turn_id != null && boundedConversationText(entry.turn_id, 1024) !== entry.turn_id) { truncated = true; continue; }
     if (!budget) { truncated = true; break; }
     const text = boundedConversationText(entry.text, Math.min(CONVERSATION_TEXT, budget));
     truncated ||= text !== entry.text;
     budget -= bytes(text);
-    entries.push({...entry, id: boundedConversationText(entry.id, 256), turn_id: boundedConversationText(entry.turn_id, 256), tool_name: boundedConversationText(entry.tool_name, 256), observed_at: boundedConversationText(entry.observed_at, 256), text});
+    entries.push({...entry, tool_name: boundedConversationText(entry.tool_name, 256), observed_at: boundedConversationText(entry.observed_at, 256), text});
   }
-  return {...source, generation: boundedConversationText(source.generation, 256), status: boundedConversationText(source.status, 1024), truncated, entries: entries.reverse()};
+  return {...source, status: boundedConversationText(source.status, 1024), truncated, entries: entries.reverse()};
+}
+const verificationTargetKey = target => target ? JSON.stringify([target.workspace_id, target.task_id, target.attempt_id, target.result_revision, target.source_revision ?? null, target.artifact_revision ?? null]) : '';
+function currentVerificationTarget(task) {
+  const expected = task.verification_target;
+  return expected && expected.workspace_id === task.target?.workspace_id && expected.task_id === task.target?.task_id && expected.attempt_id === task.attempt_id && Number.isSafeInteger(expected.result_revision) && expected.result_revision > 0 && String(expected.result_revision) === task.result_revision ? expected : null;
 }
 const states = {
   plan_review: ['계획 검토', 'amber'], queued: ['실행 대기', 'muted'], running: ['실행 중', 'accent'],
@@ -601,7 +607,24 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
     const result = node('section', 'cc-result-section'); result.append(node('h2', '', '제출된 결과'));
     result.append(node('p', 'cc-result-text', task.result || label('no_result', '아직 제출된 결과가 없습니다.')), facts([['검증 근거', task.verification || '검증 미실행'], ['사용자 확인', task.state === 'completed' ? '확인 완료' : '미확인']]));
     if (task.result_revision) { const actions = node('div', 'cc-actions'); actions.append(actionButton(label('confirm_result', '결과 확인'), task.confirm_result, {type: 'confirm_result', target: task.target, revision: task.result_revision}, 'result:' + routeKey(task.target))); result.append(actions); }
-    content.append(result); renderResultForms(task);
+    content.append(result); renderCommandVerification(task); renderResultForms(task);
+  }
+  function renderCommandVerification(task) {
+    const expected = currentVerificationTarget(task), evidence = task.command_verification;
+    if (!expected || !evidence || verificationTargetKey(evidence.target) !== verificationTargetKey(expected)) return;
+    const captions = {running:'실행 접수 · 결과 대기',passed:'통과',nonzero_exit:'실패 · 종료 코드',spawn_failed:'시작 실패',timed_out:'시간 초과',cancelled:'취소됨',interrupted:'중단됨',io_failed:'출력 읽기 실패'};
+    const section = node('section', 'cc-result-section'); section.dataset.ccCommandVerification = evidence.id;
+    section.append(node('h2', '', '앱 실행 검증 · ' + (captions[evidence.outcome] || '관측 불명')), node('pre', 'cc-log', boundedConversationText(evidence.spec?.command, 16 * 1024)), facts([
+      ['실행 폴더', boundedConversationText(evidence.spec?.cwd, 8192)], ['시도', expected.attempt_id], ['결과 revision', String(expected.result_revision)],
+      ['원본 식별자', expected.source_revision], ['산출물 식별자', expected.artifact_revision], ['종료 코드', evidence.exit_code == null ? '미확정' : String(evidence.exit_code)],
+      ['제한 시간', Number(evidence.spec?.timeout_ms) / 1000 + '초'], ['소요 시간', evidence.ended_at_ms == null ? '결과 대기' : Math.max(0, Number(evidence.ended_at_ms) - Number(evidence.started_at_ms)) + 'ms']
+    ]));
+    for (const [caption, value] of [['표준 출력', evidence.stdout], ['표준 오류', evidence.stderr]]) {
+      section.append(node('h3', 'cc-verification-output-title', caption), node('pre', 'cc-log', boundedConversationText(value, 32 * 1024) || '(출력 없음)'));
+    }
+    if (evidence.stdout_truncated || evidence.stderr_truncated) section.append(node('p', 'cc-muted', '출력이 제한되어 일부만 표시합니다.'));
+    if (evidence.error) section.append(node('p', 'cc-muted', boundedConversationText(evidence.error, 4096)));
+    section.append(node('p', 'cc-muted', '검증 실행과 취소는 이 Mac의 앱에서 확인하세요.')); content.append(section);
   }
   function renderResultForms(task) {
     if (!task.attempt_id || readOnly) return;
@@ -628,7 +651,7 @@ export function createCommandCenterView({host, send, watchSession, onVisibility,
       content.append(details);
     };
     addForm('report', task.result_report, '수동 결과 보고', 8192);
-    if (task.result_revision) addForm('verify', task.verify_result, '직접 수행한 검증 기록', 4096);
+    if (task.result_revision) addForm('verify', task.verify_result, '수동 검증 기록 · 앱 실행 아님', 4096);
   }
   function renderSettings(p) {
     const intro = title('프로젝트 설정', '메인과 작업 폴더를 정하고, 필요할 때 실행 규칙을 조정하세요.'), heading = node('div', 'cc-detail-heading'), add = button('프로젝트 추가', () => {}); add.disabled = true; add.title = str(snapshot.add_project?.reason) || '이 Mac의 프로젝트 관리에서 프로젝트를 등록해 주세요.'; heading.append(intro.querySelector('h1'), add); intro.prepend(heading);

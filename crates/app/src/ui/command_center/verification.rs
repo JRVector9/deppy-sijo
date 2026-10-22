@@ -14,7 +14,7 @@ pub(super) fn current_target(task: &Task) -> Option<&VerificationTarget> {
 
 fn outcome_label(outcome: CommandVerificationOutcome) -> &'static str {
     match outcome {
-        CommandVerificationOutcome::Running => "실행 중",
+        CommandVerificationOutcome::Running => "실행 접수 · 결과 대기",
         CommandVerificationOutcome::Passed => "통과",
         CommandVerificationOutcome::NonzeroExit => "실패 · 종료 코드",
         CommandVerificationOutcome::SpawnFailed => "시작 실패",
@@ -161,19 +161,21 @@ pub(super) fn show(
             timeout_ms: 60_000,
             output_limit_bytes: 32 * 1024,
         });
-    ui.label("검증 명령");
+    let command_label = ui.label("검증 명령");
     ui.add(
         egui::TextEdit::multiline(&mut draft.command)
             .desired_rows(2)
             .desired_width(f32::INFINITY)
             .char_limit(16 * 1024),
-    );
-    ui.label("실행 폴더");
+    )
+    .labelled_by(command_label.id);
+    let cwd_label = ui.label("실행 폴더");
     ui.add(
         egui::TextEdit::singleline(&mut draft.cwd)
             .desired_width(f32::INFINITY)
             .char_limit(8192),
-    );
+    )
+    .labelled_by(cwd_label.id);
     ui.horizontal_wrapped(|ui| {
         ui.label("제한 시간");
         let mut seconds = draft.timeout_ms / 1000;

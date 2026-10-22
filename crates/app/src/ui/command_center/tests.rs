@@ -153,6 +153,13 @@ fn main_conversation_bounds_latest_entries_and_utf8_before_rendering() {
     );
     let project = &mut snapshot.projects[0];
     let source = project.main_conversation.as_mut().unwrap();
+    source.generation = format!("{}generation", "g".repeat(300));
+    source.entries[0].id = format!("{}item", "i".repeat(300));
+    source.entries[0].turn_id = Some(format!("{}turn", "t".repeat(300)));
+    let preserved = source.clone().bounded();
+    assert_eq!(preserved.generation, source.generation);
+    assert_eq!(preserved.entries[0].id, source.entries[0].id);
+    assert_eq!(preserved.entries[0].turn_id, source.entries[0].turn_id);
     let entry = source.entries[0].clone();
     source.entries = (0..103)
         .map(|i| ConversationEntry {
@@ -189,6 +196,9 @@ fn main_conversation_bounds_latest_entries_and_utf8_before_rendering() {
         .unwrap()
         .generation
         .clear();
+    assert!(project.visible_main_conversation().is_none());
+    project.main_conversation.as_mut().unwrap().generation = "next-generation".into();
+    project.main_conversation.as_mut().unwrap().generation = "x".repeat(4097);
     assert!(project.visible_main_conversation().is_none());
     project.main_conversation.as_mut().unwrap().generation = "next-generation".into();
     project.main_target.session_id = None;
@@ -239,6 +249,285 @@ fn main_conversation_render_evidence() {
             )
             .unwrap();
         }
+    }
+}
+
+fn command_verification_fixture() -> Snapshot {
+    let mut value = serde_json::to_value(rich_fixture()).unwrap();
+    let target = serde_json::json!({
+        "workspace_id":"project-a", "task_id":"task-a", "attempt_id":"attempt-7",
+        "result_revision":3, "source_revision":"provider-source-3", "artifact_revision":"artifact-3"
+    });
+    let task = &mut value["projects"][0]["tasks"][0];
+    task["state"] = "result_submitted".into();
+    task["result"] = "실제 제출 결과".into();
+    task["result_revision"] = "3".into();
+    task["attempt_id"] = "attempt-7".into();
+    task["verification_target"] = target.clone();
+    task["execute_verification"] = serde_json::json!({"enabled":true,"reason":""});
+    task["cancel_verification"] =
+        serde_json::json!({"enabled":false,"reason":"실행 중인 검증 없음"});
+    task["command_verification"] = serde_json::json!({
+        "id":"verification-7", "target":target,
+        "spec":{"command":"printf 'actual verification'", "cwd":"/projects/a/.worktrees/task-a", "timeout_ms":60000,"output_limit_bytes":32768},
+        "started_at_ms":1000,"ended_at_ms":1300,"outcome":"passed","exit_code":0,
+        "stdout":"실제 stdout", "stderr":"실제 stderr", "stdout_truncated":false,"stderr_truncated":true,"error":null
+    });
+    serde_json::from_value(value).unwrap()
+}
+
+#[test]
+fn command_verification_displays_exact_app_execution_evidence() {
+    let snapshot = command_verification_fixture();
+    let mut initial = UiState::default();
+    initial.open_task(snapshot.projects[0].tasks[0].target.clone());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1800.0))
+        .build_ui_state(
+            |ui, state| {
+                show(ui, state, &snapshot);
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    harness.get_by_label("앱 실행 검증 · 통과");
+    harness.get_by_label("printf 'actual verification'");
+    harness.get_by_label("실제 stdout");
+    harness.get_by_label("실제 stderr");
+    harness.get_by_label("출력이 제한되어 일부만 표시합니다.");
+}
+
+#[test]
+fn command_verification_requires_explicit_execute_for_exact_result_and_literal_spec() {
+    let mut snapshot = command_verification_fixture();
+    let task = &mut snapshot.projects[0].tasks[0];
+    task.command_verification = None;
+    let target = task.target.clone();
+    let expected = task.verification_target.clone().unwrap();
+    let spec = VerificationSpec {
+        command: "printf 'reviewed command'".into(),
+        cwd: task.directory.clone(),
+        timeout_ms: 5000,
+        output_limit_bytes: 32768,
+    };
+    let mut initial = HarnessState::default();
+    initial.ui.open_task(target.clone());
+    initial.ui.command_verification_drafts.insert(
+        serde_json::to_string(&expected).unwrap(),
+        VerificationSpec {
+            command: String::new(),
+            ..spec.clone()
+        },
+    );
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1800.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    assert!(
+        !harness
+            .state()
+            .intents
+            .iter()
+            .any(|i| matches!(i, Intent::ExecuteVerification { .. }))
+    );
+    assert!(
+        harness
+            .get_by_label("검증 명령 실행")
+            .accesskit_node()
+            .is_disabled()
+    );
+    harness.get_by_label("검증 명령").focus();
+    harness.run();
+    harness.get_by_label("검증 명령").type_text(&spec.command);
+    harness.run();
+    assert_eq!(
+        harness.get_by_label("검증 명령").value(),
+        Some(spec.command.clone())
+    );
+    assert_eq!(
+        harness.get_by_label("실행 폴더").value(),
+        Some(spec.cwd.clone())
+    );
+    harness.get_by_label("검증 명령 실행").click();
+    harness.run();
+    assert!(
+        harness
+            .state()
+            .intents
+            .contains(&Intent::ExecuteVerification {
+                target,
+                expected,
+                spec
+            })
+    );
+}
+
+#[test]
+fn command_verification_cancel_identifies_only_the_current_running_evidence() {
+    let mut snapshot = command_verification_fixture();
+    let task = &mut snapshot.projects[0].tasks[0];
+    let evidence = task.command_verification.as_mut().unwrap();
+    evidence.outcome = CommandVerificationOutcome::Running;
+    evidence.ended_at_ms = None;
+    evidence.exit_code = None;
+    evidence.stdout.clear();
+    evidence.stderr.clear();
+    evidence.stdout_truncated = false;
+    evidence.stderr_truncated = false;
+    task.cancel_verification.enabled = true;
+    let expected = Intent::CancelVerification {
+        target: task.target.clone(),
+        expected: evidence.target.clone(),
+        verification_id: evidence.id.clone(),
+    };
+    let mut initial = HarnessState::default();
+    initial.ui.open_task(task.target.clone());
+    let mut harness = egui_kittest::Harness::builder()
+        .with_size(egui::vec2(1440.0, 1800.0))
+        .build_ui_state(
+            |ui, state: &mut HarnessState| {
+                state.intents.extend(show(ui, &mut state.ui, &snapshot));
+            },
+            initial,
+        );
+    use_korean_font(&mut harness);
+    harness.run();
+    assert!(harness.query_by_label("검증 명령 실행").is_none());
+    harness.get_by_label("검증 실행 취소").click();
+    harness.run();
+    assert!(harness.state().intents.contains(&expected));
+}
+
+#[test]
+fn command_verification_rejects_stale_attempt_result_and_remote_execution_intents() {
+    let snapshot = command_verification_fixture();
+    let task = &snapshot.projects[0].tasks[0];
+    for field in ["workspace_id", "task_id", "attempt_id", "result_revision"] {
+        let mut task = task.clone();
+        match field {
+            "workspace_id" => task.target.workspace_id = "foreign".into(),
+            "task_id" => task.target.task_id = Some("foreign".into()),
+            "attempt_id" => task.attempt_id = Some("next-attempt".into()),
+            _ => task.result_revision = Some("4".into()),
+        }
+        assert!(verification::current_target(&task).is_none(), "{field}");
+    }
+    for kind in ["execute_verification", "cancel_verification"] {
+        let value = serde_json::json!({"type":kind,"target":task.target,"expected":task.verification_target,
+            "spec":task.command_verification.as_ref().unwrap().spec,"verification_id":"verification-7"});
+        assert!(serde_json::from_value::<Intent>(value).is_err(), "{kind}");
+    }
+}
+
+#[test]
+fn command_verification_new_result_and_source_never_reuse_a_reviewed_old_command() {
+    for change_source in [false, true] {
+        let mut snapshot = command_verification_fixture();
+        let task = &mut snapshot.projects[0].tasks[0];
+        task.command_verification = None;
+        let previous = task.verification_target.clone().unwrap();
+        let old_key = serde_json::to_string(&previous).unwrap();
+        if change_source {
+            task.verification_target.as_mut().unwrap().source_revision = Some("new-source".into());
+        } else {
+            task.result_revision = Some("4".into());
+            task.verification_target.as_mut().unwrap().result_revision =
+                deppy_core::work_management::ResultRevision(4);
+        }
+        let current_key =
+            serde_json::to_string(task.verification_target.as_ref().unwrap()).unwrap();
+        let mut initial = HarnessState::default();
+        initial.ui.open_task(task.target.clone());
+        initial.ui.command_verification_drafts.insert(
+            old_key.clone(),
+            VerificationSpec {
+                command: "old reviewed command".into(),
+                cwd: task.directory.clone(),
+                timeout_ms: 60000,
+                output_limit_bytes: 32768,
+            },
+        );
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(1440.0, 1800.0))
+            .build_ui_state(
+                |ui, state: &mut HarnessState| {
+                    state.intents.extend(show(ui, &mut state.ui, &snapshot));
+                },
+                initial,
+            );
+        use_korean_font(&mut harness);
+        harness.run();
+        assert_eq!(
+            harness.state().ui.command_verification_drafts[&old_key].command,
+            "old reviewed command"
+        );
+        assert!(
+            harness.state().ui.command_verification_drafts[&current_key]
+                .command
+                .is_empty()
+        );
+        assert!(
+            harness
+                .get_by_label("검증 명령 실행")
+                .accesskit_node()
+                .is_disabled()
+        );
+        assert!(
+            !harness
+                .state()
+                .intents
+                .iter()
+                .any(|i| matches!(i, Intent::ExecuteVerification { .. }))
+        );
+    }
+}
+
+#[test]
+#[ignore = "offscreen GPU verification evidence; never starts the app"]
+fn command_verification_render_evidence() {
+    let output = std::env::var_os("DEPPY_CC_VERIFICATION_EVIDENCE_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| "/private/tmp/deppy-cc-verification-ui-evidence-20261022".into());
+    std::fs::create_dir_all(&output).unwrap();
+    for width in [1440.0, 390.0] {
+        let snapshot = command_verification_fixture();
+        let mut initial = UiState::default();
+        initial.open_task(snapshot.projects[0].tasks[0].target.clone());
+        let mut harness = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(
+                width,
+                if width == 390.0 { 1600.0 } else { 1800.0 },
+            ))
+            .build_ui_state(
+                |ui, state| {
+                    let rect = ui.ctx().viewport_rect();
+                    let mut surface = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+                    surface.set_clip_rect(rect);
+                    show(&mut surface, state, &snapshot);
+                },
+                initial,
+            );
+        use_korean_font(&mut harness);
+        harness.remove_cursor();
+        harness.run();
+        let name = format!("verification-{}", width as u32);
+        harness
+            .render()
+            .expect("offscreen native verification")
+            .save(output.join(format!("{name}.png")))
+            .unwrap();
+        std::fs::write(
+            output.join(format!("{name}.snapshot.json")),
+            serde_json::to_vec_pretty(&snapshot).unwrap(),
+        )
+        .unwrap();
     }
 }
 

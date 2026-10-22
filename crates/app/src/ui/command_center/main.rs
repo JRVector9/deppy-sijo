@@ -1008,7 +1008,9 @@ fn task_detail(
             } else {
                 weak(ui, snapshot, text(snapshot, "no_result"));
             }
+            verification::show(ui, state, snapshot, t, intents);
             if t.verify_result.enabled {
+                ui.label("수동 검증 기록 · 앱 실행 아님");
                 ui.label("직접 수행한 검증 명령과 결과를 기록합니다.");
                 let evidence = state
                     .verification_reports

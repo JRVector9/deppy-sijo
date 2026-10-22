@@ -5,6 +5,8 @@ use super::{Deserialize, Project, RouteTarget, Serialize};
 pub const MAX_CONVERSATION_ENTRIES: usize = 100;
 pub const MAX_CONVERSATION_TEXT_BYTES: usize = 8 * 1024;
 pub const MAX_CONVERSATION_TOTAL_BYTES: usize = 128 * 1024;
+const MAX_ID_BYTES: usize = 1024;
+const MAX_GENERATION_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -80,9 +82,21 @@ impl MainConversation {
 
     fn bounded_copy(&self) -> Self {
         let mut budget = MAX_CONVERSATION_TOTAL_BYTES;
-        let mut truncated = self.truncated || self.entries.len() > MAX_CONVERSATION_ENTRIES;
+        let mut truncated = self.truncated
+            || self.entries.len() > MAX_CONVERSATION_ENTRIES
+            || self.generation.len() > MAX_GENERATION_BYTES;
         let mut entries = Vec::with_capacity(self.entries.len().min(MAX_CONVERSATION_ENTRIES));
         for entry in self.entries.iter().rev().take(MAX_CONVERSATION_ENTRIES) {
+            if entry.id.is_empty()
+                || entry.id.len() > MAX_ID_BYTES
+                || entry
+                    .turn_id
+                    .as_ref()
+                    .is_some_and(|id| id.len() > MAX_ID_BYTES)
+            {
+                truncated = true;
+                continue;
+            }
             if budget == 0 {
                 truncated = true;
                 break;
@@ -91,8 +105,8 @@ impl MainConversation {
             truncated |= text.len() < entry.text.len();
             budget -= text.len();
             entries.push(ConversationEntry {
-                id: prefix(&entry.id, 256),
-                turn_id: entry.turn_id.as_deref().map(|v| prefix(v, 256)),
+                id: entry.id.clone(),
+                turn_id: entry.turn_id.clone(),
                 kind: entry.kind,
                 text,
                 tool_name: entry.tool_name.as_deref().map(|v| prefix(v, 256)),
@@ -103,7 +117,11 @@ impl MainConversation {
         entries.reverse();
         Self {
             target: self.target.clone(),
-            generation: prefix(&self.generation, 256),
+            generation: if self.generation.len() <= MAX_GENERATION_BYTES {
+                self.generation.clone()
+            } else {
+                String::new()
+            },
             entries,
             truncated,
             status: prefix(&self.status, 1024),
@@ -124,6 +142,7 @@ impl Project {
             || self.main_target.task_id.is_some()
             || source.target != self.main_target
             || source.generation.trim().is_empty()
+            || source.generation.len() > MAX_GENERATION_BYTES
         {
             return None;
         }

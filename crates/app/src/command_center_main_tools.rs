@@ -38,11 +38,9 @@ impl MainRegistration {
         args.extend([
             "-c".into(),
             format!(
-                "mcp_servers.deppy_command_center.url={}",
+                "mcp_servers.deppy_command_center={{url={},bearer_token_env_var=\"{TOKEN_ENV}\",enabled=true}}",
                 serde_json::to_string(&credential.endpoint)?
             ),
-            "-c".into(),
-            format!("mcp_servers.deppy_command_center.bearer_token_env_var=\"{TOKEN_ENV}\""),
         ]);
         env_plain.retain(|(name, _)| name != TOKEN_ENV);
         env_secrets.retain(|(name, _)| name != TOKEN_ENV);
@@ -548,8 +546,8 @@ mod tests {
             unreachable!()
         };
         assert_eq!(&args[..2], &["--model", "configured-model"]);
-        assert_eq!(args.len(), 6);
-        assert!(args[3].starts_with("mcp_servers.deppy_command_center.url=\"http://127.0.0.1:"));
+        assert_eq!(args.len(), 4);
+        assert!(args[3].starts_with("mcp_servers.deppy_command_center={url=\"http://127.0.0.1:"));
         assert_eq!(env_plain, vec![("KEEP".into(), "configured".into())]);
         assert_eq!(env_secrets.len(), 1);
         assert_eq!(env_secrets[0].0, TOKEN_ENV);

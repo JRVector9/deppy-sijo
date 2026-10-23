@@ -1,0 +1,26 @@
+{
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb",
+  "match_final_qa_source_files": [
+    "crates/app/src/app.rs",
+    "crates/app/src/main.rs",
+    "crates/app/src/project_keys/worker.rs",
+    "crates/app/src/ssh_clipboard.rs",
+    "crates/app/src/ssh_folder_tree.rs",
+    "crates/app/src/ssh_workspace_add.rs",
+    "crates/app/src/ui/workspace.rs",
+    "crates/connector-ui/src/popup/mod.rs",
+    "crates/i18n/locales/en-US/messages.txt",
+    "crates/i18n/locales/ja-JP/messages.txt",
+    "crates/i18n/locales/ko-KR/messages.txt",
+    "crates/i18n/locales/zh-Hans/messages.txt",
+    "crates/i18n/locales/zh-Hant/messages.txt",
+    "crates/remote-host/src/agent_environment.rs",
+    "crates/remote-host/src/clipboard.rs",
+    "crates/remote-host/src/lib.rs",
+    "crates/remote-host/src/services.rs",
+    "crates/remote-host/src/supervisor.rs",
+    "crates/remote-host/tests/supervisor.rs"
+  ],
+  "only_changes_after_final_qa": "Cargo.toml canonical0.17.0; exactly30inherited workspace Cargo.lock package versions0.17.0",
+  "uncommitted_product_changes": false
+}

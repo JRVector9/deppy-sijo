@@ -1,0 +1,44 @@
+[
+  {
+    "original": "helpers-build-first.log",
+    "sha256": "dd8c4657d635ad65e20a42a652fb2dd50ea4b929c04d395c68fe720a98f5c26d",
+    "compressed": "helpers-build-first.log.gz",
+    "compressed_sha256": "573fc62af8ac9183115658d29abb2a4d36eb270d719a1e1720bdc0d753738d86"
+  },
+  {
+    "original": "helpers-build-fourth.log",
+    "sha256": "97016fe6af6c7fb42df3e5173d0fe8d89388bf96f4d3b6b7270d919766f783ef",
+    "compressed": "helpers-build-fourth.log.gz",
+    "compressed_sha256": "cd56b07a63502d2a2fa4e0efd1229c1f10d6720ca44f3c78fd378d3e134dcf56"
+  },
+  {
+    "original": "helpers-build-second.log",
+    "sha256": "4efd130d119779aeb4b1b5eadb4dfed1f0fa8981d7d0c0aa27a2431ca52bfa74",
+    "compressed": "helpers-build-second.log.gz",
+    "compressed_sha256": "17326b3c235ca09086e153551702685e81421477c1c3d9fc68e432c35444be49"
+  },
+  {
+    "original": "helpers-build-third.log",
+    "sha256": "7b7b511a4d582d471584900e15710ef722a93567412a4c1837e9935cbf63ee5e",
+    "compressed": "helpers-build-third.log.gz",
+    "compressed_sha256": "0ff04011e8e351687b5b09dbd727626dd5a50663c68c914e656d39dfdcc5e819"
+  },
+  {
+    "original": "helpers-build.log",
+    "sha256": "f2451a3a6f946fc34c601e8e32a1e6c9ec839d3b05030c1728cc9786b6b9a470",
+    "compressed": "helpers-build.log.gz",
+    "compressed_sha256": "27faa125fd037d5dd4467d9eb69be95edb18206a99f2ec418c224b62823e2d5d"
+  },
+  {
+    "original": "native-build.log",
+    "sha256": "cd4bfb97fdb07cedfebbc6c58ceb708c0ba83c0105bc70568522690375f6c921",
+    "compressed": "native-build.log.gz",
+    "compressed_sha256": "e8b419cec9dd9f69a85e96d308743b19c3aa5a9f3d63c288695d09b50d60c13c"
+  },
+  {
+    "original": "package.log",
+    "sha256": "385e4397aec87283ab951b0901a0385d2e9d749435c79bdf05ee8c48dba6f72a",
+    "compressed": "package.log.gz",
+    "compressed_sha256": "6fe820ee2e65e46b3ec15594cfe3546a827c0c70fed053e8b055df90c3e7d31d"
+  }
+]

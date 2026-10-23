@@ -1,0 +1,17 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "-p",
+    "mcp-proxy",
+    "-p",
+    "ssh-askpass"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 92.339,
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb"
+}

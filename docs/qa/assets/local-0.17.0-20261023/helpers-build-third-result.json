@@ -1,0 +1,9 @@
+{
+  "command": [
+    "sh",
+    "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/assets/local-0.17.0-20261023/build-remote-host-native-cargo.sh"
+  ],
+  "exit_code": 101,
+  "elapsed_seconds": 6.543,
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb"
+}

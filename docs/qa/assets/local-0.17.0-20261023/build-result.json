@@ -1,0 +1,46 @@
+{
+  "kind": "Signed local developer build, debug profile; not notarized public distribution",
+  "branch": "fix/product-review-integration-20261023",
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb",
+  "version_change": {
+    "last_shipped": "0.16.0",
+    "new": "0.17.0"
+  },
+  "reported_version": "Deppy Sijo 0.17.0",
+  "plist_versions": {
+    "CFBundleVersion": "0.17.0",
+    "CFBundleShortVersionString": "0.17.0"
+  },
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.17.0/Deppy Sijo.app",
+  "restart_performed": false,
+  "running_app_pid_unchanged": 31144,
+  "ssh_workspaces": true,
+  "remote_helpers": [
+    {
+      "version": "0.17.0",
+      "target": "linux-aarch64",
+      "sha256": "b1904916de8a73114c8a9dca2a56110b64511ed54a4f7656ce3c3ee1de4af574",
+      "bytes": 8830056
+    },
+    {
+      "version": "0.17.0",
+      "target": "linux-x86_64",
+      "sha256": "f535ed34c86f9a7c336c691efbcfebbea0f148de23a20e2151429cc290072acc",
+      "bytes": 9308768
+    }
+  ],
+  "bundle_sha256": {
+    "Contents/Info.plist": "2befe636f4698e23b48e8b36e4e22afd1f8063302f0a98fac2599d7eeb26b2cd",
+    "Contents/_CodeSignature/CodeResources": "b09d8790f116c06ff79d694cc0bbfe868128b3709e57772b77dd0338374a11d4",
+    "Contents/MacOS/deppy-sijo": "aa42079888707d4719652bef612cc6d2862bb204ef0e3c0b9c29d8172197ab1d",
+    "Contents/MacOS/deppy-cloudflared": "63de599b8061b2fe1bc22ba9e7171cb05ce261f520c4e65bba7c7a07a8db96dc",
+    "Contents/MacOS/deppy-mcp-proxy": "5a192e32bbb7e0e26aeb1882f8d3ec7f572a5d577855da12524147fb34972690",
+    "Contents/MacOS/deppy-ssh-askpass": "27fbfd18772c93711c41cb38559c5b2d6d6351c96a867e5b4571134f2716440d",
+    "Contents/Resources/cloudflared-LICENSE": "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd",
+    "Contents/Resources/remote-host/manifest.json": "0719cbe7b9cfc21f212a33fcf508597840bc8f4523a9ff583472e5c471c010e0",
+    "Contents/Resources/remote-host/linux-x86_64/deppy-remote-host": "f535ed34c86f9a7c336c691efbcfebbea0f148de23a20e2151429cc290072acc",
+    "Contents/Resources/remote-host/linux-aarch64/deppy-remote-host": "b1904916de8a73114c8a9dca2a56110b64511ed54a4f7656ce3c3ee1de4af574"
+  },
+  "package_verification": "PASS (explicit local developer trust policy)",
+  "uncommitted_product_changes": ""
+}

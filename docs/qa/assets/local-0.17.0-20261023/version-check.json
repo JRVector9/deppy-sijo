@@ -1,0 +1,31 @@
+{
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb",
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.17.0/Deppy Sijo.app",
+  "app_cli": "Deppy Sijo 0.17.0",
+  "askpass_cli": "deppy-ssh-askpass 0.17.0",
+  "CFBundleVersion": "0.17.0",
+  "CFBundleShortVersionString": "0.17.0",
+  "helpers": [
+    {
+      "version": "0.17.0",
+      "target": "linux-aarch64",
+      "sha256": "b1904916de8a73114c8a9dca2a56110b64511ed54a4f7656ce3c3ee1de4af574",
+      "bytes": 8830056
+    },
+    {
+      "version": "0.17.0",
+      "target": "linux-x86_64",
+      "sha256": "f535ed34c86f9a7c336c691efbcfebbea0f148de23a20e2151429cc290072acc",
+      "bytes": 9308768
+    }
+  ],
+  "linux_tests_final_per_arch": {
+    "storage_archive": 34,
+    "remote_host_unit": 29,
+    "supervisor_integration": 4,
+    "isolated_child_fixtures_ignored_at_top_level": 2
+  },
+  "existing_running_app_unchanged": "31144 05:03:31 /Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+  "restart_performed": false,
+  "notarized_public_distribution": false
+}

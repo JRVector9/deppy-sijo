@@ -1,27 +1,52 @@
-# Active rebuild only — 0.17.0 (2026-10-23)
+# Completed rebuild only — 0.17.0 (2026-10-23)
 
-## Objective / authorization
+## Objective / completed result
 
-Current user: “재빌드 해”. Build and verify a signed local developer bundle containing completed SSH folder hierarchy, remote-agent discovery and image clipboard transfer. **No restart authorized**; do not stop/launch native app or live user sessions. Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`. Existing running bundle0.16.0 PID31144 remains untouched.
+Current user: “재빌드 해”. Built, signed and verified a new local developer bundle with approved SSH folder hierarchy, installed remote-agent discovery and SSH terminal image clipboard transfer. **No restart was requested or performed.** Existing native app0.16.0 PID31144 remains running from its original bundle; live user SSH sessions were untouched.
 
-## Preflight / completed
+Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`. Product/release source commit **9aca83f2d6264dd64447faeaafc731f42df265cb**. Local checkpoint commit includes previously reviewed feature/test/docs and release metadata; no push/main merge. Later evidence/docs commit does not change product code.
 
-- Latest local delivered bundle across91discovered bundles0.16.0. Version **0.16.0 → 0.17.0**, minor for approved native hierarchy and remote image transfer; root Cargo.toml plus exactly30inherited Cargo.lock workspace package versions updated; metadata offline/locked validates all30. No third-party changes/hard-coded crate versions.
-- All19changed product/test/locale file hashes match the final preceding QA evidence. Historical just-executed tests: App3721unit+39integration, server29unit+4integration, native tree21, Clippy/fmt/boundary/i18n allPASS, details below. No reason to repeat unchanged full App suite merely for metadata version.
-- Reusing prior successful pinned Rust1.96.1/musl native ARM64 Cargo driver recipe for both Linux helper architectures; avoids previously proven emulated Cargo fork stalls. Product build scripts unchanged. Copied build-only recipe and packager under `docs/qa/assets/local-0.17.0-20261023/`.
-- Matching helpers0.17.0 must be rebuilt; cannot bundle stale0.16.0. Native app/MCP proxy/askpass build, helper build, signing/package/version verification pending. Source checkpoint commit pending. No product release completion claimed yet.
+## Version / artifacts / design decisions
 
-## Remaining / next commands
+- **0.16.0 → 0.17.0**, minor for native folder hierarchy and remote image transfer plus agent-discovery fix. Preflight91local bundles had max0.16.0; all19modified product/test/locale file hashes matched preceding full QA. Root Cargo.toml canonical version and exactly30inherited Cargo.lock workspace versions increased. No third-party changes, hard-coded crate versions, wire/database/MCP schema changes.
+- Bundle: `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.17.0/Deppy Sijo.app`. Signed with existing VectorNine Developer ID identity. Local debug-profile developer build; not a notarized public distribution. Includes app/MCP proxy/askpass, SHA-pinned cloudflared2026.9.1, static Linux ARM64/x86_64 helpers0.17.0 sealed with architecture/hash manifest.
+- Actual packaged app CLI **Deppy Sijo0.17.0**, askpass CLI **deppy-ssh-askpass0.17.0**, both CFBundleShortVersionString and CFBundleVersion **0.17.0**. Both Linux helper binaries executed their0.17.0 --version in pinned Debian12 before sealing. Package signatures/architectures/resources and all helper manifest digests verified. Existing0.16.0 bundle remains unchanged.
+- Product source after checkpoint remained clean throughout builds. Reused proven pinned Rust1.96.1/musl native ARM64 Cargo driver (compiler/linker remain target-platform) to avoid previously proven emulated Cargo fork stalls. Separate native jobs2 target and Linux jobs1/per-arch caches. Product build scripts unchanged; build-only recipe enhanced to execute service/unit+supervisor tests on both architectures.
 
-1. Commit reviewed source plus release version checkpoint locally, record source SHA (no push/main merge).
-2. Build native executables using jobs2/shared native target; build/seal both Linux helpers with existing native-Cargo recipe, jobs1/per-arch caches.
-3. Run versioned local-bundle.py; verify native CLI, askpass, plist versions0.17.0, helper pair/signatures/hashes and unchanged running PID. Record logs/results/handoff. Never invoke dev-run.sh or restart.py.
+## Modified files / preserved evidence
+
+Release metadata `Cargo.toml`, `Cargo.lock`; local source checkpoint also includes completed19source/test/locale files and approved design/mockup/QA docs described below. New evidence under `docs/qa/assets/local-0.17.0-20261023/`: preflight, source proof, build/packaging result JSON, exact no-launch build recipe/packager, version check and **7lossless `.log.gz` files** with SHA256 index. No compiled binaries/caches added to git. Native/Linux cache symlinks remain local git-excluded.
+
+## Actual executed checks
+
+- `cargo metadata --offline --locked --no-deps --format-version 1`: PASS all30workspace packages0.17.0 and inherited manifests; no dependency version update.
+- `CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass`: **PASS92.339s**, source9aca83f2.
+- Final helper recipe: **PASS115.449s** with completed compile caches. Actual x86_64 product compile in preceding attempt **PASS12m00s**, storage tests compile **PASS9m23s**, unit tests compile **PASS48.84s**. Final retry unchanged source built supervisor test executable **PASS57.75s**.
+- Both architectures actual Debian12 execution as nobody: **34storage archive+29remote-host unit+4supervisor integrationPASS/0FAIL per architecture** (**134test executions total**). Two isolated child fixtures ignored at top level per architecture are invoked by parent tests; no duplicate counting. Image bytes/RPC, bounded cache/fork locks, isolated PATH/discovery→supervisor→PTY and reconnect/lease/input replay covered. Git/util-linux test prerequisites installed only in disposable baseline containers, then privileges dropped; `/tmp` test mount explicitlyexec.
+- Versioned `local-bundle.py`: **PASS4.330s**. Unchanged `scripts/verify-macos-package.sh` PASS with explicit local developer trust policy (`DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 DEPPY_PACKAGE_SSH_WORKSPACES=1`). Native app/askpass CLI, plist and helper versions/digests independently reread after packaging.
+- Final `ps -p31144` confirms original0.16.0 bundle process still running. No dev-run/restart/open-new-app performed. No live user CLI image E2E claimed.
+- Prior full-source App3721unit+39integrationPASS, native tree21PASS, Clippy/fmt/boundary/i18nPASS remain **historical executed results from immediately preceding phase**, not rerun in rebuild. All19changed source/test/locale hashes identical; only release metadata changed. Source proof retained.
+
+## Failed approaches / corrections
+
+All failed logs/results retained; final successful gates above do not imply earlier attempts passed.
+
+1. Build-only extra supervisor artifact extraction used unescaped `/deps/` in sed delimiter; first exit1 after successful ARM64 compilation. Changed delimiter to `#`; cache retained.
+2. New `qa` container-name prefix rejected by existing guarded timeout wrapper (exit2). Used existing allowed baseline namespace; guard unchanged.
+3. Minimal Debian12 lacks Git: added unit suite24PASS/5Git fixtureFAIL/2ignored. Installed Git+util-linux only in disposable QA container, then setpriv nobody. Product/runtime source and all assertions unchanged.
+4. Fourth attempt1420.516s compiled x86_64 product/storage/unit successfully, then supervisor test compile reported one error. Detailed JSON was in owned stage removed by cleanup, so exact original diagnostic is unavailable; do not invent a cause. Added failure-only JSON dump to evidence recipe. **Unchanged source retry compiled successfully and all134final Linux tests passed**; no product workaround/test suppression. Slow emulated Rustc observed active100%CPU, not a stalled Cargo case.
+
+## Remaining / exact next commands
+
+Rebuild request is complete. New bundle ready at path above; running app remains0.16.0 until user explicitly requests relaunch. No source implementation/rebuild work remains. Do not relaunch automatically, install on live server, push or merge main. Optional live user-agent image E2E belongs to a later explicitly authorized running-app test.
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
-CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass
-sh docs/qa/assets/local-0.17.0-20261023/build-remote-host-native-cargo.sh
-python3 docs/qa/assets/local-0.17.0-20261023/local-bundle.py
+git status --short --branch
+"target/bundle-0.17.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo" --version
+# Build-only verification; never dev-run.sh without a fresh restart request.
+DEPPY_REQUIRE_TRUSTED_SIGNING=0 DEPPY_ALLOW_UNTRUSTED_SIGNING=1 DEPPY_PACKAGE_SSH_WORKSPACES=1 sh scripts/verify-macos-package.sh 'target/bundle-0.17.0/Deppy Sijo.app'
+ps -p 31144 -o pid=,etime=,command=
 ```
 
 ---

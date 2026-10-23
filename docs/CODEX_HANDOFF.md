@@ -1,3 +1,37 @@
+# Active local rebuild and restart — 0.16.0 (2026-10-23)
+
+## Current objective
+
+Current user explicitly requested “재빌드하고 재실행해”; stopping/relaunching the identified Deppy app is authorized for this task. Build the verified integration branch, package a separate signed local developer bundle, verify CLI/plist/helper versions, then replace running 0.15.1. Do not merge main or push.
+
+## Completed / changed files / decisions
+
+- Read current AGENTS, previous handoff, status/diff and build/package verification scripts. Integration tree initially clean at 2d07b119; previous frozen product/test source 06db5a9e.
+- Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`. Original dirty fleet and existing 0.15.1 bundle remain preserved.
+- Inventoried 94 local Deppy bundles: highest shipped 0.15.1; no higher workspace source found. Running app PID40133 is the prior command-center bundle.
+- Root workspace Cargo.toml 0.15.1 → 0.16.0 (minor for SSH/new integrated features); Cargo.lock changes only the 30 inherited workspace versions, no third-party update. All workspace package manifests retain version.workspace=true.
+- Evidence `docs/qa/assets/local-0.16.0-20261023/preflight.json`. Historical 06db source manifests remain unchanged and will differ only on release version files; do not rewrite old test evidence to match the new release.
+- Docker daemon 29.5.2 reachable. Rebuild fresh sealed Linux aarch64/x86_64 helper pair for version0.16.0/wire36; do not relabel old0.13.0 helpers. Use existing target caches only. Native debug local developer packaging is the established local delivery workflow; sign with existing VectorNine Developer ID identity, no notarized/public release claim.
+
+## Tests / failed approaches / remaining work
+
+No new build/test/package/restart executed yet. Previous full source gates below remain historical executed results, not new version-build claims. No failed approach in this phase.
+
+Remaining: validate lock metadata; build helpers and execute Debian baseline/archive tests; native app/proxy/askpass build; pinned cloudflared; separate signed bundle and package/CLI/plist checks; gracefully stop exact prior app only after success; launch new bundle with existing Command Center mode and verify responsiveness; record exact source/build/restart evidence.
+
+## Exact next commands
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+cargo metadata --offline --locked --no-deps --format-version 1
+# Root owns Cargo, jobs2 serial; reuse cache, never old helper artifacts.
+sh scripts/build-remote-host.sh
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass
+# Preserve original bundle; perform versioned local packaging and verification before authorized restart.
+```
+
+---
+
 # Completed handoff — parallel product fixes and integration (2026-10-23)
 
 ## Current objective / status

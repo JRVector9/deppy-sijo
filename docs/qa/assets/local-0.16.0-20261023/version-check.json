@@ -1,0 +1,16 @@
+{
+  "metadata_command": "cargo metadata --offline --locked --no-deps --format-version 1",
+  "exit_code": 0,
+  "workspace_packages": 30,
+  "all_workspace_versions": "0.16.0",
+  "all_manifests_inherit_version": true,
+  "product_delta_from_full_tested_source_06db5a9e": [
+    "Cargo.lock",
+    "Cargo.toml"
+  ],
+  "bundle_script_ast": "PASS",
+  "files_sha256": {
+    "Cargo.lock": "1c334c202994c2b491891380f9b40fbc5dd601f4da4187a8f6f47bb3052b8357",
+    "Cargo.toml": "ca699cc2c0109fc4cbdc4db83027994613657a6731409503136baf20aa2d2374"
+  }
+}

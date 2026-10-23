@@ -1,0 +1,10 @@
+{
+  "command": [
+    "python3",
+    "scripts/prepare-cloudflared.py",
+    "--output",
+    "target/tools/cloudflared/2026.9.1/prepared-cloudflared"
+  ],
+  "elapsed_seconds": 1.468,
+  "exit_code": 0
+}

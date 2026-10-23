@@ -1,0 +1,21 @@
+{
+  "command": [
+    "docker",
+    "run",
+    "--rm",
+    "-i",
+    "--name",
+    "deppy-remote-host-build-0359f4893143aa34fb328f73b2c79253769a004b5faef220",
+    "--platform",
+    "linux/arm64",
+    "--mount",
+    "type=bind,src=/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/cargo-driver-arm64,dst=/driver",
+    "rust@sha256:1f0dbad1df66647807e6952d1db85d0b2bda7606cb2139d82517e4f009967376",
+    "sh",
+    "-eu"
+  ],
+  "script": "set -eu\ncargo_bin=/usr/local/rustup/toolchains/1.96.1-aarch64-unknown-linux-gnu/bin/cargo\nmkdir /driver/lib\ncp \"$cargo_bin\" /driver/cargo\nldd \"$cargo_bin\" > /driver/ldd.txt\nldd \"$cargo_bin\" | awk '/=> \\// {print $3} /^[[:space:]]*\\// {print $1}' | while read -r lib; do cp -L \"$lib\" /driver/lib/; done\ncp -L /lib/ld-linux-aarch64.so.1 /driver/ld-linux-aarch64.so.1\n/driver/ld-linux-aarch64.so.1 --library-path /driver/lib /driver/cargo --version\n",
+  "exit_code": 0,
+  "elapsed_seconds": 0.297,
+  "ldd": "\tlinux-vdso.so.1 (0x0000e1aa764e8000)\n\tlibdl.so.2 => /lib/aarch64-linux-gnu/libdl.so.2 (0x0000e1aa74840000)\n\tlibgcc_s.so.1 => /lib/aarch64-linux-gnu/libgcc_s.so.1 (0x0000e1aa74800000)\n\tlibpthread.so.0 => /lib/aarch64-linux-gnu/libpthread.so.0 (0x0000e1aa747d0000)\n\tlibm.so.6 => /lib/aarch64-linux-gnu/libm.so.6 (0x0000e1aa74720000)\n\tlibc.so.6 => /lib/aarch64-linux-gnu/libc.so.6 (0x0000e1aa74560000)\n\t/lib/ld-linux-aarch64.so.1 (0x0000e1aa764a0000)\n"
+}

@@ -1,0 +1,44 @@
+[
+  {
+    "file": "cargo-driver-prepare.log.gz",
+    "uncompressed_sha256": "e18efb6caebf2254f7da0f021489eb09bf5eed8f325435cee5c3fe128ba9824c",
+    "compressed_sha256": "c764b4d89148580a415a6c85293753ef890719ba9b3aa35ee4c97baada6837ae",
+    "bytes": 36
+  },
+  {
+    "file": "cloudflared-prepare.log.gz",
+    "uncompressed_sha256": "78ac04eac32fa9e0edf091f66f9ca21ca917604b9d3fd2a4126a5a7487d0f477",
+    "compressed_sha256": "9c166a68b23789dc284a3e6d1fa4ebf784aaf47df01262b71816b186041ba700",
+    "bytes": 95
+  },
+  {
+    "file": "helpers-build-native-cargo.log.gz",
+    "uncompressed_sha256": "2de43ed6e1f1c604ef5986cbc9cb166ae209c3a9e6b40a43ee831f103dacc030",
+    "compressed_sha256": "c57e63e6717db21304056a0bb58b085f102803e7ff9a40d826c9c7a7a3b45a05",
+    "bytes": 50951
+  },
+  {
+    "file": "helpers-build-retry.log.gz",
+    "uncompressed_sha256": "1ac0bcfa2f43506f4e233622fd830b52ba15e52721e42c9e68ba355bffdcdfe1",
+    "compressed_sha256": "ec3c2a802e06e57d9d6a687ce2e34c887a7acf8f822a4d343dc1c955dfc63635",
+    "bytes": 47248
+  },
+  {
+    "file": "helpers-build.log.gz",
+    "uncompressed_sha256": "30cdd24cefc50121b9caaaffdecb2288100695c3dba8e00828b5b970b60a160d",
+    "compressed_sha256": "af4054c72ecd2c2d4d3da09b4b34f8cfcd86a2e78f0c4e1e9bbd87c1a9fafe3b",
+    "bytes": 38143
+  },
+  {
+    "file": "native-build.log.gz",
+    "uncompressed_sha256": "1e50ee6da1254b03f2024231559c4c5d86373a5ac0a9444ddb4f0c2c4d98efbd",
+    "compressed_sha256": "3646d911431cbde1ea2ac9e384e7ecfdac2b1c7843e7ca248a7d48f4a2d10eee",
+    "bytes": 3110
+  },
+  {
+    "file": "package.log.gz",
+    "uncompressed_sha256": "13257244ff951ed69f3c62e2c0e88340e956122cc3348b5a6d08cff94013b97b",
+    "compressed_sha256": "9ad458b65938cb221a937fbba27154d59fd62ac8364b8596c00d723cb30c34b8",
+    "bytes": 4504
+  }
+]

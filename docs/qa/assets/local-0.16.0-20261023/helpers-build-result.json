@@ -1,0 +1,11 @@
+{
+  "command": [
+    "sh",
+    "scripts/build-remote-host.sh"
+  ],
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "source_commit": "1c8ce64ea576b0e41b6c8f255d648da37f0c7075",
+  "started": "2026-10-23T00:55:24.608190+00:00",
+  "elapsed_seconds": 540.137,
+  "exit_code": 137
+}

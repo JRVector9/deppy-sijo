@@ -1,0 +1,19 @@
+{
+  "source_commit": "1c8ce64ea576b0e41b6c8f255d648da37f0c7075",
+  "full_tested_product_source": "06db5a9e566a85ab8fc1baf92259ba167d2572f2",
+  "historical_manifest_files": 1072,
+  "unchanged_source_files": 1070,
+  "only_changes": [
+    {
+      "path": "Cargo.lock",
+      "before_sha256": "94a473f61edf8e0336a0a024b57d7d5adb5f8b0379de1a3039bd87dfa5b03efd",
+      "after_sha256": "1c334c202994c2b491891380f9b40fbc5dd601f4da4187a8f6f47bb3052b8357"
+    },
+    {
+      "path": "Cargo.toml",
+      "before_sha256": "39e1069ea509fd7aa7e64f58314ab5cf58a47ab9d8caa4ec3ecf0daeba29c4f9",
+      "after_sha256": "ca699cc2c0109fc4cbdc4db83027994613657a6731409503136baf20aa2d2374"
+    }
+  ],
+  "status": "PASS; historical test manifest preserved, version-only delta checked"
+}

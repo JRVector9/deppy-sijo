@@ -1,0 +1,33 @@
+{
+  "authorized_request": "재빌드하고 재실행해",
+  "started": "2026-10-23T01:26:44.655760+00:00",
+  "previous": [
+    {
+      "pid": 40133,
+      "executable": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo"
+    }
+  ],
+  "new_bundle": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app",
+  "source_commit": "1c8ce64ea576b0e41b6c8f255d648da37f0c7075",
+  "command_center_mode": "DEPPY_COMMAND_CENTER_V2=1",
+  "stop_actions": [
+    {
+      "kind": "graceful AppleEvent quit",
+      "exit_code": 0,
+      "stderr": ""
+    }
+  ],
+  "launch_command": [
+    "/usr/bin/open",
+    "-n",
+    "--env",
+    "DEPPY_COMMAND_CENTER_V2=1",
+    "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app"
+  ],
+  "new_process": {
+    "pid": 31144,
+    "executable": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo"
+  },
+  "process_liveness": "PASS after3s; UI responsiveness checked separately",
+  "finished": "2026-10-23T01:26:49.905005+00:00"
+}

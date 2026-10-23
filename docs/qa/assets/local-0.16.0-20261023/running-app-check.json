@@ -1,0 +1,10 @@
+{
+  "timestamp": "2026-10-23T01:27:46.561770+00:00",
+  "pid": 31144,
+  "executable": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+  "reported_version": "Deppy Sijo 0.16.0",
+  "command_center_flag": "1",
+  "native_ui_check": "CUA getApp exact bundle path returned Deppy Sijo standard window, main agent view, restored workspace list, main composer and worker sidebar in0.2838s",
+  "actions": "Read-only UI state; no provider input or agent turn sent",
+  "scope": "App launch/window restored; not a full live provider or physical-phone/SSH-server E2E test"
+}

@@ -1,0 +1,12 @@
+{
+  "command": [
+    "sh",
+    "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/assets/local-0.16.0-20261023/build-remote-host-native-cargo.sh"
+  ],
+  "cwd": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "source_commit": "1c8ce64ea576b0e41b6c8f255d648da37f0c7075",
+  "started": "2026-10-23T01:18:42.669329+00:00",
+  "elapsed_seconds": 436.137,
+  "exit_code": 0,
+  "recipe_delta": "Native ARM64 Cargo1.96.1 from pinned builder; exact original per-platform Rustc1.96.1/linker/target; jobs1; original baseline/archive/sealing gates unchanged"
+}

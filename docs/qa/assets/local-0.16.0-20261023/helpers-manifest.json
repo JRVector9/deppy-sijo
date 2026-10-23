@@ -1,0 +1,14 @@
+[
+  {
+    "version": "0.16.0",
+    "target": "linux-aarch64",
+    "sha256": "ea1dc1256f937659eb070a18781d303b88c1b946c48746e04fe7fbf29a8d1fda",
+    "bytes": 8816416
+  },
+  {
+    "version": "0.16.0",
+    "target": "linux-x86_64",
+    "sha256": "ddfeaa32b717fd7fb422be1d26f60a5f5aadc58546940cb69e18498ca350c835",
+    "bytes": 9256664
+  }
+]

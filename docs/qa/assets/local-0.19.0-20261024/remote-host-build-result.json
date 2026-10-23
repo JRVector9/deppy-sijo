@@ -1,0 +1,8 @@
+{
+  "command": [
+    "sh",
+    "docs/qa/assets/local-0.18.0-20261023/build-remote-host-native-cargo.sh"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 1319.1591708339984
+}

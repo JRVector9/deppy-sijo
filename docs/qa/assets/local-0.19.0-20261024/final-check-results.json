@@ -1,0 +1,49 @@
+[
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 4.18652545788791
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 9.831474791048095
+  },
+  {
+    "name": "provider-usage-source",
+    "command": [
+      "python3",
+      "scripts/verify-provider-usage.py",
+      "--check-only"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.08543175004888326
+  },
+  {
+    "name": "diff",
+    "command": [
+      "git",
+      "diff",
+      "--check"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.041023624944500625
+  }
+]

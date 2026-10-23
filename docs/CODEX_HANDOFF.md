@@ -1,27 +1,45 @@
-# Local 0.19.0 rebuild — 2026-10-24 (in progress)
+# Local0.19.0 rebuild complete — 2026-10-24
 
-## Objective and completed preparation
+## Objective / completed work
 
-User asks “미커밋 없지? 재빌드해”. Canonical integration tree main was clean at c6b838b97e83eb848945410f483a748e8bfe695d and exactly matched origin/main. Previous main merge/push is complete. Last shipped bundle scan max0.18.0. New project API features require minor0.19.0: root workspace version and exactly30 inherited workspace lock versions updated; external dependency graph unchanged. No product behavior changes in this rebuild. Native app/proxy/askpass plus actual Linux aarch64/x86_64 SSH helpers must be rebuilt and verified. NO launch/stop/restart authorized.
+User asked “미커밋 없지? 재빌드해”. Canonical integration-20261023 main was clean at c6b838b97e83eb848945410f483a748e8bfe695d, exactly matching origin/main. **Local0.19.0 build, signing, package/version/hash verification are complete. NO stop/launch/restart performed.** Previous main merge/push already complete. Version source commit482dfd14fa45f51e4054faa0e208564090f08647; next final commit contains only docs/evidence, then normal push and exact remote/clean check.
 
-## Verification, decisions and remaining work
+Scope correction explicitly communicated: original `/Users/jr/Desktop/projects/deppy-sijo` remains older Fleet branch331b78b3 with pre-existing modified AGENTS.md/handoff and untracked documents/HTML mockups. Preserved untouched, not the build tree. “Clean” refers to canonical main, not every historical worktree.
 
-- Before edits, cargo metadata --offline --locked --no-deps PASS; all48 previously tested task source digests unchanged. Prior5359 normalPASS/56ignored is previous source evidence, not a fresh rerun.
-- Main CI build/test run40003623932 still pending at last observation; fmt/boundaries/provider seal/Clippy/replay gates PASS. Dependency security run40003623722 FAIL: RustSec JSON contains3 vulnerabilities. Keep evidence separate from successful build; do not silently update dependencies or weaken audit. Exact findings to be included in rebuild report.
-- New package path target/bundle-0.19.0/Deppy Sijo.app, signed local developer/debug profile using existing explicit local trust verification. Not notarized public distribution.
-- Reuse pinned-image native-Cargo helper driver from docs/qa/assets/local-0.18.0-20261023/build-remote-host-native-cargo.sh (version dynamic) to avoid previously proven QEMU Cargo fork stalls. No remote installation or app launch.
-- Modified files: Cargo.toml, Cargo.lock, CHANGELOG.md, this handoff, new local0.19 QA evidence and report. Commit version source before building. Remaining: native build, both helpers/tests, package/sign, versions/hash/source verification, final evidence commit/push and clean-tree check. No new build/test result claimed yet.
+## Modified files / decisions
 
-## Exact commands
+- Last shipped bundle scan66bundles maximum0.18.0. New API feature requires minor0.19.0. Root Cargo.toml plus exactly30 inherited workspace lock entries bumped; parsed external dependency graph unchanged. CHANGELOG added0.19.0. No product behavior source edits.
+- New bundle `target/bundle-0.19.0/Deppy Sijo.app`. Debug-profile signed local developer artifact, verified with existing explicit local trust policy; not notarized public distribution. Matching actual rebuilt static Linux ARM64+x86_64 SSH helpers0.19.0 included. No overwrite of old bundles, no remote installation.
+- Build inputs1173SHA256 and48prior reviewed source digests all match. Product sources committed before build; docs-only reporting edits afterward. Protected usage source unchanged, no reseal.
+- New report docs/qa/2026-10-24-local-0.19.0-rebuild.md and assets/local-0.19.0-20261024/ record commands, results, source commit, initial older-worktree status, previous bundle versions, package/manifests and source/bundle digests.
+
+## Actual tests / results
+
+- Native app/proxy/askpass cargo build --offline --locked jobs2/shared target PASS84.37s.
+- Pinned-image native-Cargo helper driver (previous audited local0.18 evidence script, version dynamic) PASS1319.16s; Debian12 unprivileged tests74normalPASS per architecture (34archive+33remote-unit+7supervisor), **148executionsPASS/6ignored combined**. Filtered tests not counted.
+- fmt PASS4.19s; actual xtask check-boundary PASS9.83s; provider usage --check-only and diffcheck PASS.
+- Package/sign/verify PASS6.59s; app CLI and both macOS plist fields0.19.0, both helpers0.19.0.10bundle-file digests and1173source digests match. CLI version probes exit before GUI. Old app PID31144 remains running0.16.0; restart_performed=false.
+- Existing5359normalPASS/56ignored is earlier source validation, not a fresh full-suite rerun. GitHub build/test run40003623932 still in progress at final observation (macOS nextest); never claim allCIpass. Dependency-security run40003623722 **FAIL** with ctutils0.4.2/RUSTSEC-2026-0385, rustls-webpki0.103.15/RUSTSEC-2026-0382 and webpki-roots1.0.8/RUSTSEC-2026-0381. Exact advisory patch ranges in report/security-ci.json. Dependencies unchanged; no audit suppression.
+
+## Failed approaches
+
+Attempted nonexistent scripts/check-boundaries.py (exit2, no test executed). Located real cargo xtask gate and ran it successfully. Native-Cargo helper driver avoids previously documented QEMU Cargo fork stalls; QEMU jemalloc fallback notices are expected and final builds/testsPASS.
+
+## Remaining work / exact commands
+
+Rebuild itself has no product implementation left. Finish documentation/evidence commit and normal main push, verify exact remote SHA and clean canonical tree. Separate follow-up: security dependency patches and full validation, review disposition of old Fleet document/mockup edits. Do not change old worktrees automatically. No restart without new explicit request.
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
 git status --short --branch
-CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass
-sh docs/qa/assets/local-0.18.0-20261023/build-remote-host-native-cargo.sh
-python3 docs/qa/assets/local-0.19.0-20261024/local-bundle.py
+git log -3 --oneline
 python3 scripts/verify-provider-usage.py --check-only
-# Never dev-run.sh/open/kill/restart as part of this rebuild.
+git diff --check
+git push origin main
+git ls-remote origin refs/heads/main
+"target/bundle-0.19.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo" --version
+# --version exits before GUI; never dev-run.sh/open/kill/restart automatically.
+# Shared Cargo target remains /Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target.
 ```
 
 ---

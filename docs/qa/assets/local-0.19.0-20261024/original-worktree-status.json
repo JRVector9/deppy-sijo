@@ -1,0 +1,6 @@
+{
+  "path": "/Users/jr/Desktop/projects/deppy-sijo",
+  "branch": "feat/fleet-one-list-and-relay-wip",
+  "status": " M AGENTS.md\n M docs/CODEX_HANDOFF.md\n?? docs/mockups/cloud-agent-grok-scenario-20260926.html\n?? docs/mockups/deppy-ai-work-guide-20260928.html\n?? docs/mockups/workspace-source-picker-20260929.html\n?? docs/reviews/\n?? docs/superpowers/plans/2026-09-26-cloud-agent-session-bridge.md\n",
+  "scope": "Preserved pre-existing documents/mockups on original older worktree, not the main build source."
+}

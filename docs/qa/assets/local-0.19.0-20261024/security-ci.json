@@ -1,0 +1,43 @@
+{
+  "run": "https://github.com/JRVector9/deppy-sijo/actions/runs/40003623722",
+  "conclusion": "failure",
+  "findings": [
+    {
+      "id": "RUSTSEC-2026-0385",
+      "package": "ctutils",
+      "version": "0.4.2",
+      "title": "Non-constant-time mask generation and `u128` comparisons",
+      "patched": [
+        ">=0.4.4"
+      ],
+      "unaffected": [],
+      "url": "https://github.com/RustCrypto/utils/pull/1569"
+    },
+    {
+      "id": "RUSTSEC-2026-0382",
+      "package": "rustls-webpki",
+      "version": "0.103.15",
+      "title": "Certificate verification may accept distrusted intermediates",
+      "patched": [
+        ">=0.103.16, <0.104.0-alpha.1",
+        ">=0.104.0-alpha.8"
+      ],
+      "unaffected": [],
+      "url": "https://github.com/rustls/webpki/pull/546"
+    },
+    {
+      "id": "RUSTSEC-2026-0381",
+      "package": "webpki-roots",
+      "version": "1.0.8",
+      "title": "Bundled root certificates allow trust in distrusted emSign intermediates",
+      "patched": [
+        ">=1.0.10"
+      ],
+      "unaffected": [
+        "=0.26.11"
+      ],
+      "url": "https://github.com/rustls/webpki-roots/pull/133"
+    }
+  ],
+  "scope": "Read-only observation of existing dependency-security CI; dependencies unchanged during requested rebuild."
+}

@@ -1,0 +1,11 @@
+{
+  "version": "0.19.0",
+  "bundle_file_count": 10,
+  "build_source_file_count": 1173,
+  "ssh_test_executions_passed": 148,
+  "ssh_test_executions_ignored": 6,
+  "bundle_hashes": "PASS",
+  "build_source_hashes": "PASS",
+  "cli_and_plist_versions": "PASS",
+  "running_app_untouched": "PASS (PID31144 remains previous0.16.0 app)"
+}

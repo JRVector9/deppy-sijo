@@ -1,0 +1,16 @@
+{
+  "command": [
+    "cargo",
+    "build",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "-p",
+    "mcp-proxy",
+    "-p",
+    "ssh-askpass"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 84.3707174169831
+}

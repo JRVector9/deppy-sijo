@@ -1,0 +1,5 @@
+{"case": "terminal-green", "exit": 0, "seconds": 6.071, "command": ["cargo", "test", "--offline", "--locked", "-p", "terminal", "--", "--test-threads=4"]}
+{"case": "host-green", "exit": 0, "seconds": 24.022, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-remote-host", "--", "--test-threads=2"]}
+{"case": "runtime-green", "exit": 0, "seconds": 11.143, "command": ["cargo", "test", "--offline", "--locked", "-p", "runtime", "ssh_stream", "--", "--test-threads=2"]}
+{"case": "workspace-green", "exit": 0, "seconds": 84.994, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "terminal_dirty_history", "--", "--test-threads=1"]}
+{"case": "reconnect-red", "exit": 101, "seconds": 3.474, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "ssh_reconnect_transient", "--", "--nocapture", "--test-threads=1"]}

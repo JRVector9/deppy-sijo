@@ -1,0 +1,7 @@
+{
+  "app": "Deppy Sijo 0.18.0",
+  "askpass": "deppy-ssh-askpass 0.18.0",
+  "running_app_before_after": "0.16.0 PID31144 unchanged; no GUI launch",
+  "running_app_process": "31144 /Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+  "native_build_exit_code": 0
+}

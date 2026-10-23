@@ -25,7 +25,8 @@ struct UsageState {
 pub(crate) fn current(
     ctx: &egui::Context,
     agent: Option<&crate::agent_launcher::DetectedAgent>,
-) -> Option<crate::app::ProviderUsage> {
+    allow_refresh: bool,
+) -> CompletedProbe {
     let agent = agent?;
     static STATE: OnceLock<Mutex<UsageState>> = OnceLock::new();
     let state = STATE.get_or_init(|| Mutex::new(UsageState::default()));
@@ -38,7 +39,7 @@ pub(crate) fn current(
     let refresh_due = state
         .last_request
         .is_none_or(|requested| requested.elapsed() >= REFRESH_INTERVAL);
-    if state.pending.is_none() && refresh_due {
+    if allow_refresh && state.pending.is_none() && refresh_due {
         let executable = agent.executable().to_path_buf();
         let detected_launch_path = agent.launch_path().map(std::ffi::OsString::from);
         let (sender, receiver) = mpsc::sync_channel(1);
@@ -47,9 +48,17 @@ pub(crate) fn current(
         let spawned = std::thread::Builder::new()
             .name("claude-usage-probe".to_owned())
             .spawn(move || {
-                let usage = fetch_claude_usage(&executable, detected_launch_path.as_deref())
-                    .ok()
-                    .flatten();
+                let usage = match fetch_claude_usage(&executable, detected_launch_path.as_deref()) {
+                    Ok(usage) => usage,
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = "claude",
+                            reason = "probe_failed",
+                            "Usage collection failed"
+                        );
+                        None
+                    }
+                };
                 let _ = sender.send(usage.map(|usage| (Instant::now(), usage)));
                 repaint.request_repaint();
             })
@@ -59,8 +68,7 @@ pub(crate) fn current(
             state.pending = Some(receiver);
         }
     }
-    let (measured_at, usage) = state.usage?;
-    crate::app::fresh_usage_after(usage, measured_at.elapsed())
+    state.usage
 }
 
 fn last_request_after_spawn(attempted: Instant) -> Instant {
@@ -222,6 +230,8 @@ fn parse_usage(output: &str) -> Option<crate::app::ProviderUsage> {
     let weekly = extract_percent_after_label(&lines, |line| {
         let line = compact_label(line);
         !line.contains("fable")
+            && !line.contains("opus")
+            && !line.contains("sonnet")
             && (line.contains("currentweek")
                 || line.contains("weeklylimit")
                 || line.contains("weeklyusage")
@@ -251,7 +261,19 @@ fn extract_percent_after_label(lines: &[&str], matches_label: impl Fn(&str) -> b
         if !matches_label(line) {
             continue;
         }
-        for candidate in lines.iter().skip(index).take(12) {
+        for (offset, candidate) in lines.iter().skip(index).take(12).enumerate() {
+            let label = compact_label(candidate);
+            if offset > 0
+                && (label.contains("currentsession")
+                    || label.contains("currentweek")
+                    || label.contains("weeklylimit")
+                    || label.contains("weeklyusage")
+                    || label.contains("weeklyratelimit")
+                    || label.contains("7day")
+                    || label.contains("extrausage"))
+            {
+                break;
+            }
             let Some(captures) = percent.captures(candidate) else {
                 continue;
             };
@@ -268,20 +290,44 @@ fn extract_percent_after_label(lines: &[&str], matches_label: impl Fn(&str) -> b
 }
 
 fn strip_terminal_control_sequences(output: &str) -> String {
-    static OSC: OnceLock<regex::Regex> = OnceLock::new();
-    static CSI: OnceLock<regex::Regex> = OnceLock::new();
-    let osc = OSC.get_or_init(|| {
-        regex::Regex::new(r"\x1b\][^\x07]*(?:\x07|\x1b\\)").expect("static OSC regex")
-    });
-    let csi = CSI
-        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("static CSI regex"));
-    csi.replace_all(&osc.replace_all(output, ""), "")
-        .into_owned()
+    crate::provider_usage_support::strip_terminal_controls(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_usage_harness_claude_preserves_text_between_osc_controls() {
+        for end in ["\u{1b}\\", "\u{7}"] {
+            let panel = format!(
+                "\u{1b}]0;title{end}Current session\n12% used\nCurrent week (all models)\n34% used\n\u{1b}]0;title{end}"
+            );
+            assert_eq!(
+                parse_usage(&strip_terminal_control_sequences(&panel)),
+                Some((Some(12), Some(34))),
+                "independent OSC sequences must not consume visible usage"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_usage_harness_claude_missing_session_does_not_take_weekly_percent() {
+        assert_eq!(
+            parse_usage("Current session\nLoading...\nCurrent week (all models)\n34% used\n"),
+            Some((None, Some(34)))
+        );
+    }
+
+    #[test]
+    fn provider_usage_harness_claude_uses_all_models_week_not_model_specific_week() {
+        assert_eq!(
+            parse_usage(
+                "Current session\n12% used\nCurrent week (all models)\n34% used\nCurrent week (Opus)\n89% used\n"
+            ),
+            Some((Some(12), Some(34)))
+        );
+    }
 
     fn backpressured_input() -> pty::PtyInputEnqueueResult {
         pty::PtyInputEnqueueResult::Backpressured {

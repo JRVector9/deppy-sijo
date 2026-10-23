@@ -1,0 +1,22 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "grok_usage::tests::grok_\uc2e4\uce21_\ud504\ub85c\ube0c\ub294_\ubbfc\uac10\ud55c_\uc6d0\ubb38_\uc5c6\uc774_\ub05d\ub09c\ub2e4",
+    "--",
+    "--ignored",
+    "--exact",
+    "--test-threads=1"
+  ],
+  "exit_code": 101,
+  "elapsed": 25.526,
+  "summaries": [
+    "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3839 filtered out; finished in 25.31s"
+  ]
+}

@@ -4,6 +4,7 @@ use runtime::{
     SshRuntimeClient, SshTargetIdentity,
 };
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -74,6 +75,174 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.home);
     }
+}
+
+// Exercise the actual stdio bridge without SshRuntimeClient's continuously
+// draining reader. The tuple is the SSH request envelope followed by Rpc's
+// existing discriminant and payload; no command is executed by this fixture.
+struct RawBridge {
+    child: Child,
+    hello: runtime::SshServerHello,
+}
+impl RawBridge {
+    fn attach(fixture: &Fixture) -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_deppy-remote-host"))
+            .arg("--stdio")
+            .env("HOME", &fixture.home)
+            .env("SHELL", "/bin/sh")
+            .env("PATH", "/usr/bin:/bin")
+            .env("DEPPY_REMOTE_LEASE_SECONDS", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let hello = SshClientHello::new(fixture.identity.clone(), 1);
+        runtime::write_ssh_frame(
+            child.stdin.as_mut().unwrap(),
+            &postcard::to_stdvec(&hello).unwrap(),
+            64 * 1024,
+        )
+        .unwrap();
+        let bytes = runtime::read_ssh_frame(child.stdout.as_mut().unwrap(), 64 * 1024)
+            .unwrap()
+            .unwrap();
+        let hello = postcard::from_bytes::<
+            Result<runtime::SshServerHello, runtime::SshHandshakeError>,
+        >(&bytes)
+        .unwrap()
+        .unwrap();
+        Self { child, hello }
+    }
+
+    fn read_file(&mut self) {
+        let request = deppy_remote_host::services::Request::ReadFile {
+            path: b"large-output".to_vec(),
+        };
+        let context = runtime::SshRequestContext {
+            identity: self.hello.identity.clone(),
+            runtime_instance: self.hello.runtime_instance.clone(),
+            connection_generation: 1,
+            request_id: 1,
+        };
+        let envelope = (1_u64, context, 1_u32, serde_json::to_vec(&request).unwrap());
+        runtime::write_ssh_frame(
+            self.child.stdin.as_mut().unwrap(),
+            &postcard::to_stdvec(&envelope).unwrap(),
+            runtime::SSH_FRAME_BYTES_MAX,
+        )
+        .unwrap();
+    }
+
+    fn wait_for_output_pressure(&mut self) {
+        let output_fd = self.child.stdout.as_ref().unwrap().as_raw_fd();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut available: libc::c_int = 0;
+            assert_eq!(
+                unsafe { libc::ioctl(output_fd, libc::FIONREAD, &mut available) },
+                0
+            );
+            // The maximum file response is much larger than either platform's
+            // stdio pipe after its contents are encoded in the RPC response.
+            // Requiring 4 KiB excludes the small startup mux event and also
+            // works on Linux hosts configured with an 8 KiB default pipe.
+            if available >= 4 * 1024 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "large RPC did not reach stdout");
+            assert!(self.child.try_wait().unwrap().is_none());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn wait_for_exit(&mut self) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stdio bridge did not exit while stdout's read end stayed open"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+impl Drop for RawBridge {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn helper_bridge_input_eof_cancels_full_stdout_with_a_live_unread_reader() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.home.join("large-output"),
+        vec![b'X'; deppy_remote_host::files::FILE_BYTES_MAX],
+    )
+    .unwrap();
+    let mut bridge = RawBridge::attach(&fixture);
+    bridge.read_file();
+    bridge.wait_for_output_pressure();
+    // Keep stdout alive and unread: a closed reader would instead return EPIPE
+    // and accidentally let the old blocking implementation pass this test.
+    drop(bridge.child.stdin.take());
+    assert!(bridge.wait_for_exit().success());
+    assert!(bridge.child.stdout.is_some());
+}
+
+#[test]
+fn helper_bridge_closed_stdout_reader_does_not_leave_a_bridge_running() {
+    let fixture = Fixture::new();
+    std::fs::write(
+        fixture.home.join("large-output"),
+        vec![b'X'; deppy_remote_host::files::FILE_BYTES_MAX],
+    )
+    .unwrap();
+    let mut bridge = RawBridge::attach(&fixture);
+    bridge.read_file();
+    bridge.wait_for_output_pressure();
+    drop(bridge.child.stdout.take());
+    assert!(!bridge.wait_for_exit().success());
+}
+
+#[test]
+fn helper_bridge_delivers_large_output_to_an_active_reader_without_truncation() {
+    use deppy_remote_host::services::{Reply, Request, Response};
+    let fixture = Fixture::new();
+    let data: Vec<_> = (0..deppy_remote_host::files::FILE_BYTES_MAX)
+        .map(|index| (index % 251) as u8)
+        .collect();
+    std::fs::write(fixture.home.join("large-output"), &data).unwrap();
+    let (mut client, process) = fixture.attach(1, None);
+    client
+        .send_rpc(
+            53,
+            serde_json::to_vec(&Request::ReadFile {
+                path: b"large-output".to_vec(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let reply = loop {
+        if let Some(reply) = client.try_recv_rpc() {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "large output RPC deadline");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let Ok(Response::File(file)) = serde_json::from_slice::<Reply>(&reply.result.unwrap()).unwrap()
+    else {
+        panic!("large file response");
+    };
+    assert_eq!(file.content, data);
+    client.shutdown();
+    process.lock().unwrap().wait().unwrap();
 }
 #[track_caller]
 fn await_event(

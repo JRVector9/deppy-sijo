@@ -610,7 +610,7 @@ impl SshRuntimeClient {
                     && hello.runtime_instance.len() <= 128
                     && !hello.lease.is_empty()
                     && hello.lease.len() <= 128
-                    && (1..=1800).contains(&hello.lease_ttl_secs),
+                    && (1..=SshServerConfig::MAX_LEASE_TTL_SECS).contains(&hello.lease_ttl_secs),
                 SshHandshakeError::InvalidRequest
             );
             if let Some(resume) = &request.resume {
@@ -1080,6 +1080,41 @@ mod tests {
             0,
             "a completed handshake failure must let the SSH owner observe the natural exit code"
         );
+    }
+
+    #[test]
+    fn ssh_stream_client_accepts_sleep_retention_and_rejects_out_of_range_ttl() {
+        let backend = backend();
+        let config = config(&backend);
+        let request = SshClientHello::new(config.identity.clone(), 1);
+        for (seconds, accepted) in [
+            (1, true),
+            (7 * 24 * 60 * 60, true),
+            (30 * 24 * 60 * 60, true),
+            (0, false),
+            (30 * 24 * 60 * 60 + 1, false),
+            (u32::MAX, false),
+        ] {
+            let mut hello = config.negotiate(&request).unwrap();
+            hello.lease_ttl_secs = seconds;
+            let mut response = Vec::new();
+            write_ssh_frame(
+                &mut response,
+                &postcard::to_stdvec(&Ok::<_, SshHandshakeError>(hello)).unwrap(),
+                64 * 1024,
+            )
+            .unwrap();
+            let result = SshRuntimeClient::connect(
+                std::io::Cursor::new(response),
+                Vec::<u8>::new(),
+                request.clone(),
+                Arc::new(|| {}),
+            );
+            assert_eq!(result.is_ok(), accepted, "lease TTL {seconds}");
+            if let Ok(mut client) = result {
+                client.shutdown();
+            }
+        }
     }
 
     #[test]

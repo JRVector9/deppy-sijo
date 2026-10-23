@@ -92,3 +92,19 @@ Update it after:
 
 After context compaction, read applicable `AGENTS.md` files,
 `docs/CODEX_HANDOFF.md`, `git status`, and `git diff` before continuing.
+
+<!-- PROVIDER_USAGE_POLICY_BEGIN -->
+## Protected provider usage contract
+
+- Usage collection and display are protected by `docs/testing/provider-usage-contract.json`.
+  Do not change the protected files/regions, remove or ignore mandatory tests, weaken the
+  verifier/CI gates, or reseal hashes during unrelated work.
+- A future change requires an explicit user request to change usage behavior. Add a failing
+  regression first, implement the fix, run the mandatory harness, then explicitly reseal
+  with the authorization reference and verify again. Never reseal merely to pass CI.
+- For any authorized usage change run `python3 scripts/verify-provider-usage.py` and
+  `python3 -m unittest discover -s scripts/tests -p test_provider_usage_guard.py`.
+  See `docs/testing/provider-usage-harness.md` for the exact verification procedure.
+- This initial fix and seal is authorized by JR's 2026-10-23 request to fix Claude/Grok
+  usage and protect usage display with a harness.
+<!-- PROVIDER_USAGE_POLICY_END -->

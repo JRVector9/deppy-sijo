@@ -1,0 +1,17 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "launcher_modal_reopens_at_its_content_height_during_a_resize",
+    "--",
+    "--nocapture"
+  ],
+  "exit_code": 101,
+  "seconds": 24.932902415981516
+}

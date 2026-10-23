@@ -1,0 +1,12 @@
+{
+  "mode": "Investigation only; no product modification, rebuild, GUI launch/restart or live session input",
+  "branch": "fix/product-review-integration-20261023",
+  "head": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1",
+  "claude_snapshot_before": {
+    "five_hour": 8,
+    "seven_day": 79,
+    "updated_at": 1792734982
+  },
+  "live_app_version": "0.16.0",
+  "review_source_version": "0.18.0"
+}

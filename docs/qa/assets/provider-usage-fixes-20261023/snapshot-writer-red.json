@@ -1,0 +1,20 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "mcp-proxy",
+    "--bin",
+    "deppy-mcp-proxy",
+    "provider_usage_harness",
+    "--",
+    "--test-threads=4"
+  ],
+  "exit_code": 101,
+  "elapsed": 27.308,
+  "summaries": [
+    "test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 110 filtered out; finished in 0.00s"
+  ]
+}

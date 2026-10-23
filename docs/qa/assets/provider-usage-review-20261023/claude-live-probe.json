@@ -1,0 +1,7 @@
+{
+  "provider": "claude",
+  "exit_code": 0,
+  "result": "provider=claude result=Ok(Some((Some(23), Some(84)))) elapsed_ms=7462",
+  "stderr_present": false,
+  "elapsed_seconds": 7.804
+}

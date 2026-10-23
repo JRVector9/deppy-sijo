@@ -96,6 +96,7 @@ sys.exit(1)
     let (_commands, requests) = mpsc::sync_channel(COMMANDS_MAX);
     let (output, _events) = mpsc::sync_channel(EVENTS_MAX);
     let mut owner = Owner {
+        resume_required: false,
         profile,
         generation: 1,
         target: Some(target),
@@ -289,6 +290,7 @@ while True:
         interrupt: Mutex::new(None),
     });
     let mut owner = Owner {
+        resume_required: false,
         profile,
         generation: 1,
         target: Some(target),
@@ -477,6 +479,7 @@ sys.exit(1)
         }
     });
     let mut owner = Owner {
+        resume_required: false,
         profile,
         generation: 1,
         target: Some(target.clone()),

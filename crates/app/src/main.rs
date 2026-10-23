@@ -57,6 +57,7 @@ mod project_keys;
 mod prompt_library;
 mod prompt_library_worker;
 mod provider_usage_command;
+mod provider_usage_support;
 mod pty_effort;
 // Task 2 어댑터만 제공한다 — 기동 배선은 Relay 클라이언트를 붙이는 Task 4의 몫이다.
 #[allow(dead_code)]
@@ -71,7 +72,9 @@ mod settings_snapshot;
 mod shortcuts;
 mod ssh_clipboard;
 mod ssh_connection;
+mod ssh_reconnect;
 mod ssh_resume_store;
+mod ssh_terminal_paths;
 mod ssh_workspace_add;
 mod ssh_workspace_files;
 mod ssh_workspace_host;

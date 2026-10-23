@@ -1,0 +1,20 @@
+{
+  "review_base_commit": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1",
+  "running_016_source_commit": "1c8ce64ea576b0e41b6c8f255d648da37f0c7075",
+  "usage_modules_unchanged_since_running_016": {
+    "crates/app/src/claude_usage.rs": true,
+    "crates/app/src/claude_usage_snapshot.rs": true,
+    "crates/app/src/grok_usage.rs": true
+  },
+  "claude_source_selection_unchanged_since_running_016": true,
+  "product_inputs_unchanged_from_previous_rebuild": 1082,
+  "sha256": {
+    "crates/app/src/claude_usage.rs": "3911f263717a8cda161e5d9264fb16d74006abe1555a41fe57b1b1bb036ba983",
+    "crates/app/src/claude_usage_snapshot.rs": "e345c218bce77e56883a40640c3d13fc4d19ce4cdb05bab595f82aa687c249ff",
+    "crates/app/src/grok_usage.rs": "9b43a9968c67fb38f6a49d400ee27a4f9426be6ff845128b9b8ea0625cbfb341",
+    "crates/app/src/app.rs": "8fa7d7ff474ba5b0c5167bb0a530f329199ae4103b673989edab04282b7c8a6e",
+    "crates/mcp-proxy/src/main.rs": "6badd32ea93bfc88e5b22ed96870c3c78f7c498145891111c82a7725ae37d1fe"
+  },
+  "product_files_modified_in_this_task": [],
+  "app_restart": false
+}

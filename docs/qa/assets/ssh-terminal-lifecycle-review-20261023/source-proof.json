@@ -1,0 +1,13 @@
+{
+  "tree": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "head": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1",
+  "source_commit": "9aca83f2d6264dd64447faeaafc731f42df265cb",
+  "runtime_provenance": "Cargo fresh compiler-artifact binds canonical manifest/src to libruntime.rlib; bytes identical to libruntime-6b004cc85219a80a.rlib used by lifecycle fixture",
+  "runtime_rlib_sha256": "822f2f0187d0aaf3a2b53b1969b2fa79ec5691793987a12f6c42ff7710acc970",
+  "files": {
+    "crates/remote-host/src/supervisor.rs": "d0641d41d2fb533e076985141ff9cc2a6ae49468f82b3ca23602c1616ccc37b4",
+    "crates/app/src/ui/workspace.rs": "defd13c34bdee173cb14e5215eb2d072992cced0910cd577f75f008e6248ca8d",
+    "crates/terminal/src/renderer_egui.rs": "9c3417fc40ad8edcb98aae10789768cbc68de6f9e5b4d3ec952b79da47bceecf",
+    "crates/terminal/src/alacritty_backend.rs": "9a134b2f7b70fa375cebec95079ff6246dca4ff18160d40a6823906947c5d5ac"
+  }
+}

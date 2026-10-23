@@ -1,0 +1,27 @@
+# Canonical reviewed source: a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1
+# Product source/files not edited. No app launched/restarted; no live session used.
+# rustc reads existing dependency rlibs; all fixture executables are written under /tmp.
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+rustc --edition=2024 /tmp/deppy-terminal-render-review-20261023/freeze_dirty.rs -o /tmp/deppy-terminal-render-review-20261023/freeze_dirty -L dependency=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps --extern terminal=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libterminal-1f7a4f190edb9765.rlib --extern egui=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libegui-145b0bb7dedb3aaf.rlib
+/tmp/deppy-terminal-render-review-20261023/freeze_dirty
+rustc --edition=2024 /tmp/deppy-terminal-render-review-20261023/archive_conceal.rs -o /tmp/deppy-terminal-render-review-20261023/archive_conceal -L dependency=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps --extern terminal=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libterminal-1f7a4f190edb9765.rlib
+/tmp/deppy-terminal-render-review-20261023/archive_conceal
+
+# Expected successful bug-reproduction output:
+# snapshot row0=N; row1=N
+# painted text="OLD0|NEW1"; rebuilt_rows=1
+# REPRODUCED: latest snapshot says NEW0, renderer still paints OLD0
+# CONTROL: cache.clear() paints both latest rows
+# before="                    STYLED                                  "
+# after="private-value       STYLED                                  "
+# styles before=CellAttrs(15) after=CellAttrs(0)
+# REPRODUCED: hidden text becomes visible after archive round-trip; SGR attributes also lost
+
+# Archive production call chain:
+# crates/runtime/src/in_process.rs:6724-6725 make_archive_entry_with_budget -> live.serialize_scrollback_for_archive
+# crates/session/src/session.rs:323 -> backend.serialize_scrollback_bounded
+# crates/terminal/src/alacritty_backend.rs:1572-1576 -> writes original cell.c + zerowidth without HIDDEN/SGR attribute projection
+# crates/runtime/src/in_process.rs:6965-6975 inflate_archived -> insert_restored_session(..., &dump)
+# crates/runtime/src/in_process.rs:7063-7071 insert_restored_session -> Session::restore_archived
+# crates/session/src/session.rs:269-277 restore_archived -> backend.feed(archive bytes)
+# Disk persistence uses the same serializer at crates/runtime/src/in_process.rs:6816.

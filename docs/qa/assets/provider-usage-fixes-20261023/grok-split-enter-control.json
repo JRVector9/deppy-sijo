@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "elapsed": 9.343,
+  "result": "provider=grok result=Ok(Some(GrokUsage { weekly_remaining_percent: Some(57), monthly_remaining_percent: None, credits_left: None })) elapsed_ms=9056\n",
+  "metrics": "SAFE_METRICS bytes=21983 clean_chars=13233 phrases={\"/usage\": 5, \"ask\": 1, \"billing\": 0, \"connecting\": 0, \"credits\": 0, \"do you trust the contents of this directory?\": 1, \"error\": 0, \"failed\": 0, \"grok build\": 4, \"how can\": 0, \"loading\": 1, \"log in\": 0, \"monthly limit\": 0, \"no quit\": 0, \"no, quit\": 1, \"not authenticated\": 0, \"permission\": 0, \"press enter\": 0, \"ready\": 0, \"sign in\": 0, \"terminal\": 0, \"tips\": 0, \"trust this folder\": 0, \"update\": 0, \"usage\": 9, \"weekly limit\": 1, \"what would\": 0, \"yes proceed\": 0, \"yes, proceed\": 1}\n"
+}

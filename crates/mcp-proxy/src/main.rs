@@ -670,6 +670,7 @@ fn kimi_transcript_path(session_id: &str) -> Option<String> {
 /// stdin JSON에서 effort/model/남은 context%를 뽑아 **값이 바뀔 때만** DB에 기록하고,
 /// 사용자 원래 statusLine을 체이닝 호출해 그 출력을 stdout으로 통과시킨다.
 /// statusLine은 절대 claude를 막으면 안 되므로 뭐가 실패해도 조용히 진행한다.
+// PROVIDER_USAGE_WRITER_BEGIN
 fn run_statusline(args: &[String]) -> anyhow::Result<()> {
     let mut db_path: Option<std::path::PathBuf> = None;
     let mut it = args.iter();
@@ -700,6 +701,10 @@ fn run_statusline(args: &[String]) -> anyhow::Result<()> {
         .pointer("/context_window/remaining_percentage")
         .and_then(serde_json::Value::as_i64);
     let usage = claude_statusline_usage(&json);
+    // Refresh the actual measurement heartbeat even when DB values did not change.
+    if let Some((five_hour, weekly)) = usage {
+        write_claude_usage_snapshot(five_hour, weekly, &json);
+    }
     let sig = format!(
         "{}|{}|{}|{}|{}",
         effort.unwrap_or(""),
@@ -729,9 +734,6 @@ fn run_statusline(args: &[String]) -> anyhow::Result<()> {
             let _ = std::fs::create_dir_all(dir);
         }
         let _ = std::fs::write(&sig_path, sig);
-        if let Some((five_hour, weekly)) = usage {
-            write_claude_usage_snapshot(five_hour, weekly);
-        }
     }
     Ok(())
 }
@@ -751,12 +753,42 @@ fn claude_statusline_usage(json: &serde_json::Value) -> Option<(Option<u8>, Opti
     (five_hour.is_some() || weekly.is_some()).then_some((five_hour, weekly))
 }
 
-fn write_claude_usage_snapshot(five_hour: Option<u8>, weekly: Option<u8>) {
+fn claude_usage_snapshot_payload(
+    five_hour: Option<u8>,
+    weekly: Option<u8>,
+    json: &serde_json::Value,
+    updated_at: i64,
+) -> serde_json::Value {
+    let reset = |path| {
+        json.pointer(path)
+            .and_then(serde_json::Value::as_i64)
+            .filter(|value| *value > 0)
+    };
+    serde_json::json!({
+        "five_hour": five_hour, "seven_day": weekly, "updated_at": updated_at,
+        "five_hour_resets_at": reset("/rate_limits/five_hour/resets_at"),
+        "seven_day_resets_at": reset("/rate_limits/seven_day/resets_at"),
+    })
+}
+
+fn write_claude_usage_snapshot(
+    five_hour: Option<u8>,
+    weekly: Option<u8>,
+    json: &serde_json::Value,
+) {
     let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
         return;
     };
-    let dir = home.join(".deppy-sijo");
-    if std::fs::create_dir_all(&dir).is_err() {
+    write_claude_usage_snapshot_in(&home.join(".deppy-sijo"), five_hour, weekly, json);
+}
+
+fn write_claude_usage_snapshot_in(
+    dir: &std::path::Path,
+    five_hour: Option<u8>,
+    weekly: Option<u8>,
+    json: &serde_json::Value,
+) {
+    if std::fs::create_dir_all(dir).is_err() {
         return;
     }
     let path = dir.join("claude-usage.json");
@@ -766,11 +798,7 @@ fn write_claude_usage_snapshot(five_hour: Option<u8>, weekly: Option<u8>) {
         .ok()
         .and_then(|duration| i64::try_from(duration.as_secs()).ok())
         .unwrap_or_default();
-    let payload = serde_json::json!({
-        "five_hour": five_hour,
-        "seven_day": weekly,
-        "updated_at": updated_at,
-    });
+    let payload = claude_usage_snapshot_payload(five_hour, weekly, json, updated_at);
     let Ok(bytes) = serde_json::to_vec(&payload) else {
         return;
     };
@@ -781,6 +809,8 @@ fn write_claude_usage_snapshot(five_hour: Option<u8>, weekly: Option<u8>) {
         let _ = std::fs::remove_file(&temporary);
     }
 }
+
+// PROVIDER_USAGE_WRITER_END
 
 /// 세션별 statusLine 시그니처 캐시 경로(`~/.deppy-sijo/statusline/<sanitized-key>.sig`).
 fn statusline_sig_path(session_key: &str) -> std::path::PathBuf {
@@ -865,6 +895,61 @@ mod tests {
     use std::io::Write;
 
     use super::*;
+
+    // PROVIDER_USAGE_WRITER_TESTS_BEGIN
+    #[test]
+    fn provider_usage_harness_snapshot_preserves_reset_times_and_unknown_slots() {
+        let input = serde_json::json!({"rate_limits":{"five_hour":{"resets_at":1000},"seven_day":{"resets_at":2000}}});
+        let value = claude_usage_snapshot_payload(Some(23), None, &input, 100);
+        assert_eq!(value["five_hour"], 23);
+        assert!(value["seven_day"].is_null());
+        assert_eq!(value["updated_at"], 100);
+        assert_eq!(value["five_hour_resets_at"], 1000);
+        assert_eq!(value["seven_day_resets_at"], 2000);
+    }
+
+    #[test]
+    fn provider_usage_harness_snapshot_heartbeat_precedes_db_deduplication() {
+        let source = include_str!("main.rs");
+        let body = source
+            .split_once("fn run_statusline(args:")
+            .unwrap()
+            .1
+            .split_once("fn claude_statusline_usage(")
+            .unwrap()
+            .0;
+        let heartbeat = body.find("write_claude_usage_snapshot(").unwrap();
+        let deduplication = body.find("std::fs::read_to_string(&sig_path)").unwrap();
+        assert!(
+            heartbeat < deduplication,
+            "unchanged percentages must refresh the measurement timestamp even when DB writes are deduplicated"
+        );
+    }
+
+    #[test]
+    fn provider_usage_harness_snapshot_writer_replaces_old_measurement_atomically() {
+        let directory =
+            std::env::temp_dir().join(format!("deppy-usage-writer-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("claude-usage.json");
+        std::fs::write(&path, r#"{"five_hour":23,"seven_day":84,"updated_at":1}"#).unwrap();
+        let json = serde_json::json!({"rate_limits":{"five_hour":{"resets_at":2000}}});
+        write_claude_usage_snapshot_in(&directory, Some(23), None, &json);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(snapshot["five_hour"], 23);
+        assert!(snapshot["seven_day"].is_null());
+        assert_eq!(snapshot["five_hour_resets_at"], 2000);
+        assert!(snapshot["updated_at"].as_i64().unwrap() > 1);
+        assert_eq!(
+            std::fs::read_dir(&directory).unwrap().count(),
+            1,
+            "atomic temp file is consumed"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    // PROVIDER_USAGE_WRITER_TESTS_END
 
     #[test]
     fn agent_status_harness_legacy_flags_keep_fresh_runtime_ownership_and_message() {

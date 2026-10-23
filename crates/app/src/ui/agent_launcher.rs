@@ -9,6 +9,7 @@ const AGENT_ROW_GAP: f32 = 5.0;
 const VISIBLE_AGENT_ROWS: usize = 3;
 const CONTROL_HEIGHT: f32 = 34.0;
 const ACTION_HEIGHT: f32 = 32.0;
+const RESIZE_ANIMATION_SECONDS: f32 = 0.2;
 
 #[derive(Clone, Copy)]
 struct LauncherPalette {
@@ -171,6 +172,7 @@ pub(crate) struct AgentLauncherUi {
     yolo: bool,
     launch_pending: bool,
     error: Option<LauncherErrorCode>,
+    natural_body_height: Option<f32>,
 }
 
 impl AgentLauncherUi {
@@ -188,6 +190,7 @@ impl AgentLauncherUi {
             yolo: false,
             launch_pending: false,
             error: None,
+            natural_body_height: None,
         }
     }
 
@@ -202,6 +205,7 @@ impl AgentLauncherUi {
         self.yolo = false;
         self.launch_pending = false;
         self.error = None;
+        self.natural_body_height = None;
         self.open = true;
     }
 
@@ -291,6 +295,7 @@ impl AgentLauncherUi {
         // The explicit first-pass width also keeps auto-sized modal content from inheriting the
         // viewport width before its content has been measured.
         let modal_id = egui::Id::new("agent-launcher-modal-v2");
+        let opening = self.natural_body_height.is_none();
         super::popup::set_pending_modal(ctx, true);
         let modal_area = egui::Modal::default_area(modal_id).default_width(LAUNCHER_WIDTH);
         let response = egui::Modal::new(modal_id)
@@ -363,84 +368,143 @@ impl AgentLauncherUi {
 
                 launcher_hairline(ui, palette.line);
 
-                let list_height = snapshot.map_or(0.0, |snapshot| {
-                    installed_list_height(snapshot.agents().len())
+                let height_id = modal_id.with("body-height");
+                let animated_height = self.natural_body_height.map(|height| {
+                    ctx.animate_value_with_time(height_id, height, RESIZE_ANIMATION_SECONDS)
                 });
-                let empty_height = if snapshot.is_some_and(|snapshot| snapshot.agents().is_empty())
-                {
-                    36.0
-                } else {
-                    0.0
-                };
-                let detecting_height = if detecting { 20.0 } else { 0.0 };
-                let left_content_height =
-                    24.0 + detecting_height + 5.0 + list_height.max(empty_height);
-
-                let (left_rect, right_rect) = ui
-                    .scope_builder(
-                        egui::UiBuilder::new()
-                            .layout(egui::Layout::left_to_right(egui::Align::Min)),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 0.0;
-                            let left = egui::Frame::NONE
-                                .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 12,
-                                    top: 12,
-                                    bottom: 12,
-                                })
-                                .show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(AGENT_PANE_WIDTH - 28.0);
-                                        if let Some(list_intent) = self.render_agent_list(
-                                            ui, snapshot, detecting, catalog, disabled, palette,
-                                        ) {
-                                            intent = Some(list_intent);
-                                        }
-                                    });
-                                });
-                            let right = egui::Frame::NONE
-                                .fill(palette.options)
-                                .inner_margin(egui::Margin {
-                                    left: 16,
-                                    right: 16,
-                                    top: 12,
-                                    bottom: 12,
-                                })
-                                .show(ui, |ui| {
-                                    ui.vertical(|ui| {
-                                        ui.set_width(LAUNCHER_WIDTH - AGENT_PANE_WIDTH - 32.0);
-                                        ui.set_min_height(left_content_height);
-                                        if let Some(agent) = self.selected.and_then(|kind| {
-                                            snapshot.and_then(|snapshot| snapshot.find(kind))
-                                        }) {
-                                            self.render_options(ui, agent, catalog, palette);
-                                        }
-                                    });
-                                });
-                            (left.response.rect, right.response.rect)
-                        },
-                    )
-                    .inner;
-
-                let body_rect = left_rect.union(right_rect);
-                ui.painter().vline(
-                    crate::ui::snap_line_to_pixel(
-                        left_rect.right(),
-                        crate::ui::designall::SEPARATOR_WIDTH,
-                        ui.ctx().pixels_per_point(),
-                    ),
-                    body_rect.y_range(),
-                    egui::Stroke::new(1.0, palette.line),
+                let body_origin = ui.next_widget_position();
+                // Measure against unconstrained height rather than the previous Area allocation.
+                // Only the animated rectangle advances the parent, so a shorter form can shrink.
+                let mut body_ui = ui.new_child(
+                    egui::UiBuilder::new()
+                        .id_salt("animated-body")
+                        .max_rect(egui::Rect::from_min_size(
+                            body_origin,
+                            egui::vec2(LAUNCHER_WIDTH, f32::INFINITY),
+                        ))
+                        .layout(egui::Layout::top_down(egui::Align::Min)),
                 );
-
-                if let Some(error) = self.error {
-                    egui::Frame::NONE
-                        .inner_margin(egui::Margin::symmetric(16, 6))
-                        .show(ui, |ui| {
-                            ui.colored_label(palette.error, catalog.t(error.message_key(), &[]));
-                        });
+                if let Some(height) = animated_height {
+                    body_ui.set_clip_rect(body_ui.clip_rect().intersect(
+                        egui::Rect::from_min_size(body_origin, egui::vec2(LAUNCHER_WIDTH, height)),
+                    ));
                 }
+                {
+                    let ui = &mut body_ui;
+                    if self.error.is_none()
+                        && let Some(height) = animated_height
+                    {
+                        // Keep the column surface continuous while a shorter form contracts.
+                        ui.painter().rect_filled(
+                            egui::Rect::from_min_size(
+                                body_origin + egui::vec2(AGENT_PANE_WIDTH, 0.0),
+                                egui::vec2(LAUNCHER_WIDTH - AGENT_PANE_WIDTH, height),
+                            ),
+                            0.0,
+                            palette.options,
+                        );
+                    }
+                    let list_height = snapshot.map_or(0.0, |snapshot| {
+                        installed_list_height(snapshot.agents().len())
+                    });
+                    let empty_height =
+                        if snapshot.is_some_and(|snapshot| snapshot.agents().is_empty()) {
+                            36.0
+                        } else {
+                            0.0
+                        };
+                    let detecting_height = if detecting { 20.0 } else { 0.0 };
+                    let left_content_height =
+                        24.0 + detecting_height + 5.0 + list_height.max(empty_height);
+
+                    let (left_rect, right_rect) = ui
+                        .scope_builder(
+                            egui::UiBuilder::new()
+                                .layout(egui::Layout::left_to_right(egui::Align::Min)),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 0.0;
+                                let left = egui::Frame::NONE
+                                    .inner_margin(egui::Margin {
+                                        left: 16,
+                                        right: 12,
+                                        top: 12,
+                                        bottom: 12,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                            ui.set_width(AGENT_PANE_WIDTH - 28.0);
+                                            if let Some(list_intent) = self.render_agent_list(
+                                                ui, snapshot, detecting, catalog, disabled, palette,
+                                            ) {
+                                                intent = Some(list_intent);
+                                            }
+                                        });
+                                    });
+                                let right = egui::Frame::NONE
+                                    .fill(palette.options)
+                                    .inner_margin(egui::Margin {
+                                        left: 16,
+                                        right: 16,
+                                        top: 12,
+                                        bottom: 12,
+                                    })
+                                    .show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                            ui.set_width(LAUNCHER_WIDTH - AGENT_PANE_WIDTH - 32.0);
+                                            ui.set_min_height(left_content_height);
+                                            if let Some(agent) = self.selected.and_then(|kind| {
+                                                snapshot.and_then(|snapshot| snapshot.find(kind))
+                                            }) {
+                                                self.render_options(ui, agent, catalog, palette);
+                                            }
+                                        });
+                                    });
+                                (left.response.rect, right.response.rect)
+                            },
+                        )
+                        .inner;
+
+                    let mut body_rect = left_rect.union(right_rect);
+                    if self.error.is_none()
+                        && let Some(height) = animated_height
+                    {
+                        body_rect.max.y = body_rect.bottom().max(body_origin.y + height);
+                    }
+                    ui.painter().vline(
+                        crate::ui::snap_line_to_pixel(
+                            left_rect.right(),
+                            crate::ui::designall::SEPARATOR_WIDTH,
+                            ui.ctx().pixels_per_point(),
+                        ),
+                        body_rect.y_range(),
+                        egui::Stroke::new(1.0, palette.line),
+                    );
+
+                    if let Some(error) = self.error {
+                        egui::Frame::NONE
+                            .inner_margin(egui::Margin::symmetric(16, 6))
+                            .show(ui, |ui| {
+                                ui.colored_label(
+                                    palette.error,
+                                    catalog.t(error.message_key(), &[]),
+                                );
+                            });
+                    }
+                }
+                let natural_height = body_ui.min_rect().height();
+                drop(body_ui);
+                let visible_height = if self.natural_body_height.is_some() {
+                    ctx.animate_value_with_time(height_id, natural_height, RESIZE_ANIMATION_SECONDS)
+                } else {
+                    // Opening starts at its actual size, including after a previous animation.
+                    ctx.animate_value_with_time(height_id, natural_height, 0.0);
+                    natural_height
+                };
+                self.natural_body_height = Some(natural_height);
+                ui.advance_cursor_after_rect(egui::Rect::from_min_size(
+                    body_origin,
+                    egui::vec2(LAUNCHER_WIDTH, visible_height),
+                ));
 
                 launcher_hairline(ui, palette.line);
                 egui::Frame::NONE
@@ -519,6 +583,10 @@ impl AgentLauncherUi {
                     });
             });
 
+        if opening {
+            // Recenter against this opening's measured size before its first visible pass.
+            ctx.request_discard("agent launcher opening size");
+        }
         if response.should_close() && !self.launch_pending {
             self.open = false;
         }
@@ -1124,6 +1192,221 @@ const fn effort_message_key(effort: ReasoningEffort) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    fn modal_frame(
+        ctx: &egui::Context,
+        launcher: &mut super::AgentLauncherUi,
+        detected: &super::DetectionSnapshot,
+        time: f64,
+    ) -> egui::Rect {
+        modal_frame_with_output(ctx, launcher, detected, time).0
+    }
+
+    fn modal_frame_with_output(
+        ctx: &egui::Context,
+        launcher: &mut super::AgentLauncherUi,
+        detected: &super::DetectionSnapshot,
+        time: f64,
+    ) -> (egui::Rect, egui::FullOutput) {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1200.0, 1000.0),
+                )),
+                time: Some(time),
+                ..Default::default()
+            },
+            |ui| {
+                launcher.show(ui.ctx(), Some(detected), false, &catalog, &[]);
+            },
+        );
+        output.textures_delta.clear();
+        let rect = ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("agent-launcher-modal-v2")))
+            .unwrap();
+        (rect, output)
+    }
+
+    fn footer_bottom_gaps(rect: egui::Rect, output: &egui::FullOutput) -> [f32; 2] {
+        let catalog = i18n::Catalog::load(i18n::FALLBACK_LOCALE).unwrap();
+        ["agent_launcher.blank_terminal", "agent_launcher.launch"].map(|key| {
+            let label = catalog.t(key, &[]);
+            let (text_rect, clip_rect) = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        Some((text.visual_bounding_rect(), shape.clip_rect))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing footer label {label}"));
+            assert!(
+                rect.contains_rect(text_rect),
+                "footer outside modal: {text_rect:?} in {rect:?}"
+            );
+            assert!(
+                clip_rect.contains_rect(text_rect),
+                "footer clipped: {text_rect:?} by {clip_rect:?}"
+            );
+            rect.bottom() - text_rect.bottom()
+        })
+    }
+
+    #[test]
+    fn launcher_modal_resizes_gradually_in_both_directions() {
+        let ctx = egui::Context::default();
+        let detected = snapshot(&[AgentKind::Codex, AgentKind::Gemini]);
+        let mut launcher = AgentLauncherUi::new();
+        launcher.open_for("workspace".into(), "Project".into());
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        for frame in 0..30 {
+            modal_frame(&ctx, &mut launcher, &detected, frame as f64 / 60.0);
+        }
+        let short = modal_frame(&ctx, &mut launcher, &detected, 0.5);
+        launcher.select(agent(&detected, AgentKind::Codex));
+        let first = modal_frame(&ctx, &mut launcher, &detected, 0.5 + 1.0 / 60.0);
+        let middle = modal_frame(&ctx, &mut launcher, &detected, 0.6);
+        let tall = modal_frame(&ctx, &mut launcher, &detected, 0.9);
+        assert!(
+            tall.height() > short.height() + 20.0,
+            "{short:?} -> {tall:?}"
+        );
+        assert!(
+            first.height() < tall.height() - 5.0,
+            "growth jumped: {first:?} -> {tall:?}"
+        );
+        assert!(middle.height() > short.height() && middle.height() < tall.height());
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        let first_shrink = modal_frame(&ctx, &mut launcher, &detected, 1.0);
+        let middle_shrink = modal_frame(&ctx, &mut launcher, &detected, 1.1);
+        let final_short = modal_frame(&ctx, &mut launcher, &detected, 1.4);
+        assert!(first_shrink.height() > short.height() + 5.0);
+        assert!(middle_shrink.height() > short.height() && middle_shrink.height() < tall.height());
+        assert!((final_short.height() - short.height()).abs() < 1.0);
+        assert!((tall.width() - short.width()).abs() < 1.0);
+    }
+
+    #[test]
+    fn launcher_modal_reverses_a_resize_without_jumping() {
+        let ctx = egui::Context::default();
+        let detected = snapshot(&[AgentKind::Codex, AgentKind::Gemini]);
+        let mut launcher = AgentLauncherUi::new();
+        launcher.open_for("workspace".into(), "Project".into());
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        for frame in 0..3 {
+            modal_frame(&ctx, &mut launcher, &detected, frame as f64 / 60.0);
+        }
+        let short = modal_frame(&ctx, &mut launcher, &detected, 0.5);
+        launcher.select(agent(&detected, AgentKind::Codex));
+        modal_frame(&ctx, &mut launcher, &detected, 0.6);
+        let growing = modal_frame(&ctx, &mut launcher, &detected, 0.7);
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        let reversed = modal_frame(&ctx, &mut launcher, &detected, 0.71);
+        let shrinking = modal_frame(&ctx, &mut launcher, &detected, 0.8);
+        let settled = modal_frame(&ctx, &mut launcher, &detected, 1.0);
+        assert!(growing.height() > short.height() + 5.0);
+        assert!((reversed.height() - growing.height()).abs() < 10.0);
+        assert!(shrinking.height() > short.height() && shrinking.height() < reversed.height());
+        assert!((settled.height() - short.height()).abs() < 1.0);
+        assert_eq!(launcher.selected, Some(AgentKind::Gemini));
+        assert!(launcher.is_open());
+    }
+
+    #[test]
+    fn launcher_modal_reopens_at_its_content_height_during_a_resize() {
+        let ctx = egui::Context::default();
+        let detected = snapshot(&[AgentKind::Codex, AgentKind::Gemini]);
+        let mut launcher = AgentLauncherUi::new();
+        launcher.open_for("workspace".into(), "Project".into());
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        for frame in 0..3 {
+            modal_frame(&ctx, &mut launcher, &detected, frame as f64 / 60.0);
+        }
+        let (short, short_output) = modal_frame_with_output(&ctx, &mut launcher, &detected, 0.5);
+        let short_natural_height = launcher.natural_body_height;
+        launcher.select(agent(&detected, AgentKind::Codex));
+        modal_frame(&ctx, &mut launcher, &detected, 0.6);
+        let growing = modal_frame(&ctx, &mut launcher, &detected, 0.7);
+        assert!(growing.height() > short.height() + 5.0);
+        launcher.launch_succeeded();
+        assert!(launcher.open_for_kind(
+            "other-workspace".into(),
+            "Other project".into(),
+            AgentKind::Gemini,
+            &detected,
+        ));
+        let (reopened, reopened_output) =
+            modal_frame_with_output(&ctx, &mut launcher, &detected, 0.71);
+        let reopened_natural_height = launcher.natural_body_height;
+        let (next_frame, next_output) =
+            modal_frame_with_output(&ctx, &mut launcher, &detected, 0.72);
+        let diagnostics = format!(
+            "short={short:?}, natural={short_natural_height:?}, passes={}; \
+             reopened={reopened:?}, natural={reopened_natural_height:?}, passes={}; \
+             next={next_frame:?}, natural={:?}, passes={}",
+            short_output.platform_output.num_completed_passes,
+            reopened_output.platform_output.num_completed_passes,
+            launcher.natural_body_height,
+            next_output.platform_output.num_completed_passes,
+        );
+        assert!(
+            (reopened.height() - short.height()).abs() < 1.0,
+            "{diagnostics}"
+        );
+        assert!(
+            (next_frame.height() - short.height()).abs() < 1.0,
+            "{diagnostics}"
+        );
+        assert!(
+            (reopened.center().y - next_frame.center().y).abs() < 1.0,
+            "{diagnostics}"
+        );
+        assert!(launcher.is_open_for("other-workspace"));
+        assert_eq!(launcher.selected, Some(AgentKind::Gemini));
+    }
+
+    #[test]
+    fn launcher_modal_error_resize_keeps_footer_visible() {
+        let ctx = egui::Context::default();
+        let detected = snapshot(&[AgentKind::Codex, AgentKind::Gemini]);
+        let mut launcher = AgentLauncherUi::new();
+        launcher.open_for("workspace".into(), "Project".into());
+        launcher.select(agent(&detected, AgentKind::Gemini));
+        for frame in 0..3 {
+            modal_frame(&ctx, &mut launcher, &detected, frame as f64 / 60.0);
+        }
+        let (short, output) = modal_frame_with_output(&ctx, &mut launcher, &detected, 0.5);
+        let expected_gaps = footer_bottom_gaps(short, &output);
+        launcher.report_error(LauncherErrorCode::DetectionFailed);
+        let mut heights = Vec::new();
+        for time in [0.6, 0.7, 0.9] {
+            let (rect, output) = modal_frame_with_output(&ctx, &mut launcher, &detected, time);
+            let gaps = footer_bottom_gaps(rect, &output);
+            for (gap, expected) in gaps.into_iter().zip(expected_gaps) {
+                assert!((gap - expected).abs() < 1.0);
+            }
+            heights.push(rect.height());
+        }
+        assert!((heights[0] - short.height()).abs() < 1.0);
+        assert!(heights[1] > short.height() && heights[1] < heights[2]);
+        assert!(heights[2] > short.height() + 10.0);
+        launcher.detection_succeeded();
+        for time in [1.0, 1.1, 1.3] {
+            let (rect, output) = modal_frame_with_output(&ctx, &mut launcher, &detected, time);
+            let gaps = footer_bottom_gaps(rect, &output);
+            for (gap, expected) in gaps.into_iter().zip(expected_gaps) {
+                assert!((gap - expected).abs() < 1.0);
+            }
+            heights.push(rect.height());
+        }
+        assert!(heights[3] > heights[4] && heights[4] > heights[5]);
+        assert!((heights[5] - short.height()).abs() < 1.0);
+        assert_eq!(launcher.error, None);
+        assert!(!launcher.launch_pending);
+    }
+
     #[test]
     fn launcher_spawn_is_open_for_tracks_only_own_workspace_and_closure() {
         let mut ui = super::AgentLauncherUi::new();

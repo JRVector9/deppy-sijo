@@ -337,6 +337,7 @@ impl AgentTerminalUi {
         };
         let cpu = catalog.t("status_bar.cpu", &[("value", &cpu_value)]);
         let mut intent = None;
+        // PROVIDER_USAGE_STATUS_VIEW_BEGIN
         ui.allocate_ui_with_layout(
             egui::vec2(ui.available_width(), 25.0),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -360,6 +361,7 @@ impl AgentTerminalUi {
                 if usage_shown {
                     crate::ui::designall::vertical_separator(ui, 14.0);
                 }
+                // PROVIDER_USAGE_STATUS_VIEW_END
                 ui.weak(catalog.t(
                     "status_bar.sessions",
                     &[("count", &totals.sessions.to_string())],
@@ -1461,8 +1463,9 @@ mod tests {
     /// 미감지 또는 꺼짐 → 해당 칸 없음.
     /// 로고는 `paint_announcement_provider_logo`가 "{provider} logo"로 라벨을 다는
     /// `Image` 위젯이라, 칸이 그려졌는지를 클릭 없이도 값으로 확인할 수 있다.
+    // PROVIDER_USAGE_UI_HARNESS_BEGIN
     #[test]
-    fn kittest_사용량_바_칸은_켜짐_값없음과_꺼짐을_구분해_그린다() {
+    fn provider_usage_harness_status_bar_preserves_order_visibility_and_widths() {
         use egui_kittest::kittest::Queryable;
 
         let some_usage: Option<crate::app::ProviderUsage> = Some((Some(10), Some(20)));
@@ -1686,6 +1689,8 @@ mod tests {
             }
         }
     }
+
+    // PROVIDER_USAGE_UI_HARNESS_END
 
     #[test]
     fn kittest_에이전트_단축키_실패가_상태바에_보인다() {

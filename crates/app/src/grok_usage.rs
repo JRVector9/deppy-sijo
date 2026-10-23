@@ -9,6 +9,7 @@ const STALE_AFTER: Duration = Duration::from_secs(10 * 60);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
 const STARTUP_DELAY: Duration = Duration::from_secs(2);
 const SETTLE_DELAY: Duration = Duration::from_secs(2);
+const KEY_EVENT_GAP: Duration = Duration::from_millis(100);
 const MAX_OUTPUT_BYTES: usize = 100_000;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -93,9 +94,17 @@ pub(crate) fn current(
         let spawned = std::thread::Builder::new()
             .name("grok-usage-probe".to_owned())
             .spawn(move || {
-                let usage = fetch_grok_usage(&executable, detected_launch_path.as_deref())
-                    .ok()
-                    .flatten();
+                let usage = match fetch_grok_usage(&executable, detected_launch_path.as_deref()) {
+                    Ok(usage) => usage,
+                    Err(_) => {
+                        tracing::warn!(
+                            provider = "grok",
+                            reason = "probe_failed",
+                            "Usage collection failed"
+                        );
+                        None
+                    }
+                };
                 let _ = sender.send(usage.map(|usage| (Instant::now(), usage)));
                 repaint.request_repaint();
             })
@@ -333,7 +342,7 @@ fn run_grok_usage_probe(
     if Instant::now() >= deadline {
         return Ok(None);
     }
-    write_required_input(session, b"/usage\r")?;
+    write_probe_input(session, b"/usage\r", deadline)?;
 
     let mut settle_at = None;
     let mut trusted = false;
@@ -353,10 +362,19 @@ fn run_grok_usage_probe(
                 }
                 let clean = strip_terminal_control_sequences(&String::from_utf8_lossy(&bytes));
                 let lower = clean.to_ascii_lowercase();
-                if !trusted && lower.contains("trust this folder") {
-                    write_required_input(session, b"\r")?;
+                if !trusted
+                    && (lower.contains("trust this folder")
+                        || lower.contains("do you trust the contents of this directory?"))
+                {
+                    let confirmation: &[u8] =
+                        if lower.contains("do you trust the contents of this directory?") {
+                            b"y\r"
+                        } else {
+                            b"\r"
+                        };
+                    write_probe_input(session, confirmation, deadline)?;
                     trusted = true;
-                    write_required_input(session, b"/usage\r")?;
+                    write_probe_input(session, b"/usage\r", deadline)?;
                 }
                 if settle_at.is_none() && usage_panel_rendered(&lower) {
                     settle_at = Some(Instant::now() + SETTLE_DELAY);
@@ -372,6 +390,28 @@ fn run_grok_usage_probe(
 
     let clean = strip_terminal_control_sequences(&String::from_utf8_lossy(&bytes));
     Ok(parse_usage(&clean))
+}
+
+/// Grok treats a text+Enter burst as pasted text. Deliver text and the commit key as
+/// distinct events, including at the trust dialog. This runs only on the probe worker,
+/// within its original total deadline, never on the render thread or a user's terminal.
+fn write_probe_input(
+    session: &mut dyn pty::PtySession,
+    bytes: &[u8],
+    deadline: Instant,
+) -> anyhow::Result<()> {
+    if let Some(text) = bytes.strip_suffix(b"\r").filter(|text| !text.is_empty()) {
+        write_required_input(session, text)?;
+        std::thread::sleep(KEY_EVENT_GAP.min(deadline.saturating_duration_since(Instant::now())));
+        if Instant::now() >= deadline {
+            anyhow::bail!("Grok usage probe deadline reached");
+        }
+        write_required_input(session, b"\r")?;
+    } else {
+        write_required_input(session, bytes)?;
+    }
+    std::thread::sleep(KEY_EVENT_GAP.min(deadline.saturating_duration_since(Instant::now())));
+    Ok(())
 }
 
 fn write_required_input(session: &mut dyn pty::PtySession, bytes: &[u8]) -> anyhow::Result<()> {
@@ -413,21 +453,102 @@ fn compact_label(text: &str) -> String {
 }
 
 fn strip_terminal_control_sequences(output: &str) -> String {
-    static OSC: OnceLock<regex::Regex> = OnceLock::new();
-    static CSI: OnceLock<regex::Regex> = OnceLock::new();
-    let osc = OSC.get_or_init(|| {
-        regex::Regex::new(r"\x1b\][^\x07]*(?:\x07|\x1b\\)").expect("static OSC regex")
-    });
-    let csi = CSI
-        .get_or_init(|| regex::Regex::new(r"\x1b\[[0-9;?]*[ -/]*[@-~]").expect("static CSI regex"));
-    csi.replace_all(&osc.replace_all(output, ""), "")
-        .into_owned()
+    crate::provider_usage_support::strip_terminal_controls(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn provider_usage_harness_grok_preserves_text_between_osc_controls() {
+        for end in ["\u{1b}\\", "\u{7}"] {
+            let panel = format!("\u{1b}]0;title{end}Weekly limit 30% used\n\u{1b}]0;title{end}");
+            assert_eq!(
+                parse_usage(&panel).and_then(|usage| usage.weekly_remaining_percent),
+                Some(70)
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn trust_protocol(prompt: &str, osc: bool) -> Option<GrokUsage> {
+        let script = r#"
+import os, sys, tty
+tty.setraw(0)
+prompt = sys.argv[1].encode()
+if sys.argv[2] == 'osc':
+    prompt = b'\x1b]0;Grok\x1b\\' + prompt + b'\x1b]0;Grok\x1b\\'
+os.write(1, prompt)
+trusted = False
+command = False
+current_prompt = b'contents of this directory' in prompt
+while True:
+    chunk = os.read(0, 1024)
+    if not chunk:
+        break
+    # Grok's TUI treats text plus Enter in one event as pasted text.
+    # Current trust uses the y shortcut; the legacy selection uses Enter.
+    if not trusted:
+        if (current_prompt and chunk == b'y') or (not current_prompt and chunk == b'\r'):
+            trusted = True
+        continue
+    if chunk == b'/usage':
+        command = True
+    elif chunk == b'\r' and command:
+        os.write(1, b'\r\nWeekly limit 30% used\r\n')
+        sys.exit(0)
+
+"#;
+        let command = pty::CommandSpec {
+            program: "python3".to_owned(),
+            args: vec![
+                "-u".to_owned(),
+                "-c".to_owned(),
+                script.to_owned(),
+                prompt.to_owned(),
+                if osc { "osc" } else { "plain" }.to_owned(),
+            ],
+            env: Vec::new(),
+            cwd: Some(std::env::temp_dir()),
+        };
+        let mut session = pty::PortablePtyBackend.spawn(&command, 120, 40).unwrap();
+        let result =
+            run_grok_usage_probe(session.as_mut(), Instant::now() + Duration::from_secs(6));
+        session.kill().unwrap();
+        result.unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_usage_harness_grok_current_trust_question_reaches_usage() {
+        assert_eq!(
+            trust_protocol("Do you trust the contents of this directory?", false)
+                .and_then(|usage| usage.weekly_remaining_percent),
+            Some(70)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_usage_harness_grok_current_trust_question_with_osc_reaches_usage() {
+        assert_eq!(
+            trust_protocol("Do you trust the contents of this directory?", true)
+                .and_then(|usage| usage.weekly_remaining_percent),
+            Some(70)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn provider_usage_harness_grok_legacy_trust_question_still_reaches_usage() {
+        assert_eq!(
+            trust_protocol("Do you trust this folder?", false)
+                .and_then(|usage| usage.weekly_remaining_percent),
+            Some(70)
+        );
+    }
 
     const FULL_PANEL: &str = "\
 Usage

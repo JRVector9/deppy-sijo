@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "elapsed": 4.528,
+  "result": "provider=claude result=Ok(Some((Some(6), Some(85)))) elapsed_ms=4521\n",
+  "metrics": ""
+}

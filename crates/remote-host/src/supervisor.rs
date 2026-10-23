@@ -14,6 +14,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const ATTACH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -200,6 +201,96 @@ fn duplicate_stdio_input() -> anyhow::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
+struct BridgeOutput {
+    file: File,
+    original_flags: libc::c_int,
+}
+impl BridgeOutput {
+    fn stdout() -> std::io::Result<Self> {
+        let fd = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Self::new(unsafe { File::from_raw_fd(fd) })
+    }
+
+    fn new(file: File) -> std::io::Result<Self> {
+        let original_flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+        if original_flags < 0
+            || unsafe {
+                libc::fcntl(
+                    file.as_raw_fd(),
+                    libc::F_SETFL,
+                    original_flags | libc::O_NONBLOCK,
+                )
+            } < 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            file,
+            original_flags,
+        })
+    }
+
+    /// Polling alone cannot bound a blocking pipe write. O_NONBLOCK makes every
+    /// actual write interruptible; a live reader that stops consuming cannot
+    /// trap the bridge's output thread after input EOF or socket shutdown.
+    fn write_all(
+        &mut self,
+        mut bytes: &[u8],
+        done: &AtomicBool,
+        idle_timeout: Duration,
+    ) -> std::io::Result<bool> {
+        let mut last_progress = Instant::now();
+        while !bytes.is_empty() {
+            if done.load(Ordering::Acquire) {
+                return Ok(false);
+            }
+            match self.file.write(bytes) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(count) => {
+                    bytes = &bytes[count..];
+                    last_progress = Instant::now();
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    let remaining = idle_timeout.saturating_sub(last_progress.elapsed());
+                    if remaining.is_zero() {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "ssh_bridge_output_timeout",
+                        ));
+                    }
+                    let mut pollfd = libc::pollfd {
+                        fd: self.file.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let timeout_ms = remaining.as_millis().clamp(1, 100) as libc::c_int;
+                    if unsafe { libc::poll(&mut pollfd, 1, timeout_ms) } < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() != std::io::ErrorKind::Interrupted {
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(true)
+    }
+}
+impl Drop for BridgeOutput {
+    fn drop(&mut self) {
+        // dup shares file-status flags with stdout. Restore those flags before
+        // releasing our descriptor, including error and cancelled exits.
+        unsafe {
+            libc::fcntl(self.file.as_raw_fd(), libc::F_SETFL, self.original_flags);
+        }
+    }
+}
+
 fn prepare_stdio() -> anyhow::Result<(File, SshClientHello, UnixStream)> {
     let mut input = duplicate_stdio_input()?;
     let hello = read_hello(&mut input)?;
@@ -285,31 +376,33 @@ pub fn run_stdio() -> anyhow::Result<()> {
     let mut upstream = stream.try_clone()?;
     runtime::write_ssh_frame(&mut upstream, &postcard::to_stdvec(&hello)?, 64 * 1024)?;
     let downstream = stream.try_clone()?;
-    let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let done = Arc::new(AtomicBool::new(false));
     let output_done = Arc::clone(&done);
+    let stdout = BridgeOutput::stdout()?;
     let output = std::thread::Builder::new()
         .name("ssh-stdio-output".into())
         .spawn(move || -> anyhow::Result<()> {
             let result = (|| -> anyhow::Result<()> {
                 let mut downstream = downstream;
-                let mut output = std::io::stdout();
+                let mut output = stdout;
                 let mut buffer = [0; 16 * 1024];
                 loop {
                     let count = downstream.read(&mut buffer)?;
                     if count == 0 {
                         break;
                     }
-                    output.write_all(&buffer[..count])?;
-                    output.flush()?;
+                    if !output.write_all(&buffer[..count], &output_done, IO_TIMEOUT)? {
+                        break;
+                    }
                 }
                 Ok(())
             })();
-            output_done.store(true, std::sync::atomic::Ordering::Release);
+            output_done.store(true, Ordering::Release);
             result
         })?;
     let result = (|| -> std::io::Result<()> {
         let mut buffer = [0; 16 * 1024];
-        while !done.load(std::sync::atomic::Ordering::Acquire) {
+        while !done.load(Ordering::Acquire) {
             let mut pollfd = libc::pollfd {
                 fd: input.as_raw_fd(),
                 events: libc::POLLIN,
@@ -335,6 +428,7 @@ pub fn run_stdio() -> anyhow::Result<()> {
         }
         Ok(())
     })();
+    done.store(true, Ordering::Release);
     let _ = stream.shutdown(std::net::Shutdown::Both);
     let output_result = output
         .join()
@@ -381,8 +475,8 @@ pub fn run_supervisor(handler: SshRpcHandler) -> anyhow::Result<()> {
     config.lease_ttl_secs = std::env::var("DEPPY_REMOTE_LEASE_SECONDS")
         .ok()
         .and_then(|value| value.parse().ok())
-        .filter(|seconds| (1..=1800).contains(seconds))
-        .unwrap_or(300);
+        .filter(|seconds| (1..=SshServerConfig::MAX_LEASE_TTL_SECS).contains(seconds))
+        .unwrap_or(SshServerConfig::DEFAULT_LEASE_TTL_SECS);
     let mut detached_at = Instant::now();
     loop {
         match listener.accept() {
@@ -463,6 +557,252 @@ pub fn run_supervisor(handler: SshRpcHandler) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn full_output_pipe() -> (File, BridgeOutput, File) {
+        let mut descriptors = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(descriptors.as_mut_ptr()) }, 0);
+        for descriptor in descriptors {
+            assert_eq!(
+                unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) },
+                0
+            );
+        }
+        let reader = unsafe { File::from_raw_fd(descriptors[0]) };
+        let writer = unsafe { File::from_raw_fd(descriptors[1]) };
+        let duplicate = writer.try_clone().unwrap();
+        let mut output = BridgeOutput::new(writer).unwrap();
+        assert_ne!(
+            unsafe { libc::fcntl(output.file.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "the real descriptor must be nonblocking before testing a full pipe"
+        );
+        loop {
+            match output.file.write(&[0; 16 * 1024]) {
+                Ok(count) => assert_ne!(count, 0),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill stdout fixture: {error}"),
+            }
+        }
+        (reader, output, duplicate)
+    }
+
+    #[test]
+    fn bridge_output_full_pipe_honors_cancel_and_restores_descriptor_flags() {
+        let (_reader, mut output, duplicate) = full_output_pipe();
+        let done = Arc::new(AtomicBool::new(false));
+        let cancel = Arc::clone(&done);
+        let worker = std::thread::spawn(move || {
+            output
+                .write_all(b"pending", &cancel, Duration::from_secs(5))
+                .unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        let started = Instant::now();
+        done.store(true, Ordering::Release);
+        assert!(!worker.join().unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(
+            unsafe { libc::fcntl(duplicate.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
+            0,
+            "a duplicate observes restored flags after cancellation"
+        );
+    }
+
+    #[test]
+    fn bridge_output_full_pipe_honors_idle_deadline_with_live_reader() {
+        let (_reader, mut output, _duplicate) = full_output_pipe();
+        let started = Instant::now();
+        let error = output
+            .write_all(
+                b"pending",
+                &AtomicBool::new(false),
+                Duration::from_millis(150),
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn bridge_output_slow_progress_resets_idle_deadline_without_losing_bytes() {
+        let (mut reader, mut output, duplicate) = full_output_pipe();
+        drop(duplicate);
+        let mut filled: libc::c_int = 0;
+        assert_eq!(
+            unsafe { libc::ioctl(reader.as_raw_fd(), libc::FIONREAD, &mut filled) },
+            0
+        );
+        let filled = usize::try_from(filled).unwrap();
+        assert!(filled >= 4096);
+        let expected: Vec<_> = (0..filled * 32).map(|index| (index % 251) as u8).collect();
+        let payload = expected.clone();
+        let idle_timeout = Duration::from_secs(1);
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            let started = Instant::now();
+            started_tx.send(()).unwrap();
+            let result = output.write_all(&payload, &AtomicBool::new(false), idle_timeout);
+            (result, started.elapsed())
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let mut received = vec![0; filled];
+        reader.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|byte| *byte == 0));
+        // Twelve small drains keep every idle gap far below the one-second
+        // deadline while requiring the same write_all call to last longer than
+        // that deadline. More payload remains than the pipe can buffer, so this
+        // exercises repeated WouldBlock/partial-write cycles before the fast drain.
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(100));
+            let start = received.len();
+            received.resize(start + filled / 2, 0);
+            reader.read_exact(&mut received[start..]).unwrap();
+        }
+        reader.read_to_end(&mut received).unwrap();
+        let (result, elapsed) = worker.join().unwrap();
+        assert!(result.unwrap());
+        assert!(elapsed > idle_timeout);
+        assert_eq!(&received[filled..], expected);
+    }
+
+    struct LeaseEnvProbe {
+        child: std::process::Child,
+        home: PathBuf,
+    }
+
+    impl Drop for LeaseEnvProbe {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            let _ = std::fs::remove_dir_all(&self.home);
+        }
+    }
+
+    #[test]
+    #[ignore = "isolated supervisor subprocess, invoked by the environment boundary test"]
+    fn supervisor_lease_env_process_fixture() {
+        assert_eq!(
+            std::env::var("DEPPY_TEST_SUPERVISOR_LEASE").as_deref(),
+            Ok("1")
+        );
+        run_supervisor(Arc::new(crate::services::handle_rpc)).unwrap();
+    }
+
+    #[test]
+    fn supervisor_lease_environment_accepts_thirty_days_and_defaults_invalid_values() {
+        for (override_value, expected) in [
+            (None, SshServerConfig::DEFAULT_LEASE_TTL_SECS),
+            (Some("1"), 1),
+            (Some("604800"), 7 * 24 * 60 * 60),
+            (Some("2592000"), 30 * 24 * 60 * 60),
+            (Some("0"), SshServerConfig::DEFAULT_LEASE_TTL_SECS),
+            (Some("2592001"), SshServerConfig::DEFAULT_LEASE_TTL_SECS),
+            (Some("4294967295"), SshServerConfig::DEFAULT_LEASE_TTL_SECS),
+            (Some("invalid"), SshServerConfig::DEFAULT_LEASE_TTL_SECS),
+        ] {
+            // A short, private HOME keeps the socket below sockaddr_un's path
+            // limit and keeps every file inside this subprocess fixture's root.
+            let unique = uuid::Uuid::new_v4().simple().to_string();
+            let home = PathBuf::from("/tmp").join(format!("ds-lease-{}", &unique[..16]));
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&home)
+                .unwrap();
+            let base = home.join(".cache/deppy/ssh");
+            assert!(base.as_os_str().as_encoded_bytes().len() <= 57);
+            let canonical_root = std::fs::canonicalize(&home).unwrap();
+            let account = current_account().unwrap();
+            let hello = SshClientHello::new(
+                runtime::SshTargetIdentity {
+                    remote_workspace_id: crate::services::workspace_id(
+                        &account,
+                        canonical_root.to_str().unwrap(),
+                    ),
+                    account,
+                    canonical_root: canonical_root.to_str().unwrap().into(),
+                    host_key_sha256: "SHA256:lease-env-fixture".into(),
+                },
+                1,
+            );
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "supervisor::tests::supervisor_lease_env_process_fixture",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("HOME", &home)
+                .env("SHELL", "/bin/sh")
+                .env("DEPPY_TEST_SUPERVISOR_LEASE", "1")
+                .env_remove("DEPPY_REMOTE_LEASE_SECONDS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if let Some(value) = override_value {
+                command.env("DEPPY_REMOTE_LEASE_SECONDS", value);
+            }
+            let mut probe = LeaseEnvProbe {
+                child: command.spawn().unwrap(),
+                home,
+            };
+            runtime::write_ssh_frame(
+                probe.child.stdin.as_mut().unwrap(),
+                &postcard::to_stdvec(&hello).unwrap(),
+                64 * 1024,
+            )
+            .unwrap();
+            drop(probe.child.stdin.take());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                if let Ok(entries) = std::fs::read_dir(&base) {
+                    let socket = entries
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            path.extension()
+                                .is_some_and(|extension| extension == "sock")
+                        });
+                    if let Some(socket) = socket
+                        && let Ok(stream) = UnixStream::connect(socket)
+                    {
+                        break stream;
+                    }
+                }
+                assert!(
+                    probe.child.try_wait().unwrap().is_none(),
+                    "supervisor fixture exited before accepting {override_value:?}"
+                );
+                assert!(
+                    Instant::now() < deadline,
+                    "supervisor fixture startup deadline"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            stream.set_read_timeout(Some(ATTACH_TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(ATTACH_TIMEOUT)).unwrap();
+            runtime::write_ssh_frame(
+                &mut stream,
+                &postcard::to_stdvec(&hello).unwrap(),
+                64 * 1024,
+            )
+            .unwrap();
+            let bytes = runtime::read_ssh_frame(&mut stream, 64 * 1024)
+                .unwrap()
+                .unwrap();
+            let response = postcard::from_bytes::<
+                Result<runtime::SshServerHello, runtime::SshHandshakeError>,
+            >(&bytes)
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                response.lease_ttl_secs, expected,
+                "override {override_value:?}"
+            );
+        }
+    }
 
     #[test]
     fn supervisor_never_inherits_bridge_input_descriptor() {

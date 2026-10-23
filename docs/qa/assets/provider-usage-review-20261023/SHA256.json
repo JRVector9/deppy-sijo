@@ -1,0 +1,94 @@
+{
+  "baseline.json": {
+    "bytes": 394,
+    "sha256": "315442f4ee5026480d6552f81305d6c71ae9c7fda590750005f647f2b6c5b11e"
+  },
+  "claude-live-probe.json": {
+    "bytes": 185,
+    "sha256": "0d7abec17134890fac5196e27d667a8b745568ea271c21270104a1824954f178"
+  },
+  "existing-usage-tests.json": {
+    "bytes": 363,
+    "sha256": "e3740a15db8724f85cb1553a275bd90861dd58700bafc25b6fd6a54a6f2fe471"
+  },
+  "existing-usage-tests.log.gz": {
+    "bytes": 2261,
+    "sha256": "564b1d9322806ce9bd7563e053f53f6c0daf35192e45ddea5ab50e126522da74"
+  },
+  "fake-grok-legacy.py": {
+    "bytes": 709,
+    "sha256": "063e6316d5fa05eb0dd4fb39bd6476cde5b16844e77cccddccac5f5307c12c2b"
+  },
+  "fake-grok-modern.py": {
+    "bytes": 728,
+    "sha256": "3f0e5ab58d374ecdc62f5ad9269d6eb27c59a0763dfd26bd711442d44effda7f"
+  },
+  "fake-legacy-actions.json": {
+    "bytes": 24,
+    "sha256": "5cc31473ce4c66505f19d6e4157d6c25ba7224777b3218688682a3c8fe3ccae5"
+  },
+  "fake-modern-actions.json": {
+    "bytes": 10,
+    "sha256": "0af0ffe56152d8375f7eec4bf8e427c757277c35976167f73886900866d8d021"
+  },
+  "grok-control-sequence-probe.json": {
+    "bytes": 6177,
+    "sha256": "ba9e2efe00b4a1d3bfe99c5992792361847510f120772f871c48fe27212c8ff3"
+  },
+  "grok-live-probe.json": {
+    "bytes": 160,
+    "sha256": "20f80aa3a511cb0bad57f17f1cffbe8cf2308f057b9943415f667a416851d22d"
+  },
+  "grok-observed-probe.json": {
+    "bytes": 683,
+    "sha256": "f0acec5de2d04d98b01dd9c279a977880c840ff43ce48befd44c085ffd546884"
+  },
+  "grok-usage-instrumented.rs": {
+    "bytes": 29028,
+    "sha256": "b90714920d23e2d2bd11556cf35c692ccf41b82097f4f6de631ae8efe4d61d1a"
+  },
+  "harness-build.log.gz": {
+    "bytes": 20,
+    "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  "harness-dependencies.json": {
+    "bytes": 629,
+    "sha256": "8d1dfa0e659968e5c61bcd7045ec275064e7ed72f4ab84b39cc9c26a545d8bcd"
+  },
+  "observe.rs": {
+    "bytes": 4291,
+    "sha256": "855ef287551dc3db18cbcdc646dd47f51c1d4facf154d04eaa5080df5be4d15b"
+  },
+  "observer-build.log.gz": {
+    "bytes": 20,
+    "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  "osc-parser-probes.json": {
+    "bytes": 1038,
+    "sha256": "74324f61c139cdae9f3e8dfbed3e5abb195864638540bd666da860ea0a6cdcb6"
+  },
+  "parser-probes.json": {
+    "bytes": 885,
+    "sha256": "514265ae3447dfec97af5054e609548df8fa6be40482982ee236a9ec532df4d5"
+  },
+  "probe.rs": {
+    "bytes": 2010,
+    "sha256": "0d20d0916bbe872c900e5611b9cd2945c4a6d424b46e7e75eac9ff109544ac37"
+  },
+  "protocol-probe-build.log.gz": {
+    "bytes": 20,
+    "sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+  },
+  "protocol-probe.rs": {
+    "bytes": 2560,
+    "sha256": "1c3e4b628c66e0117dac2cc45e57a86eacf6864db9d80e316f28c17a7a5131cb"
+  },
+  "source-provenance.json": {
+    "bytes": 1072,
+    "sha256": "3c337d251ce014ad958d5b15ce7084f1639265e68ba9244f9a40c656b9881d96"
+  },
+  "trust-prompt-protocol-probes.json": {
+    "bytes": 438,
+    "sha256": "3c3d357580c0792a546df3355e8f49089ec047b189b7139d0e348e31a44fb372"
+  }
+}

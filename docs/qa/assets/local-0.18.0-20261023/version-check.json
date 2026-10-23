@@ -1,0 +1,14 @@
+{
+  "bundle": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.18.0/Deppy Sijo.app",
+  "version": "0.18.0",
+  "plist": {
+    "CFBundleVersion": "0.18.0",
+    "CFBundleShortVersionString": "0.18.0"
+  },
+  "source_files_verified": 1082,
+  "bundle_files_verified": 10,
+  "helper_source_unchanged": true,
+  "running_app_process": "31144 /Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+  "restart_performed": false,
+  "local_developer_bundle": true
+}

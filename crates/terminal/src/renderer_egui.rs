@@ -225,9 +225,16 @@ impl TerminalRenderCache {
         font_cache_key: Arc<egui::Galley>,
     ) {
         self.counters = RenderCounters::default();
+        // dirty_ranges is only the delta from the preceding snapshot. Home/Fleet
+        // can install several snapshots without drawing, so that last delta no
+        // longer covers everything changed since the cached rows were painted.
+        let skipped_snapshots = self
+            .last_gen
+            .is_some_and(|last| generation != last && generation != last.wrapping_add(1));
         self.last_gen = Some(generation);
         let font_size_bits = font_size.to_bits();
-        let shape_changed = self.cols != snapshot.cols
+        let shape_changed = skipped_snapshots
+            || self.cols != snapshot.cols
             || self.rows != snapshot.rows
             || self.scroll_offset != snapshot.scroll_offset
             || self.is_alt_screen != snapshot.is_alt_screen
@@ -1710,11 +1717,16 @@ mod tests {
         }
     }
 
-    /// 테스트용 단조 증가 세대 — 매 호출이 "새 스냅샷"을 뜻한다.
+    /// 테스트별 연속 세대 — 병렬 테스트가 다른 세션의 세대처럼 끼어들지 않는다.
     fn next_gen() -> u64 {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static GEN: AtomicU64 = AtomicU64::new(1);
-        GEN.fetch_add(1, Ordering::Relaxed)
+        thread_local! {
+            static GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+        }
+        GEN.with(|generation| {
+            let next = generation.get();
+            generation.set(next.wrapping_add(1));
+            next
+        })
     }
 
     /// 렌더 경로 실측(수동, `#[ignore]`) — 전용 GPU 렌더패스(Rio sugarloaf 방식) 도입을
@@ -2467,6 +2479,32 @@ mod tests {
         cursor_only.cursor.col = 2;
         cursor_only.dirty_ranges.clear();
         assert_eq!(draw_for_test(&ctx, &mut cache, &cursor_only), 0);
+    }
+
+    #[test]
+    fn skipped_snapshot_generation_rebuilds_rows_before_reusing_idle_cache() {
+        let ctx = egui::Context::default();
+        let mut cache = TerminalRenderCache::default();
+        let first = snap(4, 3, &["OLD0", "OLD1", "same"]);
+        draw_gen_for_test(&ctx, &mut cache, &first, 1);
+        assert_eq!(draw_gen_for_test(&ctx, &mut cache, &first, 1), 0);
+
+        // Generation 2 changed row 0 while Home/Fleet did not draw the terminal.
+        // Generation 3 only reports its own row 1 delta.
+        let mut latest = snap(4, 3, &["NEW0", "NEW1", "same"]);
+        latest.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
+        draw_gen_for_test(&ctx, &mut cache, &latest, 3);
+        assert_eq!(
+            first_text_run(&cache).galley.text(),
+            "NEW0",
+            "the last snapshot's dirty delta omits skipped changes"
+        );
+        assert_eq!(cache.rebuilt_rows_last_frame(), 3);
+        assert_eq!(draw_gen_for_test(&ctx, &mut cache, &latest, 3), 0);
+
+        let mut next = snap(4, 3, &["NEW0", "last", "same"]);
+        next.dirty_ranges = vec![CellRange { start: 4, end: 8 }];
+        assert_eq!(draw_gen_for_test(&ctx, &mut cache, &next, 4), 1);
     }
 
     #[test]

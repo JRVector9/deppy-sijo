@@ -1,0 +1,22 @@
+[
+  {
+    "trust_prompt": "modern",
+    "exit_code": 0,
+    "actual": "Ok(None)",
+    "actions": [
+      "/usage"
+    ],
+    "elapsed_seconds": 6.388
+  },
+  {
+    "trust_prompt": "legacy",
+    "exit_code": 0,
+    "actual": "Ok(Some(GrokUsage { weekly_remaining_percent: Some(70), monthly_remaining_percent: None, credits_left: None }))",
+    "actions": [
+      "/usage",
+      "",
+      "/usage"
+    ],
+    "elapsed_seconds": 4.459
+  }
+]

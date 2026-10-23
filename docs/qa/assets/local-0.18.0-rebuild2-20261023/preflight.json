@@ -1,0 +1,10 @@
+{
+  "version": "0.18.0",
+  "kind": "Identical-source rebuild of the current version; no new product changes or release version increment",
+  "source_inputs_verified": 1082,
+  "source_unchanged_from": "docs/qa/assets/local-0.18.0-20261023/source-proof.json",
+  "character_request": "Canceled by user; never implemented",
+  "restart_authorized": false,
+  "restart_performed": false,
+  "base_head": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1"
+}

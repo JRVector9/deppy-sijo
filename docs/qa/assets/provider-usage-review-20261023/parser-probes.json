@@ -1,0 +1,22 @@
+{
+  "claude-distinct-windows": {
+    "provider": "claude",
+    "input": "Current session\n12% used\nCurrent week (all models)\n34% used\n",
+    "actual": "Some((Some(12), Some(34)))"
+  },
+  "claude-unavailable-session-weekly-present": {
+    "provider": "claude",
+    "input": "Current session\nLoading usage data...\nCurrent week (all models)\n34% used\n",
+    "actual": "Some((Some(34), Some(34)))"
+  },
+  "claude-percent-without-orientation": {
+    "provider": "claude",
+    "input": "Current session\n12%\nCurrent week (all models)\n34%\n",
+    "actual": "None"
+  },
+  "grok-baseline": {
+    "provider": "grok",
+    "input": "Weekly limit 30% used\nMonthly limit 40% used\nCredits left: $12.34\n",
+    "actual": "Some(GrokUsage { weekly_remaining_percent: Some(70), monthly_remaining_percent: Some(60), credits_left: Some(GrokCredits { currency: Usd, minor_units: 1234 }) })"
+  }
+}

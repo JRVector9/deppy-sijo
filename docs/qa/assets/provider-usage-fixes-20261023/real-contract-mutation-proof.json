@@ -1,0 +1,6 @@
+{
+  "exact_approved_copy": "PASS",
+  "actual_grok_file_mutation_rejected": "PASS",
+  "actual_usage_view_mutation_rejected": "PASS",
+  "actual_inventory_removed_or_ignored_rejected": "PASS"
+}

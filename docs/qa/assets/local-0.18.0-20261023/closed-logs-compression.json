@@ -1,0 +1,18 @@
+{
+  "lossless_verified_logs": [
+    "app-final.log.gz",
+    "boundary-final.log.gz",
+    "clippy-final.log.gz",
+    "fmt-final.log.gz",
+    "launcher-final.log.gz",
+    "launcher-green-initial.log.gz",
+    "launcher-opening-sizing-red.log.gz",
+    "launcher-red-behavior.log.gz",
+    "launcher-red-geometry.log.gz",
+    "launcher-red.log.gz",
+    "launcher-reopen-center-red.log.gz",
+    "launcher-reopen-sizing-diagnostic.log.gz",
+    "native-build.log.gz"
+  ],
+  "running_helper_log_not_touched": true
+}

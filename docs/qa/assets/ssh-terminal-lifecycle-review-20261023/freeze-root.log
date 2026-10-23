@@ -1,0 +1,4 @@
+snapshot row0=N; row1=N
+painted text="OLD0|NEW1"; rebuilt_rows=1
+REPRODUCED: latest snapshot says NEW0, renderer still paints OLD0
+CONTROL: cache.clear() paints both latest rows

@@ -1,0 +1,7 @@
+{
+  "anyhow": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libanyhow-c83e308520a2d00c.rlib",
+  "regex": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libregex-c4c63445a24b77c0.rlib",
+  "pty": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libpty-d5c260bbcaacdd37.rlib",
+  "egui": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libegui-a62388c906179547.rlib",
+  "serde_json": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/libserde_json-2aafdc34dca6cc10.rlib"
+}

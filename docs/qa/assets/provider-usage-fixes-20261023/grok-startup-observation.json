@@ -1,0 +1,6 @@
+{
+  "exit_code": 0,
+  "result": "provider=grok result=Ok(None) elapsed_ms=25291",
+  "metrics": "SAFE_METRICS bytes=5876 clean_chars=4800 phrases={\"/usage\": 2, \"ask\": 0, \"billing\": 0, \"connecting\": 0, \"credits\": 0, \"do you trust the contents of this directory?\": 1, \"error\": 0, \"failed\": 0, \"grok build\": 2, \"how can\": 0, \"loading\": 0, \"log in\": 0, \"monthly limit\": 0, \"no quit\": 0, \"no, quit\": 1, \"not authenticated\": 0, \"permission\": 0, \"press enter\": 0, \"ready\": 0, \"sign in\": 0, \"terminal\": 0, \"tips\": 0, \"trust this folder\": 0, \"update\": 0, \"usage\": 2, \"weekly limit\": 0, \"what would\": 0, \"yes proceed\": 0, \"yes, proceed\": 1}",
+  "elapsed": 25.721
+}

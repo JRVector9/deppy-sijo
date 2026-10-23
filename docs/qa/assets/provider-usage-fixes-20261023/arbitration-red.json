@@ -1,0 +1,20 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "provider_usage_harness",
+    "--",
+    "--test-threads=4"
+  ],
+  "exit_code": 101,
+  "elapsed": 22.351,
+  "summaries": [
+    "test result: FAILED. 11 passed; 6 failed; 0 ignored; 0 measured; 3823 filtered out; finished in 2.08s"
+  ]
+}

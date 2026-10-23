@@ -1,0 +1,143 @@
+{
+  "schema": 1,
+  "authorization": "JR 2026-10-23: 사용량 보여주는곳은 고치고나면 harness로 수정하지 못하게 해놔. 코드 수정해 개선해",
+  "protected": [
+    {
+      "path": "crates/app/src/claude_usage.rs",
+      "sha256": "e54851d607f8e45b52d9834f8a8ec58db79b7434fc4325f61bc5184e80e16cfa"
+    },
+    {
+      "path": "crates/app/src/claude_usage_snapshot.rs",
+      "sha256": "0cfb93e425ac27e728ea9449c2da680c0a8d197a3d5155774c923ec3c5592883"
+    },
+    {
+      "path": "crates/app/src/grok_usage.rs",
+      "sha256": "a26ff0fd6313c5d5db6f6a6fe2491bd1206e2f9f9b1b207f10d040d99e0623d2"
+    },
+    {
+      "path": "crates/app/src/provider_usage_support.rs",
+      "sha256": "bcb08662bf6da3fee098e26c329418bcdc804f148603990916a16420cc10ae09"
+    },
+    {
+      "path": "crates/app/src/provider_usage_command.rs",
+      "sha256": "7f175808399652c46d2ec50ba9c7a33644fdd7fd25f70f6482fb57007d57bf4e"
+    },
+    {
+      "path": "crates/app/src/codex_backend_usage.rs",
+      "sha256": "b28d300b8f8fbd40f0b7d99fec70d0afaf72d41c2fbb88d42725542d0fd3dfd5"
+    },
+    {
+      "path": "crates/app/src/kimi_usage.rs",
+      "sha256": "416e351d26e0812605fe26d7f126bf1c2ffffeebd5a263f4495ef973a9639bef"
+    },
+    {
+      "path": "crates/app/src/cursor_usage.rs",
+      "sha256": "82c70cfddc83cd92360361dff014d8bc9d53067f40f824480fbb26b52141693e"
+    },
+    {
+      "path": "scripts/verify-provider-usage.py",
+      "sha256": "7d6e02be3fdc45447efc9fa8981c878a106ef59a235ab0e2d3f09ff9e22fa82e"
+    },
+    {
+      "path": "scripts/tests/test_provider_usage_guard.py",
+      "sha256": "830962d3b71aa5775714e383627de994d2c2eb629dd0b95f2c99a1cb43ab6472"
+    },
+    {
+      "path": "crates/app/src/app.rs",
+      "start": "// PROVIDER_USAGE_MODEL_BEGIN\n",
+      "end": "// PROVIDER_USAGE_MODEL_END",
+      "sha256": "841a0fdbff5d2c47c70163f0cb102fb5d5541a73b197ee61edfbdf499b8a537b"
+    },
+    {
+      "path": "crates/app/src/app.rs",
+      "start": "// PROVIDER_USAGE_VIEW_BEGIN\n",
+      "end": "// PROVIDER_USAGE_VIEW_END",
+      "sha256": "345e0b56868450adaf314519a33af3e1e35788ac36242aac34abfdf1fb5da513"
+    },
+    {
+      "path": "crates/app/src/app.rs",
+      "start": "// PROVIDER_USAGE_SELECTION_BEGIN\n",
+      "end": "// PROVIDER_USAGE_SELECTION_END",
+      "sha256": "12526d71740b4576ff8e31d7a42b51bac03c309c6781e6aca006c436391d42ce"
+    },
+    {
+      "path": "crates/app/src/ui/agent_terminal.rs",
+      "start": "// PROVIDER_USAGE_STATUS_VIEW_BEGIN\n",
+      "end": "// PROVIDER_USAGE_STATUS_VIEW_END",
+      "sha256": "b071685360b4d9e845a23dbe8d6d7fcf65a24d492128a90c98daf380cad7b6a4"
+    },
+    {
+      "path": "crates/app/src/ui/agent_terminal.rs",
+      "start": "// PROVIDER_USAGE_UI_HARNESS_BEGIN\n",
+      "end": "// PROVIDER_USAGE_UI_HARNESS_END",
+      "sha256": "8802d14d7d88432f043c3fd2e72616af6c6cd136756ab3ef6eb3e18d1aac84a2"
+    },
+    {
+      "path": "crates/mcp-proxy/src/main.rs",
+      "start": "// PROVIDER_USAGE_WRITER_BEGIN\n",
+      "end": "// PROVIDER_USAGE_WRITER_END",
+      "sha256": "74338a49fceaab32df3ce069fe53322d8a90a4916e58df41ce79a88b3e89359e"
+    },
+    {
+      "path": "crates/mcp-proxy/src/main.rs",
+      "start": "// PROVIDER_USAGE_WRITER_TESTS_BEGIN\n",
+      "end": "// PROVIDER_USAGE_WRITER_TESTS_END",
+      "sha256": "b5b0a26cc2123d185b87913ddcac87a84fc0a05ca91a15bb1fe8b892ae217184"
+    },
+    {
+      "path": ".github/workflows/build-test.yml",
+      "start": "# PROVIDER_USAGE_FAST_GATE_BEGIN\n",
+      "end": "# PROVIDER_USAGE_FAST_GATE_END",
+      "sha256": "3e3f8333020a9fd05c29a030ada508203020045812280c6370280defa30d45ec"
+    },
+    {
+      "path": ".github/workflows/build-test.yml",
+      "start": "# PROVIDER_USAGE_BEHAVIOR_GATE_BEGIN\n",
+      "end": "# PROVIDER_USAGE_BEHAVIOR_GATE_END",
+      "sha256": "78b0ba774377a776a337d52337a56c13907080108b764724021e88e76296d534"
+    },
+    {
+      "path": "AGENTS.md",
+      "start": "<!-- PROVIDER_USAGE_POLICY_BEGIN -->\n",
+      "end": "<!-- PROVIDER_USAGE_POLICY_END -->",
+      "sha256": "f9a6e600ea9012f2839501a1d92f50d4b8c3a3055bda4565f16a504fae2a395a"
+    }
+  ],
+  "test_targets": [
+    {
+      "package": "deppy-sijo",
+      "bin": "deppy-sijo",
+      "tests": [
+        "claude_usage::tests::provider_usage_harness_claude_missing_session_does_not_take_weekly_percent",
+        "claude_usage::tests::provider_usage_harness_claude_preserves_text_between_osc_controls",
+        "claude_usage::tests::provider_usage_harness_claude_uses_all_models_week_not_model_specific_week",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_expired_sources_are_unknown_not_zero",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_future_timestamp_is_not_fresh",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_legacy_timestamp_uses_file_mtime",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_newer_cached_probe_beats_file",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_newer_file_beats_probe",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_old_partial_file_does_not_starve_probe",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_partial_fresh_file_merges_missing_window",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_pending_file_read_keeps_completed_probe",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_pre_reset_probe_cannot_restore_expired_slot",
+        "claude_usage_snapshot::tests::provider_usage_harness_claude_reset_metadata_invalidates_only_reset_window",
+        "grok_usage::tests::provider_usage_harness_grok_current_trust_question_reaches_usage",
+        "grok_usage::tests::provider_usage_harness_grok_current_trust_question_with_osc_reaches_usage",
+        "grok_usage::tests::provider_usage_harness_grok_legacy_trust_question_still_reaches_usage",
+        "grok_usage::tests::provider_usage_harness_grok_preserves_text_between_osc_controls",
+        "provider_usage_support::tests::provider_usage_harness_controls_hide_incomplete_sequences_until_complete",
+        "provider_usage_support::tests::provider_usage_harness_controls_preserve_mixed_terminators_and_unicode",
+        "ui::agent_terminal::tests::provider_usage_harness_status_bar_preserves_order_visibility_and_widths"
+      ]
+    },
+    {
+      "package": "mcp-proxy",
+      "bin": "deppy-mcp-proxy",
+      "tests": [
+        "tests::provider_usage_harness_snapshot_heartbeat_precedes_db_deduplication",
+        "tests::provider_usage_harness_snapshot_preserves_reset_times_and_unknown_slots",
+        "tests::provider_usage_harness_snapshot_writer_replaces_old_measurement_atomically"
+      ]
+    }
+  ]
+}

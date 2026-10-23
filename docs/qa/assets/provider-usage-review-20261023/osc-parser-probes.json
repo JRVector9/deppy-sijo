@@ -1,0 +1,26 @@
+{
+  "claude-ST": {
+    "actual": "None",
+    "visible_plain_panel": "Current session\n12% used\nCurrent week (all models)\n34% used\n",
+    "osc_termination": "ST",
+    "method": "actual strip_terminal_control_sequences followed by parse_usage"
+  },
+  "claude-BEL": {
+    "actual": "Some((Some(12), Some(34)))",
+    "visible_plain_panel": "Current session\n12% used\nCurrent week (all models)\n34% used\n",
+    "osc_termination": "BEL",
+    "method": "actual strip_terminal_control_sequences followed by parse_usage"
+  },
+  "grok-ST": {
+    "actual": "None",
+    "visible_plain_panel": "Weekly limit 30% used\n",
+    "osc_termination": "ST",
+    "method": "actual strip_terminal_control_sequences followed by parse_usage"
+  },
+  "grok-BEL": {
+    "actual": "Some(GrokUsage { weekly_remaining_percent: Some(70), monthly_remaining_percent: None, credits_left: None })",
+    "visible_plain_panel": "Weekly limit 30% used\n",
+    "osc_termination": "BEL",
+    "method": "actual strip_terminal_control_sequences followed by parse_usage"
+  }
+}

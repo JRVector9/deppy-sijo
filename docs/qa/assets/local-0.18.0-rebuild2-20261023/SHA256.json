@@ -1,0 +1,38 @@
+{
+  "build-result.json": {
+    "bytes": 139554,
+    "sha256": "140a91ee89a68349ccb86096a5d27fae99733f38901011ea2ffdc65236347326"
+  },
+  "local-bundle.py": {
+    "bytes": 4645,
+    "sha256": "0bde1630788d6ae9532e3088aa8d0b1e463bbe1ce547c19c0e28f68822347bda"
+  },
+  "native-build-result.json": {
+    "bytes": 286,
+    "sha256": "e0a3be77871528a44278aa9180c95969371af4ba58eb83b9238e049d4d82495c"
+  },
+  "native-build.log.gz": {
+    "bytes": 91,
+    "sha256": "3f749bd1cfa2faebe23b363708d82619169df87539a0d2cbf234787b2cbe59f6"
+  },
+  "package-command-result.json": {
+    "bytes": 152,
+    "sha256": "b524ca74b26e3a2c61f7d035e0af816d193dfddd07864ec97aef23f6f03b2a83"
+  },
+  "package.log.gz": {
+    "bytes": 551,
+    "sha256": "ea21617a908cf4c03b6acfbfab0d2558fe04442938c15dab0841fe7b998757cd"
+  },
+  "preflight.json": {
+    "bytes": 441,
+    "sha256": "5df6e82a6c078824597788dea61df019a9bb4b8cdb71a731a6526ed0037174a7"
+  },
+  "source-proof.json": {
+    "bytes": 134879,
+    "sha256": "d69dfd5740bda35b5fadc59eec7ebb5cff0b6d8314bd292948c5e507a4b86225"
+  },
+  "version-check.json": {
+    "bytes": 931,
+    "sha256": "d730ef806c3a8b89baefbe667816df78cff5685a87234c05e379d654a841c4e1"
+  }
+}

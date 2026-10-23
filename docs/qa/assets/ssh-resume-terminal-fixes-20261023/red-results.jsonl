@@ -1,0 +1,5 @@
+{"case": "bridge-red", "exit": 101, "seconds": 13.826, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-remote-host", "--test", "supervisor", "helper_bridge_", "--", "--test-threads=1"]}
+{"case": "runtime-red", "exit": 101, "seconds": 10.27, "command": ["cargo", "test", "--offline", "--locked", "-p", "runtime", "ssh_stream_", "--", "--test-threads=2"]}
+{"case": "renderer-red", "exit": 101, "seconds": 5.737, "command": ["cargo", "test", "--offline", "--locked", "-p", "terminal", "skipped_snapshot_generation_rebuilds_rows_before_reusing_idle_cache", "--", "--nocapture"]}
+{"case": "archive-red", "exit": 101, "seconds": 0.131, "command": ["cargo", "test", "--offline", "--locked", "-p", "terminal", "archive_", "--", "--nocapture"]}
+{"case": "workspace-red", "exit": 101, "seconds": 56.136, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "terminal_dirty_history", "--", "--nocapture", "--test-threads=1"]}

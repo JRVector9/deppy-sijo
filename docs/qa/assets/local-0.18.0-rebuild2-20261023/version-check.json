@@ -1,0 +1,27 @@
+{
+  "status": "PASS",
+  "app_reported_version": "Deppy Sijo 0.18.0",
+  "askpass_reported_version": "deppy-ssh-askpass 0.18.0",
+  "CFBundleVersion": "0.18.0",
+  "CFBundleShortVersionString": "0.18.0",
+  "source_inputs_verified": 1082,
+  "rebuilt_bundle_files_verified": 10,
+  "previous_bundle_unmodified": true,
+  "helpers_reused_identical_version_and_sha256": [
+    {
+      "version": "0.18.0",
+      "target": "linux-aarch64",
+      "sha256": "b1f3cc5cbdcf04cb4054e9e54bab497a369d7291faece69da8210f25086c20f0",
+      "bytes": 8830864
+    },
+    {
+      "version": "0.18.0",
+      "target": "linux-x86_64",
+      "sha256": "3e70479ca0609c463bccab43610745dc7e20e847a4fc3b60eb6078a8cbd54234",
+      "bytes": 9313080
+    }
+  ],
+  "running_app_pid_unchanged": 31144,
+  "gui_launch_or_restart": false,
+  "new_test_execution": "None; identical source, prior test results retained; native build and package verification executed again"
+}

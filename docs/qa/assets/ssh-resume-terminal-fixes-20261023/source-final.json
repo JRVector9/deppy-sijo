@@ -1,0 +1,28 @@
+{
+  "repository": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023",
+  "branch": "fix/product-review-integration-20261023",
+  "base_head": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1",
+  "released": false,
+  "source_version": "0.17.0",
+  "files": {
+    "crates/app/src/app.rs": "8fa7d7ff474ba5b0c5167bb0a530f329199ae4103b673989edab04282b7c8a6e",
+    "crates/app/src/app/ssh_reconnect_tests.rs": "27a14adf7325a563415d5f177ba6ad18313cf938b7cd5938a3434a4b0f4e2390",
+    "crates/app/src/app/terminal_path_dispatch_tests.rs": "80e3123bf4f0c673138464277cf2e9e63271c69cbd8d8e90bbe27c1235c9a96e",
+    "crates/app/src/main.rs": "e3b38d8b4e52146deba8a0578d7eed9538366bb3d342ca633d4ab1cb14db7e7d",
+    "crates/app/src/ssh_reconnect.rs": "cbb2e6c03d16dc98af0c182f546e67c69b971df39eb181363bee4f29a599b581",
+    "crates/app/src/ssh_terminal_paths.rs": "31f0e6c4c01e24697e3e8c07b9c3e6e31e8f8fbcb591b2b9d30fafa8bea64f4e",
+    "crates/app/src/ssh_workspace_host.rs": "d51590569715d02209bb410e2f6423c10c537cc98e408afd639bfc2d24f27380",
+    "crates/app/src/ssh_workspace_host_linux_tests.rs": "d3f65da70ec563cc92755534cb3651cedfd840af32268b7cf25fac1b321e0a0c",
+    "crates/app/src/ssh_workspace_host_peer_tests.rs": "fdd941eba2d2d0aa32e09346afaffe40c3fb70b9955a482abde40d4e2b442a3b",
+    "crates/app/src/ui/file_tree.rs": "5c35a99be4aba4fdbc7d1ebbdddeecdb580848fb6801ead094692b8dd1b0c859",
+    "crates/app/src/ui/workspace.rs": "96343a85484c453632963380a4b56857a66dae9bd32ca5e45fcd3766f8912369",
+    "crates/app/src/ui/workspace_terminal_path.rs": "e9daae51ebb7b7c21a4ca16d69b951acc89f3c3d3b15f006f750b532ef7e2587",
+    "crates/app/src/workspace_ui_test_support/workspace_terminal_path_tests.rs": "8eb1d5d66451c009a9672720c46167e53ea376232e95fe0e8469c455b8a807ec",
+    "crates/remote-host/src/supervisor.rs": "3e7c07406a6caddf1133d45ca2835c099f263eb0920e40dac9d3a27a36b35e8e",
+    "crates/remote-host/tests/supervisor.rs": "295ad63ab2a61e3d881f85ec270b082808d0084790b32a82b098f1306b107425",
+    "crates/runtime/src/protocol/ssh.rs": "a137d08c76d1fb16daf7b01e0208a4ebb973c370adcaa00f12b1c64faed2850d",
+    "crates/runtime/src/remote/ssh_stream.rs": "ccdb45c2fd32b059ec99242f2382d1a60fbff4bc4a32f74e3e6295e8f1f365ac",
+    "crates/terminal/src/alacritty_backend.rs": "72fb4f4b6b99b268016ce1ddd29b5bab8c0cd0c12a0f9fee5da4e5db31cf9d67",
+    "crates/terminal/src/renderer_egui.rs": "931bad2bf12cd850862b9c350199ba46a9ad30074d3df49cfe0d079f3ad34c15"
+  }
+}

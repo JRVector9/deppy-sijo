@@ -577,7 +577,7 @@ pub enum DocumentTargetKind {
 /// 더블클릭 대상이 문서 탭으로 열릴지 분류한다. `.md`/`.markdown`은 markdown,
 /// `.txt`/`.log`/확장자 없음은 평문. 그 외는 `None` — 기존 OS 열기 동작을 그대로
 /// 유지한다(설계 §3.1, 기존 동작을 빼앗지 않는다).
-fn classify_document_target(path: &Path) -> Option<DocumentTargetKind> {
+pub(crate) fn classify_document_target(path: &Path) -> Option<DocumentTargetKind> {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some(ext) if ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown") => {
             Some(DocumentTargetKind::Markdown)

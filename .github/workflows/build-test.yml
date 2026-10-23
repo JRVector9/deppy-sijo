@@ -63,6 +63,12 @@ jobs:
       - name: Install pinned Rust toolchain
         run: rustup show
       - uses: Swatinem/rust-cache@v2
+      # PROVIDER_USAGE_FAST_GATE_BEGIN
+      - name: Provider usage protected source and mutation tests
+        run: |
+          python3 scripts/verify-provider-usage.py --check-only
+          python3 -m unittest discover -s scripts/tests -p test_provider_usage_guard.py
+      # PROVIDER_USAGE_FAST_GATE_END
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
       - name: xtask check-boundary
@@ -113,6 +119,10 @@ jobs:
       # 있었고, 그중 하나는 #[test] 중복이라 테스트가 조용히 죽을 수 있는 종류였다).
       - name: cargo clippy --workspace --all-targets -- -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      # PROVIDER_USAGE_BEHAVIOR_GATE_BEGIN
+      - name: Provider usage protected harness
+        run: python3 scripts/verify-provider-usage.py
+      # PROVIDER_USAGE_BEHAVIOR_GATE_END
       # 상태 검사 범위를 먼저, 같은 이름으로 돌려 실패가 어느 쪽인지 바로 보이게 한다.
       - name: Agent status ownership and provider replay
         run: cargo nextest run --workspace --locked --profile ci -E "$AGENT_STATUS_TESTS"

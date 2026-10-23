@@ -90,6 +90,10 @@ impl Cancellation {
         }
     }
 }
+pub(crate) enum SshHostTarget {
+    Open(Option<SshWorkspaceTarget>),
+    Resume(SshWorkspaceTarget),
+}
 pub struct SshWorkspaceHost {
     generation: u64,
     commands: SyncSender<HostCommand>,
@@ -97,15 +101,37 @@ pub struct SshWorkspaceHost {
     cancellation: Arc<Cancellation>,
 }
 impl SshWorkspaceHost {
+    #[cfg(test)]
+    pub(crate) fn event_fixture(generation: u64) -> (Self, SyncSender<SshHostEvent>) {
+        let (commands, _requests) = mpsc::sync_channel(COMMANDS_MAX);
+        let (output, events) = mpsc::sync_channel(EVENTS_MAX);
+        (
+            Self {
+                generation,
+                commands,
+                events,
+                cancellation: Arc::new(Cancellation {
+                    cancelled: AtomicBool::new(false),
+                    interrupt: Mutex::new(None),
+                }),
+            },
+            output,
+        )
+    }
+
     pub fn spawn(
         profile: SshConnectionProfile,
         generation: u64,
-        target: Option<SshWorkspaceTarget>,
+        target: SshHostTarget,
         db_path: PathBuf,
         resources: PathBuf,
         wake: Interrupt,
         registrar: Arc<dyn SshWorkspaceRegistration>,
     ) -> io::Result<Self> {
+        let (target, resume_required) = match target {
+            SshHostTarget::Open(target) => (target, false),
+            SshHostTarget::Resume(target) => (Some(target), true),
+        };
         if generation == 0
             || profile.validate().is_err()
             || target.as_ref().is_some_and(|target| {
@@ -131,6 +157,7 @@ impl SshWorkspaceHost {
                     profile,
                     generation,
                     target,
+                    resume_required,
                     db_path,
                     resources,
                     requests,
@@ -213,6 +240,7 @@ struct Owner {
     profile: SshConnectionProfile,
     generation: u64,
     target: Option<SshWorkspaceTarget>,
+    resume_required: bool,
     db_path: PathBuf,
     resources: PathBuf,
     requests: Receiver<HostCommand>,
@@ -538,8 +566,7 @@ impl Owner {
             .parent()
             .ok_or(SshWorkspaceError::WorkerUnavailable)?
             .to_owned();
-        let resume = crate::ssh_resume_store::load(&data, &target)
-            .map_err(|_| SshWorkspaceError::HelperFailed)?;
+        let resume = load_resume_for_connection(&data, &target, self.resume_required)?;
         let mut hello = SshClientHello::new(identity(&target), self.generation);
         hello.resume = resume;
         let version = HelperVersion::parse(env!("CARGO_PKG_VERSION"))
@@ -925,6 +952,19 @@ fn map_service_error(error: services::ServiceError) -> SshWorkspaceError {
         _ => SshWorkspaceError::RequestFailed,
     }
 }
+fn load_resume_for_connection(
+    data: &Path,
+    target: &SshWorkspaceTarget,
+    required: bool,
+) -> Result<Option<runtime::SshResume>, SshWorkspaceError> {
+    let resume =
+        crate::ssh_resume_store::load(data, target).map_err(|_| SshWorkspaceError::HelperFailed)?;
+    if required && resume.is_none() {
+        return Err(SshWorkspaceError::SessionExpired);
+    }
+    Ok(resume)
+}
+
 fn relative_to_root(root: &RemotePath, path: &RemotePath) -> Result<Vec<u8>, SshWorkspaceError> {
     let root = root.as_str();
     let path = path.as_str();
@@ -953,6 +993,42 @@ mod tests {
         ) -> Result<storage::WorkspaceTargetRow, SshWorkspaceError> {
             Err(SshWorkspaceError::RequestFailed)
         }
+    }
+    #[test]
+    fn ssh_workspace_host_automatic_resume_requires_existing_capability() {
+        let dir =
+            std::env::temp_dir().join(format!("deppy-required-resume-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = SshWorkspaceTarget::new(
+            "profile".into(),
+            "host.test".into(),
+            22,
+            "fixture".into(),
+            format!("SHA256:{}", "a".repeat(43)),
+            "workspace".into(),
+            RemotePath::new("/project").unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            load_resume_for_connection(&dir, &target, true),
+            Err(SshWorkspaceError::SessionExpired)
+        ));
+        assert!(
+            load_resume_for_connection(&dir, &target, false)
+                .unwrap()
+                .is_none()
+        );
+        let resume = runtime::SshResume {
+            runtime_instance: "instance".into(),
+            lease: "lease".into(),
+        };
+        crate::ssh_resume_store::save(&dir, &target, &resume).unwrap();
+        let loaded = load_resume_for_connection(&dir, &target, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.runtime_instance, resume.runtime_instance);
+        assert_eq!(loaded.lease, resume.lease);
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn ssh_workspace_host_keeps_typed_lease_rejection_when_remote_exits() {
@@ -985,6 +1061,7 @@ mod tests {
             },
             generation: 1,
             target: None,
+            resume_required: false,
             db_path: dir.join("test.sqlite"),
             resources: PathBuf::new(),
             requests,

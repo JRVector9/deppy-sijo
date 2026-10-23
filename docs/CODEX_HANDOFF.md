@@ -1,3 +1,287 @@
+# Plan complete: pane restoration and project API workflow — 2026-10-23
+
+## Current objective / status
+
+Latest user requested a parallel-subagent development plan for four items: split-close history width, compact project-key modal without normal desktop scroll, direct context-menu API registration, and agent discovery/use of registered project APIs. **Planning COMPLETE; implementation NOT started.** Three read-only GPT-6.1-Sol/xhigh agents investigated terminal, key UI, and agent key access; root investigated context dispatch, reviewed their notes and wrote the six-PR plan. No product code, secret data, GUI or running sessions modified; no Cargo/test suite, build, release, commit/push or restart performed this phase.
+
+## Completed work / design decisions
+
+Plan `docs/superpowers/plans/2026-10-23-pane-reflow-project-api.md` maps all four requests to six PRs with exact files, owned boundaries, completion criteria and future checks. Wave1: A terminal PR1/B compact form PR2/C catalog+grant PR4; Wave2: B quickadd PR3/C agent discovery+use PR5/A integration tests; root serializes app.rs/workspace glue, module/locale/design changes and all Cargo. PR6 covers integration/root review. Terminal cause is not reproduced or proven: existing primary streaming reflow and resize already exist, so begin with actual split-close history regression and modify only failed layer; do not guess hard newlines into soft wraps.
+
+Existing project_keys/env-run already handles scopes/fresh sources/snapshots/PEM/receipts; reuse it. Proposed additive agent grants preserve Build/StoreOnly/LegacyAgent. Models receive metadata discovery + scoped execution, not raw key lists. New calls revalidate current revision; running process env stays unchanged. Current SSH helper refuses Mac credential resolution; no unsupported cross-host key access claim or automatic credential export. General cloud read/input grants do not grant key-use.
+
+UI proposal560pt, field36/button34, editor-only12pt row/column gaps and2columns (>=452pt content width), full-width secret; normal desktop no-scroll targets and narrow-screen scroll fallback. Direct popup must own global input fence from pending/loading and render independently of Settings. Notes currently lacks API menu; add NotesAction→SidebarAction→App. API free-form service label and env variable name remain separate; new quickadd uses existing project-key secret service with catalog metadata rather than a duplicate store. Valid legacy bindings are preserved. Page notice reuse/CAS screenshot cause must be distinguished by tests, no conflict protection removed.
+
+## Modified files / checks / failed approaches
+
+Only new plan and this handoff edited in this phase. Historical provider-usage product/CI/AGENTS changes and SSH/launcher dirty work remain untouched. Read-only source review only; no new runtime reproduction or test PASS claim. Executed after plan finalization: `python3 scripts/verify-provider-usage.py --check-only` PASS; `git diff --check` PASS. No behavioral test suite executed. Initial broad shell search used an unmatched memo glob and a guessed permissions.rs path; corrected to exact known sources, no writes or product effect. Initial inspection of ApiName/ApiValue being skipped by ProjectKeysUi is intentional: App routes them to legacy API registration; it is not filed as an input-loss defect. No implementation attempted.
+
+## Remaining work / exact next-agent commands
+
+The user asked for a plan. Await implementation steering; do not describe PRs as implemented. Canonical tree remains `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch fix/product-review-integration-20261023, baseHEAD a8eb51ae plus uncommitted work. No provider-usage protected edits/reseal. No automatic launch or restart. A later changed artifact delivery must bump beyond0.18.0.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+cat AGENTS.md
+sed -n '1,90p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+cat docs/superpowers/plans/2026-10-23-pane-reflow-project-api.md
+python3 scripts/verify-provider-usage.py --check-only
+# Implementation sequence/ownership and future test commands are in the plan.
+# No dev-run.sh/open/kill/restart during planning.
+```
+
+---
+
+# Completed: provider usage fixes and protected harness — 2026-10-23
+
+## Current objective / result
+
+User requested correcting reviewed Claude/Grok usage and protecting the usage display with a harness. **Source implementation and final validation COMPLETE.** Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, base HEAD `a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1` plus uncommitted changes. Previous SSH/launcher changes preserved; nominal deppy-sijo old dirty Fleet tree untouched. No new subagents requested or spawned. No GUI restart, build/package delivery, release, commit or push. Source/test version0.18.0; any later changed delivered artifact must increase beyond0.18.0. Never dev-run.sh/open/kill/restart automatically.
+
+## Completed work / design decisions
+
+- Shared linear OSC/CSI scanner ends each control independently and preserves visible UTF-8 text. Claude parsing stops at section boundaries and excludes model-specific weekly quotas.
+- Claude file/CLI arbitration uses original measurement times, newest per available window, refresh60s and maximum retained age10m. Partial/stale files cannot starve probes; pending file reads still drain completed probes; reset/future timestamps and older pre-reset CLI values are filtered. Unknown stays unknown, never invented0. Legacy snapshot timestamps use actual mtime.
+- Grok old/current trust prompts handled only in owned usage-probe PTY. Current trust y and command text/Enter split100ms avoid TUI treating a combined event as paste. Original25s total budget/teardown/admission retained; no user terminal input.
+- Snapshot writer refreshes measurement heartbeat before database value dedup, preserves optional window resets/null slots and atomically replaces file. Added real isolated-filesystem writer coverage, with no HOME override.
+- Eight focused adapter/support modules plus usage-only marked app/model/view/selection/statusbar/writer/test/CI/policy regions protected by SHA256 contract. Verifier rejects changed protected bytes, removed/added-unreviewed/duplicated/ignored mandatory tests. User authorization required before intentional reseal. This is change detection and mandatory verification, not an OS immutable bit or absolute security boundary.
+- CI Linux source/mutation gate and macOS executable harness configured; actual remote GitHub run/branch protection not claimed. No geometry redesign; existing actual egui visibility/order/partial/narrow-width assertions retained under mandatory test name.
+
+## Modified files
+
+Usage source: `crates/app/src/{claude_usage.rs,claude_usage_snapshot.rs,grok_usage.rs,provider_usage_support.rs,main.rs,app.rs,ui/agent_terminal.rs}` and `crates/mcp-proxy/src/main.rs`. Guard/config: `scripts/verify-provider-usage.py`, `scripts/tests/test_provider_usage_guard.py`, `.github/workflows/build-test.yml`, `AGENTS.md`, `docs/testing/provider-usage-{contract.json,harness.md}`. Documents: plan `docs/superpowers/plans/2026-10-23-provider-usage-protection.md`, QA `docs/qa/2026-10-23-provider-usage-fixes.md`, this handoff, redacted evidence `docs/qa/assets/provider-usage-fixes-20261023/`. Other dirty product files are previous SSH/launcher/version work, not new changes from this phase.
+
+## Actual tests / evidence
+
+Serialized Cargo with CARGO_BUILD_JOBS2 and shared CARGO_TARGET_DIR `/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target`, --offline --locked.
+
+- Full App: **3796 unit +39 integration =3835 normal PASS**, 46unit+3integrationignored. Isolated childfixture1PASS excluded. Unit tests45.84s; command time not separately captured.
+- Full mcp-proxy: **112unit+9integration=121 normal PASS**, 1ignored;11.640s command. Combined normal App/proxy executions3956, zero failures.
+- `python3 scripts/verify-provider-usage.py --offline`: approvedsourcePASS; mandatory App20+writer3PASS, zeroignored. Mutation selftests5PASS. Additional actual-manifest synthetic-copy proof rejects a changed real Grok file, changed real usage-view region and removed/ignored inventory entries; original working files never mutated.
+- Strict Clippy App/proxy/alltargets -Dwarnings PASS33.489s; fmtallcheckPASS2.838s; xtaskboundaryPASS4.833s; gitdiffcheckPASS.
+- Actual original Grok ignored live test with usage required PASS9.151s command. Actual source-included livefetch: Grok weekly57remaining8.870s, Claude5h6used/week85used4.521s. Observer only stubs unused UI plumbing; original fetch/parser used. Fixed phrase counts/quota output only, no raw terminal/account credentials saved. No GUI end-to-end/restart or future external-CLI guarantee.
+- Source-final SHA256 proof and losslessly gzipped RED/GREEN logs with full evidence SHA256 index retained. Existing historical3816/4482 suites below are not counted as newly rerun.
+
+## Failed approaches
+
+Initial collectors RED1PASS6FAIL, arbitration RED11PASS6FAIL. Initial fixes passed focused77tests/5ignored but actual Grok still failed25.31s; y+Enter burst also failed. Per-key control succeeded9.397s; narrow text/Enter split in fresh owned probe folder succeeded9.056s. Original fakePTY was too permissive; strengthened isolated-key behavior RED1PASS3FAIL, product fix then mandatory20PASS. Writer reset/heartbeat RED0PASS2FAIL thenGREEN; final actual filesystem test also passes. No-op guard RED5FAIL then realguard5PASS. One patch context failed atomically without edits. Assertions/lints were not removed or ignored.
+
+## Remaining work / exact next-agent commands
+
+No implementation or validation work remains. User may later request commit/push or rebuild/restart; current task does not authorize those. A delivered changed bundle requires version beyond0.18.0 and all artifact version checks. Preserve protected usage areas during unrelated work and never automatically reseal.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+cat docs/qa/2026-10-23-provider-usage-fixes.md
+python3 scripts/verify-provider-usage.py --check-only
+# All final tests above already passed. Rerun only on relevant changes:
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target python3 scripts/verify-provider-usage.py --offline
+python3 -m unittest discover -s scripts/tests -p test_provider_usage_guard.py
+# Do not dev-run.sh/open/kill/restart or release changed code under0.18.0.
+```
+
+---
+
+# Completed Claude / Grok usage investigation — 2026-10-23
+
+## Objective / result
+
+User asked to inspect inaccurate Claude usage and intermittent Grok dashes. **Investigation COMPLETE;4 confirmed product defects remain unfixed (review-only request).** No product source edits, release/restart, live-session input, commit/push or user-server changes. Canonical integration branch/baseHEAD/previous dirty source preserved. Source0.18.0, running0.16.0 PID31144. Actual relevant modules and Claude selection are identical to running0.16.0 commit1c8ce64e; all1082 product inputs unchanged from prior build.
+
+## Completed findings / decisions
+
+1. Claude snapshot ~6h old,8/79; UI shows weekly79 and no5h. Snapshot validity lets weekly remain7days; app.or_else skips CLI on anypartialSome. Actual original CLI2.1.309 probe returns5h23/weekly84, file still8/79. Refresh age must be separate from quota-window age; merge missing/newer slots.
+2. OSC regex greedy body eats visible text betweenST-ended controls, shared Claude/Grok. Actual Grok5876bytes→0cleantext; shortest-ended control on samebytes4805characters reveals trust prompt. Bothprovider ST/BELfixtures reproduceNonevsvalidvalues.
+3. Grok1.0.67 prompt “Do you trust the contents of this directory?” mismatches only “trust this folder” recognized. Original liveprobe+2instrumentedobservations each~25.29s→None. RealPTYfakeCLIs isolate oldwording4.459s→70remaining (usage/Enter/usage), currentwording6.388s→None (usageonly). No real trust prompt approved. Neither regex-only nor a longer timeout fixes bothcauses. Preserve scoped confirmation to ownprobe directory and report redacted status.
+4. Claude12linepercent search crosses section: missing5h+weekly34→34/34. PreserveNone and stop at sectionboundary. Barepercentunsupported fixture not observed inliveCLI andnot filedasdefect.
+
+Full report `docs/qa/2026-10-23-provider-usage-review.md`. OfficialClaude/Grok docs verified andlinked there; Grok documentedcontext/cost isnota guaranteedquota replacement. No speculativeAPIcredentialwork. Systematic-debugging applied; no failed fixattempt or shippedfix.
+
+## Modified files / tests / evidence
+
+Only thishandoff, newreviewreport and `docs/qa/assets/provider-usage-review-20261023/` changed. Originalsource-included externalRustdiagnostic harnesses built usingCargo-resolveddeps; onlynon-fetchUIplumbingstubbed. Redactedrawoutputmetrics, parser/protocolfixtures, actualprobeoutputs andSHA256index recorded; rawterminalbuffer notpersisted. Compiled diagnostics remain/tmp andnotaddedtogit. Tests `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo usage -- --test-threads=4` withsharedtarget/jobs2: **60PASS0FAIL5ignored**,1.286scommand/0.05stests. Originalmoduleparser/OSC andrealPTYfakepromptcomparisons demonstratefailures missedbyexistingsuite; nofixpass/fullAppE2Erecovery claimed. Cargo provenancebuild andallharnesscompilesPASS. Product1082sourcehashcomparisonPASS; runningversionmodule/selectioncomparisonPASS; gitdiffcheckPASS. NoGUIlaunch.
+
+## Remaining work / exact next-agent commands
+
+Reviewdone. Fourdefects require a laterauthorizedfix; repairscopes detailed inreport. Anychangeddeliveredartifactmustbumpbeyond0.18.0 andverify allversions/resources; noautomaticrestart. ExistinguncommittedSSH/launcherwork remains untouched.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+cat docs/qa/2026-10-23-provider-usage-review.md
+cat docs/qa/assets/provider-usage-review-20261023/existing-usage-tests.json
+# Only implement when user requests fixes. No dev-run.sh/open/kill/restart.
+```
+
+---
+
+# Completed identical-source rebuild — 2026-10-23
+
+## Current objective / status
+
+User canceled the accidental pixel-character request and asked to rebuild the new version. No character code ever landed. Rebuilding current **0.18.0** from the exact same 1082 product inputs as the completed 0.18.0 build; no changed behavior or new release version is introduced by this rebuild. Canonical tree and uncommitted baseHEAD remain unchanged. No restart is authorized; do not stop/open/launch the GUI.
+
+## Work / design decisions / remaining
+
+Source hashes verified unchanged against the prior build. Reuse matching previously tested static Linux helpers 0.18.0 after manifest/hash verification; rebuild native targets and create a separately signed immutable bundle without replacing prior delivered artifacts. Evidence `docs/qa/assets/local-0.18.0-rebuild2-20261023/`. Native build PASS 0.482s (Cargo cache valid); signed bundle/package verification PASS 5.389s. Actual app/askpass CLI and both plist versions verified 0.18.0, all 1082 source hashes and 10 rebuilt bundle-file hashes independently verified; previous delivered bundle is unmodified. Matching helper manifests and SHA256 verified. Original 0.16.0 PID31144 unchanged; no GUI launch/restart. No test suite rerun because product source is identical; prior test outcomes below remain historical. Logs losslessly gzipped and evidence SHA256 indexed. No failed approach in this rebuild. All requested work complete; no character follow-up remains.
+
+## Completed artifact / exact next-agent commands
+
+`/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.18.0-rebuild2-20261023/Deppy Sijo.app`
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+cat docs/qa/assets/local-0.18.0-rebuild2-20261023/version-check.json
+# Completed artifact: target/bundle-0.18.0-rebuild2-20261023/Deppy Sijo.app
+# Do not rerun immutable packager against an existing bundle.
+# No dev-run.sh/open/kill or GUI restart; no remaining work.
+```
+
+---
+
+# Completed 0.18.0 rebuild and launcher motion — 2026-10-23
+
+## Current objective / result
+
+User requested rebuild only, smooth launcher resizing, cute job characters, and extra subagents. **Build and launcher fix COMPLETE; character request subsequently CANCELED by user (never implemented).** Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`. Base commit `a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1` plus explicitly uncommitted working tree: exact 1082 source SHA256 entries and product patch recorded. No clean-commit claim; no commit/push/merge requested or performed. Nominal deppy-sijo old Fleet tree untouched.
+
+No restart authorized or performed. Original 0.16.0 process PID 31144 remains running. Never run dev-run.sh/open/kill automatically. No live-user-server helper installation or physical-sleep testing performed.
+
+## Completed work / version / artifact
+
+- Last packaged 0.17.0 → **0.18.0**, minor for SSH automatic recovery, longer lease, terminal path links, rendering/archive fixes and launcher motion. Preflight scanned 96 bundles, maximum 0.17.0. Canonical Cargo.toml + 30 inherited Cargo.lock workspace versions updated; third-party dependencies unchanged.
+- Bundle: `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.18.0/Deppy Sijo.app`. Signed with existing VectorNine Developer ID. Local debug-profile developer build, not notarized public distribution. Includes app/proxy/askpass, pinned cloudflared 2026.9.1 and static Linux ARM64/x86_64 helpers. Actual app/askpass/helper CLI versions and both plist fields are 0.18.0. Root independently verified 1082 source inputs, helper inputs and all 10 bundle-file digests.
+- Launcher preserves 620pt two columns, 34pt controls and 32pt actions. Measure body/error natural height in an independent child; animate allocated height over 200ms, clip body and keep footer outside. Supports growth/shrink/reversal, resets on opening. One opening-only request_discard recenters cached Area using normal layout. No new timers/dependencies/execution policy changes.
+- Two gpt-6.1-sol/xhigh agents handled launcher implementation and independent review/character-location investigation. Disjoint ownership; root serialized Cargo and reviewed/integrated. Independent review found a real reopen center jump, reproduced and fixed without weakening assertions.
+
+## Modified files
+
+Previous 19 SSH/path Rust files listed in next historical phase remain unchanged and tested. Added `crates/app/src/ui/agent_launcher.rs` (20 Rust files total), Cargo.toml, Cargo.lock, docs/design/popup-components.md, docs/plans/2026-10-23-launcher-size-transition.md, docs/qa/2026-10-23-local-0.18.0-rebuild.md, this handoff, and docs/qa/assets/local-0.18.0-20261023/. Previous SSH plan/review/evidence retained. No binaries/caches added to git.
+
+## Actual tests / build results
+
+All root native Cargo commands serialized with CARGO_BUILD_JOBS=2, CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target, --offline --locked.
+
+- Metadata: all 30 packages 0.18.0; manifests inherited, no third-party changes PASS.
+- `cargo test --offline --locked -p deppy-sijo --bin deppy-sijo ui::agent_launcher::tests -- --test-threads=4`: **28 PASS**, 27.253s command / 0.30s tests. Actual Modal height/width/reversal/reopen height+center/error/footer paint bounds/clips covered.
+- `cargo test --offline --locked -p deppy-sijo -- --test-threads=4`: **3777 unit + 39 integration = 3816 normal PASS**, 121.858s. 46 unit + 3 integration ignored; child fixture 1 PASS excluded from count.
+- `cargo clippy --offline --locked -p deppy-sijo -p runtime -p terminal -p deppy-remote-host -p ssh-transport --all-targets -- -D warnings`: PASS 55.947s. `cargo fmt --all -- --check`: PASS 4.058s. `cargo run --offline --locked -p xtask -- check-boundary`: PASS 7.201s. git diff --check PASS.
+- `cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass`: PASS 62.919s. Native app/askpass CLI 0.18.0 verified without GUI launch.
+- Pinned Rust 1.96.1/musl helper recipe using native ARM64 Cargo driver: PASS 1785.807s. x86_64 product compile 15m50s; storage-test compile 9m05s; helper-unit compile 1m18s; supervisor compile 49.43s. Normal QEMU CPU-bound work, no stall. Both architectures executed in pinned Debian12 as nobody: **34 storage + 33 helper unit + 7 supervisor PASS per architecture = 148 normal executions, zero failures**. Three isolated child fixtures ignored at top level per arch are invoked by parents.
+- `python3 docs/qa/assets/local-0.18.0-20261023/local-bundle.py` via finish-build.py: PASS 4.714s. Existing verify-macos-package.sh passed with explicit local developer policy DEPPY_REQUIRE_TRUSTED_SIGNING=0, DEPPY_ALLOW_UNTRUSTED_SIGNING=1, DEPPY_PACKAGE_SSH_WORKSPACES=1. Signatures, architectures, resources, helper manifest and versions verified. Root independent version-check.json PASS; original app PID unchanged.
+- Previous 4482 SSH/path tests are historical executed results on identical 19 Rust files, not falsely counted as freshly rerun. Evidence byte/hash/gzip integrity verified; all closed logs are .log.gz.
+
+## Failed approaches
+
+Initial fixture Context.run API error and unapplied texture-delta panic corrected before actual behavioral RED. Instant growth jump RED → initial 25 focused PASS. Independent reopen center assertion exposed a second RED (27 PASS / 1 FAIL). Forced sizing_pass + discard introduced 3pt hidden/normal measurement difference (actual short height297 vs reopen294 with normal body155), failing retained height assertion. Removed forced sizing, retained one opening-only discard; all 28 and full App then PASS. No assertions/lints disabled. All failed logs and pre-center-fix source proof retained. Documentation finalizer initially searched an outdated handoff heading; corrected header and completed write, no product impact.
+
+## Remaining work / exact next-agent commands
+
+User subsequently canceled the character request; no character code was implemented. Both agents finished. No character follow-up remains.
+
+No build/package/restart work remains. Bundle 0.18.0 is delivered: any further changed product artifact must bump beyond 0.18.0. No public release/main merge/push authorized. Source changes remain uncommitted.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+cat docs/qa/2026-10-23-local-0.18.0-rebuild.md
+cat docs/qa/assets/local-0.18.0-20261023/version-check.json
+# No tests/build need repeating without new changes. No GUI restart without fresh request.
+# Character request canceled; do not implement it.
+```
+
+---
+
+# Historical phases (statuses below refer to their completion time)
+
+# Completed SSH resume / terminal fixes + path links — 2026-10-23
+
+## Current objective / result
+
+User requested parallel fixes for3review defects, longer SSH retention/sleep recovery, then clickable terminal document paths, and repeatedly asked for extra agents. **Source implementation and final checks complete.** Canonical `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, baseHEAD `a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1`. Nominal `deppy-sijo` olddirtyFleet tree untouched. All agents GPT-6.1-Sol/xhigh with disjoint ownership; root integrated, independently reviewed and serialized Cargo. No commit/push/release/restart/installed-helper/live-user-server changes. Running0.16.0 and packaged0.17.0 unchanged. Source/testversion0.17.0 is not a deliveredrelease; futureartifact must bump beyond0.17.0.
+
+## Completed work / modified files
+
+- SSH stdout bridge: actual nonblocking CLOEXEC duplicate, cancellable100ms polls,45s idle deadline reset on progress; stdinEOF cancels before join andflagsrestore. Remote lease default7days/max30days viaexistingenv, sameprotocolrangeonclient/server.
+- Root retry:1–30s bounded backoff only for previouslyauthenticated exacttarget, requiredsavedresumeproof onautomaticattempts, nofreshfallback/noinputreplay. Auth/key/helper/expiry blocks; cancel/closedworkspace/retiredtarget gates. Retire beforeevents andclearoldvisibleauthdialog. Rotate attachmentownership andskiplauncher onrecovery.
+- Renderer: clearcache whenfreeze skipsdirtyhistory; generationgap fullrowinvalidates, idle/consecutiveincremental paths retained. Archive: preserveprojectedcolors/styles andstyledspaces inclcompressedhistory; concealedtext/graphemesirreversiblyomitted withcolumns preserved, allwritesbounded.
+- Paths: boundedvisiblecellparser acrossrowedges, Koreanwide/graphemes, rawfilename priority/punctuation/wrapper/2numeric suffixfallback. Actualfilecheckasync, md/markdown/txt/log/noextension inexistingappdocumenttabs; OS allowlist unchanged. SSHlookup existingroot-scopedListDirectoryRPC,4096entries/1MiB, noLocalfallback/wirechanges, symlink/traversalreject, loadvalidatesregular/nofollow/nonblock. `~/` notguessedforSSH. Numeric suffixes locatefile only, no linejump; alt-screenapp pointerownershipretained.
+- Pending andqueuedfileopens canceledHome/Fleet/workspace/pane/session/inputownerchanges, including computedAttached/None; dispatch exactactiveworkspace/runtime+Terminal+Primaryfocus. AsyncRPC retainsoriginalruntime evenwhennewUI reusesop/gen.
+
+19changed/newRustfiles (exactSHA256manifest in QAassets): `crates/app/src/{app.rs,main.rs,ssh_workspace_host.rs,ssh_workspace_host_linux_tests.rs,ssh_workspace_host_peer_tests.rs,ssh_reconnect.rs,ssh_terminal_paths.rs,app/ssh_reconnect_tests.rs,app/terminal_path_dispatch_tests.rs,ui/file_tree.rs,ui/workspace.rs,ui/workspace_terminal_path.rs,workspace_ui_test_support/workspace_terminal_path_tests.rs}`, `crates/remote-host/{src/supervisor.rs,tests/supervisor.rs}`, `crates/runtime/src/{protocol/ssh.rs,remote/ssh_stream.rs}`, `crates/terminal/src/{alacritty_backend.rs,renderer_egui.rs}`. Documentation: plan, new QAfixreport/assets andthishandoff. Earlierreviewreport/evidence preserved.
+
+## Design decisions
+
+PhysicalTCP cannot stayconnected through sleep; remote supervisor/PTY staysalive andtheapp resumesit whilelease/serveralive. Never silentlycreatefreshPTY orreplayinput. Targetidentity/lease errorsrequiremanualrecovery. Existinghost/root/resumeproof andasyncgenerationfencesreused; noOSC8/snapshot/wireextension. Pathsarenotopenedonhover andnoFS/socketprocessworkrunsinrender. Actualprimary+attached focus andHomeguards preventlateopens onanotherpane. Test-onlyhelperpolicyfieldsadded toolderOwnerfixtures withoutchangingtestsemantics.
+
+## Tests / exact results
+
+Full affected suites **4482 distinct normal tests PASS/0FAIL** onfinalproductsource (App3773unit+39integration=3812, runtime459, ssh-transport24, remote-host33unit+7integration=40, terminal147). App46unit+3integrationignored, runtime1, transport2, remotehost3, terminal4; isolatedchildfixtures invokedbyparents notdoublecounted. Appincludes40path tests and9retrytests. Nativefullstdoutpressure/slowprogress/exactbytes,8envTTLcasesactualsupervisor, compressedhistoryarchive, actualegui pointer/cold/drag/selection/Home/runtimecollision/attachedfocus covered. No physicalsleep/liveLinuxnetwork/manualGPU/E2Eagent orlongRSSsoak claimed.
+
+FinalstrictClippy5affectedpackages/alltargets `-D warnings` PASS14.823s; no-default-featuresAppcheckPASS3.730s; cargofmtallcheckPASS2.854s; xtaskcheck-boundaryPASS4.884s; gitdiffcheckPASS. Root sourceproofall19RustSHA256unchanged acrossfinalchecks. QAassets42files independentlybyte/SHA256/gzipverified. Rootlogs `/tmp/deppy-ssh-fixes-20261023`; durable `docs/qa/assets/ssh-resume-terminal-fixes-20261023/`. FullQA `docs/qa/2026-10-23-ssh-resume-terminal-fixes.md`; completedplan `docs/plans/2026-10-23-ssh-resume-terminal-fixes.md`.
+
+## Failed approaches
+
+Actual behavioral REDbeforefix: bridge2PASS1FAIL, TTL21PASS3FAIL, renderer1FAIL, Appdirty2FAIL, archive1PASS4FAIL, auto1FAIL, pathpointer1PASS2FAIL, remotehelper1PASS5FAIL, rawpunctuation1FAIL, queuedopen1FAIL, wrappedremoteparent1FAIL, attachedfocus13PASS1FAIL. Initialcompile/fixture failures werecorrected separately (bridgeborrow,512KiBrequest→real256KiBcap,4Ownerliteralpolicyfields). FirststrictClippy2booleanlintserrors fixedequivalently. Appsecondfull3771PASS1FAIL: newRPCfixture `Harness.run` hit4stepbudget becausepane-borderfade continuouslyrepaints; changedinitialsettle toexplicit2frames, retainedallpointer/RPCassertions. Corrected13dispatchtestsPASS thenattachedRED; finalApp3773+39PASS. No tests/assertions/lintsdisabled. Allfailedlogs retained.
+
+## Remaining work / next-agent commands
+
+No sourceimplementation work remains for thisrequest. Currentchanges uncommitted, nopush/mainmerge requested. Release/rebuild/install orrestart requiresfreshuserinstruction andversionbump/artifactverification ifdistributing. Physicalsleep/liveuserSSHvalidation is optional subsequentrequestedtesting, notclaimedhere. **Do notrun dev-run.sh automatically.**
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+cat docs/qa/2026-10-23-ssh-resume-terminal-fixes.md
+# All tests/checks above already passed, rerunonlyonnewchanges:
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo test --offline --locked -p deppy-sijo -- --test-threads=4
+# source-final.json + SHA256.json in durableQAassets verifyexacttestedfiles.
+# No apprestart, dev-run.sh, user-serverinstall orreleasewithoutnewauthorization.
+```
+
+---
+
+# Completed read-only SSH / terminal / lifecycle review — 2026-10-23
+
+## Current objective / completed work
+
+User requested parallel review of SSH connection loss/session retention, terminal rendering, memory leaks/crashes. Three requested GPT-6.1-Sol/xhigh reviewers split these areas; root reviewed exact call chains and independently reran all3bug fixtures and client-drop resource probe. Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, reviewed HEAD `a8eb51ae` (product source `9aca83f2`,0.17.0).
+
+**Review complete,3confirmed medium bugs remain unfixed:** (1) remote bridge stdout backpressure prevents shutdown join completing; (2) rendering skipped snapshots lose dirty history and stale rows remain after selection/Home catch-up; (3) memory archive round-trip loses SGR8 conceal and styles. Exact conditions/locations/evidence in `docs/qa/2026-10-23-ssh-terminal-lifecycle-review.md`.
+
+## Files / decisions / tests
+
+Only `docs/CODEX_HANDOFF.md`, new review report and `docs/qa/assets/ssh-terminal-lifecycle-review-20261023/` modified/added. No product edits, commit/push/merge, user server access, GUI launch/restart or installed helper update. Running app0.16.0 unchanged; source0.17.0 reviewed. Review skill checklist unavailable; full skill execution not claimed. Default detached lease300s / max1800s / no auto reconnect are intentional policies, not duplicate bugs; continued indefinite sleep survival is not implemented.
+
+Actual root serialized Cargo checks: runtime ssh_stream21PASS; remote-host29unit+4integrationPASS; transport24PASS; terminal140PASS; App ssh_96PASS = **314PASS/0FAIL**; separate ignored cases listed in report. New reproductions demonstrate failures beyond passing existing suites. Root bridge isolated lease2s: supervisor socket removed2.633s but bridge remains until74,397bytes stdout drained, exit0.002s later. Renderer actual text OLD0|NEW1 despite snapshot NEW0/NEW1; cache.clear control correct. Archive hides private-value before but shows after, attrs15→0. Direct SshRuntimeClient50connect/Drop probe: thread/FD baseline1/3→each1/3, peak6/7,max cleanup15ms. Cargo fresh JSON+equal artifact bytes verify canonical runtime rlib provenance. Evidence includes21source/log/proof files plus SHA256 index, no executables. Final `git diff --check` PASS; all21evidence file sizes/SHA256verified. Cargo fresh artifact JSON also identifies canonical terminal0.17manifest/artifact used by archive fixture.
+
+## Failed approaches / limits / remaining
+
+Review agent initial/final model capacity errors did not change required model; source reviews and evidence were delivered. First owned bridge-pressure fixture blocked its own stdin writer, interrupted and cleaned owned processes; corrected bounded nonblocking fixture reproduces. No physical sleep/real server network blackhole/long RSS soak claimed. stdout full with a live unread reader is the exact hang trigger; a closed read end can instead unblock with EPIPE. Disk archive has separate redaction; missing-conceal finding established via memory round-trip. No additional verified panic/lock deadlock found. User requested review, so fixes and regression tests remain for a later modification request; no automatic product change/rebuild/restart.
+
+## Exact next commands
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+cat docs/qa/2026-10-23-ssh-terminal-lifecycle-review.md
+# Review-only artifacts above; fix only on a subsequent user request.
+# Repro owns its own HOME/processes; helper must report0.17.0.
+python3 docs/qa/assets/ssh-terminal-lifecycle-review-20261023/bridge_backpressure.py
+# Renderer direct rustc commands: docs/qa/assets/ssh-terminal-lifecycle-review-20261023/renderer-commands.txt
+# No dev-run.sh/GUI restart in this task.
+```
+
+---
+
 # Completed rebuild only — 0.17.0 (2026-10-23)
 
 ## Objective / completed result

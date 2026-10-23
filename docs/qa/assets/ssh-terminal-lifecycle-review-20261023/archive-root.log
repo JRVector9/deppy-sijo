@@ -1,0 +1,4 @@
+before="                    STYLED                                  "
+after="private-value       STYLED                                  "
+styles before=CellAttrs(15) after=CellAttrs(0)
+REPRODUCED: hidden text becomes visible after archive round-trip; SGR attributes also lost

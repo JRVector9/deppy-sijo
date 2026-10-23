@@ -51,6 +51,7 @@ mod tests {
                 interrupt: Mutex::new(None),
             });
             let mut owner = Owner {
+                resume_required: false,
                 profile,
                 generation,
                 target,

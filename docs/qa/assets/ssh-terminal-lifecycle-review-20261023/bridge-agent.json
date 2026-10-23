@@ -1,0 +1,15 @@
+{
+  "binary": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deppy-remote-host",
+  "version": "deppy-remote-host 0.17.0",
+  "home": "/private/tmp/dpsh-review-22d1_al3",
+  "bridge_pid": 81313,
+  "supervisor_pid": 81322,
+  "pings_sent": 903,
+  "elapsed_after_pressure_secs": 2.625,
+  "supervisor_socket_exists": false,
+  "bridge_still_running_without_stdout_consumer": true,
+  "drained_bytes_to_release": 73911,
+  "bridge_exit_after_stdout_drain": 1,
+  "release_secs": 0.001,
+  "stderr": "deppy-remote-host: Broken pipe (os error 32)\n"
+}

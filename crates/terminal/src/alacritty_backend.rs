@@ -1514,8 +1514,8 @@ fn serialize_scrollback_bounded(
         bytes: Vec::new(),
         limit: max_bytes,
     };
-    // 현재 SGR 상태 — 색이 바뀔 때만 시퀀스를 낸다
-    let mut current: Option<([u8; 3], [u8; 3])> = None;
+    // Match the supported snapshot projection, including resolved inverse colors.
+    let mut current: Option<([u8; 3], [u8; 3], CellAttrs)> = None;
     let total = history as i32 + rows as i32;
     // deppy-sijo(D): 압축된 히스토리 행은 read_line이 scratch로 복원해 준다.
     let mut scratch = Row::<AlacrittyCell>::new(cols);
@@ -1532,7 +1532,8 @@ fn serialize_scrollback_bounded(
                 let plain = cell.c == ' '
                     && cell.zerowidth().is_none()
                     && resolve_color(cell.bg, colors, DEFAULT_BG) == DEFAULT_BG
-                    && !cell.flags.contains(Flags::INVERSE);
+                    && !cell.flags.contains(Flags::INVERSE)
+                    && snapshot_cell_style(cell, colors, cell.c).attrs().is_empty();
                 if plain {
                     end -= 1;
                 } else {
@@ -1542,23 +1543,21 @@ fn serialize_scrollback_bounded(
         }
         for col in 0..end {
             let cell = &line[alacritty_terminal::index::Column(col)];
-            if cell
-                .flags
-                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            let hidden = cell.flags.contains(Flags::HIDDEN);
+            if !hidden
+                && cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
             {
                 continue;
             }
-            let (mut fg, mut bg) = (
-                resolve_color(cell.fg, colors, DEFAULT_FG),
-                resolve_color(cell.bg, colors, DEFAULT_BG),
-            );
-            if cell.flags.contains(Flags::INVERSE) {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            if current != Some((fg, bg)) {
-                if (fg, bg) == (DEFAULT_FG, DEFAULT_BG) {
-                    out.append(b"\x1b[0m")?;
-                } else {
+            let projected = snapshot_cell_style(cell, colors, cell.c);
+            let (fg, bg, attrs) = (projected.fg, projected.bg, projected.attrs());
+            if current != Some((fg, bg, attrs)) {
+                // A reset clears attributes as well as colors. Reapply the complete
+                // projected style so color changes cannot silently discard formatting.
+                out.append(b"\x1b[0m")?;
+                if (fg, bg) != (DEFAULT_FG, DEFAULT_BG) {
                     out.append(
                         format!(
                             "\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
@@ -1567,7 +1566,26 @@ fn serialize_scrollback_bounded(
                         .as_bytes(),
                     )?;
                 }
-                current = Some((fg, bg));
+                for (attr, sgr) in [
+                    (CellAttrs::BOLD, b"\x1b[1m"),
+                    (CellAttrs::DIM, b"\x1b[2m"),
+                    (CellAttrs::ITALIC, b"\x1b[3m"),
+                    (CellAttrs::UNDERLINE, b"\x1b[4m"),
+                    (CellAttrs::STRIKEOUT, b"\x1b[9m"),
+                ] {
+                    if attrs.contains(attr) {
+                        out.append(sgr)?;
+                    }
+                }
+                current = Some((fg, bg, attrs));
+            }
+            if hidden {
+                // Store the rendered conceal projection, never the source scalars.
+                // This intentionally drops concealed text; SGR 8 itself is not encryption.
+                // Project wide owners and their tail/leading spacers separately to
+                // retain occupied columns and wrapping without retaining the wide glyph.
+                out.append(b" ")?;
+                continue;
             }
             let mut buf = [0u8; 4];
             out.append(cell.c.encode_utf8(&mut buf).as_bytes())?;
@@ -2969,6 +2987,201 @@ mod tests {
         // 스크롤백 최상단까지 복원
         b.scroll(1000);
         assert_eq!(row_text(&b, 0), "line0");
+    }
+
+    #[test]
+    fn archive_conceal_projects_source_text_without_changing_columns() {
+        for (cols, text) in [
+            (40, "public|\x1b[8mprivate-value\u{301}\x1b[28m|end"),
+            (8, "A\x1b[8m漢\u{301}\x1b[28mZ"),
+            (4, "abc\x1b[8m漢\u{301}\x1b[28mX\r\nend"),
+        ] {
+            let mut original = AlacrittyBackend::new(cols, 5, 100);
+            original.feed(text.as_bytes()).unwrap();
+            let before = original.viewport_snapshot().unwrap();
+            let dump = original.serialize_scrollback().unwrap();
+            let archived_text = std::str::from_utf8(&dump).unwrap();
+            assert!(!archived_text.contains("private-value"));
+            assert!(!archived_text.contains('漢'));
+            assert!(!archived_text.contains('\u{301}'));
+
+            let mut restored = AlacrittyBackend::new(cols, 5, 100);
+            restored.feed(&dump).unwrap();
+            let after = restored.viewport_snapshot().unwrap();
+            // Concealed wide owners become ordinary spaces; their occupied columns
+            // and projected text/style must remain equal without retaining the source.
+            let projection = |snapshot: &TerminalViewportSnapshot| {
+                snapshot
+                    .visible_cells
+                    .iter()
+                    .map(|cell| (cell.c, cell.fg, cell.bg, cell.attrs()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(projection(&before), projection(&after), "{text:?}");
+            assert_eq!(before.graphemes, after.graphemes);
+        }
+    }
+
+    #[test]
+    fn archive_sgr_attributes_survive_color_changes_and_resets() {
+        let mut original = AlacrittyBackend::new(40, 3, 100);
+        original
+            .feed(b"\x1b[1mB\x1b[0m\x1b[2mD\x1b[0m\x1b[3mI\x1b[0m\x1b[4mU\x1b[0m\x1b[9mS\x1b[0m\x1b[1;2;3;4;9mA\x1b[31;44mC\x1b[39;49mF\x1b[22;23;24;29mN\x1b[7;32;45mR\x1b[0;3;34mZ")
+            .unwrap();
+        let before = original.viewport_snapshot().unwrap();
+        let all = CellAttrs(
+            CellAttrs::BOLD
+                | CellAttrs::DIM
+                | CellAttrs::ITALIC
+                | CellAttrs::UNDERLINE
+                | CellAttrs::STRIKEOUT,
+        );
+        assert_eq!(before.visible_cells[5].attrs(), all);
+        assert_eq!(before.visible_cells[6].attrs(), all);
+        assert_eq!(before.visible_cells[7].attrs(), all);
+        assert!(before.visible_cells[8].attrs().is_empty());
+
+        let dump = original.serialize_scrollback().unwrap();
+        let mut restored = AlacrittyBackend::new(40, 3, 100);
+        restored.feed(&dump).unwrap();
+        assert_eq!(
+            before.visible_cells,
+            restored.viewport_snapshot().unwrap().visible_cells
+        );
+        // The archive's final reset also prevents the last style leaking into new text.
+        restored.feed(b"\x1b[1;12Hnext").unwrap();
+        assert!(cell_at(&restored, 0, 11).attrs().is_empty());
+        assert_eq!(cell_at(&restored, 0, 11).fg, DEFAULT_FG);
+        assert_eq!(cell_at(&restored, 0, 11).bg, DEFAULT_BG);
+    }
+
+    #[test]
+    fn archive_preserves_supported_underline_variants_and_graphemes() {
+        let mut original = AlacrittyBackend::new(20, 4, 100);
+        original
+            .feed("\x1b[4:2mD\x1b[4:3mC\x1b[4:4mO\x1b[4:5mA\x1b[0m\r\n\x1b[1;3m漢e\u{301}q\u{301}\u{302}\x1b[0m".as_bytes())
+            .unwrap();
+        let before = original.viewport_snapshot().unwrap();
+        for col in 0..4 {
+            assert!(
+                before.visible_cells[col]
+                    .attrs()
+                    .contains(CellAttrs::UNDERLINE)
+            );
+        }
+        assert!(before.visible_cells[20].wide());
+        assert!(!before.graphemes.is_empty());
+
+        let dump = original.serialize_scrollback().unwrap();
+        let mut restored = AlacrittyBackend::new(20, 4, 100);
+        restored.feed(&dump).unwrap();
+        let after = restored.viewport_snapshot().unwrap();
+        assert_eq!(before.visible_cells, after.visible_cells);
+        assert_eq!(before.graphemes, after.graphemes);
+    }
+
+    #[test]
+    fn archive_preserves_styled_trailing_spaces_but_trims_default_padding() {
+        let mut original = AlacrittyBackend::new(20, 3, 100);
+        original
+            .feed(b"A\x1b[4m  \x1b[0m\r\nB\x1b[41m  \x1b[0m\r\nC   ")
+            .unwrap();
+        let dump = original.serialize_scrollback().unwrap();
+        assert!(dump.ends_with(b"C\x1b[0m"));
+        let mut restored = AlacrittyBackend::new(20, 3, 100);
+        restored.feed(&dump).unwrap();
+        assert_eq!(
+            original.viewport_snapshot().unwrap().visible_cells,
+            restored.viewport_snapshot().unwrap().visible_cells
+        );
+    }
+
+    #[test]
+    fn archive_styled_output_remains_bounded() {
+        let mut backend = AlacrittyBackend::new(20, 3, 100);
+        backend
+            .feed("\x1b[1;2;3;4;9;31;44mstyled\x1b[39;49mdefault\x1b[8m漢\u{301}\x1b[0m".as_bytes())
+            .unwrap();
+        let expected = backend.serialize_scrollback().unwrap();
+        assert_eq!(
+            backend
+                .serialize_scrollback_bounded(expected.len())
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            backend.serialize_scrollback_bounded(expected.len() - 1),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+        assert_eq!(
+            backend.serialize_scrollback_bounded(0),
+            Err(crate::ScrollbackSerializeError::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn archive_compressed_history_preserves_conceal_styles_and_graphemes_after_rehydration() {
+        let mut original = AlacrittyBackend::new(64, 5, 1000);
+        for line in 0..400 {
+            original
+                .feed(
+                    format!(
+                        "L{line:03}|\x1b[1;2;3;4;9;31;44mA\x1b[0m|\x1b[8;3;32mPRIVATE漢\u{303}\x1b[0m|q\u{301}\u{302}\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+        let compressed_rows = original.term.grid().compressed_row_count();
+        assert!(
+            compressed_rows > 0,
+            "fixture must serialize actual compressed history"
+        );
+        let history = original.term.history_size();
+        let dump = original.serialize_scrollback().unwrap();
+        assert_eq!(original.term.grid().compressed_row_count(), compressed_rows);
+        let archived_text = std::str::from_utf8(&dump).unwrap();
+        assert!(!archived_text.contains("PRIVATE"));
+        assert!(!archived_text.contains('漢'));
+        assert!(!archived_text.contains('\u{303}'));
+
+        let mut restored = AlacrittyBackend::new(64, 5, 1000);
+        restored.feed(&dump).unwrap();
+        assert_eq!(restored.term.history_size(), history);
+        assert!(restored.term.grid().compressed_row_count() > 0);
+        let projection = |snapshot: &TerminalViewportSnapshot| {
+            snapshot
+                .visible_cells
+                .iter()
+                .map(|cell| (cell.c, cell.fg, cell.bg, cell.attrs()))
+                .collect::<Vec<_>>()
+        };
+        // Cover every history and screen row, including the oldest compressed
+        // rows and the still-hot tail. Concealed wide cells project to ordinary
+        // spaces, so compare displayed columns/styles rather than source widths.
+        let mut offsets: Vec<_> = (0..=history).step_by(5).collect();
+        if offsets.last() != Some(&history) {
+            offsets.push(history);
+        }
+        for offset in offsets {
+            original.scroll_to_bottom();
+            restored.scroll_to_bottom();
+            original.scroll(offset as i32);
+            restored.scroll(offset as i32);
+            let before = original.viewport_snapshot().unwrap();
+            let after = restored.viewport_snapshot().unwrap();
+            assert_eq!(
+                projection(&before),
+                projection(&after),
+                "history offset {offset}"
+            );
+            assert_eq!(before.graphemes, after.graphemes, "history offset {offset}");
+        }
+        let oldest = original.viewport_snapshot().unwrap();
+        assert!(oldest.visible_cells[5].attrs().contains(CellAttrs::BOLD));
+        assert_eq!(oldest.visible_cells[5].fg, ANSI16[1]);
+        assert_eq!(oldest.visible_cells[5].bg, ANSI16[4]);
+        assert!(!oldest.graphemes.is_empty());
     }
 
     #[test]

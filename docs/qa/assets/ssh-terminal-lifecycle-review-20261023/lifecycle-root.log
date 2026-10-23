@@ -1,0 +1,7 @@
+BASELINE threads=1 fds=3
+SETTLED iteration=10 threads=1 fds=3
+SETTLED iteration=20 threads=1 fds=3
+SETTLED iteration=30 threads=1 fds=3
+SETTLED iteration=40 threads=1 fds=3
+SETTLED iteration=50 threads=1 fds=3
+PASS iterations=50 idle=25 pending_rpc=25 baseline=Counts { threads: 1, fds: 3 } final=Counts { threads: 1, fds: 3 } peak=Counts { threads: 6, fds: 7 } max_settle_ms=15

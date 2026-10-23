@@ -1,0 +1,14 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "mcp-proxy",
+    "--",
+    "--test-threads=4"
+  ],
+  "exit_code": 0,
+  "seconds": 11.64
+}

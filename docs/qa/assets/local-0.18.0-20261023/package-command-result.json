@@ -1,0 +1,8 @@
+{
+  "command": [
+    "python3",
+    "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/assets/local-0.18.0-20261023/local-bundle.py"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 4.714
+}

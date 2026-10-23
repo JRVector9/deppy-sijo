@@ -1,0 +1,18 @@
+{"case": "host-final", "exit": 0, "seconds": 20.244, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-remote-host", "--", "--test-threads=2"]}
+{"case": "terminal-final", "exit": 0, "seconds": 5.966, "command": ["cargo", "test", "--offline", "--locked", "-p", "terminal", "--", "--test-threads=2"]}
+{"case": "app-final", "exit": 0, "seconds": 83.174, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "--", "--test-threads=4"]}
+{"case": "runtime-final", "exit": 0, "seconds": 30.498, "command": ["cargo", "test", "--offline", "--locked", "-p", "runtime", "--", "--test-threads=4"]}
+{"case": "transport-final", "exit": 0, "seconds": 14.223, "command": ["cargo", "test", "--offline", "--locked", "-p", "ssh-transport", "--", "--test-threads=4"]}
+{"case": "clippy", "exit": 101, "seconds": 63.756, "command": ["cargo", "clippy", "--offline", "--locked", "-p", "deppy-sijo", "-p", "runtime", "-p", "terminal", "-p", "deppy-remote-host", "-p", "ssh-transport", "--all-targets", "--", "-D", "warnings"]}
+{"case": "fmt", "exit": 0, "seconds": 2.781, "command": ["cargo", "fmt", "--all", "--check"]}
+{"case": "boundary", "exit": 0, "seconds": 6.67, "command": ["cargo", "run", "--offline", "--locked", "-p", "xtask", "--", "check-boundary"]}
+{"case": "clippy-final", "exit": 0, "seconds": 26.77, "command": ["cargo", "clippy", "--offline", "--locked", "-p", "deppy-sijo", "-p", "runtime", "-p", "terminal", "-p", "deppy-remote-host", "-p", "ssh-transport", "--all-targets", "--", "-D", "warnings"]}
+{"case": "app-final2", "exit": 101, "seconds": 76.164, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "--", "--test-threads=4"]}
+{"case": "feature-check", "exit": 0, "seconds": 23.807, "command": ["cargo", "check", "--offline", "--locked", "-p", "deppy-sijo", "--no-default-features"]}
+{"case": "fmt-final", "exit": 0, "seconds": 2.767, "command": ["cargo", "fmt", "--all", "--check"]}
+{"case": "boundary-final", "exit": 0, "seconds": 4.568, "command": ["cargo", "run", "--offline", "--locked", "-p", "xtask", "--", "check-boundary"]}
+{"case": "clippy-final3", "exit": 0, "seconds": 14.823, "command": ["cargo", "clippy", "--offline", "--locked", "-p", "deppy-sijo", "-p", "runtime", "-p", "terminal", "-p", "deppy-remote-host", "-p", "ssh-transport", "--all-targets", "--", "-D", "warnings"]}
+{"case": "feature-final3", "exit": 0, "seconds": 3.73, "command": ["cargo", "check", "--offline", "--locked", "-p", "deppy-sijo", "--no-default-features"]}
+{"case": "fmt-final3", "exit": 0, "seconds": 2.854, "command": ["cargo", "fmt", "--all", "--check"]}
+{"case": "boundary-final3", "exit": 0, "seconds": 4.884, "command": ["cargo", "run", "--offline", "--locked", "-p", "xtask", "--", "check-boundary"]}
+{"case": "app-final3", "exit": 0, "seconds": null, "command": ["cargo", "test", "--offline", "--locked", "-p", "deppy-sijo", "--", "--test-threads=4"], "note": "actual exit0 via root exec session4576; wall time not separately recorded; 3773unit+39integration, child1 not doublecounted"}

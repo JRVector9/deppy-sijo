@@ -1,0 +1,45 @@
+#![allow(dead_code)]
+#[path="/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app/src/provider_usage_support.rs"] mod provider_usage_support;
+mod app {
+    pub(crate) type ProviderUsage=(Option<u8>,Option<u8>);
+    pub(crate) fn fresh_usage_after(v:ProviderUsage,_age:std::time::Duration)->Option<ProviderUsage>{Some(v)}
+}
+mod paths {pub(crate) fn home_dir()->Option<std::path::PathBuf>{ std::env::var_os("HOME").map(Into::into)}}
+mod agent_launcher {
+    pub(crate) struct DetectedAgent { pub path:std::path::PathBuf, pub launch:Option<String> }
+    impl DetectedAgent {
+        pub fn executable(&self)->&std::path::Path{&self.path}
+        pub fn launch_path(&self)->Option<&str>{self.launch.as_deref()}
+    }
+}
+#[path="/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app/src/provider_usage_command.rs"] mod provider_usage_command;
+mod claude_usage {
+    include!("/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/crates/app/src/claude_usage.rs");
+    pub fn probe(path:&std::path::Path)->anyhow::Result<Option<crate::app::ProviderUsage>>{fetch_claude_usage(path,None)}
+    pub fn parse(text:&str)->Option<crate::app::ProviderUsage>{parse_usage(text)}
+}
+mod grok_usage {
+    include!("/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/docs/qa/assets/provider-usage-fixes-20261023/grok-observed-source.rs");
+    pub fn probe(path:&std::path::Path)->anyhow::Result<Option<GrokUsage>>{fetch_grok_usage(path,None)}
+    pub fn parse(text:&str)->Option<GrokUsage>{parse_usage(text)}
+}
+fn main(){
+    let args:Vec<_>=std::env::args().collect();
+    let start=std::time::Instant::now();
+    if args[1]=="parse" {
+        let text=std::io::read_to_string(std::io::stdin()).unwrap();
+        if args[2]=="claude" { println!("{:?}",claude_usage::parse(&text)); }
+        else {println!("{:?}",grok_usage::parse(&text));}
+        return;
+    }
+    let path=std::path::Path::new(&args[2]);
+    if args[1]=="claude" {println!("provider=claude result={:?} elapsed_ms={}",claude_usage::probe(path),start.elapsed().as_millis());}
+    else {println!("provider=grok result={:?} elapsed_ms={}",grok_usage::probe(path),start.elapsed().as_millis());}
+}
+
+fn observe(clean:&str,bytes:usize){
+ let lower=clean.to_lowercase();
+ let phrases=["trust this folder","do you trust the contents of this directory?","yes, proceed","yes proceed","no, quit","no quit","usage","/usage","weekly limit","monthly limit","credits","billing","loading","not authenticated","sign in","log in","update","press enter","terminal","error","failed","connecting","ready","tips","what would","how can","ask","permission","grok build"];
+ let counts:std::collections::BTreeMap<_,_>=phrases.into_iter().map(|s|(s,lower.matches(s).count())).collect();
+ eprintln!("SAFE_METRICS bytes={bytes} clean_chars={} phrases={counts:?}",clean.len());
+}

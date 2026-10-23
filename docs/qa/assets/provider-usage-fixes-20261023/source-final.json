@@ -1,0 +1,15 @@
+{
+  "crates/app/src/app.rs": "cc6d70cdd17b1a8f773934524f506b2396074cfc396539314b898b9c330ceb08",
+  "crates/app/src/claude_usage.rs": "e54851d607f8e45b52d9834f8a8ec58db79b7434fc4325f61bc5184e80e16cfa",
+  "crates/app/src/claude_usage_snapshot.rs": "0cfb93e425ac27e728ea9449c2da680c0a8d197a3d5155774c923ec3c5592883",
+  "crates/app/src/grok_usage.rs": "a26ff0fd6313c5d5db6f6a6fe2491bd1206e2f9f9b1b207f10d040d99e0623d2",
+  "crates/app/src/provider_usage_support.rs": "bcb08662bf6da3fee098e26c329418bcdc804f148603990916a16420cc10ae09",
+  "crates/app/src/main.rs": "3b18b2998ad4c04e981846709f160eafc3bc2e91f706c6068cc85082d829b4b5",
+  "crates/app/src/ui/agent_terminal.rs": "5dd4cf11f7acc8971c9ceb2a278c0a203eeeaefc90bb3b166e580652f94afe68",
+  "crates/mcp-proxy/src/main.rs": "f62bcc1ab8da82d90ae0c563996dd9da480b53880133c9544a3c436785843bdd",
+  "scripts/verify-provider-usage.py": "7d6e02be3fdc45447efc9fa8981c878a106ef59a235ab0e2d3f09ff9e22fa82e",
+  "scripts/tests/test_provider_usage_guard.py": "830962d3b71aa5775714e383627de994d2c2eb629dd0b95f2c99a1cb43ab6472",
+  ".github/workflows/build-test.yml": "9004555080d44c66390a2348c177b100a7707d29e8d1057b7a9866221fbe9ae5",
+  "AGENTS.md": "e2330e289eb15bf36626d4730178b12d6ae01de22c834bb2cabb879b17751c49",
+  "docs/testing/provider-usage-contract.json": "00a4aa17b07c37f6e0d83601fc334d7994d9a446b3527d27096f589d05ce3e1e"
+}

@@ -1,0 +1,86 @@
+{
+  "app-ssh.log.gz": {
+    "bytes": 3386,
+    "sha256": "f879c8c35cc22da11a752d16b6a302a6e38f096b9f7f5387cb07a4dea91f008d"
+  },
+  "archive-root.log": {
+    "bytes": 277,
+    "sha256": "eece23b89de9069881baab6b867c4dc021cfd48489e8c3204753beef966c23cd"
+  },
+  "archive_conceal.rs": {
+    "bytes": 1072,
+    "sha256": "228f51fda2072c75eb03c84f3abc09dcacddce56e5846de2d387e0d35a9a94ea"
+  },
+  "bridge-agent.json": {
+    "bytes": 565,
+    "sha256": "6108698b955af5a16778b903a3f283d2d93473952ebb529782540e49a5251df2"
+  },
+  "bridge-file-rpc.json": {
+    "bytes": 584,
+    "sha256": "4c38805e1011feb845ddd0df1fb1927e9e412983efcb96c8b90970050af6f72a"
+  },
+  "bridge-root.json": {
+    "bytes": 565,
+    "sha256": "a87fc97a176ef64572ed726121ee08c4ec0d74e89925a1ac4fcc8e32217f82a4"
+  },
+  "bridge_backpressure.py": {
+    "bytes": 4574,
+    "sha256": "bd46f043eaeebc1144b05c70d43f19459f96ce90cb1de24e44d91d31a88a11a9"
+  },
+  "bridge_file_rpc.py": {
+    "bytes": 4683,
+    "sha256": "e49c46d555a9fa8b6e7b04ab8f2acfe98bf122a90356f330164c202a41d717bf"
+  },
+  "freeze-root.log": {
+    "bytes": 178,
+    "sha256": "786f03df437568bc3e2a8f5311a2ff2da092de3b4b0c88df47af392bf7675843"
+  },
+  "freeze_dirty.rs": {
+    "bytes": 2632,
+    "sha256": "eec947a60a27eb94ac17585f2c7195c6adfda948edf0e97ab58d140a002a6b10"
+  },
+  "lifecycle-agent.log": {
+    "bytes": 379,
+    "sha256": "87f677606bbfa7beacff9f60019865f04cddc48ea56cfe8fa47de5a06f8193f3"
+  },
+  "lifecycle-compile-argv.json": {
+    "bytes": 16113,
+    "sha256": "0e0c0d406031e0fb071c81fa339794ec98aa80c0fa06c3974bb556a3377d9d9e"
+  },
+  "lifecycle-root.log": {
+    "bytes": 379,
+    "sha256": "a00c86a9557eb2d66829c91d41e092b63ba6f27e6d56dad723d0256944af7486"
+  },
+  "remote-host.log.gz": {
+    "bytes": 1460,
+    "sha256": "49b8c749a6defca4b2c0a88fb923d1b6f268f883991f0a547a871696e7cb2996"
+  },
+  "renderer-commands.txt": {
+    "bytes": 2525,
+    "sha256": "2521300a0b84674d968ebb85c0e1ed916b48a4642c633dfc3874d8856ed93e86"
+  },
+  "runtime-provenance.jsonl.gz": {
+    "bytes": 12139,
+    "sha256": "c189b9261b9d79429fea9f1f8f628af5bc134d5d7f566f18a5fb69251044b0cc"
+  },
+  "runtime.log.gz": {
+    "bytes": 1092,
+    "sha256": "32e78ba2fc618b049026ca662fefdcf601d1619ab0389bf09d04987933bb7f52"
+  },
+  "source-proof.json": {
+    "bytes": 932,
+    "sha256": "0a012f783eff8fd1d6a39694568b4118f358e4011fb0fc2b66667029e6037cae"
+  },
+  "ssh_client_drop_probe.rs": {
+    "bytes": 3784,
+    "sha256": "6d4d2cfcd3835f4363e08025721840b37cf6c685728ec81a4fb70267bae32833"
+  },
+  "terminal.log.gz": {
+    "bytes": 4484,
+    "sha256": "35595fb84c103dbb8737156710c5d4d6522333197742e2505ca98b6f345c3a08"
+  },
+  "transport.log.gz": {
+    "bytes": 1331,
+    "sha256": "3ef37a1bf7423011a3fdf8f89867b281e7804a3c30f0485f736357937a613e7d"
+  }
+}

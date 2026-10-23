@@ -1,0 +1,8 @@
+{
+  "command": [
+    "python3",
+    "docs/qa/assets/local-0.18.0-rebuild2-20261023/local-bundle.py"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 5.389
+}

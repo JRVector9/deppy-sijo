@@ -1,0 +1,19 @@
+{
+  "command": [
+    "cargo",
+    "test",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "--bin",
+    "deppy-sijo",
+    "grok_usage::tests::grok_실측_프로브는_민감한_원문_없이_끝난다",
+    "--",
+    "--ignored",
+    "--exact",
+    "--test-threads=1"
+  ],
+  "exit_code": 0,
+  "seconds": 9.151
+}

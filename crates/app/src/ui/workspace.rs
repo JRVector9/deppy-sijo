@@ -16,6 +16,9 @@ use terminal::{TerminalViewportSnapshot, input_mapper, renderer_egui};
 use super::format_bytes;
 use crate::config::TerminalConfig;
 
+#[path = "workspace_terminal_path.rs"]
+mod terminal_path;
+
 /// 경로 해석 캐시 TTL. 실제 filesystem/process 조회는 App host가 수행한다.
 const PATH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
 const RESIZE_VIEWPORT_QUIET: std::time::Duration = std::time::Duration::from_millis(32);
@@ -2026,6 +2029,8 @@ pub struct WorkspaceUi {
     protocol_inflight: HashMap<(WorkspaceProtocolOperation, u64), PendingProtocolIntent>,
     protocol_retry_at: Option<std::time::Instant>,
     pending_path_resolution: Option<PendingPathResolution>,
+    /// A real file click survives hover movement until its exact host resolution completes.
+    pending_terminal_path_activation: Option<PendingPathResolution>,
     /// 직전 폴더 클릭 (경로, 시각) — 더블클릭이 clicked를 두 번 발화시켜 같은 cd가
     /// 연속 주입되는 것을 막는다.
     last_dir_click: Option<(std::path::PathBuf, std::time::Instant)>,
@@ -2495,6 +2500,7 @@ pub enum WorkspaceIoCompletion {
     OpenUrlFailed,
 }
 
+#[derive(Clone)]
 struct PendingPathResolution {
     operation: WorkspaceIoOperation,
     generation: u64,
@@ -2952,6 +2958,12 @@ impl SessionView {
     }
 
     fn install_snapshot(&mut self, snapshot: Arc<TerminalViewportSnapshot>) {
+        // Selection freeze can replace multiple pending snapshots without
+        // advancing snapshot_gen. Their last dirty delta cannot update cached
+        // rows from before the freeze, even when a fresh event wins promotion.
+        if self.pending_snapshot.is_some() {
+            self.render_cache.clear();
+        }
         self.summary = last_line_summary(&snapshot);
         self.snapshot = Some(snapshot);
         self.snapshot_gen = self.snapshot_gen.wrapping_add(1);
@@ -3210,6 +3222,7 @@ impl WorkspaceUi {
             protocol_inflight: HashMap::with_capacity(WORKSPACE_PROTOCOL_CAP),
             protocol_retry_at: None,
             pending_path_resolution: None,
+            pending_terminal_path_activation: None,
             last_dir_click: None,
             last_url_click: None,
             last_text_paste: None,
@@ -3296,6 +3309,7 @@ impl WorkspaceUi {
     /// App이 보류 중인 포커스 대상이 stale임을 확인했거나 더 최신 네비게이션을 받았을 때
     /// 존재하지 않는 pane이 터미널 입력을 독점하지 않도록 예약을 취소한다.
     pub(crate) fn cancel_terminal_focus(&mut self) {
+        self.cancel_terminal_path_activation();
         self.pending_focus = None;
         self.explicit_pending_focus = None;
         self.explicit_pending_focus_observed = false;
@@ -4530,6 +4544,36 @@ impl WorkspaceUi {
                         PathClick::OpenFile(resolved.path.into_path())
                     }
                 });
+                let activate =
+                    self.pending_terminal_path_activation
+                        .as_ref()
+                        .is_some_and(|activation| {
+                            activation.operation == pending.operation
+                                && activation.generation == pending.generation
+                                && activation.session == pending.session
+                                && activation.word == pending.word
+                        });
+                if activate {
+                    self.pending_terminal_path_activation = None;
+                    let current_session = self.mux.as_deref().and_then(|mux| {
+                        let pane = self.pending_focus.as_ref().or(mux.focused_pane.as_ref())?;
+                        mux.tabs
+                            .iter()
+                            .flat_map(|tab| &tab.panes)
+                            .find(|candidate| &candidate.id == pane)
+                            .and_then(|candidate| candidate.session_id)
+                    });
+                    if current_session == Some(pending.session)
+                        && self.sessions.get(&pending.session).is_some_and(|view| {
+                            view.snapshot
+                                .as_ref()
+                                .is_some_and(|snapshot| !snapshot.is_alt_screen)
+                        })
+                        && let Some(PathClick::OpenFile(path)) = &result
+                    {
+                        self.request_open_path(path.clone());
+                    }
+                }
                 self.path_click_cache = Some((
                     pending.session,
                     pending.word,
@@ -4692,6 +4736,30 @@ impl WorkspaceUi {
                 WorkspaceIoErrorCode::Busy => WorkspaceNativeError::Busy,
                 _ => WorkspaceNativeError::PathRejected,
             });
+        }
+    }
+
+    /// App calls this before leaving a workspace or changing the terminal input owner.
+    pub(crate) fn cancel_terminal_path_activation(&mut self) {
+        self.pending_terminal_path_activation = None;
+        self.io_intents
+            .retain(|intent| !matches!(intent, WorkspaceIoIntent::OpenPath(_)));
+    }
+
+    fn activate_terminal_path(&mut self, session: SessionId, word: &str) {
+        self.cancel_terminal_path_activation();
+        match self.resolve_path_cached(session, word) {
+            Some(PathClick::OpenFile(path)) => self.request_open_path(path),
+            Some(PathClick::Dir(_)) => {}
+            None => {
+                if let Some(pending) = &self.pending_path_resolution
+                    && pending.session == session
+                    && pending.generation == self.io_generation
+                    && pending.word == word
+                {
+                    self.pending_terminal_path_activation = Some(pending.clone());
+                }
+            }
         }
     }
 
@@ -5154,6 +5222,10 @@ impl WorkspaceUi {
         {
             return None;
         }
+        // Preview movement cannot replace an unresolved explicit click or its queued query.
+        if self.pending_terminal_path_activation.is_some() {
+            return None;
+        }
         let Ok(word) = bounded_path_word(word) else {
             return None;
         };
@@ -5187,6 +5259,7 @@ impl WorkspaceUi {
     }
 
     fn invalidate_path_resolution(&mut self) {
+        self.cancel_terminal_path_activation();
         self.io_generation = self.io_generation.wrapping_add(1).max(1);
         self.path_click_cache = None;
         self.pending_path_resolution = None;
@@ -7870,7 +7943,7 @@ impl WorkspaceUi {
             }
             // 선택이 없으면(freeze 해제) freeze 중 보관한 최신본으로 catch-up한다 — 새
             // Viewport가 안 와도 화면이 선택 당시에 멈추지 않게(codex).
-            if !selected && let Some(pending) = view.pending_snapshot.take() {
+            if !selected && let Some(pending) = view.pending_snapshot.clone() {
                 view.install_snapshot(pending);
             }
             let Some(snapshot) = view.snapshot.clone() else {
@@ -8166,18 +8239,47 @@ impl WorkspaceUi {
                     as usize;
                 row * snapshot.cols as usize + col
             };
-            // 폴더/URL hover·단일 클릭 — 이동 가능한 폴더 단어 위에서는 커서를 손가락으로
-            // 바꾸고 클릭하면 그 폴더로 cd, URL 위에서는 클릭하면 기본 브라우저로 연다
-            // (2026-07-14/2026-07-17 사용자). 파일은 커서를 바꾸지 않는다(복사용 선택과
-            // 혼동 방지 — 열기는 우클릭 메뉴). alt screen(TUI)은 cd 주입 금지라 통째로 비활성.
+            // A new gesture supersedes an unresolved file click. Hover alone does not.
+            if output.response.drag_started()
+                || ui.input(|input| input.pointer.button_pressed(egui::PointerButton::Primary))
+            {
+                self.cancel_terminal_path_activation();
+            }
+            // Files share the existing host resolver and deferred OpenPath lane. The helper
+            // recovers paths spanning visible rows; ordinary URL/folder words retain their
+            // existing behavior. Alternate-screen applications keep ownership of their UI.
             if mode.is_local()
                 && !snapshot.is_alt_screen
                 && let Some(pos) = output.response.hover_pos()
-                && let Some((s, e)) = word_range_at(&snapshot, cell_at(pos))
+                && let Some(candidate) = terminal_path::candidate_at(
+                    snapshot.cols as usize,
+                    snapshot.visible_cells.len(),
+                    cell_at(pos),
+                    |index| {
+                        let cell = snapshot.visible_cells[index];
+                        if cell.wide_spacer() {
+                            if snapshot.is_trailing_wide_spacer(index) {
+                                terminal_path::PathCell::Continuation
+                            } else {
+                                terminal_path::PathCell::WrapFiller
+                            }
+                        } else {
+                            terminal_path::PathCell::Glyph(cell.c, snapshot.cell_grapheme(index))
+                        }
+                    },
+                )
+                .or_else(|| {
+                    let (start, end) = word_range_at(&snapshot, cell_at(pos))?;
+                    Some(terminal_path::PathCandidate {
+                        word: renderer_egui::selection_text(&snapshot, start, end),
+                        start,
+                        end,
+                    })
+                })
             {
-                let word = renderer_egui::selection_text(&snapshot, s, e);
+                let word = &candidate.word;
                 // URL은 cwd 해석이 필요 없는 문자열 판정이라 폴더보다 먼저 본다.
-                if let Some(url) = extract_url(&word) {
+                if let Some(url) = extract_url(word) {
                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                     if terminal_primary_pointer_clicked(&output.response) && surface_focused {
                         // 더블클릭이 clicked를 두 번 발화 — 같은 URL 연속 열기를 막는다
@@ -8190,38 +8292,71 @@ impl WorkspaceUi {
                             self.request_open_url(url);
                         }
                     }
-                } else if matches!(
-                    self.resolve_path_cached(session, &word),
-                    Some(PathClick::Dir(_))
-                ) {
-                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                    // 포커스된 pane에서만 cd — 비포커스 pane을 포커스하려는 클릭이
-                    // cd까지 주입하면 안 된다 (codex 리뷰 MEDIUM). 첫 클릭은 포커스만,
-                    // 포커스된 뒤의 클릭이 이동한다.
-                    if terminal_primary_pointer_clicked(&output.response) && surface_focused {
-                        // 실제 경로 판정은 App host가 완료한 immutable cache만 사용한다.
-                        // cwd가 바뀌면 set_session_cwds가 pending/cache를 무효화한다.
-                        if let Some(PathClick::Dir(path)) = self.resolve_path_cached(session, &word)
-                        {
-                            // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
-                            let duplicate = self.last_dir_click.as_ref().is_some_and(|(p, at)| {
-                                *p == path && at.elapsed() < std::time::Duration::from_millis(800)
-                            });
-                            if !duplicate {
-                                self.last_dir_click =
-                                    Some((path.clone(), std::time::Instant::now()));
-                                // file tree의 "이 폴더로 이동"과 같은 헬퍼 — 셸별
-                                // cd 문법/인용(PowerShell -LiteralPath, cmd /d)을 공유.
-                                let bytes = cd_paste_bytes(
-                                    &path,
-                                    self.session_shell_kind(session),
-                                    bracketed,
+                } else {
+                    let clicked = terminal_primary_pointer_clicked(&output.response)
+                        && !output.response.double_clicked()
+                        && !output.response.triple_clicked()
+                        && surface_focused;
+                    match self.resolve_path_cached(session, word) {
+                        Some(PathClick::OpenFile(_)) => {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            let cols = snapshot.cols as usize;
+                            let painter = ui.painter_at(output.response.rect);
+                            for row in candidate.start / cols..=candidate.end / cols {
+                                let first = candidate.start.max(row * cols) % cols;
+                                let last = candidate.end.min((row + 1) * cols - 1) % cols + 1;
+                                let y =
+                                    output.origin.y + (row as f32 + 1.0) * output.cell_size.y - 1.0;
+                                painter.line_segment(
+                                    [
+                                        egui::pos2(
+                                            output.origin.x + first as f32 * output.cell_size.x,
+                                            y,
+                                        ),
+                                        egui::pos2(
+                                            output.origin.x + last as f32 * output.cell_size.x,
+                                            y,
+                                        ),
+                                    ],
+                                    egui::Stroke::new(1.0, ui.visuals().hyperlink_color),
                                 );
-                                self.send(RuntimeCommand::WriteInput { session, bytes });
-                                // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
-                                self.invalidate_path_resolution();
+                            }
+                            if clicked {
+                                self.activate_terminal_path(session, word);
                             }
                         }
+                        Some(PathClick::Dir(path)) => {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            // An unfocused pane's first click only focuses it.
+                            if clicked {
+                                // 더블클릭은 clicked를 두 번 발화 — 같은 경로 연속 cd를 막는다.
+                                let duplicate =
+                                    self.last_dir_click.as_ref().is_some_and(|(p, at)| {
+                                        *p == path
+                                            && at.elapsed() < std::time::Duration::from_millis(800)
+                                    });
+                                if !duplicate {
+                                    self.last_dir_click =
+                                        Some((path.clone(), std::time::Instant::now()));
+                                    // file tree의 "이 폴더로 이동"과 같은 헬퍼 — 셸별
+                                    // cd 문법/인용(PowerShell -LiteralPath, cmd /d)을 공유.
+                                    let bytes = cd_paste_bytes(
+                                        &path,
+                                        self.session_shell_kind(session),
+                                        bracketed,
+                                    );
+                                    self.send(RuntimeCommand::WriteInput { session, bytes });
+                                    // cd로 셸 cwd가 바뀐다 — 방금 만든 해석 캐시도 무효.
+                                    self.invalidate_path_resolution();
+                                }
+                            }
+                        }
+                        None if clicked => {
+                            // A first click is retained until this exact session/op/generation
+                            // has been checked. A directory result never becomes a file open.
+                            self.activate_terminal_path(session, word);
+                        }
+                        None => {}
                     }
                 }
             }
@@ -8245,7 +8380,7 @@ impl WorkspaceUi {
                 // 살리기로 한 사용자 결정이다(2026-08-18).
                 //
                 // URL 열기는 단일 클릭(위 hover/click 블록)이 담당한다 — 여기서도 열면
-                // 이중 발화된다(2026-07-17). 파일 열기는 우클릭 메뉴, 폴더 진입은 단일 클릭.
+                // 이중 발화된다(2026-07-17). 파일·폴더의 클릭도 위 분기만 담당한다.
                 if let Some((s, e)) = line_range_at(&snapshot, cell_at(pos)) {
                     self.selection = Some((session, s, e));
                 }
@@ -8286,7 +8421,7 @@ impl WorkspaceUi {
                     if view.pending_snapshot.as_ref().is_some_and(|p| {
                         (p.cols, p.rows) == (snapshot.cols, snapshot.rows)
                             && p.scroll_offset != snapshot.scroll_offset
-                    }) && let Some(pending) = view.pending_snapshot.take()
+                    }) && let Some(pending) = view.pending_snapshot.clone()
                     {
                         // scroll_offset 증가(과거로) = 내용이 아래로 이동 → 앵커도 아래로
                         let delta_rows = pending.scroll_offset - snapshot.scroll_offset;
@@ -8296,9 +8431,7 @@ impl WorkspaceUi {
                             snapshot.cols as usize,
                             snapshot.rows as usize,
                         );
-                        view.summary = last_line_summary(&pending);
-                        view.snapshot = Some(pending);
-                        view.snapshot_gen = view.snapshot_gen.wrapping_add(1);
+                        view.install_snapshot(pending);
                     }
                 }
                 self.selection = Some((session, anchor, cell_at(pos)));
@@ -10039,6 +10172,11 @@ impl WorkspaceUi {
     }
 
     fn begin_terminal_refocus(&mut self, pane: runtime::MuxPaneId) {
+        if self.mux.as_deref().is_none_or(|mux| {
+            self.pending_focus.as_ref().or(mux.focused_pane.as_ref()) != Some(&pane)
+        }) {
+            self.cancel_terminal_path_activation();
+        }
         self.pending_focus = Some(pane);
         if let Some(deferred) = self.pending_ime_submit.take() {
             if deferred.preedit_at_submit.is_empty() {
@@ -11222,6 +11360,7 @@ fn visible_split_contains_session(snapshot: &MuxSnapshot, session: SessionId) ->
 mod tests {
     include!("../workspace_ui_test_support/workspace_table_resize_tests.rs");
     include!("../workspace_ui_test_support/workspace_application_wheel_tests.rs");
+    include!("../workspace_ui_test_support/workspace_terminal_path_tests.rs");
 
     #[test]
     fn pr2_selected_text_keeps_captured_owner_and_bounded_no_submit_intent() {
@@ -19201,6 +19340,172 @@ mod tests {
 
     fn snapshot(text: &str) -> Arc<TerminalViewportSnapshot> {
         shaped_snapshot(12, 2, text)
+    }
+
+    fn dirty_history_snapshot(
+        text: &str,
+        dirty: std::ops::Range<usize>,
+    ) -> Arc<TerminalViewportSnapshot> {
+        let mut snapshot = shaped_snapshot(10, 3, text);
+        Arc::make_mut(&mut snapshot).dirty_ranges = vec![terminal::CellRange {
+            start: dirty.start,
+            end: dirty.end,
+        }];
+        snapshot
+    }
+
+    fn paint_dirty_history_workspace(ctx: &egui::Context, workspace: &mut WorkspaceUi) -> String {
+        let output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            workspace.show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), true);
+        });
+        let text = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("|");
+        output.drop_without_applying_deltas();
+        text
+    }
+
+    fn dirty_history_workspace() -> (WorkspaceUi, SessionId) {
+        let session = SessionId(7);
+        let mut workspace = WorkspaceUi::new();
+        workspace.mux = Some(mux(
+            "primary",
+            vec![tab(
+                "primary",
+                vec![pane("pane", session)],
+                LayoutNode::Pane(pane_id("pane")),
+            )],
+            "pane",
+        ));
+        workspace
+            .sessions
+            .entry(session)
+            .or_default()
+            .install_snapshot(dirty_history_snapshot("OLD0      OLD1", 0..30));
+        (workspace, session)
+    }
+
+    #[test]
+    fn terminal_dirty_history_survives_selection_freeze_catch_up() {
+        // A fresh event can arrive after deselection but before the next draw;
+        // both that path and direct pending promotion must retain all changes.
+        for fresh_before_draw in [false, true] {
+            let (mut workspace, session) = dirty_history_workspace();
+            let ctx = egui::Context::default();
+            paint_dirty_history_workspace(&ctx, &mut workspace);
+            paint_dirty_history_workspace(&ctx, &mut workspace);
+            assert_eq!(
+                workspace.sessions[&session]
+                    .render_cache
+                    .rebuilt_rows_last_frame(),
+                0
+            );
+            let frozen_generation = workspace.sessions[&session].snapshot_gen;
+            workspace.selection = Some((session, 0, 3));
+            for snapshot in [
+                dirty_history_snapshot("NEW0      OLD1", 0..10),
+                dirty_history_snapshot("NEW0      NEW1", 10..20),
+            ] {
+                workspace.handle_events(
+                    &[RuntimeEvent::Viewport {
+                        session,
+                        snapshot,
+                        bracketed_paste: false,
+                    }],
+                    &catalog(),
+                );
+            }
+            let frozen = paint_dirty_history_workspace(&ctx, &mut workspace);
+            assert!(
+                frozen.contains("OLD0") && frozen.contains("OLD1"),
+                "{frozen:?}"
+            );
+            assert_eq!(workspace.sessions[&session].snapshot_gen, frozen_generation);
+            assert_eq!(
+                workspace.sessions[&session]
+                    .render_cache
+                    .rebuilt_rows_last_frame(),
+                0
+            );
+            workspace.clear_selection(session);
+            if fresh_before_draw {
+                workspace.handle_events(
+                    &[RuntimeEvent::Viewport {
+                        session,
+                        snapshot: dirty_history_snapshot("NEW0      NEW1", 20..30),
+                        bracketed_paste: false,
+                    }],
+                    &catalog(),
+                );
+            }
+            let caught_up = paint_dirty_history_workspace(&ctx, &mut workspace);
+            assert!(
+                caught_up.contains("NEW0") && caught_up.contains("NEW1"),
+                "{caught_up:?}"
+            );
+            assert!(
+                !caught_up.contains("OLD0") && !caught_up.contains("OLD1"),
+                "{caught_up:?}"
+            );
+            assert!(workspace.sessions[&session].pending_snapshot.is_none());
+            paint_dirty_history_workspace(&ctx, &mut workspace);
+            assert_eq!(
+                workspace.sessions[&session]
+                    .render_cache
+                    .rebuilt_rows_last_frame(),
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_dirty_history_survives_home_fleet_events_without_rendering() {
+        let (mut workspace, session) = dirty_history_workspace();
+        let ctx = egui::Context::default();
+        paint_dirty_history_workspace(&ctx, &mut workspace);
+        paint_dirty_history_workspace(&ctx, &mut workspace);
+        let rendered_generation = workspace.sessions[&session].snapshot_gen;
+        for snapshot in [
+            dirty_history_snapshot("NEW0      OLD1", 0..10),
+            dirty_history_snapshot("NEW0      NEW1", 10..20),
+        ] {
+            workspace.update_hidden_with_native_input(
+                &ctx,
+                &[RuntimeEvent::Viewport {
+                    session,
+                    snapshot,
+                    bracketed_paste: false,
+                }],
+                &catalog(),
+                crate::native_key_monitor::NativeKeyDownBatch::default,
+            );
+        }
+        assert_eq!(
+            workspace.sessions[&session].snapshot_gen,
+            rendered_generation + 2
+        );
+        let caught_up = paint_dirty_history_workspace(&ctx, &mut workspace);
+        assert!(
+            caught_up.contains("NEW0") && caught_up.contains("NEW1"),
+            "{caught_up:?}"
+        );
+        assert!(
+            !caught_up.contains("OLD0") && !caught_up.contains("OLD1"),
+            "{caught_up:?}"
+        );
+        paint_dirty_history_workspace(&ctx, &mut workspace);
+        assert_eq!(
+            workspace.sessions[&session]
+                .render_cache
+                .rebuilt_rows_last_frame(),
+            0
+        );
     }
 
     fn shaped_snapshot(cols: usize, rows: usize, text: &str) -> Arc<TerminalViewportSnapshot> {

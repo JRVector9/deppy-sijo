@@ -1,0 +1,16 @@
+{
+  "binary": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deppy-remote-host",
+  "version": "deppy-remote-host 0.17.0",
+  "home": "/private/tmp/dpsh-review-3y2qxwo_",
+  "bridge_pid": 69438,
+  "supervisor_pid": 69439,
+  "rpc": "ReadFile blob.txt (128 KiB)",
+  "stdin_closed_with_stdout_reader_open": true,
+  "elapsed_after_pressure_secs": 7.36,
+  "supervisor_socket_exists": true,
+  "bridge_still_running_without_stdout_consumer": true,
+  "drained_bytes_to_release": 73728,
+  "bridge_exit_after_stdout_drain": 0,
+  "release_secs": 0.001,
+  "stderr": ""
+}

@@ -103,12 +103,17 @@ pub struct SshServerConfig {
 }
 
 impl SshServerConfig {
+    /// Detached PTYs survive a normal week away from the client. Expiration is
+    /// measured by the remote supervisor, independently of the Mac's sleep.
+    pub const DEFAULT_LEASE_TTL_SECS: u32 = 7 * 24 * 60 * 60;
+    pub const MAX_LEASE_TTL_SECS: u32 = 30 * 24 * 60 * 60;
+
     pub fn new(identity: SshTargetIdentity, runtime_instance: String) -> Self {
         Self {
             identity,
             runtime_instance,
             lease: uuid::Uuid::new_v4().to_string(),
-            lease_ttl_secs: 300,
+            lease_ttl_secs: Self::DEFAULT_LEASE_TTL_SECS,
             require_resume: false,
         }
     }
@@ -130,6 +135,10 @@ impl SshServerConfig {
             .map_err(|_| SshHandshakeError::InvalidRequest)?;
         anyhow::ensure!(
             hello.connection_generation > 0,
+            SshHandshakeError::InvalidRequest
+        );
+        anyhow::ensure!(
+            (1..=Self::MAX_LEASE_TTL_SECS).contains(&self.lease_ttl_secs),
             SshHandshakeError::InvalidRequest
         );
         anyhow::ensure!(
@@ -281,6 +290,36 @@ mod tests {
             error.downcast_ref::<SshHandshakeError>(),
             Some(&SshHandshakeError::ProtocolMismatch)
         );
+    }
+
+    #[test]
+    fn ssh_stream_default_detached_lease_survives_a_week_away() {
+        let config = SshServerConfig::new(identity(), "runtime-a".into());
+        let hello = config
+            .negotiate(&SshClientHello::new(identity(), 1))
+            .unwrap();
+        assert_eq!(hello.lease_ttl_secs, 7 * 24 * 60 * 60);
+    }
+
+    #[test]
+    fn ssh_stream_server_rejects_detached_leases_outside_one_second_to_thirty_days() {
+        let mut config = SshServerConfig::new(identity(), "runtime-a".into());
+        let hello = SshClientHello::new(identity(), 1);
+        for seconds in [1, 7 * 24 * 60 * 60, 30 * 24 * 60 * 60] {
+            config.lease_ttl_secs = seconds;
+            assert_eq!(config.negotiate(&hello).unwrap().lease_ttl_secs, seconds);
+        }
+        for seconds in [0, 30 * 24 * 60 * 60 + 1, u32::MAX] {
+            config.lease_ttl_secs = seconds;
+            assert_eq!(
+                config
+                    .negotiate(&hello)
+                    .err()
+                    .unwrap()
+                    .downcast_ref::<SshHandshakeError>(),
+                Some(&SshHandshakeError::InvalidRequest)
+            );
+        }
     }
 
     #[test]

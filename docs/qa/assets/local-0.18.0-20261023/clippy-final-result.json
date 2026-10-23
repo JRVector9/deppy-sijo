@@ -1,0 +1,24 @@
+{
+  "command": [
+    "cargo",
+    "clippy",
+    "--offline",
+    "--locked",
+    "-p",
+    "deppy-sijo",
+    "-p",
+    "runtime",
+    "-p",
+    "terminal",
+    "-p",
+    "deppy-remote-host",
+    "-p",
+    "ssh-transport",
+    "--all-targets",
+    "--",
+    "-D",
+    "warnings"
+  ],
+  "exit_code": 0,
+  "elapsed_seconds": 55.947
+}

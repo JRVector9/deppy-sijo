@@ -1,0 +1,7 @@
+{
+  "provider": "grok",
+  "exit_code": 0,
+  "result": "provider=grok result=Ok(None) elapsed_ms=25289",
+  "stderr_present": false,
+  "elapsed_seconds": 25.63
+}

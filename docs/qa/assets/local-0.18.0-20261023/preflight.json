@@ -1,0 +1,396 @@
+{
+  "base_head": "a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1",
+  "old_version": "0.17.0",
+  "new_version": "0.18.0",
+  "bundle_inventory": [
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.14.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.14.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.15.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-command-center-20261020/target/bundle-0.15.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.15.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.13.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle-0.12.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.12.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle-0.13.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.13.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ime-cloud-20261015/target/bundle-0.13.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.13.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.16.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.17.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.17.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.11.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.2.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.3.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.3.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.10/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.10"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.11/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.11"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.7/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.7"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.8/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.8"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.4.9/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.9"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.5.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.6.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.6.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-main-workspace-menu-20261022/target/bundle-0.7.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.7.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.11.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.2.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.3.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.3.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.10/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.10"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.11/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.11"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.7/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.7"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.8/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.8"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.4.9/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.9"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.5.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.6.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.6.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-performance/target/bundle-0.7.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.7.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.11.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.2.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.2.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.3.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.3.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.10/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.10"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.11/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.11"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.6/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.6"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.7/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.7"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.8/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.8"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.4.9/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.4.9"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.2/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.2"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.3/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.3"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.4/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.4"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.5.5/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.5.5"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.6.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.0"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.6.1/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.6.1"
+    },
+    {
+      "path": "/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/bundle-0.7.0/Deppy Sijo.app/Contents/Info.plist",
+      "version": "0.7.0"
+    }
+  ],
+  "verified_prior_qa_source_files": 19,
+  "restart_authorized": false,
+  "running_app_pid_before": 31144,
+  "reason": "SSH automatic resume and longer lease, terminal path links and rendering/archive fixes; launcher size transition fix",
+  "release_kind": "signed local developer build, debug profile"
+}

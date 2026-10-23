@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.19.1] - 2026-10-24
+
+- Patch ctutils, rustls-webpki and webpki-roots for the three current RustSec advisories without changing other dependency versions or suppressing the audit.
+- Preserve historical worktree documents and mockups in an explicitly archived main collection; commit the originals without merging unrelated legacy product code.
+- Local corrected developer rebuild; app restart requires a separate explicit request.
+
 ## [0.19.0] - 2026-10-24
 
 - Add direct project API registration from Notes and terminal menus with a compact key editor and explicit metadata reload.

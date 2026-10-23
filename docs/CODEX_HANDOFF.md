@@ -1,3 +1,30 @@
+# Main integration — 2026-10-24
+
+## Current objective / result
+
+User explicitly requested “main에 병합해”. In the canonical integration-20261023 tree, switched to the unbound local `main` and ran `git merge --ff-only fix/product-review-integration-20261023` successfully. Local main was bc950e88; latest fetched origin/main was f78ebb69. The reviewed source branch ba1c8d314a7ff33463e090007412abdba0f4b326 contains both, with no origin/main-only commits. Entire source branch (201 accumulated commits relative to origin/main) is now in local main; this documentation commit is the only addition after the fast-forward. Next operation is a normal push of main and verification of exact remote HEAD/clean working tree. No force-push, source conflict resolution or branch deletion.
+
+## Verification and limits
+
+- Source SHA25648 files matches final reviewed/tested source after switching/fast-forward. Provider usage --check-only and gitdiffcheck actually PASS again this task. No product source changed during integration, so previous5359 normalPASS/56ignored remains the source evidence; no new full test rerun claimed.
+- GitHub main is unprotected; no existing PR for this source branch, no branch CI runs (workflows run for PR/main). Main push triggers build/test and dependency-security workflows. CI result is separate from successful Git integration and must not be reported PASS before completion.
+- Only merging source was requested. No application launch/stop/restart, local release build or deployment performed. Source version0.18.0; any later changed delivered app must bump above latest shipped0.18.0 and verify binary/bundle versions.
+- Canonical path remains `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, now on `main` tracking `origin/main`. Previous task branch remains available. Original nominal tree and other preserved worktrees unchanged. Previous cleanup backups are retained as recorded below.
+
+## Exact next-agent commands
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git log -3 --oneline
+git ls-remote origin refs/heads/main
+git rev-list --left-right --count origin/main...fix/product-review-integration-20261023
+python3 scripts/verify-provider-usage.py --check-only
+# After push, feature-branch-only count must be0. Do not restart automatically.
+```
+
+---
+
 # Completed commit/push and legacy-folder cleanup — 2026-10-24
 
 ## Current objective / result

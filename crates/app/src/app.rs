@@ -10532,6 +10532,10 @@ const SSH_WORKSPACE_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::fr
 const SSH_WORKSPACE_CLOSE_MAX: usize = 9;
 const SSH_WORKSPACE_CLOSE_BATCH: usize = 64;
 enum SshProviderAction {
+    TerminalClipboard {
+        owner: crate::ssh_clipboard::Owner,
+        upload: crate::ssh_clipboard::Upload,
+    },
     Directory {
         operation: ui::file_tree::FileTreeMaintenanceOperation,
         generation: u64,
@@ -13664,6 +13668,7 @@ fn apply_aux_search_action(
 }
 
 enum AppHostIoAction {
+    RemoteTerminalClipboard(crate::ssh_clipboard::Owner),
     Connector(connector_service::HostAction),
     Workspace {
         workspace_id: String,
@@ -14279,6 +14284,10 @@ fn cancel_pending_workspace_clone_result(
 }
 
 enum AppHostIoCompletion {
+    RemoteTerminalClipboard {
+        owner: crate::ssh_clipboard::Owner,
+        result: Result<crate::ssh_clipboard::ReadResult, ui::workspace::WorkspaceIoErrorCode>,
+    },
     Dispatch(connector_contract::ConnectorIntent),
     Workspace {
         workspace_id: String,
@@ -14317,6 +14326,7 @@ enum AppHostIoCompletion {
 
 #[derive(Clone)]
 enum AppHostIoFallback {
+    RemoteTerminalClipboard(Box<crate::ssh_clipboard::Owner>),
     Import {
         operation_id: connector_contract::OperationId,
         source: connector_contract::ImportSource,
@@ -14381,6 +14391,9 @@ enum AppHostIoFallback {
 impl AppHostIoFallback {
     fn for_action(action: &AppHostIoAction) -> Self {
         match action {
+            AppHostIoAction::RemoteTerminalClipboard(owner) => {
+                Self::RemoteTerminalClipboard(Box::new(owner.clone()))
+            }
             AppHostIoAction::Connector(connector_service::HostAction::RequestImportSource {
                 operation_id,
                 source,
@@ -14488,6 +14501,10 @@ impl AppHostIoFallback {
 
     fn into_completion(self) -> AppHostIoCompletion {
         match self {
+            Self::RemoteTerminalClipboard(owner) => AppHostIoCompletion::RemoteTerminalClipboard {
+                owner: *owner,
+                result: Err(ui::workspace::WorkspaceIoErrorCode::NativeFailure),
+            },
             Self::Import {
                 operation_id,
                 source,
@@ -16215,6 +16232,12 @@ fn run_app_host_io(
     cancel: &std::sync::atomic::AtomicBool,
 ) -> AppHostIoCompletion {
     match action {
+        AppHostIoAction::RemoteTerminalClipboard(owner) => {
+            AppHostIoCompletion::RemoteTerminalClipboard {
+                owner,
+                result: crate::ssh_clipboard::read(),
+            }
+        }
         AppHostIoAction::Workspace {
             workspace_id,
             runtime_instance,
@@ -17469,6 +17492,34 @@ impl App {
     ) {
         use crate::ssh_workspace_files::RemoteListingProgress;
         match action {
+            SshProviderAction::TerminalClipboard { owner, mut upload } => {
+                if workspace != owner.workspace_id || !self.remote_clipboard_owner_current(&owner) {
+                    return;
+                }
+                let pending = self
+                    .runtime_by_instance(owner.runtime_instance)
+                    .is_some_and(|runtime| {
+                        runtime
+                            .workspace_ui
+                            .terminal_clipboard_pending(owner.operation, owner.generation)
+                    });
+                if !pending {
+                    return;
+                }
+                let result = reply
+                    .ok_or(ui::workspace::WorkspaceIoErrorCode::NativeFailure)
+                    .and_then(|(_, reply)| upload.accept(reply, &owner.target.remote_workspace_id));
+                match result {
+                    Ok(None) => self.queue_ssh_rpc(
+                        workspace,
+                        upload.request(),
+                        SshProviderAction::TerminalClipboard { owner, upload },
+                    ),
+                    Ok(Some(payload)) => self.complete_remote_clipboard(owner, Ok(payload)),
+                    Err(error) => self.complete_remote_clipboard(owner, Err(error)),
+                }
+            }
+
             SshProviderAction::Directory {
                 operation,
                 generation,
@@ -17630,6 +17681,33 @@ impl App {
         }
         Ok(())
     }
+    fn remote_clipboard_owner_current(&self, owner: &crate::ssh_clipboard::Owner) -> bool {
+        self.runtime_by_instance(owner.runtime_instance)
+            .is_some_and(|runtime| runtime.id == owner.workspace_id && runtime.runtime.is_remote())
+            && matches!(self.workspace_targets.get(&owner.workspace_id),
+                Some(WorkspaceTarget::Ssh(target)) if target == &owner.target)
+    }
+    fn complete_remote_clipboard(
+        &mut self,
+        owner: crate::ssh_clipboard::Owner,
+        result: Result<
+            ui::workspace::TerminalClipboardPayload,
+            ui::workspace::WorkspaceIoErrorCode,
+        >,
+    ) {
+        if !self.remote_clipboard_owner_current(&owner) {
+            return;
+        }
+        self.apply_app_host_completion(AppHostIoCompletion::Workspace {
+            workspace_id: owner.workspace_id,
+            runtime_instance: owner.runtime_instance,
+            completion: ui::workspace::WorkspaceIoCompletion::TerminalClipboardRead {
+                operation: owner.operation,
+                generation: owner.generation,
+                result,
+            },
+        });
+    }
     fn route_ssh_host_action(&mut self, action: AppHostIoAction) -> Option<AppHostIoAction> {
         // Local host effects are gated by the action owner, rather than its displayed path.
         let remote = match &action {
@@ -17669,6 +17747,28 @@ impl App {
             return Some(action);
         }
         match action {
+            AppHostIoAction::Workspace {
+                workspace_id,
+                runtime_instance,
+                intent:
+                    ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
+                        operation,
+                        generation,
+                    },
+            } => {
+                if let Some(provider) = self.remote_provider(&workspace_id) {
+                    let owner = crate::ssh_clipboard::Owner {
+                        workspace_id,
+                        runtime_instance,
+                        target: provider.target().clone(),
+                        operation,
+                        generation,
+                    };
+                    if self.remote_clipboard_owner_current(&owner) {
+                        return Some(AppHostIoAction::RemoteTerminalClipboard(owner));
+                    }
+                }
+            }
             AppHostIoAction::FileTreeMaintenance(intent) => {
                 match intent.request {
                     ui::file_tree::FileTreeMaintenanceRequest::ListDirectory {
@@ -17750,6 +17850,43 @@ impl App {
     )]
     fn apply_app_host_completion(&mut self, completion: AppHostIoCompletion) {
         match completion {
+            AppHostIoCompletion::RemoteTerminalClipboard { owner, result } => {
+                if !self.remote_clipboard_owner_current(&owner) {
+                    return;
+                }
+                match result {
+                    Ok(crate::ssh_clipboard::ReadResult::Text(payload)) => {
+                        self.complete_remote_clipboard(owner, Ok(payload))
+                    }
+                    Ok(crate::ssh_clipboard::ReadResult::Images(upload)) => {
+                        if self.ssh_pending_rpc.values().any(|pending| {
+                            matches!(pending.action, SshProviderAction::TerminalClipboard { .. })
+                        }) {
+                            self.complete_remote_clipboard(
+                                owner,
+                                Err(ui::workspace::WorkspaceIoErrorCode::Busy),
+                            );
+                            return;
+                        }
+                        let current = self
+                            .runtime_by_instance_mut(owner.runtime_instance)
+                            .is_some_and(|runtime| {
+                                runtime.workspace_ui.begin_remote_clipboard_transfer(
+                                    owner.operation,
+                                    owner.generation,
+                                )
+                            });
+                        if current {
+                            self.queue_ssh_rpc(
+                                owner.workspace_id.clone(),
+                                upload.request(),
+                                SshProviderAction::TerminalClipboard { owner, upload },
+                            );
+                        }
+                    }
+                    Err(error) => self.complete_remote_clipboard(owner, Err(error)),
+                }
+            }
             AppHostIoCompletion::Dispatch(intent) => {
                 if matches!(
                     &intent,
@@ -44090,6 +44227,55 @@ mod tests {
         );
         assert!(document.source.is_empty());
         assert!(app.document_load_inflight.is_none());
+        assert!(app.ssh_pending_rpc.is_empty());
+    }
+    #[test]
+    fn ssh_workspace_clipboard_read_is_routed_instead_of_rejected_as_host_file_io() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let action = AppHostIoAction::Workspace {
+            workspace_id: app.active.id.clone(),
+            runtime_instance: app.active.runtime_instance,
+            intent: ui::workspace::WorkspaceIoIntent::ReadTerminalClipboard {
+                operation: ui::workspace::WorkspaceIoOperation::for_test(1),
+                generation: 1,
+            },
+        };
+        assert!(
+            app.route_ssh_host_action(action).is_some(),
+            "SSH paste must read the local clipboard then stage images remotely"
+        );
+    }
+    #[test]
+    fn ssh_workspace_clipboard_owner_is_invalid_after_runtime_or_target_changes() {
+        let (mut app, _) = ssh_workspace_isolated_app_fixture();
+        let mut owner = crate::ssh_clipboard::Owner {
+            workspace_id: app.active.id.clone(),
+            runtime_instance: app.active.runtime_instance,
+            target: app
+                .remote_provider(&app.active.id)
+                .unwrap()
+                .target()
+                .clone(),
+            operation: ui::workspace::WorkspaceIoOperation::for_test(1),
+            generation: 1,
+        };
+        assert!(app.remote_clipboard_owner_current(&owner));
+        owner.runtime_instance += 1;
+        assert!(!app.remote_clipboard_owner_current(&owner));
+        owner.runtime_instance -= 1;
+        owner.target.remote_workspace_id = "different-root".into();
+        assert!(!app.remote_clipboard_owner_current(&owner));
+        owner.target = app
+            .remote_provider(&app.active.id)
+            .unwrap()
+            .target()
+            .clone();
+        app.workspace_targets.remove(&app.active.id);
+        assert!(!app.remote_clipboard_owner_current(&owner));
+        app.apply_app_host_completion(AppHostIoCompletion::RemoteTerminalClipboard {
+            owner,
+            result: Err(ui::workspace::WorkspaceIoErrorCode::NativeFailure),
+        });
         assert!(app.ssh_pending_rpc.is_empty());
     }
     #[test]

@@ -28,6 +28,7 @@ pub enum Request {
         staged: bool,
     },
     InspectAgents,
+    StageClipboardImage(crate::clipboard::ImageChunk),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ pub enum Response {
     Written(files::FileRevision),
     Git(Vec<u8>),
     Agents(Vec<Agent>),
+    ClipboardImage(crate::clipboard::Receipt),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -159,6 +161,12 @@ fn dispatch(context: &runtime::SshRequestContext, request: Request) -> Reply {
             .map(Response::Git)
             .map_err(ServiceError::Git),
         Request::InspectAgents => Ok(Response::Agents(inspect_agents())),
+        Request::StageClipboardImage(chunk) => crate::clipboard::stage(
+            &workspace_id(&context.identity.account, &context.identity.canonical_root),
+            chunk,
+        )
+        .map(Response::ClipboardImage)
+        .map_err(ServiceError::Files),
     }
 }
 
@@ -177,17 +185,24 @@ pub fn workspace_id(account: &str, root: &str) -> String {
 
 fn inspect_agents() -> Vec<Agent> {
     use std::os::unix::fs::PermissionsExt;
-    let path = std::env::var_os("PATH").unwrap_or_default();
+    let path = crate::agent_environment::current_path();
     let directories: Vec<_> = std::env::split_paths(&path)
         .filter(|path| path.is_absolute())
-        .take(64)
+        .take(96)
         .collect();
     [
         ("claude", "claude"),
         ("codex", "codex"),
+        ("opencode", "opencode"),
+        ("gemini", "gemini"),
+        ("aider", "aider"),
+        ("goose", "goose"),
+        ("amp", "amp"),
         ("kimi", "kimi"),
+        ("qwen-code", "qwen"),
         ("grok", "grok"),
         ("cursor", "cursor-agent"),
+        ("copilot", "copilot"),
     ]
     .into_iter()
     .filter_map(|(kind, executable)| {
@@ -244,6 +259,141 @@ mod tests {
     fn call(context: &runtime::SshRequestContext, request: &Request) -> Reply {
         serde_json::from_slice(&handle_rpc(context, &serde_json::to_vec(request).unwrap()).unwrap())
             .unwrap()
+    }
+    #[test]
+    fn ssh_agent_discovery_finds_home_installations_without_login_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let bin = fixture.0.join(".local/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        for executable in [
+            "claude",
+            "codex",
+            "opencode",
+            "gemini",
+            "aider",
+            "goose",
+            "amp",
+            "kimi",
+            "qwen",
+            "grok",
+            "cursor-agent",
+            "copilot",
+        ] {
+            let path = bin.join(executable);
+            std::fs::write(
+                &path,
+                if executable == "codex" {
+                    "#!/usr/bin/env deppy-node-fixture\n"
+                } else {
+                    "#!/bin/sh\nexit 0\n"
+                },
+            )
+            .unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let node_bin = fixture.0.join(".nvm/versions/node/v99.0.0/bin");
+        std::fs::create_dir_all(&node_bin).unwrap();
+        let interpreter = node_bin.join("deppy-node-fixture");
+        std::fs::write(&interpreter, "#!/bin/sh\nprintf interpreter-ok\n").unwrap();
+        std::fs::set_permissions(interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "services::tests::ssh_agent_discovery_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HOME", &fixture.0)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated HOME/PATH subprocess, invoked by ssh_agent_discovery_finds_home_installations_without_login_path"]
+    fn ssh_agent_discovery_child() {
+        let agents = inspect_agents();
+        let mut command = std::process::Command::new(
+            &agents
+                .iter()
+                .find(|agent| agent.kind == "codex")
+                .expect("Codex in home bin")
+                .executable,
+        );
+        crate::agent_environment::configure_child(&mut command);
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"interpreter-ok");
+        let actual: Vec<_> = agents.into_iter().map(|agent| agent.kind).collect();
+        for kind in [
+            "claude",
+            "codex",
+            "opencode",
+            "gemini",
+            "aider",
+            "goose",
+            "amp",
+            "kimi",
+            "qwen-code",
+            "grok",
+            "cursor",
+            "copilot",
+        ] {
+            assert!(
+                actual.iter().any(|value| value == kind),
+                "missing {kind}: {actual:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_image_clipboard_is_staged_on_the_server_before_a_path_is_returned() {
+        let fixture = Fixture::new();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "services::tests::ssh_image_clipboard_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("HOME", &fixture.0)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "isolated HOME subprocess, invoked by ssh_image_clipboard_is_staged_on_the_server_before_a_path_is_returned"]
+    fn ssh_image_clipboard_child() {
+        use sha2::{Digest, Sha256};
+        let fixture = Fixture::new();
+        let data = b"\x89PNG\r\n\x1a\nimage-clipboard-fixture";
+        let request = serde_json::json!({"StageClipboardImage": {
+            "upload_id": uuid::Uuid::new_v4().to_string(), "offset": 0,
+            "total": data.len(), "sha256": Sha256::digest(data).iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "extension": "png", "data": data,
+        }});
+        let reply: serde_json::Value = serde_json::from_slice(
+            &handle_rpc(&context(&fixture.0), &serde_json::to_vec(&request).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let path = reply["Ok"]["ClipboardImage"]["path"]
+            .as_str()
+            .expect("server-staged path, not unsupported RPC");
+        assert!(std::path::Path::new(path).starts_with(std::env::var_os("HOME").unwrap()));
+        assert_eq!(std::fs::read(path).unwrap(), data);
     }
     #[test]
     fn services_files_same_paths_are_isolated_by_context_root() {

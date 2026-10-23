@@ -2260,6 +2260,13 @@ struct TerminalSearch {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WorkspaceIoOperation(u64);
 
+#[cfg(test)]
+impl WorkspaceIoOperation {
+    pub(crate) fn for_test(value: u64) -> Self {
+        Self(value)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspacePathKind {
     Directory,
@@ -2507,6 +2514,7 @@ struct PendingPaste {
     /// 요청 시각 — 워크스페이스가 warm으로 물러났다 돌아온 뒤 도착한 옛 paste가
     /// 살아있는 세션(바뀐 프롬프트)에 뒤늦게 꽂히지 않게 만료시킨다(codex Medium).
     requested_at: std::time::Instant,
+    ttl: std::time::Duration,
 }
 
 #[derive(Clone, Copy)]
@@ -3368,7 +3376,7 @@ impl WorkspaceUi {
     fn expire_pending_pastes(&mut self) {
         let before = self.pending_pastes.len();
         self.pending_pastes
-            .retain(|pending| pending.requested_at.elapsed() <= PASTE_TASK_TTL);
+            .retain(|pending| pending.requested_at.elapsed() <= pending.ttl);
         if self.pending_pastes.len() != before {
             self.native_error = Some(WorkspaceNativeError::ClipboardExpired);
             self.io_intents.retain(|intent| match intent {
@@ -4544,7 +4552,7 @@ impl WorkspaceUi {
                     .remove(index)
                     .expect("exact pending checked");
                 // cwd 세대는 경로 조회의 수명이다. 붙여넣기는 원래 요청 세션과 토큰으로 검증한다.
-                if pending.requested_at.elapsed() > PASTE_TASK_TTL {
+                if pending.requested_at.elapsed() > pending.ttl {
                     self.native_error = Some(WorkspaceNativeError::ClipboardExpired);
                     return;
                 }
@@ -4603,6 +4611,36 @@ impl WorkspaceUi {
         }
     }
 
+    pub(crate) fn terminal_clipboard_pending(
+        &self,
+        operation: WorkspaceIoOperation,
+        generation: u64,
+    ) -> bool {
+        self.pending_pastes.iter().any(|pending| {
+            pending.operation == operation
+                && pending.generation == generation
+                && pending.requested_at.elapsed() <= pending.ttl
+        })
+    }
+
+    pub(crate) fn begin_remote_clipboard_transfer(
+        &mut self,
+        operation: WorkspaceIoOperation,
+        generation: u64,
+    ) -> bool {
+        self.expire_pending_pastes();
+        let Some(pending) = self
+            .pending_pastes
+            .iter_mut()
+            .find(|pending| pending.operation == operation && pending.generation == generation)
+        else {
+            return false;
+        };
+        // One fixed deadline from the original gesture; progress never renews it.
+        pending.ttl = std::time::Duration::from_secs(120);
+        true
+    }
+
     fn request_terminal_clipboard(
         &mut self,
         session: SessionId,
@@ -4643,6 +4681,7 @@ impl WorkspaceUi {
             shell_kind,
             text_fallback,
             requested_at: std::time::Instant::now(),
+            ttl: PASTE_TASK_TTL,
         });
     }
 
@@ -21585,6 +21624,56 @@ mod tests {
             } if *target == session
                 && *bytes == paths_insert_paste_bytes(&paths, ShellKind::Posix, true)
         ));
+    }
+
+    #[test]
+    fn remote_image_transfer_has_a_fixed_deadline_and_pastes_to_original_session_once() {
+        let mut ui = WorkspaceUi::new();
+        ui.request_terminal_clipboard(
+            SessionId(77),
+            true,
+            crate::ui::file_tree::ShellKind::Posix,
+            None,
+        );
+        let Some(WorkspaceIoIntent::ReadTerminalClipboard {
+            operation,
+            generation,
+        }) = ui.take_io_intent()
+        else {
+            panic!("clipboard request")
+        };
+        assert!(!ui.begin_remote_clipboard_transfer(operation, generation + 1));
+        assert!(ui.begin_remote_clipboard_transfer(operation, generation));
+        ui.pending_pastes.front_mut().unwrap().requested_at -= std::time::Duration::from_secs(11);
+        ui.expire_pending_pastes();
+        assert!(ui.terminal_clipboard_pending(operation, generation));
+        let paths = vec![PathBuf::from(
+            "/home/ubuntu/.cache/deppy/ssh-clipboard/image.png",
+        )];
+        for _ in 0..2 {
+            ui.complete_io(WorkspaceIoCompletion::TerminalClipboardRead {
+                operation,
+                generation,
+                result: TerminalClipboardPayload::try_new(paths.clone(), None),
+            });
+        }
+        let commands = drain_protocol(&mut ui);
+        assert_eq!(commands.len(), 1);
+        assert!(
+            matches!(&commands[0], RuntimeCommand::WriteInput { session: SessionId(77), bytes }
+            if bytes.starts_with(b"\x1b[200~") && bytes.windows(b"/home/ubuntu/".len()).any(|w| w == b"/home/ubuntu/") && !bytes.contains(&b'\r'))
+        );
+        assert!(!ui.terminal_clipboard_pending(operation, generation));
+        ui.request_terminal_clipboard(
+            SessionId(88),
+            true,
+            crate::ui::file_tree::ShellKind::Posix,
+            None,
+        );
+        let pending = ui.pending_pastes.front_mut().unwrap();
+        let (operation, generation) = (pending.operation, pending.generation);
+        pending.requested_at -= std::time::Duration::from_secs(11);
+        assert!(!ui.begin_remote_clipboard_transfer(operation, generation));
     }
 
     #[test]

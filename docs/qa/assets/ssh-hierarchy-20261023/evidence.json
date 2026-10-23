@@ -1,0 +1,140 @@
+{
+  "branch": "fix/product-review-integration-20261023",
+  "base_head": "286b23dddb33e54a262c1ae64b9cf43bb4888b4f",
+  "delivery": "source and investigation tests only; no released app/helper or restart",
+  "source_sha256": {
+    "crates/app/src/app.rs": "2798bf0897477317f48c97e631774b0d722d2a3c9c9b40df9d224759afbf1d24",
+    "crates/app/src/main.rs": "7231dff6bf65e353af9581bff0b38e30ca15e642ea89f13ad06fd94e22429f80",
+    "crates/app/src/project_keys/worker.rs": "90692c5857676fb6f74a0a9c0520521f6d0a06b9e972fe7a70c915ec65652f6f",
+    "crates/app/src/ssh_clipboard.rs": "89668e1a7f8135e147c40ec1dfce2015f059085e9d1f553ae8aaa7575d7b672e",
+    "crates/app/src/ssh_folder_tree.rs": "0817a8b65d284458f59132b244c112f4e597d06ba0bde37491a616d197f5c649",
+    "crates/app/src/ssh_workspace_add.rs": "3f599fcde09a5f3445bdf3f6d6e028fa0d0d847fe00ebea1973ae5ff66c31c58",
+    "crates/app/src/ui/workspace.rs": "defd13c34bdee173cb14e5215eb2d072992cced0910cd577f75f008e6248ca8d",
+    "crates/connector-ui/src/popup/mod.rs": "5121cb8de52c0e0efe6714490da2b46b74490caf15c435e2820e05e584fc57aa",
+    "crates/i18n/locales/en-US/messages.txt": "b0f17dff83e4dff390eca721c3b27cd977a93a91803db9d1a6a50dde3e322bda",
+    "crates/i18n/locales/ja-JP/messages.txt": "82fc519f17078261075f1a46222d81a124a362c1454a477bd6004eb2e0c5f3ed",
+    "crates/i18n/locales/ko-KR/messages.txt": "794b7bfed9b7b3aeb7d60bd14d46ab7d7c5f6f336573ba0d793ca070f2c72b2f",
+    "crates/i18n/locales/zh-Hans/messages.txt": "b9a58651c28dbae592cc65226e65d5859a1b2cb820b77f2e43261c6541a94e57",
+    "crates/i18n/locales/zh-Hant/messages.txt": "434a4a6e558b7a52b96a509f2375d94d5a757c35fbf53fe965d2a72538852559",
+    "crates/remote-host/src/agent_environment.rs": "768f114f1392ef7f9d47b3a6d6b8f4389fbbfae3ad761162b087cdbba3451b31",
+    "crates/remote-host/src/clipboard.rs": "08a12ef1d1c82ff0c4c82c1866fbb9f742f6742dab94a58c7f3a8a3c85804cb2",
+    "crates/remote-host/src/lib.rs": "325e338044ecccc3289b18caa1c9c3fb7cc8167afc95a7dcd4e165099142afcb",
+    "crates/remote-host/src/services.rs": "fc001df2b08b88cc14a1c94e57f7d3516f7db4113ac91b0b01a5469097dc5d17",
+    "crates/remote-host/src/supervisor.rs": "d0641d41d2fb533e076985141ff9cc2a6ae49468f82b3ca23602c1616ccc37b4",
+    "crates/remote-host/tests/supervisor.rs": "beb94c592e5a789843358e11e7df2cd3e9abb36a5d6027785e9ba81a82565169"
+  },
+  "screenshots": {
+    "native-narrow.png": "320a7e4da845b5cb0f41d99389c9172cc36420692a02e81680d7b6af665c804b",
+    "native-desktop.png": "ab558897c2db5acc42825270d806c6408bab44f9d05fded18bc24a7491121e7b"
+  },
+  "logs": [
+    {
+      "log": "tree-keyboard-final.log",
+      "original_sha256": "e21ede6562deaf326a45a2231e172cc51fb61fa9b476830ecb8881d80936d58d",
+      "compressed_file": "tree-keyboard-final.log.gz",
+      "compressed_sha256": "521b4f0968acbd20d2fea506c57442102710c63097188eb69aae6899b35777b9"
+    },
+    {
+      "log": "tree-render-final.log",
+      "original_sha256": "d113fef28fc9c808b20598416bc584adab189f63fe180d9f324c4449c2f58909",
+      "compressed_file": "tree-render-final.log.gz",
+      "compressed_sha256": "a47e78432954aa264ae5d1a7620a216995cbc580c097adf3cf0cac28fbb89b81"
+    },
+    {
+      "log": "remote-host-combined-final.log",
+      "original_sha256": "2cea7d0c0bb4738551564f09cf97876393383e8c2b5b373fbf91003cf9df6a25",
+      "compressed_file": "remote-host-combined-final.log.gz",
+      "compressed_sha256": "e4d51615a766ff53741411c261d343373c387e0c8ffe34604c4483edcec25284"
+    },
+    {
+      "log": "linux-unit.log",
+      "original_sha256": "bc092fc34b9f6f480a12272e2291b3c6a5816444e14b422f22cafbb95eacf8be",
+      "compressed_file": "linux-unit.log.gz",
+      "compressed_sha256": "3b5b3c8d3519dff8a909dbf2d91498f9954007dde4aa0825f7391b1e9111e191"
+    },
+    {
+      "log": "linux-helper-integration-final.log",
+      "original_sha256": "8d08e7904adb0e8d65d3d7f71ec4fd760a54b03e2848786992973bf7c2338fdc",
+      "compressed_file": "linux-helper-integration-final.log.gz",
+      "compressed_sha256": "c78ed28a3c63a1997cb4bbd1907012569303c81bdc52c52cca0d05852715c997"
+    },
+    {
+      "log": "client-review-red.log",
+      "original_sha256": "bc7f35a427948da8d1d68555bb0b1791cba3cd726d7c329a61fcd62367736e12",
+      "compressed_file": "client-review-red.log.gz",
+      "compressed_sha256": "7db4612631b4be0f4651668183b132015bb66d10b9ceb73f0bf12e08bbeab821"
+    },
+    {
+      "log": "client-review-green.log",
+      "original_sha256": "68357c99cb66c5d90e279559a31c38df6b851ac66721e772144841c20118b28b",
+      "compressed_file": "client-review-green.log.gz",
+      "compressed_sha256": "88741de7d09e99a08d43343c2858e10e943f915ab9c983b33934124d490ba232"
+    },
+    {
+      "log": "clipboard-store-red.log",
+      "original_sha256": "e6f764884e9e4282ca3c34c01d687aaa960850d5e34bcd611acec0f3b2ab0a11",
+      "compressed_file": "clipboard-store-red.log.gz",
+      "compressed_sha256": "fb5ffab3839407123bd85b19dbcd5e3076a4bb14207a3fd833d0b48f172766da"
+    },
+    {
+      "log": "clipboard-store-green.log",
+      "original_sha256": "96981c91e310a280454e160a4d8c60cdbf9c47f0d48a8ca34878bb8c8237a1a6",
+      "compressed_file": "clipboard-store-green.log.gz",
+      "compressed_sha256": "c562f1c4cdfb88f50de5147ee35c315b5a8fdc0f875b69258a4bcb15f471dc88"
+    },
+    {
+      "log": "clipboard-lock-red.log",
+      "original_sha256": "010f395c32ad1f9fa135c9e864d58ec01932803bbe80217424bf15d8db1c86a4",
+      "compressed_file": "clipboard-lock-red.log.gz",
+      "compressed_sha256": "e238573b9cbe00e67e7240f6e18c0ef27ce79f14d6b6a43f47c53378fe83878b"
+    },
+    {
+      "log": "app-full-final.log",
+      "original_sha256": "dc1d245c9d238fd5db1af7ad53940347c5c168022a7ca5aca55c6b975905aa2f",
+      "compressed_file": "app-full-final.log.gz",
+      "compressed_sha256": "e0de904768a613ee42d6c086ff511ecc585e283c6ad1e145936c602fab512a27"
+    },
+    {
+      "log": "project-keys-isolated.log",
+      "original_sha256": "8004b6db5e59ea04d22218e87efb525dad6abe3ec5928f5f45a138202cc5d738",
+      "compressed_file": "project-keys-isolated.log.gz",
+      "compressed_sha256": "61d18d3dffdf6f85698e1556aece4f937264918677ee2241c3a80b94d2fb030d"
+    },
+    {
+      "log": "app-full-corrected.log",
+      "original_sha256": "13c31cbda3d837331dd858ab196f5bb409b7a283741453fd3dad456f1c330cd3",
+      "compressed_file": "app-full-corrected.log.gz",
+      "compressed_sha256": "5f2ce3071adc3d72ba8ae5d9c0177c3b913080163e3cd0a1fa7478be93ac74c7"
+    },
+    {
+      "log": "clippy-combined-final.log",
+      "original_sha256": "f7ec6ea37097eff861a997c2f415c7b00a0704f2eb3b5f5b971b323cac644e8b",
+      "compressed_file": "clippy-combined-final.log.gz",
+      "compressed_sha256": "e13b70573858351ffb0e54373cc12e8c60e553fad9c393cfc52aa1afb74e2e51"
+    },
+    {
+      "log": "clippy-combined-corrected.log",
+      "original_sha256": "7c2c386ff403f5c53bd6701cf0727a034e949312c049d4fea9e8e34caec37a5d",
+      "compressed_file": "clippy-combined-corrected.log.gz",
+      "compressed_sha256": "d7a0aed5d549dc8cdd9e28debcf6c2ad8b05105232475070eee36ba33dafba82"
+    },
+    {
+      "log": "fmt-corrected.log",
+      "original_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "compressed_file": "fmt-corrected.log.gz",
+      "compressed_sha256": "9ceffb7310338057cfe71a4ae1e2c98d2c485d81cdef906532a801f457a38d64"
+    },
+    {
+      "log": "boundary-final.log",
+      "original_sha256": "8d7c4d5d8240d736ab328979573e9b3e39c398f5ae69174c70975d96ff485de9",
+      "compressed_file": "boundary-final.log.gz",
+      "compressed_sha256": "1f09e58b005b99de3d02ae1f3fa92098621b78a00b3881d8bd59923f23a0acd4"
+    },
+    {
+      "log": "i18n-final.log",
+      "original_sha256": "bc4101defa2d245f05e2f377667d53dfda76f71d7c53c54add6bb888c499290b",
+      "compressed_file": "i18n-final.log.gz",
+      "compressed_sha256": "13bc0e42f4c3f9a3f607887a03e0cdbf4767940beeaf22134011a177114560b0"
+    }
+  ]
+}

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="ko">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Deppy Sijo · SSH 폴더 계층 시안</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--surface:#181b20;--raised:#21242c;--hover:#292e38;--line:#32363e;--border:#4a505b;--text:#d5d8dd;--muted:#a3a9b3;--accent:#39b7d0;--accent-low:#153440;--row:34px;--control:36px;--button:34px;--gap:16px}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:13px/1.5 -apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR",sans-serif}button,input{font:inherit;color:inherit}button{border:1px solid transparent;background:transparent;cursor:pointer}button:hover{background:var(--hover)}button:focus-visible,input:focus-visible,[role=treeitem]:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}button:disabled{cursor:default;opacity:.45}svg{width:16px;height:16px;flex-shrink:0;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}[hidden]{display:none!important}
+.page-head{padding:18px 28px;border-bottom:1px solid var(--line);display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}.page-head strong{font-size:14px}.page-head span{font-size:12px;color:var(--muted)}main{display:flex;justify-content:center;align-items:flex-start;gap:38px;padding:32px 24px}.popup{display:flex;flex-direction:column;max-height:calc(100dvh - 122px);width:560px;max-width:100%;background:var(--surface);border:1px solid var(--border);border-radius:6px;overflow:hidden;flex-shrink:0}.popup-head{padding:19px 22px 16px;border-bottom:1px solid var(--line);position:relative}.popup-head h1{font-size:18px;font-weight:600;line-height:1.3;margin:0 32px 5px 0}.popup-head p{font-size:12px;color:var(--muted);margin:0}.close{position:absolute;right:15px;top:16px;width:30px;height:30px;border-radius:3px;display:grid;place-items:center}.popup-head,.footer{flex-shrink:0}.body{min-height:0;overflow-y:auto;padding:18px 22px 21px}.sources{display:flex;gap:6px;margin-bottom:17px}.sources span{padding:6px 13px;min-height:34px;border:1px solid transparent;border-radius:3px;color:var(--muted)}.sources .active{border-color:var(--border);background:var(--raised);color:var(--text)}.server{display:flex;align-items:center;gap:9px;border-bottom:1px solid var(--line);padding:0 0 15px;margin-bottom:16px}.server svg{color:var(--muted)}.server-name{font-weight:500}.server small{color:var(--muted);margin-left:auto;font-size:11px;white-space:nowrap}.dot{display:inline-block;width:6px;height:6px;background:#4bc9a0;border-radius:50%;margin-right:5px;vertical-align:middle}.label-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:7px}.label-row strong{font-size:12px;font-weight:600}.icon-button{height:28px;min-width:28px;display:inline-grid;place-items:center;border-radius:3px;color:var(--muted)}.pathbar{display:flex;align-items:center;gap:3px;height:var(--control);background:var(--bg);border:1px solid var(--border);border-radius:3px;padding:0 5px;margin-bottom:8px}.up{width:26px;height:26px;display:grid;place-items:center;border-right:1px solid var(--line);margin-right:2px;color:var(--muted)}.crumbs{display:flex;align-items:center;overflow:auto;min-width:0;scrollbar-width:none;flex:1}.crumb{padding:3px 5px;border-radius:2px;font-size:12px;white-space:nowrap}.crumb:last-child{color:var(--accent)}.sep{color:#68717e;flex-shrink:0;width:12px;height:12px}.manual{display:flex;gap:7px;min-width:0;flex:1}.manual input{height:26px;border:0;background:var(--bg);min-width:0;width:100%;padding:0 5px;font:12px/1.4 ui-monospace,SFMono-Regular,monospace}.manual button{white-space:nowrap;font-size:12px;padding:2px 7px;color:var(--accent)}.tree{height:clamp(150px,calc(100dvh - 600px),306px);overflow:auto;overscroll-behavior:contain;background:var(--bg);border:1px solid var(--line);border-radius:3px;scrollbar-color:var(--border) var(--bg);scrollbar-width:thin;padding:4px;position:relative}.tree-row{height:var(--row);display:flex;gap:7px;align-items:center;padding-right:9px;border-radius:2px;cursor:pointer;position:relative;white-space:nowrap}.tree-row:hover{background:#1d222a}.tree-row[aria-selected=true]{background:var(--accent-low);color:#bce7ee;box-shadow:inset 2px 0 var(--accent)}.toggle{display:grid;place-items:center;width:22px;height:28px;padding:0;flex-shrink:0;border-radius:2px}.toggle svg{width:13px;height:13px;transition:transform .1s}.toggle.open svg{transform:rotate(90deg)}.folder{color:#9aa8b8;width:16px}.tree-row[aria-selected=true] .folder{color:var(--accent)}.folder-name{overflow:hidden;text-overflow:ellipsis;min-width:0}.row-note{margin-left:auto;font-size:10px;color:var(--muted)}.check{margin-left:auto;color:var(--accent);width:14px}.hint{font-size:11px;color:var(--muted);margin:6px 0 0}.selection{margin-top:var(--gap);padding:11px 12px;background:var(--bg);border:1px solid var(--line);border-radius:3px}.selection-label{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);margin-bottom:4px}.selection-label .ok{margin-left:auto;color:#79d2b5;font-size:10px}.selection code{font:12px/1.6 ui-monospace,SFMono-Regular,monospace;overflow-wrap:anywhere;display:block}.selection small{font-size:11px;color:var(--muted)}.footer{border-top:1px solid var(--line);background:#1b1e24;padding:12px 22px;display:flex;align-items:center;justify-content:space-between;gap:12px}.footer>span{font-size:11px;color:var(--muted)}.actions{display:flex;gap:8px;margin-left:auto}.btn{height:var(--button);padding:6px 13px;border-radius:3px;white-space:nowrap}.btn.primary{background:var(--accent);color:#0d1c21;font-weight:600}.btn.primary:hover{background:#65c9dc}.notice{margin-top:10px;padding:9px 11px;border:1px solid #805159;color:#ffc8c8;background:#2a1c23;border-radius:3px;font-size:12px}.notes{max-width:248px;padding-top:17px}.notes h2{font-size:14px;margin:0 0 20px}.notes ol{padding-left:20px;margin:0}.notes li{padding:0 0 20px 3px;color:var(--muted);font-size:12px;line-height:1.75}.notes li strong{display:block;color:var(--text);font-size:13px;margin-bottom:3px}.notes .caption{border-top:1px solid var(--line);padding-top:15px;font-size:11px;color:var(--muted)}.reset{border:1px solid var(--border);border-radius:3px;height:30px;padding:3px 10px;font-size:12px}.result{color:#79d2b5;font-size:12px;margin:12px 0 0}.tree-empty{padding:12px 16px;color:var(--muted);font-size:12px}.guide-line{position:absolute;left:0;top:0;bottom:0;width:1px;background:var(--line)}
+@media(max-width:900px){main{gap:24px;padding:24px 16px}.notes{max-width:205px}.page-head{padding:16px}}@media(max-width:760px){main{flex-direction:column;align-items:center;padding:16px}.notes{max-width:560px;width:100%;padding:0}.notes h2{margin-bottom:12px}.notes li{padding-bottom:12px}.page-head{gap:4px}.page-head span{width:100%}.popup{flex-shrink:1}.body{padding-left:16px;padding-right:16px}.popup-head{padding-left:16px;padding-right:16px}.footer{padding-left:16px;padding-right:16px}.footer>span{display:none}.tree{height:272px}.server small{font-size:10px}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+<svg hidden aria-hidden="true"><defs>
+<symbol id="chevron" viewBox="0 0 20 20"><path d="m8 5 5 5-5 5"/></symbol>
+<symbol id="folder" viewBox="0 0 20 20"><path d="M2 5a1 1 0 0 1 1-1h5l2 2h7a1 1 0 0 1 1 1v9H2Z"/></symbol>
+<symbol id="server" viewBox="0 0 20 20"><rect x="3" y="3" width="14" height="6" rx="1"/><rect x="3" y="11" width="14" height="6" rx="1"/><path d="M6 6h.01M6 14h.01M10 6h4M10 14h4"/></symbol>
+<symbol id="arrow" viewBox="0 0 20 20"><path d="m5 9 5-5 5 5M10 4v12"/></symbol>
+<symbol id="edit" viewBox="0 0 20 20"><path d="m13 3 4 4-9 9-5 1 1-5Z M11 5l4 4"/></symbol>
+<symbol id="check" viewBox="0 0 20 20"><path d="m4 10 4 4 8-8"/></symbol>
+<symbol id="close" viewBox="0 0 20 20"><path d="m5 5 10 10M15 5 5 15"/></symbol>
+</defs></svg>
+<header class="page-head"><strong>SSH 폴더 선택 · 계층형 시안</strong><span>클릭 가능한 시안 데이터입니다. 실제 SSH 연결이나 워크스페이스 추가는 실행하지 않습니다.</span></header>
+<main>
+<section class="popup" aria-labelledby="dialog-title">
+  <header class="popup-head"><h1 id="dialog-title">워크스페이스 추가</h1><p>서버에서 작업할 폴더를 선택하세요.</p><button class="close" aria-label="시안 안내 보기" id="close-demo"><svg><use href="#close"/></svg></button></header>
+  <div class="body">
+    <div class="sources" aria-label="추가 방식"><span>내 폴더</span><span>GitHub 저장소</span><span class="active" aria-current="true">SSH 서버</span></div>
+    <div class="server"><svg><use href="#server"/></svg><span class="server-name">ubuntu@gpu3090</span><small><i class="dot"></i>연결됨 · 시안</small></div>
+    <div class="label-row"><strong id="folder-label">서버 폴더</strong><button class="icon-button" id="collapse" title="하위 폴더 모두 접기" aria-label="하위 폴더 모두 접기"><svg><path d="m5 7 5-4 5 4m-10 6 5 4 5-4"/></svg></button></div>
+    <div class="pathbar"><button class="up" id="up" aria-label="상위 폴더로 이동" title="상위 폴더로 이동"><svg><use href="#arrow"/></svg></button><nav class="crumbs" id="crumbs" aria-label="현재 탐색 경로"></nav><form class="manual" id="manual" hidden><input aria-label="서버 폴더 절대 경로" id="path-input" autocomplete="off" spellcheck="false"><button type="submit">이동</button></form><button class="icon-button" id="edit-path" title="경로 직접 입력" aria-label="경로 직접 입력"><svg><use href="#edit"/></svg></button></div>
+    <div class="tree" id="tree" role="tree" aria-labelledby="folder-label"></div>
+    <p class="hint">화살표로 펼치기 · 폴더 이름을 눌러 선택</p>
+    <div class="notice" role="status" id="error" hidden></div>
+    <div class="selection" aria-live="polite"><div class="selection-label">선택한 폴더<span class="ok" id="verified">선택 확인 · 시안</span></div><code id="selected-path"></code><small>ubuntu@gpu3090</small></div>
+  </div>
+  <footer class="footer"><span>↑ ↓ 이동 · ← → 접기 / 펼치기</span><div class="actions"><button class="btn" id="reset">취소</button><button class="btn primary" id="confirm">워크스페이스 추가</button></div></footer>
+</section>
+<aside class="notes"><h2>바뀌는 부분</h2><ol><li><strong>상위 &gt; 하위 경로</strong>현재 위치를 경로 막대로 보여줍니다. 상위 경로를 누르거나 위쪽 화살표로 돌아갈 수 있습니다.</li><li><strong>접고 펼치는 폴더</strong>들여쓰기와 폴더 아이콘으로 관계를 구분합니다. 펼쳐도 선택한 폴더는 바뀌지 않습니다.</li><li><strong>짧고 고정된 목록</strong>폴더가 많으면 목록 안에서 스크롤합니다. 선택 경로와 추가 버튼은 밀려나지 않습니다.</li><li><strong>선택 대상을 명확하게</strong>선택 행에 청록색 표시를 붙이고, 하단에 전체 경로를 보여줍니다.</li></ol><p class="caption">기존 공용 팝업 규격 유지<br>폭 560px · 입력 36px · 행 / 버튼 34px<br>실제 구현에서는 폴더를 펼칠 때만 하위 목록을 조회합니다.</p><button class="reset" id="initial">처음 상태로</button><p class="result" role="status" id="result"></p></aside>
+</main>
+<script>
+'use strict';
+const ROOT='/home/ubuntu/projects';
+const folders={
+ '/':['home','opt','srv','var'], '/home':['ubuntu'], '/home/ubuntu':['projects','Downloads','.config'],
+ [ROOT]:['nmv-rsv','xAegis-fast','nomorevibe','nomorevibe-deepseek-admin','xAegis-devfix','nmv-qc','nmv-second','xAegis-update-approvals','nmv-rem','nmv-build','nmv-follow','xAegis-nmv','xAegis-local-id-fix','nmv-garb','nmv-ci2','xAegis-update-integration','.agents','nmv-hold','nmv-qwen-timeout','nmv-ocfix'],
+ [ROOT+'/nomorevibe']:['apps','packages','docs','scripts'], [ROOT+'/nomorevibe/apps']:['admin','web'],
+ [ROOT+'/nomorevibe/apps/web']:['public','src'], [ROOT+'/nomorevibe/apps/web/src']:['app','components','lib'],
+ [ROOT+'/nomorevibe/packages']:['shared','ui'], [ROOT+'/xAegis-fast']:['src','tests'],
+ '/var':['log','private'], '/var/private':null
+};
+const $=id=>document.getElementById(id), icon=id=>`<svg aria-hidden="true"><use href="#${id}"/></svg>`;
+const parent=p=>p.slice(0,p.lastIndexOf('/'))||'/', name=p=>p==='/'?'/':p.slice(p.lastIndexOf('/')+1), join=(p,n)=>(p==='/'?'':p)+'/'+n;
+let base=ROOT, selected=ROOT+'/nomorevibe/apps/web', expanded=new Set([ROOT,ROOT+'/nomorevibe',ROOT+'/nomorevibe/apps']), focused=selected, visible=[];
+function showError(text=''){ $('error').hidden=!text; $('error').textContent=text; }
+function render(){
+ const oldScroll=$('tree').scrollTop, hadFocus=$('tree').contains(document.activeElement);
+ const parts=base.split('/').filter(Boolean), crumbs=[['/','/']]; let path='';
+ for(const part of parts){path+='/'+part;crumbs.push([part,path]);}
+ $('crumbs').replaceChildren();
+ crumbs.forEach(([label,target],index)=>{if(index){const s=document.createElementNS('http://www.w3.org/2000/svg','svg');s.classList.add('sep');s.innerHTML='<use href="#chevron"/>';$('crumbs').append(s);}const b=document.createElement('button');b.className='crumb';b.textContent=label;b.dataset.path=target;b.onclick=()=>navigate(target);if(index===crumbs.length-1)b.setAttribute('aria-current','location');$('crumbs').append(b);});
+ $('up').disabled=base==='/';$('tree').replaceChildren();visible=[];
+ function append(p,level,index,total){
+  const children=folders[p]??[], open=expanded.has(p), row=document.createElement('div');
+  row.className='tree-row';row.dataset.path=p;row.setAttribute('role','treeitem');row.setAttribute('aria-level',level+1);row.setAttribute('aria-posinset',index+1);row.setAttribute('aria-setsize',total);row.setAttribute('aria-selected',String(p===selected));row.setAttribute('aria-label',name(p));if(children.length)row.setAttribute('aria-expanded',String(open));row.tabIndex=p===focused?0:-1;row.style.paddingLeft=(level*18)+'px';
+  const toggle=document.createElement('button');toggle.className='toggle'+(open?' open':'');toggle.tabIndex=-1;toggle.setAttribute('aria-label',`${name(p)} ${open?'접기':'펼치기'}`);if(children.length){toggle.innerHTML=icon('chevron');toggle.onclick=e=>{e.stopPropagation();focused=p;expanded.has(p)?expanded.delete(p):expanded.add(p);render();focusRow(p);};}else{toggle.style.visibility='hidden';toggle.disabled=true;}row.append(toggle);
+  const f=document.createElementNS('http://www.w3.org/2000/svg','svg');f.classList.add('folder');f.setAttribute('aria-hidden','true');f.innerHTML='<use href="#folder"/>';row.append(f);
+  const label=document.createElement('span');label.className='folder-name';label.textContent=name(p);row.append(label);row.title=p;
+  if(p===selected){const check=document.createElement('span');check.className='check';check.innerHTML=icon('check');row.append(check);}
+  row.onclick=()=>choose(p);row.ondblclick=()=>{if(children.length){focused=p;expanded.has(p)?expanded.delete(p):expanded.add(p);render();focusRow(p);}};
+  row.onfocus=()=>{focused=p;document.querySelectorAll('.tree-row').forEach(r=>r.tabIndex=r===row?0:-1);};row.onkeydown=e=>key(e,p);
+  $('tree').append(row);visible.push(p);if(open)children.forEach((n,i)=>append(join(p,n),level+1,i,children.length));
+ }
+ append(base,0,0,1);if(!visible.includes(focused)){focused=base;$('tree').firstElementChild.tabIndex=0;}
+ $('tree').scrollTop=oldScroll;if(hadFocus)focusRow(focused,false);
+ $('selected-path').textContent=selected||'폴더를 선택하세요.';$('confirm').disabled=!selected;$('verified').hidden=!selected;
+}
+function focusRow(p,scroll=true){const el=[...$('tree').children].find(r=>r.dataset.path===p);if(el){el.focus({preventScroll:true});if(scroll)el.scrollIntoView({block:'nearest'});}}
+function choose(p){if(folders[p]===null){showError('이 폴더에 접근할 권한이 없습니다. 다른 폴더를 선택하세요.');return;}selected=p;focused=p;showError();$('result').textContent='';render();focusRow(p,false);}
+function navigate(p){if(!(p in folders)){showError('시안 데이터에 없는 경로입니다. /home/ubuntu/projects에서 폴더를 선택해 보세요.');return;}if(folders[p]===null){showError('이 폴더에 접근할 권한이 없습니다.');return;}base=p;expanded.add(p);focused=p;showError();$('manual').hidden=true;$('crumbs').hidden=false;render();$('tree').scrollTop=0;}
+function key(e,p){let i=visible.indexOf(p),child=folders[p]??[];if(['ArrowDown','ArrowUp','ArrowRight','ArrowLeft','Home','End','Enter',' '].includes(e.key))e.preventDefault();else return;
+ if(e.key==='ArrowDown')focused=visible[Math.min(i+1,visible.length-1)];if(e.key==='ArrowUp')focused=visible[Math.max(0,i-1)];if(e.key==='Home')focused=visible[0];if(e.key==='End')focused=visible.at(-1);
+ if(e.key==='ArrowRight'&&child.length){if(!expanded.has(p)){expanded.add(p);render();}else focused=join(p,child[0]);}
+ if(e.key==='ArrowLeft'){if(expanded.has(p)&&child.length){expanded.delete(p);render();}else if(p!==base)focused=parent(p);}
+ if(e.key==='Enter'||e.key===' '){choose(p);return;}focusRow(focused);
+}
+function initial(){base=ROOT;selected=ROOT+'/nomorevibe/apps/web';expanded=new Set([ROOT,ROOT+'/nomorevibe',ROOT+'/nomorevibe/apps']);focused=selected;showError();$('result').textContent='';$('manual').hidden=true;$('crumbs').hidden=false;render();$('tree').scrollTop=0;}
+$('up').onclick=()=>navigate(parent(base));$('edit-path').onclick=()=>{const show=$('manual').hidden;$('manual').hidden=!show;$('crumbs').hidden=show;if(show){$('path-input').value=base;$('path-input').focus();$('path-input').select();}};
+$('manual').onsubmit=e=>{e.preventDefault();let p=$('path-input').value.trim().replace(/\/+$/,'')||'/';navigate(p);};$('manual').onkeydown=e=>{if(e.key==='Escape'){e.preventDefault();$('manual').hidden=true;$('crumbs').hidden=false;$('edit-path').focus();}};
+$('collapse').onclick=()=>{expanded=new Set([base]);focused=base;render();$('tree').scrollTop=0;};$('initial').onclick=initial;$('reset').onclick=initial;
+$('confirm').onclick=()=>{$('result').textContent=`선택 완료 · ${selected} (시안)`;};$('close-demo').onclick=()=>{$('result').textContent='시안입니다. 실제 앱 창은 닫지 않습니다.';};
+initial();
+</script>
+</html>

@@ -224,6 +224,7 @@ fn prepare_stdio() -> anyhow::Result<(File, SshClientHello, UnixStream)> {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null());
+            crate::agent_environment::configure_child(&mut command);
             // The supervisor receives no SSH PTY/control terminal and survives the
             // bridge's SIGHUP. It owns only its own descendants, never other apps.
             unsafe {

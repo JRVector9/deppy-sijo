@@ -1,3 +1,100 @@
+# Active rebuild only — 0.17.0 (2026-10-23)
+
+## Objective / authorization
+
+Current user: “재빌드 해”. Build and verify a signed local developer bundle containing completed SSH folder hierarchy, remote-agent discovery and image clipboard transfer. **No restart authorized**; do not stop/launch native app or live user sessions. Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`. Existing running bundle0.16.0 PID31144 remains untouched.
+
+## Preflight / completed
+
+- Latest local delivered bundle across91discovered bundles0.16.0. Version **0.16.0 → 0.17.0**, minor for approved native hierarchy and remote image transfer; root Cargo.toml plus exactly30inherited Cargo.lock workspace package versions updated; metadata offline/locked validates all30. No third-party changes/hard-coded crate versions.
+- All19changed product/test/locale file hashes match the final preceding QA evidence. Historical just-executed tests: App3721unit+39integration, server29unit+4integration, native tree21, Clippy/fmt/boundary/i18n allPASS, details below. No reason to repeat unchanged full App suite merely for metadata version.
+- Reusing prior successful pinned Rust1.96.1/musl native ARM64 Cargo driver recipe for both Linux helper architectures; avoids previously proven emulated Cargo fork stalls. Product build scripts unchanged. Copied build-only recipe and packager under `docs/qa/assets/local-0.17.0-20261023/`.
+- Matching helpers0.17.0 must be rebuilt; cannot bundle stale0.16.0. Native app/MCP proxy/askpass build, helper build, signing/package/version verification pending. Source checkpoint commit pending. No product release completion claimed yet.
+
+## Remaining / next commands
+
+1. Commit reviewed source plus release version checkpoint locally, record source SHA (no push/main merge).
+2. Build native executables using jobs2/shared native target; build/seal both Linux helpers with existing native-Cargo recipe, jobs1/per-arch caches.
+3. Run versioned local-bundle.py; verify native CLI, askpass, plist versions0.17.0, helper pair/signatures/hashes and unchanged running PID. Record logs/results/handoff. Never invoke dev-run.sh or restart.py.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass
+sh docs/qa/assets/local-0.17.0-20261023/build-remote-host-native-cargo.sh
+python3 docs/qa/assets/local-0.17.0-20261023/local-bundle.py
+```
+
+---
+
+# Completed SSH hierarchy / launcher / image paste — 2026-10-23
+
+## Objective / result
+
+User approved native implementation of `docs/mockups/ssh-folder-hierarchy-20261023.html` (“새로 만든 시안대로 트리방식등 적용되면 돼”), and previously requested missing remote Codex/Grok discovery plus SSH agent-terminal image paste, with parallel agents. All three source changes and final verification are complete.
+
+Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, base HEAD `286b23dd`. Original dirty `/Users/jr/Desktop/projects/deppy-sijo` untouched. Current changes are uncommitted; no push/merge performed in this task.
+
+No fresh restart request. Running release0.16.0 and live user SSH sessions were not stopped, relaunched or updated. This is source/investigation-test completion, not a delivered product build. Future delivery requires a higher app version and matching helpers; current0.16.0 is the previous release version.
+
+## Completed work / design decisions
+
+- Approved interactive HTML opened in visible Chrome target `27C07BFA72B9FAD783431411DD36E175`;10browser assertions and actual1180×853/390×844 overflow/footer checks PASS. CLI macOS resize minimum500 was bypassed with owned-tab CDP viewport emulation for actual390, not misreported500.
+- Native lazy server tree replaces flat picker. Independent expand/name select, breadcrumbs/up/direct path input,34pt rows/36pt path, shared palette/painter icons, internal scroll and selected full-path card. Connected server summary explicitly34pt; connection details and name optional/collapsed. Cache32directories/2048entries/512KiB, expanded32/depth32. No local path I/O or network inside rendering. Existing generation/request/path fences retained; canonical verified selection remains independent of navigation; exact selected==verified root required for Add. Auth/trust/install forms unchanged.
+- Native keyboard arrows/Home/End move actual egui focus; Enter/Space select and verify. EditorEsc closes editor only. Click requests focus; avoid Context lock reentry. No continuous forced scrolling. Native screenshot fixture programmatically selects web without scrolling; actual clicks select visible row and keyboard scrolls once.
+- Read-only gpu3090 evidence established noninteractive helper PATH missing `~/.local/bin`, while login PATH resolves installed Codex/Grok. Shared bounded home/Node install resolver used for both discovery and spawned supervisor; no shell startup execution/global env mutation.12agent catalogue matches launcher, includes official `.opencode/bin`.
+- Image cause: App rejected remote ReadTerminalClipboard before native read. Worker reads up to16images/32MiB aggregate, sends256KiB authenticated RPC chunks, stages private remote cache and only pastes acknowledged remote paths into original terminal, no Enter. Text bypass preserved. Scope: direct SSH terminal clipboard; bottom composer attachment chooser/drag and all CLI version behaviors not claimed.
+- Ownership pins runtime instance, workspace, SSH target, original session/operation/generation plus connection/request fences. Consume-once; fixed120s remote deadline from gesture, local10s unchanged; one active image upload. Stale/reconnect/duplicate/error does not paste.
+- Server derives account+canonical-root namespace.0700 cache,0600regular single-link files, pinned descriptor-relative operations and NOFOLLOW; bounded64files/256MiB/24h; checksum/magic, atomic no-replace publish. Client validates exact workspace/uploadUUID/extension/directory before advancing offset. Receipt path validated before server mutation. Explicit RAII flock unlock handles concurrent fork inheritance. Large fallback Owner boxed; no lint suppression.
+
+## Parallel ownership / modified files
+
+Three explicitly requested GPT-6.1-Sol/xhigh agents finished with disjoint scopes; root reviewed integration and ran final Cargo serially:
+
+- Discovery/native tree agent: `remote-host/src/agent_environment.rs` review, `app/src/ssh_workspace_add.rs`, new `ssh_folder_tree.rs`, exactly3palette field visibilities in `connector-ui/src/popup/mod.rs`, six keys in five `i18n/locales/*/messages.txt`, popup design and HTML case01.
+- Image client agent: new `app/src/ssh_clipboard.rs`, exact receipt regressions; independent read-only tree review; test-only Busy retry in `app/src/project_keys/worker.rs` after proven existing startup race.
+- Image storage agent: new `remote-host/src/clipboard.rs`; descriptor safety, bounds, duplicate cleanup and fork lock review; independent App ownership review.
+- Root: `app/src/app.rs`, `main.rs`, `ui/workspace.rs`; `remote-host/src/lib.rs`, `services.rs`, `supervisor.rs`, `tests/supervisor.rs`; approved HTML, plan, QA report/evidence and this handoff. No Cargo manifests/lock/version changes.
+
+## Executed tests / results
+
+Common environment: `CARGO_BUILD_JOBS=2`, `CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target`. Raw logs `/tmp/deppy-ssh-20261023-qa/`; final source hashes, lossless compressed logs and two native screenshots preserved in `docs/qa/assets/ssh-hierarchy-20261023/` and QA report. Do not double count filtered/child/repeated results.
+
+- Full current App `cargo test --offline --locked -p deppy-sijo -- --test-threads=4`: **3721unit+39integrationPASS/0FAIL**,49manual/measurement tests ignored. Log `app-full-corrected.log`,81.50s including compile.
+- Current remote-host full Cargo: **29unit+4actual helper integrationPASS/0FAIL**,2isolated child fixtures ignored at top level but invoked by parent tests. `remote-host-combined-final.log`,15.40s.
+- Linux ARM64 musl unit **29PASS/2child fixtures ignored** and actual authenticated stdio/supervisor/PTY integration **4PASS** on Debian12 as nobody. Fixture interpreter proves augmented PATH without launching real paid CLI; image RPC proves remote bytes before receipt.
+- Native focused tree **21PASS/0FAIL/1separate renderer**, actual arrows/Home/End/Enter/Space/Left/Escape and full-path painted text inside clip/abovefooter. Final ignored8state renderer separately **1PASS**,16PNGs,6.22s. Root viewed final desktop800×950/narrow390×700; images retained.
+- Client regressions actual RED6PASS/2FAIL → **10PASS** after exact receipt validation; all included in full final App. Cache redirection/invalidHOME/duplicate-part3RED→8PASS, plus deterministic fork lock RED→GREEN included in29server tests.
+- `cargo clippy --offline --locked -p deppy-sijo -p deppy-remote-host -p connector-ui --all-targets -- -D warnings`: **PASS**,22.93s (`clippy-combined-corrected.log`).
+- `cargo fmt --all -- --check`: **PASS**,2.73s (`fmt-corrected.log`). `cargo run --offline --locked -p xtask -- check-boundary`: **PASS**,5.71s. `... -- i18n-check`: **PASS**,50.00s;1752literal calls/five locales (184dynamic calls documented by existing tool). `git diff --check`: PASS.
+
+## Failed approaches / corrections
+
+- Discovery isolated HOME/PATH and App remote clipboard route tests demonstrated original defects before fix. Image compile initially used unsupported LowerHex; corrected explicit digest hex.
+- Server quota test Io traced to fork-inherited flock retained after close; deterministic fork/pipe test proved explicit unlock correction. Ancestor permission and descriptor safety regressions fixed rather than removed. Client unrelated path acceptance and offset mutation fixed before final10PASS.
+- Native first private palette import failed compilation; corrected public shared palette. Real render rejected clipped full path, missing glyphs, oversized connection form, then blank tree from unbounded RTL summary; explicit34pt allocation, painter icons and compact fields fixed. Keyboard REDs exposed default directional focus double move, editorEsc modal close, click focus omission, Context memory lock reentry; fixed and all21PASS. Renderer success alone was not treated as visual parity.
+- Linux runner first extracted wrong Cargo JSON artifact; fixed schema-bound selection. Initial tmpfs `/tmp` was Docker defaultnoexec:3integrationPASS/1PermissionDenied. Captured PTY PATH/HOME and mount flags; changed test runner only to `rw,exec`, same product source4PASS. No product workaround/live server change.
+- First full App run **3720PASS/1FAIL/46ignored**: unchanged project-key test initial select_scope unwrap got legitimate transientBusy while source worker held selection. Unchanged isolated testPASS; production already repaints/retries. Test-only initial Busy retry bounded5s/10ms, all other errors and subsequent assertions retained. Final full App rerunPASS.
+- First combined Clippy found200byte fallback Err; box only new fallback Owner. Earlier PATH int-plus-one warning fixed equivalent inequality. Both finalClippyPASS; no allow added.
+
+## Remaining / exact next commands
+
+No required source work remains for approved three tasks. No claim of live user Claude/Codex image E2E or installed-helper update. Future release must build matching app/helper with version greater than last shipped; restart needs fresh explicit request. Do not invoke dev-run/build-and-launch automatically.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+# Review final report/source hashes; no need to rerun unchanged passing suites.
+open docs/qa/2026-10-23-ssh-hierarchy-launcher-image-paste.md
+open docs/mockups/ssh-folder-hierarchy-20261023.html
+# If later product source changes, use these serialized gates:
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo test --offline --locked -p deppy-sijo -- --test-threads=4
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo test --offline --locked -p deppy-remote-host -- --test-threads=4
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo clippy --offline --locked -p deppy-sijo -p deppy-remote-host -p connector-ui --all-targets -- -D warnings
+```
+
+---
+
 # Completed local rebuild and restart — 0.16.0 (2026-10-23)
 
 ## Current objective / completed result

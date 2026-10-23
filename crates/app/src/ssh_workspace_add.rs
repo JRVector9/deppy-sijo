@@ -13,6 +13,8 @@ use std::{
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 const DIRECTORY_LIMIT: usize = 256;
 const DIRECTORY_BYTES_MAX: usize = 128 * 1024;
+#[path = "ssh_folder_tree.rs"]
+mod folder_tree;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SshWorkspaceDraft {
@@ -182,6 +184,8 @@ pub struct SshWorkspaceAddUi {
     server: Option<SshWorkspaceTarget>,
     agents: Vec<Agent>,
     directory: Option<(RemotePath, DirectoryPage)>,
+    tree: folder_tree::FolderTree,
+    browse_changes_root: bool,
     path_input: String,
     selected_path: Option<RemotePath>,
     verified: Option<SshWorkspaceTarget>,
@@ -216,6 +220,8 @@ impl SshWorkspaceAddUi {
             server: None,
             agents: Vec::new(),
             directory: None,
+            tree: folder_tree::FolderTree::default(),
+            browse_changes_root: true,
             path_input: String::new(),
             selected_path: None,
             verified: None,
@@ -277,7 +283,10 @@ impl SshWorkspaceAddUi {
         self.phase == Phase::Connected
             && !self.exhausted
             && self.pending_verify.is_none()
-            && self.verified.is_some()
+            && self
+                .verified
+                .as_ref()
+                .is_some_and(|target| self.selected_path.as_ref() == Some(&target.canonical_root))
             && self.profile.is_some()
     }
     #[cfg(test)]
@@ -312,6 +321,7 @@ impl SshWorkspaceAddUi {
         self.verified = None;
         self.prompt = None;
         self.directory = None;
+        self.tree = folder_tree::FolderTree::default();
         self.pending_browse = None;
         self.pending_verify = None;
         self.queued.clear();
@@ -435,12 +445,26 @@ impl SshWorkspaceAddUi {
                         .is_some_and(|cursor| cursor.revision.len() > 256)
                 {
                     self.error = Some(SshWorkspaceError::RequestFailed);
+                    if !self.browse_changes_root && self.tree.page(&path).is_none() {
+                        self.tree.collapse(&path);
+                    }
                     self.pending_browse = None;
                     return false;
                 }
                 self.pending_browse = None;
-                self.path_input = path.as_str().to_owned();
-                self.directory = Some((path, page));
+                if self.browse_changes_root {
+                    self.path_input = path.as_str().to_owned();
+                    self.tree.navigate(&path);
+                    self.directory = Some((path.clone(), page.clone()));
+                } else if self
+                    .directory
+                    .as_ref()
+                    .is_some_and(|(root, _)| root == &path)
+                {
+                    self.directory = Some((path.clone(), page.clone()));
+                }
+                let root = self.directory.as_ref().map(|(root, _)| root);
+                self.tree.cache(path, page, root);
             }
             SshWorkspaceUpdate::RootVerified { request_id, target } => {
                 if self.phase != Phase::Connected
@@ -474,6 +498,12 @@ impl SshWorkspaceAddUi {
                     return false;
                 }
                 if browse {
+                    if !self.browse_changes_root
+                        && let Some((_, path)) = self.pending_browse.as_ref()
+                        && self.tree.page(path).is_none()
+                    {
+                        self.tree.collapse(path);
+                    }
                     self.pending_browse = None;
                 }
                 if verify {
@@ -544,16 +574,29 @@ impl SshWorkspaceAddUi {
         path: RemotePath,
         cursor: Option<DirectoryCursor>,
     ) -> Option<SshWorkspaceIntent> {
+        self.request_directory(path, cursor, true)
+    }
+    fn request_directory(
+        &mut self,
+        path: RemotePath,
+        cursor: Option<DirectoryCursor>,
+        changes_root: bool,
+    ) -> Option<SshWorkspaceIntent> {
         if self.phase != Phase::Connected {
             return None;
         }
         let request_id = self.request_id()?;
+        if !self.browse_changes_root
+            && let Some((_, previous)) = self.pending_browse.as_ref()
+            && self.tree.page(previous).is_none()
+        {
+            self.tree.collapse(previous);
+        }
         self.pending_browse = Some((request_id, path.clone()));
-        self.pending_verify = None;
-        self.selected_path = None;
-        self.verified = None;
-        self.path_input = path.as_str().to_owned();
-        self.directory = None;
+        self.browse_changes_root = changes_root;
+        if changes_root {
+            self.path_input = path.as_str().to_owned();
+        }
         self.error = None;
         Some(SshWorkspaceIntent::Browse {
             generation: self.generation,
@@ -579,7 +622,7 @@ impl SshWorkspaceAddUi {
     }
     fn folder_path(parent: &RemotePath, name: &[u8]) -> Option<RemotePath> {
         let name = std::str::from_utf8(name).ok()?;
-        if name.is_empty() || name.contains('/') {
+        if name.is_empty() || name.contains('/') || name == "." || name == ".." {
             return None;
         }
         RemotePath::new(format!("{}/{name}", parent.as_str().trim_end_matches('/'))).ok()
@@ -605,94 +648,104 @@ impl SshWorkspaceAddUi {
         if !self.queued.is_empty() {
             ui.ctx().request_repaint();
         }
-        popup::field(
-            ui,
-            &catalog.t("workspace.ssh.address", &[]),
-            Some(&catalog.t("workspace.ssh.address_hint", &[])),
-            |ui| {
-                let key = match self.phase {
-                    Phase::Connecting => "workspace.ssh.connecting",
-                    Phase::Connected => "workspace.ssh.recheck",
-                    Phase::Offline => "workspace.ssh.reconnect",
-                    _ => "workspace.ssh.connect",
-                };
-                let enabled = !matches!(
-                    self.phase,
-                    Phase::Connecting | Phase::Prompt | Phase::Install | Phase::Registering
-                );
-                let label = catalog.t(key, &[]);
-                let button_width = ui.fonts_mut(|fonts| {
-                    fonts
-                        .layout_no_wrap(
-                            label.clone(),
-                            egui::FontId::proportional(13.0),
-                            egui::Color32::WHITE,
-                        )
-                        .size()
-                        .x
-                }) + 26.0;
-                let narrow = ui.available_width() < button_width + 31.0;
-                ui.horizontal_wrapped(|ui| {
-                    ui.spacing_mut().item_spacing.x = 7.0;
-                    let width = if narrow {
-                        ui.available_width()
-                    } else {
-                        (ui.available_width() - button_width - 7.0).max(24.0)
+        let connected = self.phase == Phase::Connected;
+        let previous_spacing = ui.spacing().item_spacing.y;
+        if connected {
+            ui.spacing_mut().item_spacing.y = 8.0;
+        }
+        let show_connection_fields = !connected || self.show_connection_summary(ui, catalog);
+        if show_connection_fields {
+            popup::field(
+                ui,
+                &catalog.t("workspace.ssh.address", &[]),
+                Some(&catalog.t("workspace.ssh.address_hint", &[])),
+                |ui| {
+                    let key = match self.phase {
+                        Phase::Connecting => "workspace.ssh.connecting",
+                        Phase::Connected => "workspace.ssh.recheck",
+                        Phase::Offline => "workspace.ssh.reconnect",
+                        _ => "workspace.ssh.connect",
                     };
-                    let input = ui
-                        .allocate_ui_with_layout(
-                            egui::vec2(width, 36.0),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| popup::text_input(ui, &mut self.draft.destination, ""),
-                        )
-                        .inner;
-                    if input.changed() {
-                        action = Some(self.cancel());
-                    }
-                    if popup::action_button(ui, &label, popup::ActionTone::Secondary, enabled)
-                        .clicked()
-                    {
-                        action = self.connect();
-                    }
-                });
-            },
-        );
-        egui::CollapsingHeader::new(catalog.t("workspace.ssh.options", &[]))
-            .id_salt("ssh_workspace_options")
-            .show(ui, |ui| {
-                popup::field(
-                    ui,
-                    &catalog.t("workspace.ssh.port", &[]),
-                    Some(&catalog.t("workspace.ssh.port_hint", &[])),
-                    |ui| {
-                        if popup::text_input(ui, &mut self.draft.port, "").changed() {
+                    let enabled = !matches!(
+                        self.phase,
+                        Phase::Connecting | Phase::Prompt | Phase::Install | Phase::Registering
+                    );
+                    let label = catalog.t(key, &[]);
+                    let button_width = ui.fonts_mut(|fonts| {
+                        fonts
+                            .layout_no_wrap(
+                                label.clone(),
+                                egui::FontId::proportional(13.0),
+                                egui::Color32::WHITE,
+                            )
+                            .size()
+                            .x
+                    }) + 26.0;
+                    let narrow = ui.available_width() < button_width + 31.0;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 7.0;
+                        let width = if narrow {
+                            ui.available_width()
+                        } else {
+                            (ui.available_width() - button_width - 7.0).max(24.0)
+                        };
+                        let input = ui
+                            .allocate_ui_with_layout(
+                                egui::vec2(width, 36.0),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| popup::text_input(ui, &mut self.draft.destination, ""),
+                            )
+                            .inner;
+                        if input.changed() {
                             action = Some(self.cancel());
                         }
-                    },
-                );
-                if ui
-                    .checkbox(
-                        &mut self.draft.use_identity_file,
-                        catalog.t("workspace.ssh.specific_key", &[]),
-                    )
-                    .changed()
-                {
-                    action = Some(self.cancel());
-                }
-                if self.draft.use_identity_file {
+                        if popup::action_button(ui, &label, popup::ActionTone::Secondary, enabled)
+                            .clicked()
+                        {
+                            action = self.connect();
+                        }
+                    });
+                },
+            );
+            egui::CollapsingHeader::new(catalog.t("workspace.ssh.options", &[]))
+                .id_salt("ssh_workspace_options")
+                .show(ui, |ui| {
                     popup::field(
                         ui,
-                        &catalog.t("workspace.ssh.key_path", &[]),
-                        Some(&catalog.t("workspace.ssh.key_hint", &[])),
+                        &catalog.t("workspace.ssh.port", &[]),
+                        Some(&catalog.t("workspace.ssh.port_hint", &[])),
                         |ui| {
-                            if popup::text_input(ui, &mut self.draft.identity_file, "").changed() {
+                            if popup::text_input(ui, &mut self.draft.port, "").changed() {
                                 action = Some(self.cancel());
                             }
                         },
                     );
-                }
-                ui.add(egui::Label::new(catalog.t("workspace.ssh.config_hint", &[])).wrap());
-            });
+                    if ui
+                        .checkbox(
+                            &mut self.draft.use_identity_file,
+                            catalog.t("workspace.ssh.specific_key", &[]),
+                        )
+                        .changed()
+                    {
+                        action = Some(self.cancel());
+                    }
+                    if self.draft.use_identity_file {
+                        popup::field(
+                            ui,
+                            &catalog.t("workspace.ssh.key_path", &[]),
+                            Some(&catalog.t("workspace.ssh.key_hint", &[])),
+                            |ui| {
+                                if popup::text_input(ui, &mut self.draft.identity_file, "")
+                                    .changed()
+                                {
+                                    action = Some(self.cancel());
+                                }
+                            },
+                        );
+                    }
+                    ui.add(egui::Label::new(catalog.t("workspace.ssh.config_hint", &[])).wrap());
+                });
+        }
         match self.phase {
             Phase::Connecting => popup::notice(
                 ui,
@@ -802,21 +855,7 @@ impl SshWorkspaceAddUi {
                     });
                 }
             }
-            Phase::Connected => {
-                if let Some(server) = &self.server {
-                    popup::notice(
-                        ui,
-                        &catalog.t(
-                            "workspace.ssh.connected",
-                            &[(
-                                "server",
-                                &format!("{}@{}:{}", server.account, server.host, server.port),
-                            )],
-                        ),
-                        popup::NoticeTone::Info,
-                    );
-                }
-            }
+            Phase::Connected => {}
             Phase::Offline => popup::notice(
                 ui,
                 &catalog.t("workspace.ssh.offline", &[]),
@@ -837,133 +876,12 @@ impl SshWorkspaceAddUi {
             );
         }
         ui.separator();
-        ui.label(
-            egui::RichText::new(catalog.t("workspace.ssh.folders", &[]))
-                .size(12.0)
-                .strong(),
-        );
+        self.show_folder_heading(ui, catalog);
         if self.phase == Phase::Connected {
-            let parent = self.directory.as_ref().and_then(|(path, _)| {
-                (path.as_str() != "/")
-                    .then(|| {
-                        path.as_str()
-                            .rsplit_once('/')
-                            .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
-                            .unwrap_or("/")
-                    })
-                    .and_then(|path| RemotePath::new(path).ok())
-            });
-            let (row, up_clicked) = ui
-                .scope(|ui| {
-                    // Both horizontal layouts must begin at the shared input height.
-                    // Expanding an initially 18pt nested row shifts its controls down.
-                    ui.spacing_mut().interact_size.y = 36.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let up = popup::action_button(
-                            ui,
-                            "↑",
-                            popup::ActionTone::Ghost,
-                            parent.is_some(),
-                        );
-                        up.widget_info(|| {
-                            egui::WidgetInfo::labeled(
-                                egui::WidgetType::Button,
-                                ui.is_enabled(),
-                                catalog.t("workspace.ssh.up", &[]),
-                            )
-                        });
-                        let up = up.on_hover_text(catalog.t("workspace.ssh.up", &[]));
-                        let row = popup::path_input(
-                            ui,
-                            &mut self.path_input,
-                            &catalog.t("workspace.ssh.open_path", &[]),
-                        );
-                        (row, up.clicked())
-                    })
-                    .inner
-                })
-                .inner;
-            if up_clicked && let Some(parent) = parent {
-                action = self.browse(parent, None);
+            if let Some(intent) = self.show_folder_tree(ui, catalog) {
+                action = Some(intent);
             }
-            if row.input.changed() {
-                self.selected_path = None;
-                self.verified = None;
-                self.pending_verify = None;
-                self.pending_browse = None;
-            }
-            if row.browse.clicked()
-                || (row.input.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)))
-            {
-                match RemotePath::new(self.path_input.clone()) {
-                    Ok(path) => action = self.browse(path, None),
-                    Err(_) => self.error = Some(SshWorkspaceError::FolderMissing),
-                }
-            }
-            if let Some((path, page)) = self.directory.clone() {
-                popup::list_row(ui, |ui| {
-                    let mut count = 0;
-                    for entry in page.entries.iter().filter(|entry| entry.is_directory) {
-                        count += 1;
-                        let target = Self::folder_path(&path, &entry.name);
-                        let name = std::str::from_utf8(&entry.name).unwrap_or("");
-                        let label = if name.is_empty() {
-                            catalog.t("workspace.ssh.unsupported_name", &[])
-                        } else {
-                            name.to_owned()
-                        };
-                        let selected = target
-                            .as_ref()
-                            .is_some_and(|target| self.selected_path.as_ref() == Some(target));
-                        let response = ui.add_enabled(
-                            target.is_some(),
-                            egui::Button::selectable(selected, label)
-                                .min_size(egui::vec2(ui.available_width(), 34.0)),
-                        );
-                        if let Some(target) = target {
-                            if response.double_clicked()
-                                || (response.has_focus()
-                                    && ui.input(|input| input.key_pressed(egui::Key::ArrowRight)))
-                            {
-                                action = self.browse(target, None);
-                            } else if response.clicked() {
-                                action = self.verify_root(target);
-                            }
-                        }
-                    }
-                    if count == 0 {
-                        ui.add(egui::Label::new(catalog.t("workspace.ssh.empty", &[])).wrap());
-                    }
-                });
-                if popup::action_button(
-                    ui,
-                    &catalog.t("workspace.ssh.choose_current", &[]),
-                    popup::ActionTone::Secondary,
-                    true,
-                )
-                .clicked()
-                {
-                    action = self.verify_root(path.clone());
-                }
-                if let Some(cursor) = page.next
-                    && popup::action_button(
-                        ui,
-                        &catalog.t("workspace.ssh.next_page", &[]),
-                        popup::ActionTone::Ghost,
-                        true,
-                    )
-                    .clicked()
-                {
-                    action = self.browse(path, Some(cursor));
-                }
-            } else {
-                popup::notice(
-                    ui,
-                    &catalog.t("workspace.ssh.loading_folders", &[]),
-                    popup::NoticeTone::Info,
-                );
-            }
+            self.show_folder_selection(ui, catalog);
             if self.pending_verify.is_some() {
                 ui.label(catalog.t("workspace.ssh.checking_root", &[]));
             }
@@ -993,20 +911,28 @@ impl SshWorkspaceAddUi {
                 popup::NoticeTone::Info,
             );
         }
-        if let Some(path) = &self.selected_path {
-            ui.add(
-                egui::Label::new(catalog.t("workspace.ssh.selected", &[("path", path.as_str())]))
-                    .wrap(),
-            );
+        if !connected {
+            self.show_folder_selection(ui, catalog);
         }
-        popup::field(
-            ui,
-            &catalog.t("workspace.ssh.name", &[]),
-            Some(&catalog.t("workspace.ssh.name_hint", &[])),
-            |ui| {
-                popup::text_input(ui, &mut self.draft.name, "");
-            },
-        );
+        let mut name_field = |ui: &mut egui::Ui| {
+            popup::field(
+                ui,
+                &catalog.t("workspace.ssh.name", &[]),
+                Some(&catalog.t("workspace.ssh.name_hint", &[])),
+                |ui| {
+                    popup::text_input(ui, &mut self.draft.name, "");
+                },
+            );
+        };
+        if connected {
+            egui::CollapsingHeader::new(catalog.t("workspace.ssh.name", &[]))
+                .id_salt("ssh_workspace_optional_name")
+                .default_open(false)
+                .show(ui, name_field);
+        } else {
+            name_field(ui);
+        }
+        ui.spacing_mut().item_spacing.y = previous_spacing;
         self.clear_secret_widget(ui.ctx());
         action
     }
@@ -1198,6 +1124,43 @@ mod tests {
         }));
         assert_eq!(ui.directory.as_ref().unwrap().0, second);
     }
+    #[test]
+    fn ssh_workspace_browsing_preserves_independently_verified_selection() {
+        let (mut state, profile, mut target) = setup();
+        connected(&mut state, profile, target.clone());
+        let selected = RemotePath::new("/srv/selected").unwrap();
+        let Some(SshWorkspaceIntent::VerifyRoot { request_id, .. }) =
+            state.verify_root(selected.clone())
+        else {
+            panic!("verify fixture")
+        };
+        target.canonical_root = selected.clone();
+        state.apply_snapshot(SshWorkspaceSnapshot {
+            generation: state.generation(),
+            update: SshWorkspaceUpdate::RootVerified { request_id, target },
+        });
+        assert!(state.can_add());
+        assert!(
+            state
+                .browse(RemotePath::new("/other").unwrap(), None)
+                .is_some()
+        );
+        assert_eq!(state.selected_path(), Some(&selected));
+        assert!(
+            state.can_add(),
+            "browsing must not replace the chosen folder"
+        );
+        let request_id = state.pending_browse.as_ref().unwrap().0;
+        state.apply_snapshot(SshWorkspaceSnapshot {
+            generation: state.generation(),
+            update: SshWorkspaceUpdate::RequestFailed {
+                request_id,
+                error: SshWorkspaceError::PermissionDenied,
+            },
+        });
+        assert_eq!(state.selected_path(), Some(&selected));
+        assert!(state.can_add());
+    }
     /// Test-only server snapshots for comparing the approved eight-state HTML design.
     /// Registered success closes the picker in App; its last picker state is verified-ready.
     #[cfg(feature = "ssh-workspaces")]
@@ -1330,6 +1293,9 @@ mod tests {
                             generation: state.generation(),
                             update: SshWorkspaceUpdate::Offline,
                         });
+                    }
+                    if index == 7 {
+                        state.approved_tree_render_fixture();
                     }
                 }
                 5 => {
@@ -1470,7 +1436,7 @@ mod tests {
             });
         harness.run();
         let parent = harness.get_by_label("Parent folder").rect();
-        let open = harness.get_by_label("Open path").rect();
+        let open = harness.get_by_label("Enter path").rect();
         assert!(
             (parent.center().y - open.center().y).abs() < 1.0,
             "parent navigation belongs in the path row: {parent:?} {open:?}"

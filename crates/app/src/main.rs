@@ -69,6 +69,7 @@ mod remote_bootstrap;
 mod session_aux;
 mod settings_snapshot;
 mod shortcuts;
+mod ssh_clipboard;
 mod ssh_connection;
 mod ssh_resume_store;
 mod ssh_workspace_add;

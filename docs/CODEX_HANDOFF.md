@@ -1,11 +1,33 @@
-# Commit and legacy-folder cleanup in progress — 2026-10-24
+# Completed commit/push and legacy-folder cleanup — 2026-10-24
 
-Current user request explicitly authorizes commit, push, and removal of now-unneeded deppy-sijo folders under `~/Desktop/projects`. No app restart, release or main merge is requested. Canonical tree remains integration-20261023.
+## Current objective / result
 
-- Previous reviewed SSH/launcher/usage changes committed separately as `4c8c58ed`, reconstructed from the preserved pre-API baseline rather than mixing the two phases. Staged provider usage contract and staged diff check PASS.
-- Current reviewed API source SHA25648 files unchanged from final tests5359PASS; usage source and diff checks rerunPASS. Next commit contains API feature, compact UI, terminal regressions and its review evidence.
-- Cleanup inventory `/tmp/deppy-commit-cleanup-inventory-20261024.json`. Preserve original common Git tree, current integration tree, live preview cwd trees (ime-cloud/performance) and shared build target tree(ssh-workspace). Other legacy trees may be archived privately with full non-cache files/status/patches and verified digests before worktree removal. Keep branch refs; do not delete deppy/deppy-mux/other projects, /private/tmp worktrees or fixture credentials.
-- Remaining: commit API work, push current branch and verify exact remote hash; archive/verify inactive legacy worktrees, remove those only, record results and preserved reasons; commit/push final handoff/report. No force-push.
+User explicitly requested commit, push, and deletion of now-unneeded deppy-sijo folders under `~/Desktop/projects`. Source commits **4c8c58ed** (previous reviewed SSH/launcher/provider usage fixes) and **ed842f0c** (current scoped API/UI feature and review fixes) were created separately and pushed to `origin/fix/product-review-integration-20261023`. `git ls-remote` matched exact source head `ed842f0c82009b489cbe6d3e2419fed04928329a`. This final documentation commit records completed cleanup; normal push follows. No main merge, release/build delivery or app restart.
+
+## Cleanup and preservation
+
+- Removed10 inactive legacy worktrees under projects: agent-wait-audit, cc-fix-native, cc-fix-pwa, cc-fix-workflow, cloud-agent-mcp, command-center, main-workspace-menu, perf-model, perf-storage, pwa-reading (full names in report).
+- Before each removal, archived all non-cache files, symlinks, staged/unstaged binary patches and status; verified archived bytes, current source modes, unchanged status/HEAD/branch and no active cwd/open files. All-ref Git bundle verified first. Standard git worktree remove --force used only after checks. Each original branch ref remains unchanged.
+- Private backup `/Users/jr/Library/Application Support/Deppy Sijo/maintenance/2026-10-24-worktree-cleanup/`,0700 parent/0600 archives. Contains repository.bundle,10source archives(total205386061bytes), per-tree manifests and patches, plan/results/final-verification JSON, RESTORE.md. Not uploaded to GitHub. Final validation:10paths absent,10worktree entries gone,10branch heads retained,10archive digests match. Archive regular-file modes also verified after deletion. Sourceproof48files unchanged from tested state; provider usage guard and diff checkPASS.
+- Preserved five required trees: `deppy-sijo` (common Git/active shells), `deppy-sijo-integration-20261023` (current source/running bundle), `deppy-sijo-ime-cloud-20261015` and `deppy-sijo-performance` (active Python preview cwd), `deppy-sijo-ssh-workspace-20261022` (shared Cargo target). Other projects, SSH fixture and /private/tmp worktrees untouched. Observed free-space increase about69.4GB (filesystem/APFS concurrent-activity observation, not logical du sum).
+- Report `docs/qa/2026-10-24-commit-and-worktree-cleanup.md`; API report appended source commit/push record. Product code unchanged, no new full test rerun claimed. Existing5359PASS/56ignored remains the verified source result.
+
+## Next agent / exact commands
+
+No further product implementation is pending in this phase. Read prior implementation support limits below. Current canonical tree/branch still integration-20261023 / fix/product-review-integration-20261023. If asked to recover a removed tree, use private RESTORE.md and retained branch; never guess or discard its archived edits. If asked for a delivered changed app, bump beyond shipped0.18.0 and verify artifact versions; restart only with explicit current request.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+cat AGENTS.md
+sed -n '1,115p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git log -3 --oneline
+git worktree list
+cat docs/qa/2026-10-24-commit-and-worktree-cleanup.md
+python3 scripts/verify-provider-usage.py --check-only
+# Shared target stays /Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target.
+# Never dev-run.sh/open/kill/restart automatically.
+```
 
 ---
 

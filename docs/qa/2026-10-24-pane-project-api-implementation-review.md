@@ -86,3 +86,7 @@ Cargo는 root가 직렬 실행했다. 공통 조건은 `CARGO_BUILD_JOBS=2`, sha
 - [검증 증거·소스 SHA256 목록](assets/pane-project-api-20261024/README.md)에 현재 작업 소스 48개와 baseline digest, lossless gzip 로그, 합성 UI 이미지 네 장을 보존했다. [edit](assets/pane-project-api-20261024/edit.png) / [API 바로 등록](assets/pane-project-api-20261024/api-quick-add.png) / [desktop](assets/pane-project-api-20261024/desktop.png) / [narrow](assets/pane-project-api-20261024/narrow.png).
 - 여섯 PR은 작업 분할 단위다. 이번 구현 단계에서 실제 git commit·push·GitHub PR 생성·main 병합은 하지 않았다. 기존 미커밋 작업과 섞어 일괄 커밋하지 않았다.
 - 소스 구현 및 요청한 병렬 코드 리뷰는 마쳤다. 지원 경계와 재현되지 않은 terminal 증상은 위와 같이 남긴다. 실행 중 앱에는 이 변경을 아직 배포하지 않았다.
+
+## 후속 커밋·푸시 — 2026-10-24
+
+사용자 후속 요청으로 이전에 검증한 SSH·런처·사용량 변경을 `4c8c58ed`에 별도 커밋하고, 이번 API/UI/회귀 작업을 `ed842f0c`에 커밋했다. `origin/fix/product-review-integration-20261023`로 정상 푸시한 뒤 원격 HEAD가 `ed842f0c82009b489cbe6d3e2419fed04928329a`와 같은 것을 확인했다. 위 “커밋하지 않음”은 구현·리뷰 종료 시점의 기록이다. 제품 소스는 최종 테스트 이후 바뀌지 않았으며, 배포·앱 재시작·main 병합은 하지 않았다.

@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.19.0] - 2026-10-24
+
+- Add direct project API registration from Notes and terminal menus with a compact key editor and explicit metadata reload.
+- Let new local Claude, Codex, Cursor and Grok sessions discover explicitly permitted project APIs and execute with current selected keys, scoped authorization and redacted output.
+- Include the reviewed SSH recovery, launcher and usage fixes merged into main; package matching versioned SSH helpers.
+- Signed local developer build; no automatic app restart.
+
 ## [0.15.1] - 2026-10-20
 
 - Show each main agent and worker provider once in project settings while preserving every model and reasoning-effort option.

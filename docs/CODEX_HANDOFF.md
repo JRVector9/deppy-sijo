@@ -1,3 +1,31 @@
+# Local 0.19.0 rebuild — 2026-10-24 (in progress)
+
+## Objective and completed preparation
+
+User asks “미커밋 없지? 재빌드해”. Canonical integration tree main was clean at c6b838b97e83eb848945410f483a748e8bfe695d and exactly matched origin/main. Previous main merge/push is complete. Last shipped bundle scan max0.18.0. New project API features require minor0.19.0: root workspace version and exactly30 inherited workspace lock versions updated; external dependency graph unchanged. No product behavior changes in this rebuild. Native app/proxy/askpass plus actual Linux aarch64/x86_64 SSH helpers must be rebuilt and verified. NO launch/stop/restart authorized.
+
+## Verification, decisions and remaining work
+
+- Before edits, cargo metadata --offline --locked --no-deps PASS; all48 previously tested task source digests unchanged. Prior5359 normalPASS/56ignored is previous source evidence, not a fresh rerun.
+- Main CI build/test run40003623932 still pending at last observation; fmt/boundaries/provider seal/Clippy/replay gates PASS. Dependency security run40003623722 FAIL: RustSec JSON contains3 vulnerabilities. Keep evidence separate from successful build; do not silently update dependencies or weaken audit. Exact findings to be included in rebuild report.
+- New package path target/bundle-0.19.0/Deppy Sijo.app, signed local developer/debug profile using existing explicit local trust verification. Not notarized public distribution.
+- Reuse pinned-image native-Cargo helper driver from docs/qa/assets/local-0.18.0-20261023/build-remote-host-native-cargo.sh (version dynamic) to avoid previously proven QEMU Cargo fork stalls. No remote installation or app launch.
+- Modified files: Cargo.toml, Cargo.lock, CHANGELOG.md, this handoff, new local0.19 QA evidence and report. Commit version source before building. Remaining: native build, both helpers/tests, package/sign, versions/hash/source verification, final evidence commit/push and clean-tree check. No new build/test result claimed yet.
+
+## Exact commands
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+CARGO_BUILD_JOBS=2 CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target cargo build --offline --locked -p deppy-sijo -p mcp-proxy -p ssh-askpass
+sh docs/qa/assets/local-0.18.0-20261023/build-remote-host-native-cargo.sh
+python3 docs/qa/assets/local-0.19.0-20261024/local-bundle.py
+python3 scripts/verify-provider-usage.py --check-only
+# Never dev-run.sh/open/kill/restart as part of this rebuild.
+```
+
+---
+
 # Main integration — 2026-10-24
 
 ## Current objective / result

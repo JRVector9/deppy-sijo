@@ -1,0 +1,24 @@
+{
+  "updated_packages": [
+    {
+      "package": "ctutils",
+      "before": "0.4.2",
+      "after": "0.4.4"
+    },
+    {
+      "package": "rustls-webpki",
+      "before": "0.103.15",
+      "after": "0.103.16"
+    },
+    {
+      "package": "webpki-roots",
+      "before": "1.0.8",
+      "after": "1.0.10"
+    }
+  ],
+  "compatibility_reference_updates": [
+    "ureq3.4.0 dependency label",
+    "webpki-roots0.26.11 re-export parent label"
+  ],
+  "all_other_graph_entries_identical": true
+}

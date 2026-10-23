@@ -1,0 +1,53 @@
+[
+  {
+    "name": "audit",
+    "command": [
+      "cargo",
+      "audit",
+      "--json",
+      "--file",
+      "Cargo.lock"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 1.4350718749919906
+  },
+  {
+    "name": "deny",
+    "command": [
+      "cargo",
+      "deny",
+      "--offline",
+      "--locked",
+      "check",
+      "bans",
+      "licenses",
+      "sources"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.7636203749570996
+  },
+  {
+    "name": "metadata",
+    "command": [
+      "cargo",
+      "metadata",
+      "--offline",
+      "--locked",
+      "--no-deps",
+      "--format-version",
+      "1"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.02901683305390179
+  },
+  {
+    "name": "provider-usage-source",
+    "command": [
+      "python3",
+      "scripts/verify-provider-usage.py",
+      "--check-only"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 0.04558945808093995
+  }
+]

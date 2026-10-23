@@ -1,0 +1,50 @@
+[
+  {
+    "status": " M",
+    "path": "AGENTS.md",
+    "sha256": "b8833f5b3b707b57c6e8aaf377f48f1f67ce802a5b98299132b0ad6822f366bb",
+    "size": 3723
+  },
+  {
+    "status": " M",
+    "path": "docs/CODEX_HANDOFF.md",
+    "sha256": "8ae097d2ffdbb462ec0426378b34cd1a221f27aaf1cb760bf7eeeecf2c10d734",
+    "size": 1222639
+  },
+  {
+    "status": "??",
+    "path": "docs/mockups/cloud-agent-grok-scenario-20260926.html",
+    "sha256": "12703910526db441cf85f48a39e64ef5aec8751706a393f7f77422bb09af8aa6",
+    "size": 60496
+  },
+  {
+    "status": "??",
+    "path": "docs/mockups/deppy-ai-work-guide-20260928.html",
+    "sha256": "c4bfded8ec7607818379b0f6330f3ca61b88e224c641edbd04ddcbabe0e3d797",
+    "size": 34213
+  },
+  {
+    "status": "??",
+    "path": "docs/mockups/workspace-source-picker-20260929.html",
+    "sha256": "35d252d54dc2b908b63b65e19be259670be39da5e89f404213aa3362ab44bc6c",
+    "size": 15688
+  },
+  {
+    "status": "??",
+    "path": "docs/reviews/2026-09-27-automatic-mcp-connect.md",
+    "sha256": "7ad2e4c9a316eb785f6f71815a8c6f6c42049dca9bf415fbca8b9423bb4af437",
+    "size": 8247
+  },
+  {
+    "status": "??",
+    "path": "docs/reviews/2026-09-27-mcp-managed-connectivity-options.md",
+    "sha256": "63979f9f8af20f94315459b74486f7181b4154d2769dae2efa73247463b44413",
+    "size": 11108
+  },
+  {
+    "status": "??",
+    "path": "docs/superpowers/plans/2026-09-26-cloud-agent-session-bridge.md",
+    "sha256": "a841515a6f44664beff703beebd7d47fe9e44e5d62907335420ffaf385c73163",
+    "size": 37429
+  }
+]

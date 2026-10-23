@@ -1,0 +1,770 @@
+{
+  "command": "cargo test --workspace --offline --locked -- --test-threads=4",
+  "result": "PASS",
+  "suite_count": 95,
+  "passed": 6641,
+  "ignored": 79,
+  "counting": "Last parent summary per Cargo Running/Doc-tests section; nested child fixture summaries excluded",
+  "suites": [
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/agent_mcp-0f6eb2ed276f1bae)",
+      "kind": "unit_or_integration",
+      "passed": 99,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 1
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/audit-0f1ff28b8a798834)",
+      "kind": "unit_or_integration",
+      "passed": 65,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/auth-e554b630603701cb)",
+      "kind": "unit_or_integration",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_contract-8d168f92e8c87abd)",
+      "kind": "unit_or_integration",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_service-c958c995ee99ce43)",
+      "kind": "unit_or_integration",
+      "passed": 83,
+      "failed": 0,
+      "ignored": 2,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/connector_ui-f1226ec6b3874259)",
+      "kind": "unit_or_integration",
+      "passed": 35,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 1
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_core-ca1c6d8e40e93140)",
+      "kind": "unit_or_integration",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_remote_host-e8401f4625f9f15f)",
+      "kind": "unit_or_integration",
+      "passed": 33,
+      "failed": 0,
+      "ignored": 3,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_remote_host-e04dc635d014ea35)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/supervisor.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/supervisor-9565b4f745502bd2)",
+      "kind": "unit_or_integration",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_sijo-f80b2798fb8eb4be)",
+      "kind": "unit_or_integration",
+      "passed": 3872,
+      "failed": 0,
+      "ignored": 46,
+      "nested_summary_lines_excluded": 1
+    },
+    {
+      "suite": "tests/agent_state_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/agent_state_boundary-4d375b4bb6966e09)",
+      "kind": "unit_or_integration",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/alloc_phys_footprint_release.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/alloc_phys_footprint_release-3fb283ef5395d471)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/dotenv_launch_boundary.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/dotenv_launch_boundary-0c7c863511721882)",
+      "kind": "unit_or_integration",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/lazy_bounded_worker.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/lazy_bounded_worker-437a018772898855)",
+      "kind": "unit_or_integration",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/logging_policy.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/logging_policy-1a9afd0bc1baa26e)",
+      "kind": "unit_or_integration",
+      "passed": 15,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/scrollback_rss_end_to_end.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/scrollback_rss_end_to_end-e0c92ad5a06e113f)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/http_client-81c2de269719270a)",
+      "kind": "unit_or_integration",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/i18n-35af98b0681ea861)",
+      "kind": "unit_or_integration",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mcp-21d58ebb74baaf34)",
+      "kind": "unit_or_integration",
+      "passed": 105,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_mcp_proxy-ce6b37d802a9c800)",
+      "kind": "unit_or_integration",
+      "passed": 112,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/hook_task_prompt.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/hook_task_prompt-25e580ea47cc9f1e)",
+      "kind": "unit_or_integration",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mcp_store-a43fb5da0ac291df)",
+      "kind": "unit_or_integration",
+      "passed": 42,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mux-c46ba343cdc52395)",
+      "kind": "unit_or_integration",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/persist-718deb96c45d11c4)",
+      "kind": "unit_or_integration",
+      "passed": 29,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/platform-c3c81c206115442e)",
+      "kind": "unit_or_integration",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/pty-8396bc57923305b9)",
+      "kind": "unit_or_integration",
+      "passed": 70,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_protocol-9e363d24e338ddde)",
+      "kind": "unit_or_integration",
+      "passed": 13,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/relay_wire_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_wire_vectors-943447ee8e1a9e15)",
+      "kind": "unit_or_integration",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_server-05407a8218d538d6)",
+      "kind": "unit_or_integration",
+      "passed": 36,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_server-664062fe68ccad6b)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/deploy_manifests.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deploy_manifests-303dcf3a49921046)",
+      "kind": "unit_or_integration",
+      "passed": 6,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/shutdown.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/shutdown-0513feec15de282e)",
+      "kind": "unit_or_integration",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/transport_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/transport_contract-cbb1fe81273007bd)",
+      "kind": "unit_or_integration",
+      "passed": 9,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/runtime-edb78a732243c753)",
+      "kind": "unit_or_integration",
+      "passed": 462,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/secret-e30e8b83594753df)",
+      "kind": "unit_or_integration",
+      "passed": 86,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/session-116ab99bcacb8984)",
+      "kind": "unit_or_integration",
+      "passed": 82,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/terminal_table_resize.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/terminal_table_resize-49567f08066bbc6b)",
+      "kind": "unit_or_integration",
+      "passed": 3,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/ssh_askpass-46b53c2196395dd9)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/deppy_ssh_askpass-ec00d1ec74c5c997)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/companion.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/companion-3957b260a7f4c76a)",
+      "kind": "unit_or_integration",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/protocol.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/protocol-4480f93836d4ce28)",
+      "kind": "unit_or_integration",
+      "passed": 2,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/ssh_transport-70a732e4b49e2a94)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/config_context.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/config_context-547719523d1fca51)",
+      "kind": "unit_or_integration",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/destination.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/destination-e4b23fe81994bac2)",
+      "kind": "unit_or_integration",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/openssh_loopback.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/openssh_loopback-d8b3ad7ddf45907e)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/worker.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/worker-c2bc7247d994d12c)",
+      "kind": "unit_or_integration",
+      "passed": 22,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/storage-ce1cc2109159a478)",
+      "kind": "unit_or_integration",
+      "passed": 531,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/background_agent_lifecycle.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/background_agent_lifecycle-5aac7f5a43d43966)",
+      "kind": "unit_or_integration",
+      "passed": 8,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/storage_core-df71dd2088c699f6)",
+      "kind": "unit_or_integration",
+      "passed": 7,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/terminal-eb0643f9d1ae01a8)",
+      "kind": "unit_or_integration",
+      "passed": 148,
+      "failed": 0,
+      "ignored": 4,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/lib.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/web_remote-16906d34d74e6be5)",
+      "kind": "unit_or_integration",
+      "passed": 408,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/chrome_support_contract.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/chrome_support_contract-54a614bb9ddc04fc)",
+      "kind": "unit_or_integration",
+      "passed": 1,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/cloud_results_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/cloud_results_chrome-2fc2f211b93c1329)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/command_center_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/command_center_chrome-26ea7cc324cc8c85)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/mobile_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mobile_shell_chrome-dc3aba3e9ff924ef)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/mobile_usability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/mobile_usability_chrome-c8641d61fd6e4301)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/pwa_unified_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/pwa_unified_chrome-ba76ce3f1dbb87b1)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 2,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/relay_shell_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_shell_chrome-36e41c49de025a46)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/relay_shell_deploy.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_shell_deploy-b9ac59abf0e87e83)",
+      "kind": "unit_or_integration",
+      "passed": 10,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/relay_webcrypto_vectors.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/relay_webcrypto_vectors-46a740d1d5fb9da0)",
+      "kind": "unit_or_integration",
+      "passed": 4,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/transport_independence.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/transport_independence-b64bc7f82aada5d0)",
+      "kind": "unit_or_integration",
+      "passed": 5,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/viewer_core_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_core_chrome-dbe4ff161fb7aeb4)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/viewer_grapheme_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_grapheme_chrome-93072d0fca42be42)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/viewer_history_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_history_chrome-99c6bdc0e9b11229)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/viewer_readability_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_readability_chrome-b5c64340e6b48285)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "tests/viewer_reading_chrome.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/viewer_reading_chrome-2b76af1933b3899f)",
+      "kind": "unit_or_integration",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 1,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "unittests src/main.rs (/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target/debug/deps/xtask-e1d8b40ae127e57f)",
+      "kind": "unit_or_integration",
+      "passed": 19,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "agent_mcp",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "audit",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "auth",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "connector_contract",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "connector_service",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "connector_ui",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "deppy_core",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "deppy_remote_host",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "http_client",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "i18n",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "mcp",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "mcp_store",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "mux",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "persist",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "platform",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "pty",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "relay_protocol",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "relay_server",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "runtime",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "secret",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "session",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "ssh_askpass",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "ssh_transport",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "storage",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "storage_core",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "terminal",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    },
+    {
+      "suite": "web_remote",
+      "kind": "rustdoc",
+      "passed": 0,
+      "failed": 0,
+      "ignored": 0,
+      "nested_summary_lines_excluded": 0
+    }
+  ]
+}

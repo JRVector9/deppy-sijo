@@ -1,0 +1,16 @@
+{
+  "branch": "feat/fleet-one-list-and-relay-wip",
+  "head": "a789466bbf9def2e1791cc9abd76eafd49214368",
+  "clean": true,
+  "original_handoff_preserved_as_suffix": true,
+  "changed_paths": [
+    "AGENTS.md",
+    "docs/CODEX_HANDOFF.md",
+    "docs/mockups/cloud-agent-grok-scenario-20260926.html",
+    "docs/mockups/deppy-ai-work-guide-20260928.html",
+    "docs/mockups/workspace-source-picker-20260929.html",
+    "docs/reviews/2026-09-27-automatic-mcp-connect.md",
+    "docs/reviews/2026-09-27-mcp-managed-connectivity-options.md",
+    "docs/superpowers/plans/2026-09-26-cloud-agent-session-bridge.md"
+  ]
+}

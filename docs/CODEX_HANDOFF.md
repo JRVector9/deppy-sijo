@@ -1,34 +1,43 @@
-# Security dependencies and legacy document cleanup — 2026-10-24 (in progress)
+# Security and legacy-document fixes complete — 2026-10-24
 
-## Objective / investigation
+## Current objective / completed work
 
-User explicitly asks to fix both preceding findings: failed dependency-security audit and pre-existing uncommitted documents/mockups in original worktree. Canonical main is11f1f041, clean before task. Old nominal Fleet tree contains exactly8dirty paths (2modified tracked docs,6untracked docs/HTML), no product Rust changes. Two review docs byte-identical to main;3HTML mockups and superseded8-PR plan absent;286added historical handoff lines absent. AGENTS version-policy addition already in main. Old branch331b78b3 is NOT ancestor of main: never merge its product source to resolve document cleanup.
+User requested fixing both preceding findings. **Both are resolved:** three security dependencies patched and local+GitHub audit PASS;8old dirty documents/mockups preserved/committed/pushed with clean original worktree. Corrected0.19.1 local app and matching SSH helpers actually built/signed/verified. NO stop/launch/restart. Source commitde785879f57eb53cd691380144400f7da892a183 already pushed to main; old document checkpointa789466bbf9def2e1791cc9abd76eafd49214368 already pushed to its existing Fleet branch. This final main documentation/archive/evidence commit follows; final normal push/clean check is publishing, not remaining product implementation.
 
-## Design / remaining plan
+## Modified files / key decisions
 
-- Audit reproduced locally with exit1 and3known vulnerabilities; patched audit now exits0 with zero vulnerabilities. Official RustSec and maintainer sources confirm fixed compatible patches: ctutils>=0.4.4, rustls-webpki>=0.103.16, webpki-roots>=1.0.10. Update only affected locked crates, preserve CI/audit/protected usage gates. Exact graph delta verified: only3patched package versions/checksums and2parent dependency labels; audit/deny(metadata licenses/sources)/metadata/provider source gates PASS. Full native workspace tests and corrected artifact build remain.
-- Preserve8dirty files and patch before cleanup. Review/commit documents on original branch without merging ancient product source. Bring unique historical documents/handoff additions into main's explicitly historical archive, retain duplicate review docs in existing main locations. Byte/hash verification required before any cleanup; no unreviewed discards. Old8files committed and pushed to a789466bbf9def2e1791cc9abd76eafd49214368 with original handoff content intact; exact local/remote SHA verified, original worktree clean. Unique4drafts plus286handoff lines archived on main; duplicate2reviews unchanged.
-- Latest request does not authorize app restart. No app stop/launch/restart. Corrected local artifact will be0.19.1, root+30workspace lock versions bumped. Actual native/helper rebuild and package verification pending; old0.19.0 artifact unchanged. No new build result claimed yet.
-- Temporary evidence /tmp/deppy-security-docs-20261024 contains baseline Cargo.lock, old dirty path hashes and binary patch. Final evidence/report to docs/qa after checks. No subagents requested in current task.
+- Cargo.lock only3external patches: ctutils0.4.2→0.4.4, rustls-webpki0.103.15→0.103.16, webpki-roots1.0.8→1.0.10;2parent reference labels updated, including compatibility roots0.26.11. Exact normalized graph equality verifies no other dependency change. No audit/CI suppression, no protected usage edits/reseal.
+- Delivered local fix version0.19.0→0.19.1: root Cargo.toml+30inherited workspace lock versions, CHANGELOG. Source proof1173inputs. No Rust behavior source edits. Native jobs2 and Linux jobs1 ran concurrently on distinct targets/caches; each target serialized.
+- Old nominal worktree is NOT ancestor of main. Never merge its unrelated product source. Old8files committed intact (handoff original preserved as suffix after current-source pointer); private0700/0600backup verified before preservation. No source deleted.4unique drafts copied byte-identically to docs/archive/legacy-fleet-202609,286historical handoff additions+patch retained,2duplicate reviews unchanged in main. Old AGENTS mandatory-version addition already exactly present in main. Archive README marks obsolete plans/history explicitly.
+- New report docs/qa/2026-10-24-security-and-legacy-docs-remediation.md, archive README/manifest and docs/qa/assets/local-0.19.1-20261024 retain exact source, original documents, commands/results and SHA256 proof.
 
-## Comparison-check correction
+## Actual tests / results
 
-First graph assertion classified ureq as changed because its dependency version label changed, then stopped before GREEN audit. Corrected comparison preserves both webpki-roots versions and normalizes only the3intended package version/checksum pairs and2parent reference labels; exact complete graph equality PASS. No extra crate update or product fix needed for this test-script error. cargo-nextest is not installed locally (probe only); use built-in cargo test --workspace for actual regressions, do not claim a nextest run.
+- Audit RED exit1/3vulnerabilities; patched GREEN and fresh final audit exit0/0vulnerabilities. cargo deny bans/licenses/sources PASS; no policy changes. Official maintainer/RustSec and non-yanked crates.io patch checksums verified.
+- GitHub dependency-security run40015043988 **completed SUCCESS** for both RustSec and license/source/bans jobs on de785879. Exact job JSON retained. Do not confuse successful security workflow with unrelated full GitHub build workflow state; fresh full workspace tests ran locally.
+- cargo test --workspace --offline --locked -- --test-threads=4 **6641normalPASS/79ignored,95suites**,656.45s. Last parent summary per Running/Doc-tests section excludes nested child fixtures. Full strict workspace Clippy -Dwarnings PASS134.86s; fmt PASS2.86s; xtask boundary PASS6.35s; native app/proxy/askpass build PASS71.20s.
+- Static Linux ARM64+x86_64 helper build+Debian12 tests PASS1544.81s.74normalPASS/3ignored per architecture, **148test executionsPASS/6ignored combined**. Filtered tests not counted. Both helper versions0.19.1, actual rebuilt binaries (not relabeled).
+- Local package/signature/resource verification PASS. App CLI+both macOS plist fields0.19.1. New artifact target/bundle-0.19.1/Deppy Sijo.app, debug-profile signed local developer bundle, not notarized public distribution.10bundle hashes+1173source hashes match. Previous67bundle scan max0.19.0; old artifacts untouched. Old app PID31144 still running0.16.0. No app restart or remote helper installation.
+- Original worktree clean, exact remote/locala789466b match;8backup original hashes+4archive copies+2duplicate reviews+286handoff lines+original handoff suffix all actually reverified. Provider source guard and diff check PASS. New final doc staging check/push follows. No old test counts reused as this task's result.
 
-## Build scheduling
+## Failed approaches
 
-Native host Cargo jobs2 and Linux container Cargo jobs1 use wholly separate targets/caches and can run concurrently for this release to reduce elapsed time; no two host Cargo operations overlap, and no two Linux architectures overlap. Product inputs are committed and hash-fenced throughout. Do not edit Cargo/product sources after proof until results are checked.
+Initial graph dictionary comparison overcounted unchanged ureq dependency-label change and could drop duplicate roots package names; it stopped before GREEN audit. Replaced with exact complete lock normalization of only3intended version/checksum pairs and2reference labels, then equality PASS. No extra package update needed. cargo-nextest unavailable locally (probe only); used built-in full cargo test, no nextest run claimed. QEMU jemalloc fallback notices expected; both helper builds/tests succeeded. Final staged diff check caught a blank EOF line in verbatim archived handoff additions; appended a clearly marked HTML footer after all286original lines, verified exact prefix SHA, then reran the unchanged check. No historical content removed.
 
-## Exact next commands
+## Remaining work / exact commands
+
+No requested source fixes remain. Finish publishing this final docs/archive/evidence commit and verify clean canonical main/exact remote SHA. Original old worktree already clean/pushed. Future work should use canonical integration-20261023 main; old Fleet is historical. Restart only after a new explicit request.
 
 ```sh
 cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
-cargo audit --json --file Cargo.lock
-cargo update -p ctutils --precise 0.4.4
-cargo update -p rustls-webpki --precise 0.103.16
-cargo update -p webpki-roots@1.0.8 --precise 1.0.10
-# Check actual graph delta before tests/commit; do not update unrelated dependencies.
-# Shared native target /Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target, jobs2.
+git status --short --branch
+git log -3 --oneline
+git ls-remote origin refs/heads/main
+python3 scripts/verify-provider-usage.py --check-only
+"target/bundle-0.19.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo" --version
+git -C /Users/jr/Desktop/projects/deppy-sijo status --short --branch
+# Source proof and bundle SHA256: docs/qa/assets/local-0.19.1-20261024/build-result.json.
+# Never dev-run.sh/open/kill/restart automatically. Shared native target stays ssh-workspace-20261022/target.
 ```
 
 ---

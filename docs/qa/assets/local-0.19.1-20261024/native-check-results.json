@@ -1,0 +1,76 @@
+[
+  {
+    "name": "workspace-tests",
+    "command": [
+      "cargo",
+      "test",
+      "--workspace",
+      "--offline",
+      "--locked",
+      "--",
+      "--test-threads=4"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 656.4459224169841
+  },
+  {
+    "name": "workspace-clippy",
+    "command": [
+      "cargo",
+      "clippy",
+      "--workspace",
+      "--all-targets",
+      "--offline",
+      "--locked",
+      "--",
+      "-D",
+      "warnings"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 134.86396487499587
+  },
+  {
+    "name": "fmt",
+    "command": [
+      "cargo",
+      "fmt",
+      "--all",
+      "--",
+      "--check"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 2.863114250008948
+  },
+  {
+    "name": "boundary",
+    "command": [
+      "cargo",
+      "run",
+      "--offline",
+      "--locked",
+      "-p",
+      "xtask",
+      "--",
+      "check-boundary"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 6.349067999981344
+  },
+  {
+    "name": "native-build",
+    "command": [
+      "cargo",
+      "build",
+      "--offline",
+      "--locked",
+      "-p",
+      "deppy-sijo",
+      "-p",
+      "mcp-proxy",
+      "-p",
+      "ssh-askpass"
+    ],
+    "exit_code": 0,
+    "elapsed_seconds": 71.19756583299022
+  }
+]

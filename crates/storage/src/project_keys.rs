@@ -769,7 +769,7 @@ fn write_key(conn: &Connection, key: &ProjectKey) -> anyhow::Result<()> {
     conn.execute("INSERT INTO project_keys(id,workspace_id,environment,name,credential_id,source_baseline_credential_id,auth_credential_id,revision,legacy_reference,payload_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) ON CONFLICT(id) DO UPDATE SET name=excluded.name,credential_id=excluded.credential_id,source_baseline_credential_id=excluded.source_baseline_credential_id,auth_credential_id=excluded.auth_credential_id,revision=excluded.revision,legacy_reference=excluded.legacy_reference,payload_json=excluded.payload_json",rusqlite::params![key.id,key.workspace_id,key.environment.as_str(),key.name,key.credential_id,key.source_baseline_credential_id,auth,key.revision as i64,key.legacy_reference,json])?;
     Ok(())
 }
-fn check_save(
+pub(super) fn check_save(
     conn: &Connection,
     workspace: &str,
     environment: KeyEnvironment,
@@ -905,7 +905,7 @@ fn record_value_publication(conn: &Connection, key: &ProjectKey) -> anyhow::Resu
     conn.execute("INSERT INTO project_key_changes(key_id,workspace_id,environment,payload_json) SELECT id,workspace_id,environment,json_object('key_id',id,'workspace_id',workspace_id,'environment',environment,'revision',revision,'occurred_at',json_extract(payload_json,'$.last_good_at'),'kind','value_saved','storage_state',json_extract(payload_json,'$.storage_state'),'remote_state',json_extract(payload_json,'$.github.state')) FROM project_keys k WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM project_key_changes e WHERE e.key_id=k.id AND json_extract(e.payload_json,'$.revision')=k.revision AND json_extract(e.payload_json,'$.kind')='value_saved')",[&key.id])?;
     Ok(())
 }
-fn finish_save(conn: &Connection, mut key: ProjectKey) -> anyhow::Result<ProjectKey> {
+pub(super) fn finish_save(conn: &Connection, mut key: ProjectKey) -> anyhow::Result<ProjectKey> {
     // A newer local generation invalidates all in-flight old sends, even with automatic sends off.
     conn.execute(
         "DELETE FROM project_key_github_outbox WHERE key_id=?1",
@@ -2287,6 +2287,7 @@ impl Db {
         saved.revision = next_revision(current)?;
         saved.validate().map_err(anyhow::Error::msg)?;
         tx.execute("INSERT INTO project_key_build_recipes(id,workspace_id,environment,revision,payload_json) VALUES (?1,?2,?3,?4,?5) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision,payload_json=excluded.payload_json",rusqlite::params![saved.id,workspace,environment.as_str(),saved.revision as i64,encode(&saved,PROJECT_KEY_METADATA_BYTES_MAX)?])?;
+        tx.execute("DELETE FROM project_api_grants WHERE workspace_id=?1 AND environment=?2 AND recipe_id=?3",rusqlite::params![workspace,environment.as_str(),saved.id])?;
         tx.commit()?;
         Ok(ProjectKeyCas::Committed(saved))
     }
@@ -2310,6 +2311,7 @@ impl Db {
                 current_revision: current,
             }
         } else {
+            tx.execute("DELETE FROM project_api_grants WHERE workspace_id=?1 AND environment=?2 AND recipe_id=?3",rusqlite::params![workspace,environment.as_str(),id])?;
             tx.execute("DELETE FROM project_key_build_recipes WHERE id=?1", [id])?;
             ProjectKeyCas::Committed(())
         };

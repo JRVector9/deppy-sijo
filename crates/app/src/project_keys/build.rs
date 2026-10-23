@@ -69,6 +69,21 @@ impl ProjectKeysService {
         cwd: &Path,
         runner: &dyn ProcessRunner,
     ) -> Result<ProjectBuildReceipt, ProjectKeysError> {
+        self.run_build_selected(scope, recipe, command, cwd, runner, None)
+    }
+
+    pub(super) fn run_build_selected(
+        &self,
+        scope: &ProjectKeysScope,
+        recipe: Option<&ProjectBuildRecipe>,
+        command: &[String],
+        cwd: &Path,
+        runner: &dyn ProcessRunner,
+        selected: Option<(
+            &deppy_core::project_api_access::ProjectApiSessionScope,
+            &[String],
+        )>,
+    ) -> Result<ProjectBuildReceipt, ProjectKeysError> {
         if command.is_empty()
             || command.len() > 128
             || command.iter().map(String::len).sum::<usize>() > 8192
@@ -90,10 +105,15 @@ impl ProjectKeysService {
         )?;
         let mut effective: BTreeMap<String, ProjectKey> = BTreeMap::new();
         let mut disconnected_required = Vec::new();
-        for mut key in keys
-            .into_iter()
-            .filter(|key| matches!(key.usage, KeyUsage::Build | KeyUsage::LegacyAgent))
-        {
+        for mut key in keys.into_iter().filter(|key| {
+            selected.map_or_else(
+                || matches!(key.usage, KeyUsage::Build | KeyUsage::LegacyAgent),
+                |(_, ids)| ids.contains(&key.id),
+            )
+        }) {
+            if selected.is_some() {
+                key.required = true;
+            }
             if key.source.is_file() {
                 let Some(index) = settings
                     .sources
@@ -123,8 +143,14 @@ impl ProjectKeysService {
         {
             return Err(ProjectKeysError::SourceMissing);
         }
+        if selected.is_some_and(|(_, ids)| effective.len() != ids.len()) {
+            return Err(ProjectKeysError::Conflict);
+        }
         let mut temporary = TemporaryKeys::create()?;
         let mut environment = ProcessEnvironment::default();
+        environment
+            .remove_names
+            .push("DEPPY_PROJECT_API_CAPABILITY".into());
         let mut used_keys = Vec::new();
         // Remove every registered name in either environment before injecting this snapshot.
         // This also removes optional/missing values from an old shell's ambient environment.
@@ -177,6 +203,11 @@ impl ProjectKeysService {
                 }
                 continue;
             }
+            if selected.is_some() {
+                environment
+                    .output_secrets
+                    .push(SecretString::new(bundle.access().expose().into()));
+            }
             let value = if matches!(
                 key.delivery,
                 KeyDelivery::FilePath | KeyDelivery::TemporaryFile
@@ -208,6 +239,12 @@ impl ProjectKeysService {
         // Every failure after publishing a running receipt must settle that receipt.
         let result = self
             .root_handle(scope)
+            .and_then(|root| {
+                if let Some((actor, ids)) = selected {
+                    self.check_agent_grants(actor, ids, recipe.map(|recipe| recipe.id.as_str()))?;
+                }
+                Ok(root)
+            })
             .and_then(|_| runner.run_in_directory(command, &cwd, &environment, None, true));
         // PEM files are needed only by the child; a busy receipt database must not retain them.
         drop(temporary);
@@ -223,6 +260,621 @@ mod tests {
     use super::*;
     use crate::project_keys::{process::ProcessOutput, tests::Fixture};
     use std::sync::{Mutex, atomic::Ordering};
+
+    fn selected_actor(
+        fixture: &Fixture,
+        key: &ProjectKey,
+    ) -> deppy_core::project_api_access::ProjectApiSessionScope {
+        use deppy_core::project_api_access::*;
+        fixture
+            .service
+            .db
+            .project_api_access_save(
+                &ProjectApiAccess {
+                    key_id: key.id.clone(),
+                    workspace_id: key.workspace_id.clone(),
+                    environment: key.environment,
+                    revision: 1,
+                    execution_name: Some(key.name.clone()),
+                    service_name: None,
+                    description: None,
+                    documentation_url: None,
+                    agent_enabled: true,
+                },
+                None,
+            )
+            .unwrap();
+        let actor = ProjectApiSessionScope {
+            workspace_id: key.workspace_id.clone(),
+            environment: key.environment,
+            principal_id: "local-agent".into(),
+            session_id: "output-session".into(),
+            generation: "output-generation".into(),
+            actor_kind: ProjectApiActorKind::LocalSession,
+        };
+        fixture
+            .service
+            .db
+            .project_api_grant_save(
+                &ProjectApiGrant {
+                    scope: actor.clone(),
+                    key_id: key.id.clone(),
+                    access_revision: 1,
+                    operation: ProjectApiOperation::Environment,
+                    recipe_id: None,
+                    expires_at: now() + 60,
+                },
+                now(),
+            )
+            .unwrap();
+        actor
+    }
+
+    // This helper runs in an isolated real PTY so its stdout and stderr cross the same
+    // boundary that an already-running agent sees, with no launch-time secret corpus.
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_output_pty_helper() {
+        let mode = std::env::var("DEPPY_SELECTED_OUTPUT_FIXTURE").unwrap_or_default();
+        if !matches!(
+            mode.as_str(),
+            "1" | "blocked" | "tostop" | "prompt" | "cross"
+        ) {
+            return;
+        }
+        let fixture = Fixture::new();
+        let mut key = fixture.key("SELECTED_TOKEN", KeySource::Vault);
+        key.usage = KeyUsage::StoreOnly;
+        key.required = false;
+        let key = fixture.save(key, "fresh-selected-fixture-token");
+        let actor = selected_actor(&fixture, &key);
+        if mode == "cross" {
+            fixture.service.run_agent_command(
+                &actor,
+                std::slice::from_ref(&key.id),
+                None,
+                &["/bin/sh".into(), "-c".into(),
+                    "printf 'cross='; printf '%.8s' \"$SELECTED_TOKEN\"; sleep 0.04; printf '%s\\n' \"${SELECTED_TOKEN#????????}\" >&2".into()],
+                Path::new("."),
+                &crate::project_keys::process::NativeProcessRunner::for_cli(),
+            ).unwrap();
+            println!("selected-output-complete");
+            return;
+        }
+        if mode == "prompt" {
+            let runner = crate::project_keys::process::NativeProcessRunner::for_cli();
+            let receipt = fixture.service.run_agent_command(
+                &actor,
+                std::slice::from_ref(&key.id),
+                None,
+                &["/bin/sh".into(), "-c".into(), concat!(
+                    "printf '\\033['; sleep 0.04; printf '31mtoken-stdout-prompt?\\033[0m'; ",
+                    "read first; test \"$first\" = fixture-answer || exit 1; ",
+                    "printf '\\342' >&2; sleep 0.04; printf '\\234\\223 token-stderr-prompt?' >&2; ",
+                    "read second; test \"$second\" = fixture-answer || exit 1; ",
+                    "printf 'token-output='; printf '%.8s' \"$SELECTED_TOKEN\"; printf '\\033['; sleep 0.04; ",
+                    "printf '31m%s\\033[0m\\n' \"${SELECTED_TOKEN#????????}\"; ",
+                    "printf 'token-output=%s\\n' \"$SELECTED_TOKEN\" >&2",
+                ).into()],
+                Path::new("."),
+                &runner,
+            ).unwrap();
+            assert_eq!(receipt.exit_code, Some(0));
+            let mut pem = fixture.key("SELECTED_PEM", KeySource::Vault);
+            pem.usage = KeyUsage::StoreOnly;
+            pem.required = false;
+            pem.kind = KeyKind::PrivateKey;
+            pem.delivery = KeyDelivery::TemporaryFile;
+            let pem = fixture.save(pem, "private-selected-fixture-pem-value");
+            let actor = selected_actor(&fixture, &pem);
+            let receipt = fixture.service.run_agent_command(
+                &actor,
+                std::slice::from_ref(&pem.id),
+                None,
+                &["/bin/sh".into(), "-c".into(), concat!(
+                    "printf 'pem-stdout-prompt?'; read first; test \"$first\" = fixture-answer || exit 1; ",
+                    "printf 'pem-stderr-prompt?' >&2; read second; test \"$second\" = fixture-answer || exit 1; ",
+                    "printf 'pem-output='; cat \"$SELECTED_PEM\"; printf '\\n'; ",
+                    "printf 'pem-output=' >&2; cat \"$SELECTED_PEM\" >&2; printf '\\n' >&2",
+                ).into()],
+                Path::new("."),
+                &runner,
+            ).unwrap();
+            assert_eq!(receipt.exit_code, Some(0));
+            println!("selected-output-complete");
+            return;
+        }
+        if mode == "tostop" {
+            // This subprocess owns the isolated PTY. Ensure the regression does not depend
+            // on a launching shell's ignored/blocked job-control signal state.
+            let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            unsafe {
+                libc::sigemptyset(&mut signals);
+                libc::sigaddset(&mut signals, libc::SIGTTOU);
+                libc::signal(libc::SIGTTOU, libc::SIG_DFL);
+            }
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) },
+                0
+            );
+            let mut attributes = unsafe { std::mem::zeroed::<libc::termios>() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut attributes) },
+                0
+            );
+            attributes.c_lflag |= libc::TOSTOP;
+            assert_eq!(
+                unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &attributes) },
+                0
+            );
+        }
+        if mode == "blocked" {
+            use std::{
+                sync::Arc,
+                time::{Duration, Instant},
+            };
+            // Fill the isolated helper's stdout pipe before Native starts, then restore its
+            // original flags. The parent deliberately does not read until the helper exits.
+            let flags = unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe {
+                    libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags | libc::O_NONBLOCK)
+                },
+                0
+            );
+            let padding = [b'x'; 4096];
+            loop {
+                let count = unsafe {
+                    libc::write(libc::STDOUT_FILENO, padding.as_ptr().cast(), padding.len())
+                };
+                if count < 0 {
+                    assert_eq!(
+                        std::io::Error::last_os_error().kind(),
+                        std::io::ErrorKind::WouldBlock
+                    );
+                    break;
+                }
+                assert!(count > 0);
+            }
+            assert_eq!(
+                unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_SETFL, flags) },
+                0
+            );
+            let runner = Arc::new(crate::project_keys::process::NativeProcessRunner::for_cli());
+            let cancel = runner.clone();
+            let timer = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                cancel.cancel();
+            });
+            let started = Instant::now();
+            let result = fixture.service.run_agent_command(
+                &actor,
+                std::slice::from_ref(&key.id),
+                None,
+                &["/bin/sh".into(), "-c".into(),
+                    "while :; do printf 'blocked-stdout=%s\\n' \"$SELECTED_TOKEN\"; printf 'blocked-stderr=%s\\n' \"$SELECTED_TOKEN\" >&2; done".into()],
+                Path::new("."),
+                runner.as_ref(),
+            );
+            timer.join().unwrap();
+            assert!(matches!(result, Err(ProjectKeysError::Process)));
+            assert!(started.elapsed() < Duration::from_secs(1));
+            assert!(runner.wait_for_idle(Duration::from_millis(100)));
+            assert_eq!(
+                unsafe { libc::fcntl(libc::STDOUT_FILENO, libc::F_GETFL) },
+                flags
+            );
+            drop(fixture);
+            // libtest's completion banner would itself block on the deliberately full pipe.
+            std::process::exit(0);
+        }
+        let runner = crate::project_keys::process::NativeProcessRunner::for_cli();
+        let command = [
+            "/bin/sh".into(),
+            "-c".into(),
+            concat!(
+                "printf 'stdout='; printf '%.8s' \"$SELECTED_TOKEN\"; sleep 0.04; ",
+                "printf '%s\\n' \"${SELECTED_TOKEN#????????}\"; ",
+                "printf 'stderr=' >&2; printf '%.8s' \"$SELECTED_TOKEN\" >&2; sleep 0.04; ",
+                "printf '%s\\n' \"${SELECTED_TOKEN#????????}\" >&2",
+            )
+            .into(),
+        ];
+        let first = fixture
+            .service
+            .run_agent_command(
+                &actor,
+                std::slice::from_ref(&key.id),
+                None,
+                &command,
+                Path::new("."),
+                &runner,
+            )
+            .unwrap();
+        assert_eq!(first.exit_code, Some(0));
+        let rotated = fixture
+            .service
+            .save_key(
+                &fixture.scope,
+                key.clone(),
+                Some(key.revision),
+                ValueEdit::Replace(
+                    SensitiveDraft::new("rotated-selected-fixture-token".into()).unwrap(),
+                ),
+            )
+            .unwrap();
+        let second = fixture
+            .service
+            .run_agent_command(
+                &actor,
+                std::slice::from_ref(&key.id),
+                None,
+                &command,
+                Path::new("."),
+                &runner,
+            )
+            .unwrap();
+        assert_eq!(second.exit_code, Some(0));
+        assert_eq!(
+            second.used_keys[0].revision,
+            rotated.last_good_revision.unwrap()
+        );
+
+        let mut pem = fixture.key("SELECTED_PEM", KeySource::Vault);
+        pem.usage = KeyUsage::StoreOnly;
+        pem.required = false;
+        pem.kind = KeyKind::PrivateKey;
+        pem.delivery = KeyDelivery::TemporaryFile;
+        let pem = fixture.save(pem, "private-selected-fixture-pem-value");
+        let pem_actor = selected_actor(&fixture, &pem);
+        let receipt = fixture
+            .service
+            .run_agent_command(
+                &pem_actor,
+                std::slice::from_ref(&pem.id),
+                None,
+                &[
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    concat!(
+                        "printf 'pem-stdout='; head -c 8 \"$SELECTED_PEM\"; sleep 0.04; ",
+                        "tail -c +9 \"$SELECTED_PEM\"; printf '\\n'; ",
+                        "printf 'pem-stderr=' >&2; head -c 8 \"$SELECTED_PEM\" >&2; sleep 0.04; ",
+                        "tail -c +9 \"$SELECTED_PEM\" >&2; printf '\\n' >&2",
+                    )
+                    .into(),
+                ],
+                Path::new("."),
+                &runner,
+            )
+            .unwrap();
+        assert_eq!(receipt.exit_code, Some(0));
+        if mode == "tostop" {
+            let mut signals = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+            assert_eq!(
+                unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut signals) },
+                0
+            );
+            assert_eq!(unsafe { libc::sigismember(&signals, libc::SIGTTOU) }, 0);
+            let mut action = unsafe { std::mem::zeroed::<libc::sigaction>() };
+            assert_eq!(
+                unsafe { libc::sigaction(libc::SIGTTOU, std::ptr::null(), &mut action) },
+                0
+            );
+            assert_eq!(action.sa_sigaction, libc::SIG_DFL);
+        }
+        println!("selected-output-complete");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_cancels_with_blocked_consumer() {
+        use std::{
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "project_keys::build::tests::project_api_selected_output_pty_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("DEPPY_SELECTED_OUTPUT_FIXTURE", "blocked")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("selected output cancellation blocked behind its consumer");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        // Only drain after exit: this test must not accidentally relieve the backpressure.
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            status.success(),
+            "blocked-consumer helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_is_redacted_before_pty_and_session_logs() {
+        check_selected_output_pty("1");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_survives_tostop_terminal() {
+        check_selected_output_pty("tostop");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_keeps_interactive_prompts_visible() {
+        check_selected_output_pty("prompt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_redacts_shared_stdout_stderr() {
+        check_selected_output_pty("cross");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_redacts_shared_regular_file() {
+        use std::process::{Command, Stdio};
+        let fixture = Fixture::new();
+        let path = fixture.root.join("shared-output.log");
+        let output = std::fs::File::create(&path).unwrap();
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "project_keys::build::tests::project_api_selected_output_pty_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("DEPPY_SELECTED_OUTPUT_FIXTURE", "cross")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(output.try_clone().unwrap()))
+            .stderr(Stdio::from(output))
+            .status()
+            .unwrap();
+        let output = std::fs::read_to_string(path).unwrap();
+        assert!(status.success(), "shared-file helper failed: {output}");
+        assert!(!output.contains("fresh-selected-fixture-token"));
+        assert_eq!(output.matches("cross=[REDACTED]").count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_native_output_preserves_distinct_destinations() {
+        use std::process::{Command, Stdio};
+        let fixture = Fixture::new();
+        let stdout_path = fixture.root.join("stdout.log");
+        let stderr_path = fixture.root.join("stderr.log");
+        let status = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "project_keys::build::tests::project_api_selected_output_pty_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("DEPPY_SELECTED_OUTPUT_FIXTURE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(std::fs::File::create(&stdout_path).unwrap()))
+            .stderr(Stdio::from(std::fs::File::create(&stderr_path).unwrap()))
+            .status()
+            .unwrap();
+        let stdout = std::fs::read_to_string(stdout_path).unwrap();
+        let stderr = std::fs::read_to_string(stderr_path).unwrap();
+        assert!(
+            status.success(),
+            "distinct-output helper failed: {stdout} {stderr}"
+        );
+        assert_eq!(stdout.matches("stdout=[REDACTED]").count(), 3);
+        assert!(!stdout.contains("stderr="));
+        assert_eq!(stderr.matches("stderr=[REDACTED]").count(), 3);
+        assert!(!stderr.contains("stdout="));
+        for value in [
+            "fresh-selected-fixture-token",
+            "rotated-selected-fixture-token",
+            "private-selected-fixture-pem-value",
+        ] {
+            assert!(!stdout.contains(value));
+            assert!(!stderr.contains(value));
+        }
+    }
+
+    #[cfg(unix)]
+    fn check_selected_output_pty(mode: &str) {
+        use std::{
+            io::Read,
+            os::{fd::FromRawFd, unix::process::CommandExt},
+            process::{Command, Stdio},
+            time::{Duration, Instant},
+        };
+        let mut master_fd = -1;
+        let mut slave_fd = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master_fd,
+                    &mut slave_fd,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+        let slave = unsafe { std::fs::File::from_raw_fd(slave_fd) };
+        let flags = unsafe { libc::fcntl(master_fd, libc::F_GETFL) };
+        assert_eq!(
+            unsafe { libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "project_keys::build::tests::project_api_selected_output_pty_helper",
+                "--exact",
+                "--nocapture",
+            ])
+            .env("DEPPY_SELECTED_OUTPUT_FIXTURE", mode)
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave.try_clone().unwrap()))
+            .stderr(Stdio::from(slave));
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() < 0
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as libc::c_ulong, 0) < 0
+                    || libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpgrp()) < 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let fixture = Fixture::new();
+        let mut log =
+            storage::SessionLogWriter::open_key(&fixture.root, "selected-output").unwrap();
+        // Deliberately empty: the long-running session never resolved these fresh values.
+        let mut parent_redactor = secret::RedactionService::new().stream_redactor();
+        let mut child = command.spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut status = None;
+        let prompts = [
+            "token-stdout-prompt?",
+            "token-stderr-prompt?",
+            "pem-stdout-prompt?",
+            "pem-stderr-prompt?",
+        ];
+        let mut answered = 0;
+        loop {
+            let mut bytes = [0u8; 1024];
+            match master.read(&mut bytes) {
+                Ok(count) if count > 0 => {
+                    output.extend_from_slice(&bytes[..count]);
+                    log.append_output(&parent_redactor.redact_chunk(&bytes[..count]))
+                        .unwrap();
+                    if mode == "prompt"
+                        && answered < prompts.len()
+                        && String::from_utf8_lossy(&output).contains(prompts[answered])
+                    {
+                        master.write_all(b"fixture-answer\n").unwrap();
+                        answered += 1;
+                    }
+                    continue;
+                }
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if status.is_some() {
+                        break;
+                    }
+                }
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                Err(error) => panic!("PTY read failed: {error}"),
+            }
+            if status.is_none() {
+                status = child.try_wait().unwrap();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                panic!("selected output helper timed out");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let status = status.unwrap_or_else(|| child.wait().unwrap());
+        assert!(
+            status.success(),
+            "selected output helper failed ({status}): {}",
+            String::from_utf8_lossy(&output)
+        );
+        log.append_output(&parent_redactor.flush()).unwrap();
+        log.flush();
+        let terminal = String::from_utf8(output).unwrap();
+        assert!(terminal.contains("selected-output-complete"));
+        let ansi = std::fs::read_to_string(
+            storage::SessionLogWriter::ansi_path(&fixture.root, "selected-output").unwrap(),
+        )
+        .unwrap();
+        let plain =
+            std::fs::read_to_string(fixture.root.join("selected-output/redacted.plain.txt"))
+                .unwrap();
+        for text in [&terminal, &ansi, &plain] {
+            for value in [
+                "fresh-selected-fixture-token",
+                "rotated-selected-fixture-token",
+                "private-selected-fixture-pem-value",
+            ] {
+                assert!(
+                    !text.contains(value),
+                    "selected secret crossed output boundary"
+                );
+            }
+            if mode == "cross" {
+                assert_eq!(text.matches("cross=[REDACTED]").count(), 1);
+                assert_eq!(text.matches("[REDACTED]").count(), 1);
+            } else if mode == "prompt" {
+                assert_eq!(answered, prompts.len());
+                assert_eq!(text.matches("[REDACTED]").count(), 4);
+                for prompt in prompts {
+                    assert_eq!(text.matches(prompt).count(), 1);
+                }
+            } else {
+                assert_eq!(text.matches("[REDACTED]").count(), 6);
+                assert_eq!(text.matches("stdout=[REDACTED]").count(), 3);
+                assert_eq!(text.matches("stderr=[REDACTED]").count(), 3);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_api_selected_redaction_capacity_rejects_before_native_spawn() {
+        let fixture = Fixture::new();
+        let mut key = fixture.key("SELECTED_TOKEN", KeySource::Vault);
+        key.usage = KeyUsage::StoreOnly;
+        key.required = false;
+        let value = "x".repeat(secret::RedactionCorpusLimits::PRODUCTION.max_bytes / 128 + 1);
+        assert!(
+            secret::RedactionService::new()
+                .acquire_execution_lease(&[&SecretString::new(value.clone())])
+                .is_err()
+        );
+        let key = fixture.save(key, &value);
+        let actor = selected_actor(&fixture, &key);
+        let result = fixture.service.run_agent_command(
+            &actor,
+            std::slice::from_ref(&key.id),
+            None,
+            &[
+                "/bin/sh".into(),
+                "-c".into(),
+                "touch unexpected-spawn".into(),
+            ],
+            Path::new("."),
+            &crate::project_keys::process::NativeProcessRunner::for_cli(),
+        );
+        assert!(
+            !fixture.root.join("unexpected-spawn").exists(),
+            "unprotectable selected API child was spawned"
+        );
+        assert!(matches!(result, Err(ProjectKeysError::Process)));
+    }
+
     struct BlockingReceiptRunner {
         db_path: PathBuf,
         lock: Mutex<Option<rusqlite::Connection>>,

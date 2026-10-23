@@ -53,7 +53,7 @@ pub fn agent_then_shell_script() -> String {
     let prefix = session::AGENT_EXIT_SENTINEL_PREFIX;
     let fence_prefix = pty::query_fence::AGENT_QUERY_FENCE_PREFIX.replace("\x1b", "\\033");
     format!(
-        r#""$@"; __deppy_exit=$?; __deppy_stamp="${{TMPDIR:-/tmp}}/{prefix}$$"; __deppy_stamp_safe=0; if [ ! -e "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ]; then __deppy_stamp_safe=1; elif [ -f "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ] && [ -O "$__deppy_stamp" ]; then __deppy_stamp_safe=1; fi; __deppy_stamp_ok=0; if [ "$__deppy_stamp_safe" -eq 1 ] && printf '%s' "$__deppy_exit" 2>/dev/null > "$__deppy_stamp"; then __deppy_stamp_ok=1; fi; if [ -t 1 ]; then printf '{fence_prefix}%s\007' "$$"; fi; if [ "$__deppy_stamp_ok" -ne 1 ]; then exit "$__deppy_exit"; fi; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; if [ -n "${{DEPPY_SHIM_DIR:-}}" ] && [ -d "$DEPPY_SHIM_DIR" ]; then PATH="$DEPPY_SHIM_DIR:$PATH"; export PATH; fi; exec "${{SHELL:-/bin/sh}}""#
+        r#""$@"; __deppy_exit=$?; __deppy_stamp="${{TMPDIR:-/tmp}}/{prefix}$$"; __deppy_stamp_safe=0; if [ ! -e "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ]; then __deppy_stamp_safe=1; elif [ -f "$__deppy_stamp" ] && [ ! -L "$__deppy_stamp" ] && [ -O "$__deppy_stamp" ]; then __deppy_stamp_safe=1; fi; __deppy_stamp_ok=0; if [ "$__deppy_stamp_safe" -eq 1 ] && printf '%s' "$__deppy_exit" 2>/dev/null > "$__deppy_stamp"; then __deppy_stamp_ok=1; fi; if [ -t 1 ]; then printf '{fence_prefix}%s\007' "$$"; fi; if [ "$__deppy_stamp_ok" -ne 1 ]; then exit "$__deppy_exit"; fi; stty sane 2>/dev/null || true; {DRAIN_PENDING_TTY_INPUT}; stty sane 2>/dev/null || true; unset DEPPY_AGENT_EXECUTABLE DEPPY_SHIM_GUARD DEPPY_PROJECT_API_CAPABILITY; if [ -n "${{DEPPY_SHELL_ZDOTDIR:-}}" ]; then ZDOTDIR="$DEPPY_SHELL_ZDOTDIR"; export ZDOTDIR; fi; if [ -n "${{DEPPY_SHELL_USER_ZDOTDIR:-}}" ]; then DEPPY_USER_ZDOTDIR="$DEPPY_SHELL_USER_ZDOTDIR"; export DEPPY_USER_ZDOTDIR; fi; unset DEPPY_SHELL_ZDOTDIR DEPPY_SHELL_USER_ZDOTDIR; if [ -n "${{DEPPY_SHIM_DIR:-}}" ] && [ -d "$DEPPY_SHIM_DIR" ]; then PATH="$DEPPY_SHIM_DIR:$PATH"; export PATH; fi; exec "${{SHELL:-/bin/sh}}""#
     )
 }
 
@@ -197,6 +197,49 @@ mod tests {
                 "agent:none|shell:/h/.deppy-sijo/zdot:/h/custom:gone:gone:{}:/usr/bin:/bin",
                 shims.display()
             )
+        );
+    }
+
+    #[test]
+    fn project_api_capability_reaches_agent_but_is_absent_from_fallback_shell() {
+        use std::io::Write as _;
+        let directory = std::env::temp_dir().join(format!(
+            "deppy-agent-capability-boundary-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(agent_then_shell_script())
+            .arg(AGENT_SESSION_WRAPPER_NAME)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("printf 'agent:%s|' \"${DEPPY_PROJECT_API_CAPABILITY:+present}\"")
+            .env_clear()
+            .env(
+                "DEPPY_PROJECT_API_CAPABILITY",
+                "synthetic-session-capability",
+            )
+            .env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh")
+            .env("TMPDIR", &directory)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"printf 'shell:%s' \"${DEPPY_PROJECT_API_CAPABILITY-gone}\"; exit\n")
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "agent:present|shell:gone",
+            "fallback shell must not inherit the finished agent's API bearer"
         );
     }
 

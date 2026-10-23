@@ -19,6 +19,9 @@ pub struct ProcessOutput {
 pub struct ProcessEnvironment {
     pub values: Vec<(String, SecretString)>,
     pub remove_names: Vec<String>,
+    /// Raw selected API values, including the contents of delivered temporary files.
+    /// An empty list retains the legacy subprocess output behavior.
+    pub output_secrets: Vec<SecretString>,
 }
 pub trait ProcessRunner: Send + Sync {
     fn run(
@@ -248,6 +251,215 @@ fn nonblocking<T: std::os::fd::AsRawFd>(pipe: &T) -> Result<(), ProjectKeysError
     }
     Ok(())
 }
+
+#[cfg(unix)]
+struct TtyOutputSignalMask {
+    previous: Option<libc::sigset_t>,
+}
+#[cfg(unix)]
+impl TtyOutputSignalMask {
+    fn acquire(target: libc::c_int) -> Result<Option<Self>, ProjectKeysError> {
+        if unsafe { libc::isatty(target) } != 1 {
+            return Ok(None);
+        }
+        let mut blocked = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::sigemptyset(&mut blocked);
+            libc::sigaddset(&mut blocked, libc::SIGTTOU);
+        }
+        if unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut previous) } != 0 {
+            return Err(ProjectKeysError::Process);
+        }
+        Ok(Some(Self {
+            previous: Some(previous),
+        }))
+    }
+
+    fn restore(&mut self) -> Result<(), ProjectKeysError> {
+        if let Some(previous) = &self.previous {
+            if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, previous, std::ptr::null_mut()) }
+                != 0
+            {
+                return Err(ProjectKeysError::Process);
+            }
+            self.previous = None;
+        }
+        Ok(())
+    }
+}
+#[cfg(unix)]
+impl Drop for TtyOutputSignalMask {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+/// One bounded streaming projection. Only the child's pipe is made nonblocking: inherited
+/// destination flags belong to the caller's open-file description and must stay unchanged.
+#[cfg(unix)]
+enum SelectedOutputReader {
+    Stdout(std::process::ChildStdout),
+    Stderr(std::process::ChildStderr),
+    Merged(std::os::unix::net::UnixStream),
+}
+#[cfg(unix)]
+impl Read for SelectedOutputReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stdout(pipe) => pipe.read(bytes),
+            Self::Stderr(pipe) => pipe.read(bytes),
+            Self::Merged(pipe) => pipe.read(bytes),
+        }
+    }
+}
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for SelectedOutputReader {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Stdout(pipe) => std::os::fd::AsRawFd::as_raw_fd(pipe),
+            Self::Stderr(pipe) => std::os::fd::AsRawFd::as_raw_fd(pipe),
+            Self::Merged(pipe) => std::os::fd::AsRawFd::as_raw_fd(pipe),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shared_output_destination() -> Result<bool, ProjectKeysError> {
+    let mut stdout = unsafe { std::mem::zeroed::<libc::stat>() };
+    let mut stderr = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(libc::STDOUT_FILENO, &mut stdout) } != 0
+        || unsafe { libc::fstat(libc::STDERR_FILENO, &mut stderr) } != 0
+    {
+        return Err(ProjectKeysError::Process);
+    }
+    // Include ordinary `> log 2>&1` files as well as PTYs/pipes. Conservatively merge two
+    // separate opens of the same output object, too: independently delayed fragments could
+    // otherwise reconstruct a raw secret in that object. Different objects stay separate.
+    Ok(stdout.st_dev == stderr.st_dev
+        && stdout.st_ino == stderr.st_ino
+        && stdout.st_mode & libc::S_IFMT == stderr.st_mode & libc::S_IFMT
+        && stdout.st_rdev == stderr.st_rdev)
+}
+
+#[cfg(unix)]
+struct RedactedOutputPipe {
+    pipe: SelectedOutputReader,
+    target: libc::c_int,
+    redactor: secret::FixedStreamRedactor,
+    pending: Vec<u8>,
+    offset: usize,
+    eof: bool,
+}
+#[cfg(unix)]
+impl RedactedOutputPipe {
+    fn new(
+        pipe: SelectedOutputReader,
+        target: libc::c_int,
+        redactor: secret::FixedStreamRedactor,
+    ) -> Result<Self, ProjectKeysError> {
+        nonblocking(&pipe)?;
+        Ok(Self {
+            pipe,
+            target,
+            redactor,
+            pending: Vec::new(),
+            offset: 0,
+            eof: false,
+        })
+    }
+
+    fn done(&self) -> bool {
+        self.eof && self.pending.is_empty()
+    }
+
+    fn pump(&mut self) -> Result<bool, ProjectKeysError> {
+        let mut progressed = false;
+        if self.pending.is_empty() && !self.eof {
+            let mut chunk = [0u8; 4096];
+            match self.pipe.read(&mut chunk) {
+                Ok(0) => {
+                    self.eof = true;
+                    self.pending = self.redactor.flush();
+                    progressed = true;
+                }
+                Ok(count) => {
+                    // FixedStreamRedactor bounds carry using the checked corpus maximum.
+                    // Do not read another chunk until this projection has been forwarded.
+                    self.pending = self.redactor.redact_chunk(&chunk[..count]);
+                    progressed = true;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => return Err(ProjectKeysError::Process),
+            }
+        }
+        if self.pending.is_empty() {
+            return Ok(progressed);
+        }
+        let mut ready = libc::pollfd {
+            fd: self.target,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        let polled = unsafe { libc::poll(&mut ready, 1, 0) };
+        if polled < 0 {
+            return if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                Ok(progressed)
+            } else {
+                Err(ProjectKeysError::Process)
+            };
+        }
+        if ready.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            return Err(ProjectKeysError::Process);
+        }
+        if ready.revents & libc::POLLOUT == 0 {
+            return Ok(progressed);
+        }
+        // POSIX PIPE_BUF is at least 512. A single relay owns both streams and only writes
+        // a small chunk after readiness; a blocked consumer leaves cancellation responsive.
+        // Unrelated writers sharing a blocking destination can still race poll readiness,
+        // as with ordinary inherited output. Never mutate that shared descriptor's flags.
+        let bytes = &self.pending[self.offset..];
+        // The command owns the foreground process group. With TOSTOP, its relay parent
+        // must block SIGTTOU while writing the inherited tty (without changing disposition).
+        let mut signal_mask = TtyOutputSignalMask::acquire(self.target)?;
+        let count =
+            unsafe { libc::write(self.target, bytes.as_ptr().cast(), bytes.len().min(512)) };
+        // Capture errno before restoring the calling thread's prior mask.
+        let written = if count < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(count as usize)
+        };
+        if let Some(mask) = &mut signal_mask {
+            mask.restore()?;
+        }
+        match written {
+            Ok(0) => Err(ProjectKeysError::Process),
+            Ok(count) => {
+                self.offset += count;
+                if self.offset == self.pending.len() {
+                    self.pending.clear();
+                    self.offset = 0;
+                }
+                Ok(true)
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                Ok(progressed)
+            }
+            Err(_) => Err(ProjectKeysError::Process),
+        }
+    }
+}
 struct RunOptions<'a> {
     directory: Option<&'a std::fs::File>,
     deadline: Option<Instant>,
@@ -356,6 +568,30 @@ impl NativeProcessRunner {
             .first()
             .filter(|a| !a.is_empty())
             .ok_or(ProjectKeysError::InvalidInput)?;
+        let redaction: Option<(secret::FixedStreamRedactor, secret::RedactionLease)> =
+            if environment.output_secrets.is_empty() {
+                None
+            } else {
+                // Selected execution uses inherited stdin and relays both output streams. The
+                // separate legacy helper protocol (captured stdout / explicit stdin) stays intact.
+                if !inherit || stdin.is_some() {
+                    return Err(ProjectKeysError::InvalidInput);
+                }
+                #[cfg(unix)]
+                {
+                    let service = secret::RedactionService::new();
+                    let lease = service
+                        .acquire_execution_lease(
+                            &environment.output_secrets.iter().collect::<Vec<_>>(),
+                        )
+                        .map_err(|_| ProjectKeysError::Process)?;
+                    Some((service.fixed_stream_redactor(), lease))
+                }
+                #[cfg(not(unix))]
+                {
+                    return Err(ProjectKeysError::Process);
+                }
+            };
         let mut cmd = Command::new(executable);
         cmd.args(&argv[1..]);
         if directory.is_none() {
@@ -405,18 +641,49 @@ impl NativeProcessRunner {
         } else {
             Stdio::null()
         });
-        cmd.stdout(if inherit {
+        cmd.stdout(if inherit && redaction.is_none() {
             Stdio::inherit()
         } else {
             Stdio::piped()
         });
-        // Never collect raw network/subprocess errors; child build output is intentionally its own terminal output.
-        cmd.stderr(if inherit {
+        // Legacy builds retain direct terminal output. Selected API output is filtered before
+        // reaching the caller's PTY, model, or session logger.
+        cmd.stderr(if redaction.is_some() {
+            Stdio::piped()
+        } else if inherit {
             Stdio::inherit()
         } else {
             Stdio::null()
         });
+        #[cfg(unix)]
+        let merged_output = if redaction.is_some() && shared_output_destination()? {
+            use std::os::fd::OwnedFd;
+            let (reader, writer) =
+                std::os::unix::net::UnixStream::pair().map_err(|_| ProjectKeysError::Process)?;
+            let stderr = writer.try_clone().map_err(|_| ProjectKeysError::Process)?;
+            cmd.stdout(Stdio::from(OwnedFd::from(writer)));
+            cmd.stderr(Stdio::from(OwnedFd::from(stderr)));
+            Some(reader)
+        } else {
+            None
+        };
+        #[cfg(unix)]
+        if redaction.is_some()
+            && self.interactive_signals
+            && CLI_INTERRUPTED.load(Ordering::Acquire)
+        {
+            self.cancel();
+        }
+        if redaction.is_some()
+            && (self.cancelled.load(Ordering::Acquire)
+                || (operation_deadline.is_some() && Instant::now() >= deadline))
+        {
+            return Err(ProjectKeysError::Process);
+        }
         let mut child = cmd.spawn().map_err(|_| ProjectKeysError::Process)?;
+        // Command retains explicitly supplied Stdio handles after spawn. Close its private
+        // merged write ends now, or EOF would never reach the relay after the child exits.
+        drop(cmd);
         #[cfg(unix)]
         let _foreground = if self.interactive_signals
             && inherit
@@ -432,6 +699,15 @@ impl NativeProcessRunner {
         } else {
             None
         };
+        #[cfg(unix)]
+        if let Some((redactor, _lease)) = &redaction {
+            return self.relay_selected_output(
+                child,
+                merged_output,
+                redactor,
+                operation_deadline.map(|_| deadline),
+            );
+        }
         let reader = child.stdout.take().map(|mut pipe| {
             let cancelled = self.cancelled.clone();
             let stop = Arc::new(AtomicBool::new(false));
@@ -585,6 +861,80 @@ impl NativeProcessRunner {
             std::thread::sleep(Duration::from_millis(5));
         }
     }
+
+    #[cfg(unix)]
+    fn relay_selected_output(
+        &self,
+        mut child: std::process::Child,
+        merged_output: Option<std::os::unix::net::UnixStream>,
+        redactor: &secret::FixedStreamRedactor,
+        deadline: Option<Instant>,
+    ) -> Result<ProcessOutput, ProjectKeysError> {
+        let result = (|| {
+            let mut outputs = if let Some(pipe) = merged_output {
+                vec![RedactedOutputPipe::new(
+                    SelectedOutputReader::Merged(pipe),
+                    libc::STDOUT_FILENO,
+                    redactor.new_stream(),
+                )?]
+            } else {
+                vec![
+                    RedactedOutputPipe::new(
+                        SelectedOutputReader::Stdout(
+                            child.stdout.take().ok_or(ProjectKeysError::Process)?,
+                        ),
+                        libc::STDOUT_FILENO,
+                        redactor.new_stream(),
+                    )?,
+                    RedactedOutputPipe::new(
+                        SelectedOutputReader::Stderr(
+                            child.stderr.take().ok_or(ProjectKeysError::Process)?,
+                        ),
+                        libc::STDERR_FILENO,
+                        redactor.new_stream(),
+                    )?,
+                ]
+            };
+            let mut status = None;
+            loop {
+                if self.interactive_signals && CLI_INTERRUPTED.load(Ordering::Acquire) {
+                    self.cancel();
+                }
+                if self.cancelled.load(Ordering::Acquire)
+                    || deadline.is_some_and(|end| Instant::now() >= end)
+                {
+                    return Err(ProjectKeysError::Process);
+                }
+                if status.is_none() {
+                    status = child.try_wait().map_err(|_| ProjectKeysError::Process)?;
+                    if status.is_some() {
+                        // Descendants must not retain the command's output pipes after the
+                        // direct child exits. Drain their already-written bytes, then flush.
+                        unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    }
+                }
+                let mut progressed = false;
+                for output in &mut outputs {
+                    progressed |= output.pump()?;
+                }
+                if let Some(status) = status
+                    && outputs.iter().all(RedactedOutputPipe::done)
+                {
+                    return Ok(ProcessOutput {
+                        exit_code: status.code().unwrap_or(1),
+                        stdout: vec![],
+                    });
+                }
+                if !progressed {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        })();
+        // This includes pipe preparation, cancellation, deadline, and downstream failures.
+        // The relay owns no output worker threads or unbounded output capture.
+        terminate(&mut child);
+        result
+    }
 }
 
 pub trait Clipboard: Send + Sync {
@@ -621,6 +971,56 @@ impl Clipboard for NativeClipboard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn selected_inherited_output_preserves_timeout_and_explicit_deadline_semantics() {
+        let mut environment = ProcessEnvironment::default();
+        environment
+            .output_secrets
+            .push(SecretString::new("selected-fixture-secret".into()));
+        let runner = NativeProcessRunner::with_timeout(Duration::from_millis(20));
+        let started = Instant::now();
+        let output = runner
+            .run(
+                &["/bin/sh".into(), "-c".into(), "sleep 0.1".into()],
+                Path::new("/"),
+                &environment,
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(started.elapsed() >= Duration::from_millis(80));
+        let runner = NativeProcessRunner::with_timeout(Duration::from_secs(2));
+        let started = Instant::now();
+        assert!(matches!(
+            runner.run_until(
+                &["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+                Path::new("/"),
+                &environment,
+                None,
+                true,
+                started + Duration::from_millis(80),
+            ),
+            Err(ProjectKeysError::Process)
+        ));
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(runner.wait_for_idle(Duration::ZERO));
+
+        let started = Instant::now();
+        let output = runner
+            .run(
+                &["/bin/sh".into(), "-c".into(), "sleep 5 & exit 0".into()],
+                Path::new("/"),
+                &environment,
+                None,
+                true,
+            )
+            .unwrap();
+        assert_eq!(output.exit_code, 0);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
     #[test]
     fn native_child_uses_retained_directory_after_path_replacement() {
         let root = std::env::temp_dir().join(format!("deppy-key-cwd-{}", uuid::Uuid::new_v4()));

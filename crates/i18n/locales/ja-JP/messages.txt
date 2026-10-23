@@ -2138,3 +2138,22 @@ workspace.ssh.status.connected = 接続済み
 workspace.ssh.status.offline = オフライン
 workspace.ssh.closing = リモートセッションを終了しています。サーバーの確認をお待ちください。
 workspace.ssh.close_unconfirmed = リモートセッションの終了を確認できませんでした。再接続する前にサーバーの状態を確認してください。
+
+# Project API quick registration and compact editor
+project_keys.reload_latest = 最新の状態を再読み込み
+project_keys.reload_hint = 入力した変更を破棄し、最新の状態を読み込みます。
+project_keys.add_title = プロジェクトキーを追加
+project_keys.api_add_title = APIを登録
+project_keys.api_service_name = サービス名
+project_keys.api_service_hint = 例: 自分のAPI
+project_keys.api_binding = 実行時の変数名
+project_keys.api_description = 説明
+project_keys.api_documentation = ドキュメントURL
+project_keys.api_agent_enabled = このプロジェクトのエージェントに許可
+project_keys.api_agent_hint = 許可された新しい実行で最新のキーを使います。
+project_keys.api_storage_label = 保存済みAPI
+workspace.quick_register_api = APIを登録…
+project_keys.quick_loading = プロジェクトAPI登録を準備中…
+project_keys.quick_ssh_unavailable = SSH プロジェクトでは API の直接登録に対応していません。この Mac のキーはリモートサーバーに送信されません。
+project_keys.api_details = 追加オプション
+project_keys.api_binding_hint = エージェントまたはビルドで使用する場合に入力。

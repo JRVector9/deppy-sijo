@@ -21,6 +21,10 @@ pub struct NotesInput<'a> {
 pub enum NotesAction {
     /// 본문이 바뀌었다. App이 디바운스해 DB에 쓴다.
     Edited(String),
+    RegisterApi {
+        workspace_id: String,
+        prefill: Option<super::environment::EnvironmentPrefill>,
+    },
 }
 
 #[derive(Default)]
@@ -218,6 +222,7 @@ impl NotesUi {
             .range(&output.galley)
             .unwrap_or_default();
         let has_selection = !selection.is_empty();
+        let mut registration = None;
         if let Some(menu_response) = menu_response {
             super::context_menu::show(&menu_response, |ui| {
                 use super::context_menu::Icon;
@@ -269,7 +274,65 @@ impl NotesUi {
                         ui.ctx().request_repaint();
                     }
                 }
+                ui.separator();
+                if super::context_menu::button(
+                    ui,
+                    catalog.t("workspace.quick_register_api", &[]),
+                    Icon::Settings,
+                )
+                .clicked()
+                {
+                    registration = Some(NotesAction::RegisterApi {
+                        workspace_id: input.workspace_id.to_owned(),
+                        prefill: None,
+                    });
+                    ui.close();
+                }
+                if has_selection {
+                    use super::environment::{EnvironmentPrefill, EnvironmentSelectionKind};
+                    let selected = selection.slice_str(&self.buffer);
+                    super::context_menu::submenu(
+                        ui,
+                        catalog.t("workspace.menu.add_to_environment", &[]),
+                        Icon::Settings,
+                        |ui| {
+                            for (kind, label) in [
+                                (
+                                    EnvironmentSelectionKind::ApiName,
+                                    "workspace.menu.use_as_api_name",
+                                ),
+                                (
+                                    EnvironmentSelectionKind::ApiValue,
+                                    "workspace.menu.use_as_api_value",
+                                ),
+                            ] {
+                                if super::context_menu::enabled_button(
+                                    ui,
+                                    kind.accepts(selected),
+                                    catalog.t(label, &[]),
+                                    Icon::Settings,
+                                )
+                                .clicked()
+                                {
+                                    registration = Some(NotesAction::RegisterApi {
+                                        workspace_id: input.workspace_id.to_owned(),
+                                        prefill: EnvironmentPrefill::from_selection(kind, selected),
+                                    });
+                                    ui.close();
+                                }
+                            }
+                        },
+                    );
+                }
             });
+        }
+
+        if registration.is_some() {
+            // TextEdit collapses its selection on the next unfocused render.
+            // Returning from registration must retain the same cursor range,
+            // just like the existing copy/edit context-menu commands.
+            response.request_focus();
+            ui.ctx().request_repaint();
         }
 
         // 하단 한 줄만 둔다 — 포커스 색은 **쓰지 않는다**(2026-08-10 사용자: 정확하게
@@ -289,7 +352,9 @@ impl NotesUi {
             response.request_focus();
         }
 
-        (date_inserted || response.changed()).then(|| NotesAction::Edited(self.buffer.clone()))
+        registration.or_else(|| {
+            (date_inserted || response.changed()).then(|| NotesAction::Edited(self.buffer.clone()))
+        })
     }
 
     /// 터미널 선택 등 **밖에서** 들어오는 편집을 버퍼에 즉시 반영한다(PR-4: 「메모에
@@ -437,6 +502,10 @@ mod tests {
         workspace: &'static str,
         stored: &'static str,
         copied: Vec<String>,
+        registered: Vec<(
+            String,
+            Option<super::super::environment::EnvironmentPrefill>,
+        )>,
     }
 
     fn note_harness(catalog: &i18n::Catalog) -> egui_kittest::Harness<'_, NoteHarnessState> {
@@ -447,7 +516,7 @@ mod tests {
             .with_step_dt(1.0 / 60.0)
             .build_ui_state(
                 move |ui, state: &mut NoteHarnessState| {
-                    if let Some(NotesAction::Edited(body)) = state.notes.render(
+                    match state.notes.render(
                         ui,
                         NotesInput {
                             workspace_id: state.workspace,
@@ -455,7 +524,14 @@ mod tests {
                         },
                         catalog,
                     ) {
-                        state.edited = Some(body);
+                        Some(NotesAction::Edited(body)) => state.edited = Some(body),
+                        Some(NotesAction::RegisterApi {
+                            workspace_id,
+                            prefill,
+                        }) => {
+                            state.registered.push((workspace_id, prefill));
+                        }
+                        None => {}
                     }
                     ui.output(|output| {
                         for command in &output.commands {
@@ -471,6 +547,7 @@ mod tests {
                     workspace: "ws-a",
                     stored: "first middle last",
                     copied: Vec::new(),
+                    registered: Vec::new(),
                 },
             )
     }
@@ -531,6 +608,98 @@ mod tests {
         harness.drop_at(end);
         harness.step();
         assert_eq!(selected_note(harness), "middle");
+    }
+
+    #[test]
+    fn kittest_note_registration_captures_original_workspace_without_editing() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        let original_cursor = egui::text_edit::TextEditState::load(&harness.ctx, text_id("ws-a"))
+            .unwrap()
+            .cursor
+            .char_range();
+        open_note_menu(&mut harness);
+        harness
+            .get_by_label(&catalog.t("workspace.quick_register_api", &[]))
+            .click();
+        harness.run();
+        assert_eq!(harness.state().registered.len(), 1);
+        assert_eq!(harness.state().registered[0].0, "ws-a");
+        assert!(harness.state().registered[0].1.is_none());
+        assert_eq!(harness.state().notes.buffer, "first middle last");
+        assert_eq!(selected_note(&harness), "middle");
+        assert_eq!(
+            egui::text_edit::TextEditState::load(&harness.ctx, text_id("ws-a"))
+                .unwrap()
+                .cursor
+                .char_range(),
+            original_cursor
+        );
+        assert!(harness.state().edited.is_none());
+    }
+
+    #[test]
+    fn kittest_note_selected_api_fields_keep_selection_and_sensitive_one_shot_prefill() {
+        use super::super::environment::EnvironmentSelectionKind;
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        for (kind, label) in [
+            (
+                EnvironmentSelectionKind::ApiName,
+                "workspace.menu.use_as_api_name",
+            ),
+            (
+                EnvironmentSelectionKind::ApiValue,
+                "workspace.menu.use_as_api_value",
+            ),
+        ] {
+            let mut harness = note_harness(&catalog);
+            drag_middle(&mut harness);
+            let original_cursor =
+                egui::text_edit::TextEditState::load(&harness.ctx, text_id("ws-a"))
+                    .unwrap()
+                    .cursor
+                    .char_range();
+            open_note_menu(&mut harness);
+            harness
+                .get_by_label_contains(&catalog.t("workspace.menu.add_to_environment", &[]))
+                .hover();
+            harness.run_steps(3);
+            harness.get_by_label(&catalog.t(label, &[])).click();
+            harness.run();
+            assert_eq!(harness.state().registered.len(), 1);
+            let (workspace, prefill) = harness.state_mut().registered.pop().unwrap();
+            assert_eq!(workspace, "ws-a");
+            let (actual_kind, value) = prefill.unwrap().into_parts();
+            assert_eq!(actual_kind, kind);
+            assert_eq!(value.into_inner(), "middle");
+            assert_eq!(harness.state().notes.buffer, "first middle last");
+            assert_eq!(selected_note(&harness), "middle");
+            assert_eq!(
+                egui::text_edit::TextEditState::load(&harness.ctx, text_id("ws-a"))
+                    .unwrap()
+                    .cursor
+                    .char_range(),
+                original_cursor
+            );
+            assert!(harness.state().edited.is_none());
+        }
+    }
+
+    #[test]
+    fn kittest_note_context_menu_offers_project_api_registration_without_editing() {
+        use egui_kittest::kittest::Queryable as _;
+        let catalog = catalog();
+        let mut harness = note_harness(&catalog);
+        drag_middle(&mut harness);
+        open_note_menu(&mut harness);
+        harness.get_by_label(&catalog.t("workspace.quick_register_api", &[]));
+        harness.get_by_label_contains(&catalog.t("workspace.menu.add_to_environment", &[]));
+        assert_eq!(harness.state().notes.buffer, "first middle last");
+        assert_eq!(selected_note(&harness), "middle");
+        assert!(harness.state().edited.is_none());
     }
 
     #[test]

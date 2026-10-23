@@ -1455,6 +1455,10 @@ impl CloudAgent {
         req: &mut Request,
         send: &mut impl FnMut(&Target, Effect) -> Result<(), String>,
     ) -> Result<Option<Value>, String> {
+        if agent_mcp::is_project_api_tool(&req.tool) {
+            agent_mcp::parse_project_api_call(&req.tool, &req.args).map_err(str::to_owned)?;
+            return Err("project_api_cloud_unavailable_no_effect".into());
+        }
         let a = &req.args;
         let allowed: &[&str] = match req.tool.as_str() {
             "list_sessions" => &[],

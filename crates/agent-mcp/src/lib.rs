@@ -7,6 +7,10 @@ pub use completion::{
     MAX_COMPLETION_EVENT_BYTES, MAX_COMPLETION_RECEIPTS, MAX_COMPLETION_WATCHES,
 };
 mod main_tools;
+mod project_api_tools;
+pub use project_api_tools::{
+    ProjectApiCall, is_project_api_tool, parse_project_api_call, project_api_tools,
+};
 mod management;
 pub use main_tools::{MainScope, PendingMainScope, is_main_tool, main_tools};
 mod oauth;
@@ -64,6 +68,11 @@ pub fn encode_input(text: &str, submit: bool) -> anyhow::Result<Vec<u8>> {
 }
 
 pub fn tools() -> Value {
+    tools_with_project_api_access(false)
+}
+
+/// Project API tools require a host implementation in addition to session sharing.
+pub fn tools_with_project_api_access(available: bool) -> Value {
     let identity = json!({"session_id":{"type":"string"},"generation":{"type":"string"},"operation_id":{"type":"string","description":"Unique ID for this action. Reuse only for the exact same action; never retry unknown input with a new ID."},"run_id":{"type":"string","description":"Optional run owned by this authenticated connection and exact session generation."}});
     let mut result = vec![
         json!({"name":"list_sessions","description":"List explicitly shared Deppy terminal sessions. Keep the UUID and generation for subsequent calls.","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}}),
@@ -163,6 +172,9 @@ pub fn tools() -> Value {
         let mut properties = session.as_object().unwrap().clone();
         properties.extend(extra.as_object().unwrap().clone());
         result.push(json!({"name":name,"description":description,"inputSchema":{"type":"object","properties":properties,"required":required,"additionalProperties":false},"annotations":{"readOnlyHint":read_only}}));
+    }
+    if available {
+        result.extend(project_api_tools());
     }
     json!({"tools":result})
 }

@@ -212,6 +212,7 @@ struct TableResizeRuntimeFixture {
     ctx: egui::Context,
     root: PathBuf,
     session: SessionId,
+    follow_spawned_session: bool,
     window: egui::Vec2,
     sent: Vec<(u16, u16)>,
     applied: Vec<runtime::ResizeStamp>,
@@ -221,6 +222,30 @@ struct TableResizeRuntimeFixture {
 #[cfg(unix)]
 impl TableResizeRuntimeFixture {
     fn new(pixels_per_point: f32) -> Self {
+        // No provider, prompt, refresh key or input is involved. The shell owns the source
+        // table and redraws only on SIGWINCH, so stty proves the actual child PTY geometry.
+        let script = r#"
+stty -echo
+draw() {
+    set -- $(stty size)
+    printf '\033[H\033[2JWIDTH=%s ROWS=%s\r\n' "$2" "$1"
+    printf '| %-*s |\r\n' "$(($2 - 6))" 'agent table'
+    printf '| %-*s |\r\n' "$(($2 - 6))" 'table content'
+    printf 'READY=%sx%s\r\n' "$2" "$1"
+}
+trap 'draw' WINCH
+draw
+while :; do read -r command || continue; done
+"#;
+        Self::with_source(pixels_per_point, script, 100, "READY=80x24")
+    }
+
+    fn with_source(
+        pixels_per_point: f32,
+        script: &str,
+        scrollback_lines: usize,
+        ready_marker: &str,
+    ) -> Self {
         use runtime::{RuntimeCommandSink, RuntimeEventStream};
         struct NoSecrets;
         impl runtime::RuntimeSecretResolver for NoSecrets {
@@ -242,26 +267,11 @@ impl TableResizeRuntimeFixture {
         )
         .unwrap();
         let events = client.subscribe();
-        // No provider, prompt, refresh key or input is involved. The shell owns the source
-        // table and redraws only on SIGWINCH, so stty proves the actual child PTY geometry.
-        let script = r#"
-stty -echo
-draw() {
-    set -- $(stty size)
-    printf '\033[H\033[2JWIDTH=%s ROWS=%s\r\n' "$2" "$1"
-    printf '| %-*s |\r\n' "$(($2 - 6))" 'agent table'
-    printf '| %-*s |\r\n' "$(($2 - 6))" 'table content'
-    printf 'READY=%sx%s\r\n' "$2" "$1"
-}
-trap 'draw' WINCH
-draw
-while :; do read -r command || continue; done
-"#;
         client
             .send_command(RuntimeCommand::SpawnAgent {
                 cols: 80,
                 rows: 24,
-                scrollback_lines: 100,
+                scrollback_lines,
                 agent_config_id: None,
                 command: "/bin/sh".into(),
                 args: vec!["-c".into(), script.into()],
@@ -283,6 +293,7 @@ while :; do read -r command || continue; done
             ctx,
             root,
             session: SessionId(0),
+            follow_spawned_session: true,
             window: egui::vec2(800.0, 600.0),
             sent: vec![],
             applied: vec![],
@@ -295,7 +306,7 @@ while :; do read -r command || continue; done
                     .sessions
                     .get(&fixture.session)
                     .and_then(|view| view.snapshot.as_ref())
-                    .is_some_and(|screen| table_resize_screen_text(screen).contains("READY=80x24"))
+                    .is_some_and(|screen| table_resize_screen_text(screen).contains(ready_marker))
         });
         fixture
     }
@@ -304,7 +315,11 @@ while :; do read -r command || continue; done
         let events = self.events.drain();
         for event in &events {
             match event {
-                RuntimeEvent::AgentSpawned { session } => self.session = *session,
+                RuntimeEvent::AgentSpawned { session }
+                    if self.follow_spawned_session || self.session == SessionId(0) =>
+                {
+                    self.session = *session;
+                }
                 RuntimeEvent::ResizeApplied { session, stamp } if *session == self.session => {
                     self.applied.push(*stamp);
                 }
@@ -313,7 +328,10 @@ while :; do read -r command || continue; done
                 } if *session == self.session => {
                     self.failures.push(*reason);
                 }
-                RuntimeEvent::SpawnFailed { .. } | RuntimeEvent::SessionExited { .. } => {
+                RuntimeEvent::SessionExited { session, .. } if *session == self.session => {
+                    panic!("private table shell exited");
+                }
+                RuntimeEvent::SpawnFailed { .. } => {
                     panic!("private table shell failed to start or exited");
                 }
                 _ => {}
@@ -322,6 +340,7 @@ while :; do read -r command || continue; done
         self.ui.handle_events(&events, &catalog());
     }
 
+    #[track_caller]
     fn wait_until(&mut self, mut ready: impl FnMut(&mut Self) -> bool) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -331,7 +350,35 @@ while :; do read -r command || continue; done
             }
             assert!(
                 std::time::Instant::now() < deadline,
-                "private resize fixture timed out"
+                "private resize fixture timed out: panes={:?}, sent={:?}, desired={:?}, snapshot={:?}, text={:?}",
+                self.ui.mux.as_ref().map(|mux| mux
+                    .tabs
+                    .iter()
+                    .map(|tab| tab.panes.len())
+                    .collect::<Vec<_>>()),
+                self.sent,
+                self.ui
+                    .sessions
+                    .get(&self.session)
+                    .and_then(|view| view.resize_desired),
+                self.ui
+                    .sessions
+                    .get(&self.session)
+                    .and_then(|view| view.snapshot.as_ref())
+                    .map(|screen| (
+                        screen.cols,
+                        screen.rows,
+                        screen.scroll_offset,
+                        screen.history
+                    )),
+                self.ui
+                    .sessions
+                    .get(&self.session)
+                    .and_then(|view| view.snapshot.as_ref())
+                    .map(|screen| table_resize_screen_text(screen)
+                        .chars()
+                        .take(300)
+                        .collect::<String>())
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
@@ -375,8 +422,8 @@ while :; do read -r command || continue; done
                                     rows,
                                     ..
                                 } = &command
+                                    && *session == self.session
                                 {
-                                    assert_eq!(*session, self.session);
                                     self.sent.push((*cols, *rows));
                                 }
                                 self.client.send_command_owned(command)
@@ -486,6 +533,35 @@ while :; do read -r command || continue; done
             right - left,
             self.window
         );
+    }
+
+    fn render_current_window(&mut self) -> Vec<egui::epaint::ClippedShape> {
+        let mut output = self.ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.window)),
+                ..Default::default()
+            },
+            |ui| {
+                self.ui
+                    .show_with_input(ui, &TerminalConfig::default(), &[], &catalog(), false);
+                self.ui.flush_render_side_effects(ui.ctx());
+                crate::app::dispatch_terminal_protocol_tail(&mut self.ui, ui.ctx(), |command| {
+                    if let RuntimeCommand::ResizeTracked {
+                        session,
+                        cols,
+                        rows,
+                        ..
+                    } = &command
+                        && *session == self.session
+                    {
+                        self.sent.push((*cols, *rows));
+                    }
+                    self.client.send_command_owned(command)
+                });
+            },
+        );
+        output.textures_delta.clear();
+        output.shapes
     }
 }
 
@@ -611,5 +687,277 @@ fn table_resize_native_geometry_runtime_pty_redraw_and_remote_restore_use_latest
         fixture.wait_until(|fixture| fixture.failures.contains(&runtime::ResizeFailure::Stale));
         fixture.wait_table((120, 32), (120, 32));
         fixture.wait_table((80, 24), (80, 24));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn table_resize_sibling_close_reflows_old_scrollback_without_new_source_output() {
+    assert_sibling_close_history_reflow(HistoryCloseCase::Stable);
+}
+
+#[cfg(unix)]
+#[test]
+fn table_resize_sibling_close_releases_selection_before_reflowing_old_scrollback() {
+    assert_sibling_close_history_reflow(HistoryCloseCase::Selected);
+}
+
+#[cfg(unix)]
+#[test]
+fn table_resize_sibling_close_during_resize_rejects_late_old_history_ack() {
+    assert_sibling_close_history_reflow(HistoryCloseCase::InFlight);
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+enum HistoryCloseCase {
+    Stable,
+    Selected,
+    InFlight,
+}
+
+#[cfg(unix)]
+fn assert_sibling_close_history_reflow(case: HistoryCloseCase) {
+    use runtime::RuntimeCommandSink;
+    use unicode_normalization::UnicodeNormalization;
+
+    const ASCII: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv";
+    const MIXED: &str =
+        "가나다라마바사아자차카타파하가나다라마바사아자차카타파하e\u{301}👩\u{200d}💻";
+    // Only the test-owned shell receives input. It emits history once; SIGWINCH
+    // produces no redraw, so any subsequent joining must come from terminal reflow.
+    let script = format!(
+        r#"
+stty -echo
+trap ':' WINCH
+printf 'HISTORY_READY\r\n'
+while :; do
+    read -r command || continue
+    case "$command" in
+        history)
+            printf '\033[3J\033[H\033[2J'
+            i=0
+            while [ "$i" -lt 450 ]; do
+                printf 'A%03d|%s|END\r\n' "$i" '{ASCII}'
+                printf 'M%03d|%s|끝\r\n' "$i" '{MIXED}'
+                i=$((i + 1))
+            done
+            printf '| A    | B    |\r\n| one  | two  |\r\nHISTORY_DONE\r\n'
+            ;;
+    esac
+done
+"#
+    );
+    let mut fixture = TableResizeRuntimeFixture::with_source(1.0, &script, 4000, "HISTORY_READY");
+    // These split-close cases follow the original survivor; older multi-spawn
+    // fixtures deliberately follow the latest spawned agent instead.
+    fixture.follow_spawned_session = false;
+    eprintln!("history fixture: source ready");
+    let survivor = fixture.ui.mux.as_ref().unwrap().tabs[0].panes[0].id.clone();
+    fixture
+        .client
+        .send_command(RuntimeCommand::SpawnAgentBeside {
+            pane: survivor.clone(),
+            cols: 60,
+            rows: 24,
+            scrollback_lines: 100,
+            agent_config_id: None,
+            command: "/bin/cat".into(),
+            args: vec![],
+            env_plain: vec![],
+            env_secrets: vec![],
+            waiting_regex: None,
+            approval_regex: None,
+            error_regex: None,
+            done_regex: None,
+        })
+        .unwrap();
+    fixture.wait_until(|fixture| fixture.ui.mux.as_ref().unwrap().tabs[0].panes.len() == 2);
+    eprintln!("history fixture: split created");
+    let sibling = fixture.ui.mux.as_ref().unwrap().tabs[0]
+        .panes
+        .iter()
+        .find(|pane| pane.id != survivor)
+        .unwrap()
+        .id
+        .clone();
+    fixture
+        .client
+        .send_command(RuntimeCommand::FocusPane {
+            pane: survivor.clone(),
+        })
+        .unwrap();
+    fixture.wait_until(|fixture| {
+        fixture.render_target((60, 24));
+        let view = &fixture.ui.sessions[&fixture.session];
+        view.snapshot
+            .as_ref()
+            .is_some_and(|screen| (screen.cols, screen.rows) == (60, 24))
+            && view.resize_presentation.is_none()
+    });
+    eprintln!("history fixture: narrow geometry applied");
+    fixture
+        .client
+        .send_command(RuntimeCommand::WriteInput {
+            session: fixture.session,
+            bytes: b"history\n".to_vec(),
+        })
+        .unwrap();
+    fixture.wait_until(|fixture| {
+        fixture.render_current_window();
+        fixture.ui.sessions[&fixture.session]
+            .snapshot
+            .as_ref()
+            .is_some_and(|screen| table_resize_screen_text(screen).contains("HISTORY_DONE"))
+    });
+    eprintln!("history fixture: history output complete");
+    fixture
+        .client
+        .send_command(RuntimeCommand::Scroll {
+            session: fixture.session,
+            delta: 10_000,
+        })
+        .unwrap();
+    fixture.wait_until(|fixture| {
+        fixture.render_current_window();
+        fixture.ui.sessions[&fixture.session]
+            .snapshot
+            .as_ref()
+            .is_some_and(|screen| {
+                // Clear-screen intentionally preserves the former live screen in history.
+                // The first source row follows that startup marker at the oldest offset.
+                screen.scroll_offset > 512
+                    && table_resize_screen_text(screen)
+                        .lines()
+                        .any(|line| line.starts_with("A000|"))
+            })
+    });
+    let narrow = fixture.ui.sessions[&fixture.session]
+        .snapshot
+        .clone()
+        .unwrap();
+    eprintln!("history fixture: oldest narrow history visible");
+    let ascii_line = format!("A000|{ASCII}|END");
+    assert!(!table_resize_screen_text(&narrow).contains(&ascii_line));
+    assert!(narrow.history.unwrap().total_lines > 900);
+    let narrow_stamp = *fixture.applied.last().unwrap();
+    match case {
+        HistoryCloseCase::Stable => {}
+        HistoryCloseCase::Selected => {
+            // Coordinates refer to the frozen narrow grid. A structural resize must
+            // release them before installing differently arranged source cells.
+            fixture.ui.selection = Some((fixture.session, 60, 65));
+        }
+        HistoryCloseCase::InFlight => {
+            // Admit a real resize, but withhold its ACK/viewport from WorkspaceUi.
+            // Closing the sibling now must eventually send the latest wide target.
+            fixture.render_target((64, 24));
+            let request = fixture.ui.sessions[&fixture.session]
+                .resize_request
+                .unwrap();
+            assert_eq!(request.target, (64, 24));
+            assert!(request.applied.is_none());
+        }
+    }
+    let split_window = fixture.window;
+
+    fixture
+        .client
+        .send_command(RuntimeCommand::ClosePane { pane: sibling })
+        .unwrap();
+    let mut shapes = vec![];
+    fixture.wait_until(|fixture| {
+        shapes = fixture.render_current_window();
+        let view = &fixture.ui.sessions[&fixture.session];
+        fixture.ui.mux.as_ref().unwrap().tabs[0].panes.len() == 1
+            && view.resize_desired.is_some_and(|target| target.0 >= 120)
+            && view
+                .snapshot
+                .as_ref()
+                .is_some_and(|screen| screen.cols >= 120)
+            && view.resize_presentation.is_none()
+            && !view.live_resize_step_pending()
+    });
+    assert_eq!(
+        fixture.window, split_window,
+        "only closing the sibling widens the pane"
+    );
+    assert_eq!(
+        fixture.ui.mux.as_ref().unwrap().tabs[0].panes[0].id,
+        survivor
+    );
+    let view = &fixture.ui.sessions[&fixture.session];
+    let wide = view.snapshot.as_ref().unwrap();
+    assert!(
+        fixture.ui.selection.is_none(),
+        "old selection coordinates must not survive reflow"
+    );
+    assert_eq!(view.resize_desired, Some((wide.cols, wide.rows)));
+    assert_eq!(fixture.sent.last(), Some(&(wide.cols, wide.rows)));
+    assert_eq!(
+        fixture.applied.last().map(|stamp| (stamp.cols, stamp.rows)),
+        Some((wide.cols, wide.rows))
+    );
+    assert!(wide.history.unwrap().total_lines < narrow.history.unwrap().total_lines);
+    assert!(
+        wide.scroll_offset > 256,
+        "fixture must still view old compressed history"
+    );
+    let mut wide_text = String::new();
+    for (index, cell) in wide.visible_cells.iter().enumerate() {
+        if !cell.wide_spacer() {
+            wide.push_cell_text(index, &mut wide_text);
+        }
+        if (index + 1).is_multiple_of(usize::from(wide.cols)) {
+            wide_text.push('\n');
+        }
+    }
+    assert!(
+        wide_text.contains(&ascii_line),
+        "old ASCII rows must join at the new width: {wide_text}"
+    );
+    let mixed_line: String = format!("M000|{MIXED}|끝").nfc().collect();
+    assert!(
+        wide_text.contains(&mixed_line),
+        "old Korean/grapheme rows must join without loss: {wide_text}"
+    );
+    fn paints_ascii(shape: &egui::Shape) -> bool {
+        match shape {
+            egui::Shape::Text(text) => text.galley.job.text.contains(ASCII),
+            egui::Shape::Vec(shapes) => shapes.iter().any(paints_ascii),
+            _ => false,
+        }
+    }
+    assert!(
+        shapes.iter().any(|shape| paints_ascii(&shape.shape)),
+        "final paint must contain the joined old line"
+    );
+    assert!(
+        fixture.failures.is_empty(),
+        "resize failures: {:?}",
+        fixture.failures
+    );
+    if matches!(case, HistoryCloseCase::InFlight) {
+        let latest = Arc::clone(wide);
+        let generation = view.snapshot_gen;
+        fixture.ui.handle_events(
+            &[
+                RuntimeEvent::ResizeApplied {
+                    session: fixture.session,
+                    stamp: narrow_stamp,
+                },
+                RuntimeEvent::ViewportTracked {
+                    session: fixture.session,
+                    stamp: narrow_stamp,
+                    snapshot: narrow,
+                    bracketed_paste: false,
+                },
+            ],
+            &catalog(),
+        );
+        let view = &fixture.ui.sessions[&fixture.session];
+        assert_eq!(view.snapshot_gen, generation);
+        assert!(Arc::ptr_eq(view.snapshot.as_ref().unwrap(), &latest));
     }
 }

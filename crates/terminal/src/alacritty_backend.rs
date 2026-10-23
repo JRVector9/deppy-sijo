@@ -3359,6 +3359,45 @@ mod tests {
         assert!(!a.search_scrollback("새 출력", 1000).matches.is_empty());
     }
 
+    #[test]
+    fn streaming_resize_alt_round_trip_preserves_compressed_primary_soft_wraps_and_archive() {
+        const ASCII: &str =
+            "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv";
+        let first = format!("A000|{ASCII}|END");
+        let mut original = AlacrittyBackend::new(60, 24, 4000);
+        for row in 0..450 {
+            original
+                .feed(format!("A{row:03}|{ASCII}|END\r\n").as_bytes())
+                .unwrap();
+        }
+        assert!(original.term.grid().compressed_row_count() > 256);
+        let archive = original.serialize_scrollback().unwrap();
+        original
+            .feed(b"\x1b[?1049hALT-TUI\r\n| A    | B    |\r\n| one  | two  |")
+            .unwrap();
+        original.resize(120, 24).unwrap();
+        let alternate = original.screen_text();
+        assert!(alternate.contains("| A    | B    |"));
+        assert!(alternate.contains("| one  | two  |"));
+        assert!(!alternate.contains("A000|"));
+        original.feed(b"\x1b[?1049l").unwrap();
+        original.scroll(10_000);
+        assert_eq!(row_text(&original, 0), first);
+
+        let mut restored = AlacrittyBackend::new(60, 24, 4000);
+        restored.feed(&archive).unwrap();
+        assert!(restored.term.grid().compressed_row_count() > 256);
+        restored.scroll(10_000);
+        assert_ne!(row_text(&restored, 0), first);
+        restored.resize(120, 24).unwrap();
+        assert_eq!(row_text(&restored, 0), first);
+        assert_eq!(original.term.history_size(), restored.term.history_size());
+        assert!(
+            original.serialize_scrollback() == restored.serialize_scrollback(),
+            "inactive primary resize and archive replay must preserve the same logical rows"
+        );
+    }
+
     /// 압축된 히스토리를 직렬화한 결과가, 전부 복원(inflate)한 뒤 직렬화한 것과 동일.
     #[test]
     fn deppy_압축_serialize는_inflate와_동일() {

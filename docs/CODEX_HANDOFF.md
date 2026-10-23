@@ -1,3 +1,123 @@
+# Commit and legacy-folder cleanup in progress — 2026-10-24
+
+Current user request explicitly authorizes commit, push, and removal of now-unneeded deppy-sijo folders under `~/Desktop/projects`. No app restart, release or main merge is requested. Canonical tree remains integration-20261023.
+
+- Previous reviewed SSH/launcher/usage changes committed separately as `4c8c58ed`, reconstructed from the preserved pre-API baseline rather than mixing the two phases. Staged provider usage contract and staged diff check PASS.
+- Current reviewed API source SHA25648 files unchanged from final tests5359PASS; usage source and diff checks rerunPASS. Next commit contains API feature, compact UI, terminal regressions and its review evidence.
+- Cleanup inventory `/tmp/deppy-commit-cleanup-inventory-20261024.json`. Preserve original common Git tree, current integration tree, live preview cwd trees (ime-cloud/performance) and shared build target tree(ssh-workspace). Other legacy trees may be archived privately with full non-cache files/status/patches and verified digests before worktree removal. Keep branch refs; do not delete deppy/deppy-mux/other projects, /private/tmp worktrees or fixture credentials.
+- Remaining: commit API work, push current branch and verify exact remote hash; archive/verify inactive legacy worktrees, remove those only, record results and preserved reasons; commit/push final handoff/report. No force-push.
+
+---
+
+# Completed source implementation and parallel review — 2026-10-24
+
+## Current objective / state
+
+User approved `docs/superpowers/plans/2026-10-23-pane-reflow-project-api.md`, then asked for extra subagents and parallel review of all implementation. Latest “이어서해” resumed that task. **Source implementation, three independent parallel reviews, verified finding fixes, and final checks are complete.** Report: `docs/qa/2026-10-24-pane-project-api-implementation-review.md`.
+
+Canonical tree ONLY `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, HEAD `a8eb51ae5d8cdaaff2b9246ad96aeb474d724ed1`. Preserve previous SSH/launcher/usage/version dirty work; task baseline `/tmp/deppy-pane-api-baseline-20261023/{files,hashes.json,before.patch}`. Nominal deppy-sijo is another dirty tree, untouched. Index empty; no commit/push/PR/main merge or release/restart performed in this phase. Source/test version0.18.0; future changed delivered app MUST bump above latest shipped0.18.0 and verify binary +both macOS bundle versions. Never dev-run/open/stop/restart without current explicit authorization.
+
+## Completed work / design decisions
+
+- Actual split-close 900-line Unicode scrollback, selection, in-flight resize/late oldACK, compressed+alt, archive regressions5PASS. **Original terminal symptom not reproduced, NO new terminal product fix.** Preserve explicit CRLF/TUI hard-line semantics.
+- 560pt compact editor with12pt row/column gaps, two columns>=452pt,36pt fields/34pt footer/80pt PEM; modal-owned errors; explicit authoritative metadata-only ReloadEditor with scope/generation/key CAS guards. Exact UUID+Vault+StoreOnly fallback avoids downgrading ordinary DEPPY_API_ Build/LegacyAgent keys. Four synthetic UI exports/geometry reviewed against HTML44/50/51; no live app inspection.
+- Notes/Terminal direct API registration, original project/runtime capture, global host/input fence from loading through errors/SSH notice, one-use sensitive prefill, cancellation and stale ACK protection. FileTree forwards NotesAction; no independent file/folder API menu. Service name and execution env variable separate; defaultStoreOnly +explicit opt-in, existing bound name read-only.
+- Metadata-only API discovery, explicit selected keys, exact workspace/environment/principal/session/generation scope, random bearer with domain SHA256 DB digests, atomic capability+grant refresh, <=24h expiry and bounded capacity. List does not open SecretStore; execution authorizes before Keychain, resolves latest selected values/PEM only to child env/files, strips bearer and emits receipt. No Build/StoreOnly/Cloud automatic elevation. SaveApi stages denied metadata before activation.
+- Local new Claude/Codex/Cursor/Grok sessions receive model-readable bootstrap, including quick right split. Runtime-owned credential lifetime hook avoids unsafe config-ID/FIFO association.256-credit lazy cleanup worker retains failed cleanup until retry, no DB on GUI thread. In-memory reference revocation immediate, durable DB/file cleanup asynchronous.
+- Selected-key native output masks fresh/rotated values and PEM before PTY/model/session logs. Additive FixedStreamRedactor uses immutable zeroizing corpus/shared cached KMP tables and prefix/ANSI retention, preserving old StreamRedactor. Same stdout/stderr object merged before masking; distinct sinks preserved. Owned PTY prompt-response/TOSTOP, file redirection, split-token, capacity, deadline/cancellation regressions pass.
+- Mandatory boundary found6 concrete DB references after behavior checks. Added storage-neutral ProjectApiRepository with adapter and worker DB opener only in app.rs, preserving worker construction and authorization semantics. Independent reviewer found no further defects. Boundary gate unchanged and PASS.
+
+## Modified files
+
+Current task changes37 pre-existing source files and adds11 source files; exact baseline/current SHA256 list in `docs/qa/assets/pane-project-api-20261024/task-source-sha256.json`. Main groups: App/quick-registration/launch, project_keys UI/service/CLI/build/process/repository, core/storage API access+capability, MCP, runtime credential lifetime, secret fixed-stream API, terminal/session/App regressions, five locales. Documentation: plan/report, popup design+HTML, this handoff. Older dirty Cargo/SSH/launcher/usage regions preserved; provider protected source seal verified unchanged.
+
+## Actual final tests / evidence
+
+All Cargo serialized by root with jobs2, shared target `/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target`, `--offline --locked`. No subagent Cargo/GUI/commit. Logs and PNGs retained losslessly with SHA256 index under `docs/qa/assets/pane-project-api-20261024/`.
+
+- Full App **3872unit+39integration=3911 normal PASS,49ignored**, rerun AFTER final DB-port refactor; unit50.39s. `/tmp/deppy-pane-api-app-final2.log`. Isolated childfixture1 extra excluded.
+- Full secret86PASS; core/session/storage/terminal801PASS5ignored; runtime462PASS1ignored; agent-mcp99PASS1ignored. **5359 normal PASS,56ignored aggregate**, no focused/childfixture duplicates. No source changes in these crates after their full checks.
+- Final focused selected11/fixed-stream6/ordinary-prefix3PASS; offscreenexport1PASS5.08s, PNG4. Root directly viewed edit and API quick-add synthetic render.
+- Final strict Clippy allaffected inclsecret/alltargets/-Dwarnings **PASS50.90s**, `/tmp/deppy-pane-api-clippy-final3.log`, AFTER DB-port refactor. fmtallcheckPASS `/tmp/deppy-pane-api-fmt-final2.log`; unchanged boundaryPASS `/tmp/deppy-pane-api-boundary-final2.log`; provider source --check-onlyPASS `/tmp/deppy-pane-api-usage-guard-final.log`; diffcheckPASS. No guard weakening/reseal.
+- Evidence SHA256, all48 current source digests,20gzip integrity checks and report/plan relative links verified PASS after final document generation. Final gitdiffcheckPASS; index empty.
+- This is not a delivered binary, real account workflow or GUI restart verification. Existing ignored manual/live/performance tests remain explicitly ignored, not counted as passes.
+
+## Failed approaches / retained evidence
+
+- Actual RED→GREEN for12 behavior cause groups in report: project mismatch, quicksplit bootstrap, fallback bearer, reload stale ACK and unrelated source lock, menu kind/SSH notice, MCP omitted args, selected output leak/capacity, TOSTOP, prompt withholding, shared-output reconstruction, ordinary-prefix compatibility. Plus architecture boundary6locations fixed via port. No assertion removals/ignoring/lint allowlists.
+- Initial selected-output RED setup was invalid StoreOnly+required=true; not counted as real leak evidence. Corrected fixture before meaningful RED. Spinner test bounded frames fixed without product workaround.
+- Shared test pump first changed spawn-follow default and broke existing wheel test. Reproduced focused, restored default and made new history cases opt-out only; full App thenPASS. First strictClippy7style/layout errors fixed without suppressions.
+- Rejected FIFO/configID lifecycle association because runtime can spawn sessions outside App path; actual process lifetime owns credential lease instead. Rejected idle-flush redaction because delayed secret fragments could leak; retained only actual pattern prefix/unfinished ANSI with bounded fail-closed behavior.
+
+## Remaining scope / next agent
+
+No pending work in the completed source review phase. Original terminal symptom remains unreproduced. Kimi additive bootstrap, SSH Mac-vault execution, Cloud API recipe bridge/grant UI, existing-session injection or automatic24h capability renewal are unsupported and not advertised as available. Existing child env snapshots remain immutable; next command uses latest key. OS external-writer race on a shared blocking output destination is not claimed eliminated.
+
+If asked to deliver a new app, first reconcile source changes against task baseline and prior dirty work, bump above latest shipped0.18.0, then build/package and verify binary+bundle versions. Only restart if explicitly requested in that task. Do not automatically stage all dirty files or package unreleased0.18.0 changes.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+cat AGENTS.md
+sed -n '1,115p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+cat docs/qa/2026-10-24-pane-project-api-implementation-review.md
+python3 scripts/verify-provider-usage.py --check-only
+# Source evidence is stored in the working tree; prior logs remain under /tmp too.
+# Re-run relevant checks only if product source changes; all final gates above actually passed.
+# Never dev-run.sh/open/kill/restart automatically.
+```
+
+---
+
+# Historical checkpoints (superseded by completed status above)
+
+# In progress: pane restoration and project API workflow — 2026-10-23
+
+## Objective / authorization
+
+User approved six-PR plan with “진행해”, then requested extra subagents. Canonical tree `/Users/jr/Desktop/projects/deppy-sijo-integration-20261023`, branch `fix/product-review-integration-20261023`, HEAD a8eb51ae plus preserved prior dirty changes. Baseline `/tmp/deppy-pane-api-baseline-20261023/{files,hashes.json,before.patch}`. No restart/release/delivered build authorized. Source0.18.0; later changed delivered artifact must bump above0.18.0. No commits/pushes this phase yet.
+
+## Completed work / design decisions
+
+- Terminal A added actual split-close/history/selection/pending-old-ACK/compressed-alt/archive regressions, all5PASS. **Original symptom NOT reproduced and NO terminal product fix made.** Preserve explicit CRLF/TUI hard-line semantics; do not infer table redraw.
+- UI B implemented560pt compact editor,12pt gaps,2columns>=452pt,36pt fields/34pt buttons/80pt PEM; modal-owned errors and explicit stale reload; independent direct API form, optional execution binding, explicit agent opt-in, masked value, advanced details. Notes/FileTree direct registration captures origin. Six B files frozen; final API/Notes GREEN pending.
+- Core/storage API metadata/grant validation4PASS; app metadata catalog2 and selected latest-value execution1PASS. Existing Build/StoreOnly usage not elevated. MCP schemas/parser2PASS. Generic SaveKey rename and recipe changes must invalidate stale permissions (new RED/implementation underway).
+- Root added global quick registration host/fence, original workspace/runtime capture, no Settings navigation, loading/Esc handling. Four host tests PASS previously; Spinner fixture corrected to bounded frames; matched load-error invisible modal regression newly added, root fix pending RED.
+- Reviewer found IDs alone are not authentication. New per-local-session random bearer, SHA256-only DB storage, exact actor/expiry/capacity, child secret env only, revocation. Capability storage3RED observed then implementation ready, Apphelper2RED pending. No separate API vault. Local dynamic grant refresh must be atomic with capability check; cloud never implicitly grants keys.
+- C implementing metadata-only CLI/stdioMCP, scoped selected-key execution, native provider bootstrap. Bootstrap must reach model through provider additive context/MCP, not env alone. Unsupported adapters/SSH must remain explicit. Root launch lifecycle glue still NOT implemented; extra lifecycle agent investigating bounded association/cleanup. Feature4 NOT complete. Critical subsequent source proof: runtime-internal CommandCenter SpawnAgent bypasses App FIFO, so FIFO tracking is NOT safe. Rejected approach: configID queue/barrier association. Use local generic RuntimeSecretResolver session-credential lifetime hook (no wire change) so actual PTY worker owns API lease/cleanup; no MAIN authority.
+- Root updated5locales and popup design/HTML cases44/50. Usage protected source untouched; no reseal.
+
+## Ownership / current work
+
+Root owns app.rs/registries/locales/design/global quickhost/all Cargo. A terminal completed. B UI completed/frozen. C `/root/plan_agent_key_access_20261023` owns core/storage API access and project_keys service/catalog/agent_access/CLI/MCP leaves. Reviewer `/root/project_api_isolation_review_20261023` owns new storage/project_api_capability.rs and app/project_keys/session_capability.rs. Extra `/root/project_api_launch_lifecycle` now exclusively owns app.rs launch glue, new app/project_api_launch.rs and minimal runtime/host.rs + in_process.rs local lifetime hook. B resumed only UI partial-save recovery regression/implementation. Root has transferred app.rs ownership and must not write it until returned. All gpt-6.1-sol/xhigh. Agents no Cargo/commit/GUI; root serialized Cargo jobs2/shared target. No provider-usage protected edits/reseal.
+
+## Tests / failed approaches
+
+Logs `/tmp/deppy-pane-api-*.log`. Executed RED: geometry1/pageerror1/inputfence1/core2/storage2/catalog2/selectedexecution1/quickAPIform2/Notesmenu1/MCPschema2. Corresponding earlier GREEN: UI37PASS(2laterAPIRED,1ignored); core/storage4PASS; catalog2+execution1PASS; MCPschema2PASS; terminal5PASS. More API/CLI/bootstrap/security regressions await gates; do not count as passed. Storage gate3 had2PASS5expectedFAIL, implementation now ready. App gate3 did NOT run tests: compilefailed Db::open_in_memory in external storage fixture, now corrected to existing isolated Fixture. Recompile in progress session31441 log `/tmp/deppy-pane-api-app-gate3-build2.log`. Initial terminal test timeout and Spinner Harness::run repaint exhaustion were fixture issues, corrected; no false product root-cause claim. Provider usage check-only and gitdiffcheck passed earlier; final rerun required.
+
+## Remaining work / exact next commands
+
+1. App gate5 compile PASS42.36s log /tmp/deppy-pane-api-gate5-build.log. Gate5 project_api:25PASS4expectedFAIL (new lifetimeguard stub, cloud no-effect handler, Codex capability forwarding, local recipe grant). Corresponding GREEN authorized. Previous App gate3: UI44PASS1ignored; project_api13PASS10expectedFAIL; capability2RED true. quickhost loading/error cancel source fixed; latest notice-query fixture corrected to exact locale text, needsGREEN. Notes24PASS1actualFAIL: API submenu focus missing collapsesselection; B applied minimalfocusrestore, needsGREEN. Lifecycle4trackerRED then4GREEN; cleanupworker/ref2RED actual; oldpause test notyetcompiled. CriticalFIFOapproach abandoned, newruntimehookregressions pending.
+2. Storagegate4:7PASS1FAIL dynamicrefresh cannotstartnestedtransaction (project_key_list opens own tx); C corrected scoped pointreads. Storagegate5 running26769 /tmp/deppy-pane-api-storage-gate5-green.log. MCPactualserverexposure1RED confirmed thenC implemented; currentcloud design changed to gate APItools byexplicitavailability(defaultfalse) ratherthanadvertiseunimplementedcloudhandler. Newgate/cloudunsupported/localrecipe regressions pending.
+3. Quickhost error/cancel/attached scope now7PASS; Notes25PASS1ignored. Offscreen UI render export1PASS (4ownedfixturePNGs in /private/tmp/deppy-project-keys-ui-20261012); root inspected edit and APIquickadd images, compact layout/no internal desktop scroll. HTML44/50 updated for80pt textarea specificity/requiredcheckbox/bindinghint. Usage sourceguard/diffcheckPASS again. Finish launch/quicklaunch runtime guard integration and tests with lifecycleagent; noFIFO. Runtime actualprocess lifetimeRED1 acquire0vs1 confirmed (/tmp/deppy-pane-api-runtime-lifetime-red.log), GREEN authorized. Newnormal/quickworkerhelper2RED pending. Cloud/Kimi/SSH unsupported boundary agreed; no genericcloudAPItools advertisement; neverclaimsecretbridge/grantUI implemented.
+4. Reconcile design HTML with real form geometry; run meaningful full affected tests/strictClippy/fmt/boundary/sourceguard, review scope against approved plan; commit only coherent approved deltas without mixing old dirty work.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+cat AGENTS.md
+sed -n '1,90p' docs/CODEX_HANDOFF.md
+git status --short --branch
+git diff --stat
+# all Cargo serialized with CARGO_BUILD_JOBS=2 and
+# CARGO_TARGET_DIR=/Users/jr/Desktop/projects/deppy-sijo-ssh-workspace-20261022/target
+# cargo ... --offline --locked
+python3 scripts/verify-provider-usage.py --check-only
+# Never dev-run.sh/open/kill/restart for this task.
+```
+
+---
+
 # Plan complete: pane restoration and project API workflow — 2026-10-23
 
 ## Current objective / status

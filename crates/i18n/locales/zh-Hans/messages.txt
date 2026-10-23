@@ -2138,3 +2138,22 @@ workspace.ssh.status.connected = 已连接
 workspace.ssh.status.offline = 离线
 workspace.ssh.closing = 正在关闭远程会话。请等待服务器确认。
 workspace.ssh.close_unconfirmed = 无法确认远程会话已关闭。重新连接前请检查服务器状态。
+
+# Project API quick registration and compact editor
+project_keys.reload_latest = 重新载入最新状态
+project_keys.reload_hint = 放弃草稿并载入最新状态。
+project_keys.add_title = 添加项目密钥
+project_keys.api_add_title = 注册 API
+project_keys.api_service_name = 服务名称
+project_keys.api_service_hint = 例如：我的 API
+project_keys.api_binding = 执行变量名
+project_keys.api_description = 说明
+project_keys.api_documentation = 文档地址
+project_keys.api_agent_enabled = 允许此项目的代理使用
+project_keys.api_agent_hint = 仅新的授权执行使用当前密钥。
+project_keys.api_storage_label = 已保存的 API
+workspace.quick_register_api = 注册 API…
+project_keys.quick_loading = 正在准备项目 API 注册…
+project_keys.quick_ssh_unavailable = SSH 项目暂不支持直接注册 API。此 Mac 的密钥不会传送到远程服务器。
+project_keys.api_details = 更多选项
+project_keys.api_binding_hint = 代理或构建使用时必填。

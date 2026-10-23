@@ -1,6 +1,10 @@
 #[path = "workspace_env.rs"]
 mod workspace_env;
 pub use workspace_env::CredentialEnvBinding;
+#[path = "project_api_access.rs"]
+mod project_api_access;
+#[path = "project_api_capability.rs"]
+mod project_api_capability;
 #[path = "project_keys.rs"]
 mod project_keys;
 pub use project_keys::{
@@ -926,6 +930,8 @@ CREATE INDEX idx_relay_devices_recency
     // Append-only: project/environment key metadata and durable value-free GitHub delivery.
     project_keys::MIGRATION,
     workspace_target::MIGRATION,
+    project_api_access::MIGRATION,
+    project_api_capability::MIGRATION,
 ];
 
 /// 옵션2: 저장된 에이전트 세션 한 행 — 재시작 복원 시 native resume에 쓴다.

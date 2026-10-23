@@ -472,6 +472,17 @@ fn execute(
 ) -> Result<ProjectKeysAckPayload, ProjectKeysError> {
     let scope = &fence.scope;
     match action {
+        ProjectKeysAction::ReloadEditor { key_id } => {
+            let snapshot = service.snapshot(scope, fence.generation)?;
+            if !snapshot.keys.iter().any(|key| {
+                key.id == key_id
+                    && key.workspace_id == scope.workspace_id
+                    && key.environment == scope.environment
+            }) {
+                return Err(ProjectKeysError::Stale);
+            }
+            return Ok(ProjectKeysAckPayload::Refreshed(Box::new(snapshot)));
+        }
         ProjectKeysAction::Refresh { key_id } => {
             service.refresh_scope(scope)?;
             if let Some(key_id) = key_id {
@@ -505,6 +516,7 @@ fn execute(
                     _ => ProjectKeysError::Storage,
                 });
             }
+            return Ok(ProjectKeysAckPayload::Refreshed(Box::new(snapshot)));
         }
         ProjectKeysAction::LoadKeyChanges {
             key_id,
@@ -622,6 +634,24 @@ fn execute(
         } => {
             return service
                 .save_key(scope, *key, expected_revision, value)
+                .map(|key| ProjectKeysAckPayload::SavedKey(Box::new(key)));
+        }
+        ProjectKeysAction::SaveApiKey {
+            key,
+            expected_revision,
+            value,
+            access,
+            expected_access_revision,
+        } => {
+            return service
+                .save_api_key(
+                    scope,
+                    *key,
+                    expected_revision,
+                    value,
+                    *access,
+                    expected_access_revision,
+                )
                 .map(|key| ProjectKeysAckPayload::SavedKey(Box::new(key)));
         }
         ProjectKeysAction::DeleteKey {
@@ -901,6 +931,220 @@ mod tests {
             Ok(())
         }
     }
+    fn assert_editor_reload_ignores_unrelated_missing_source_and_secret_store(locked: bool) {
+        let fixture = Fixture::new();
+        let source = KeySource::Dotenv {
+            file: ".env".into(),
+        };
+        std::fs::write(
+            fixture.root.join(".env"),
+            "UNRELATED_TOKEN=source-fixture\n",
+        )
+        .unwrap();
+        fixture
+            .service
+            .import_source(&fixture.scope, source, vec!["UNRELATED_TOKEN".into()])
+            .unwrap();
+        let unrelated = fixture
+            .service
+            .db
+            .project_key_list(&fixture.scope.workspace_id, fixture.scope.environment)
+            .unwrap()
+            .remove(0);
+        std::fs::remove_file(fixture.root.join(".env")).unwrap();
+        fixture
+            .service
+            .observe_key(&fixture.scope, &unrelated)
+            .unwrap();
+
+        let key = fixture.save(
+            fixture.key("VAULT_API_TOKEN", KeySource::Vault),
+            "vault-fixture",
+        );
+        let access = deppy_core::project_api_access::ProjectApiAccess {
+            key_id: key.id.clone(),
+            workspace_id: fixture.scope.workspace_id.clone(),
+            environment: fixture.scope.environment,
+            revision: 1,
+            execution_name: Some(key.name.clone()),
+            service_name: Some("Original API label".into()),
+            description: None,
+            documentation_url: None,
+            agent_enabled: false,
+        };
+        let key = fixture
+            .service
+            .save_api_key(
+                &fixture.scope,
+                key.clone(),
+                Some(key.revision),
+                ValueEdit::Keep,
+                access,
+                None,
+            )
+            .unwrap();
+        let cached = fixture.service.snapshot(&fixture.scope, 23).unwrap();
+        let mut latest_access = cached.api_access[0].clone();
+        latest_access.service_name = Some("Latest API label".into());
+        let latest_key = fixture
+            .service
+            .save_api_key(
+                &fixture.scope,
+                key.clone(),
+                Some(key.revision),
+                ValueEdit::Keep,
+                latest_access,
+                Some(cached.api_access[0].revision),
+            )
+            .unwrap();
+        let latest_access = fixture
+            .service
+            .db
+            .project_api_access_list(&fixture.scope.workspace_id, fixture.scope.environment)
+            .unwrap()
+            .remove(0);
+        assert!(latest_key.revision > key.revision);
+        assert!(latest_access.revision > cached.api_access[0].revision);
+        assert!(cached.keys.iter().any(|entry| entry.id == unrelated.id
+            && entry.storage_state == KeyStorageState::MissingSource));
+        let store_calls = fixture.store.2.load(Ordering::Acquire);
+        fixture.store.1.store(locked, Ordering::Release);
+        let fence = ProjectKeysFence {
+            scope: fixture.scope.clone(),
+            generation: cached.generation,
+            request_id: 1,
+        };
+        let selected = Mutex::new(Selection {
+            scope: Some(fixture.scope.clone()),
+            generation: fence.generation,
+        });
+        let result = execute(
+            &fixture.service,
+            &fence,
+            ProjectKeysAction::ReloadEditor {
+                key_id: key.id.clone(),
+            },
+            &selected,
+            &NoClipboard,
+            &NoProcess,
+        );
+        assert!(
+            result.is_ok(),
+            "metadata reload must ignore unrelated source failure and locked secrets: {result:?}"
+        );
+        let ProjectKeysAckPayload::Refreshed(snapshot) = result.unwrap() else {
+            panic!("editor reload must carry authoritative metadata")
+        };
+        assert_eq!(
+            fixture.store.2.load(Ordering::Acquire),
+            store_calls,
+            "reloading editor metadata must never read or write a secret"
+        );
+        assert_eq!(snapshot.scope, fixture.scope);
+        assert_eq!(snapshot.generation, fence.generation);
+        assert!(snapshot.error.is_none());
+        assert_eq!(
+            snapshot
+                .keys
+                .iter()
+                .find(|entry| entry.id == key.id)
+                .unwrap()
+                .revision,
+            latest_key.revision
+        );
+        assert_eq!(snapshot.api_access[0], latest_access);
+        assert!(snapshot.keys.iter().any(|entry| entry.id == unrelated.id
+            && entry.storage_state == KeyStorageState::MissingSource));
+    }
+
+    #[test]
+    fn editor_metadata_reload_ignores_an_unrelated_missing_source() {
+        assert_editor_reload_ignores_unrelated_missing_source_and_secret_store(false);
+    }
+
+    #[test]
+    fn editor_metadata_reload_never_reads_a_locked_secret_store() {
+        assert_editor_reload_ignores_unrelated_missing_source_and_secret_store(true);
+    }
+
+    #[test]
+    fn refresh_ack_carries_the_exact_scoped_projection_for_editor_recovery() {
+        let fixture = Fixture::new();
+        let key = fixture.save(
+            fixture.key("REFRESH_TOKEN", KeySource::Vault),
+            "fixture-value",
+        );
+        let access = deppy_core::project_api_access::ProjectApiAccess {
+            key_id: key.id.clone(),
+            workspace_id: fixture.scope.workspace_id.clone(),
+            environment: fixture.scope.environment,
+            revision: 1,
+            execution_name: Some(key.name.clone()),
+            service_name: Some("Refresh fixture API".into()),
+            description: None,
+            documentation_url: None,
+            agent_enabled: false,
+        };
+        fixture
+            .service
+            .save_api_key(
+                &fixture.scope,
+                key.clone(),
+                Some(key.revision),
+                ValueEdit::Keep,
+                access,
+                None,
+            )
+            .unwrap();
+        let fence = ProjectKeysFence {
+            scope: fixture.scope.clone(),
+            generation: 17,
+            request_id: 1,
+        };
+        let selected = Mutex::new(Selection {
+            scope: Some(fixture.scope.clone()),
+            generation: fence.generation,
+        });
+        let result = execute(
+            &fixture.service,
+            &fence,
+            ProjectKeysAction::Refresh {
+                key_id: Some(key.id.clone()),
+            },
+            &selected,
+            &NoClipboard,
+            &NoProcess,
+        )
+        .unwrap();
+        let ProjectKeysAckPayload::Refreshed(snapshot) = result else {
+            panic!("Refresh must carry its authoritative metadata projection")
+        };
+        assert_eq!(snapshot.scope, fixture.scope);
+        assert_eq!(snapshot.generation, fence.generation);
+        assert!(snapshot.error.is_none());
+        let current_key = fixture
+            .service
+            .db
+            .project_key_get(
+                &fixture.scope.workspace_id,
+                fixture.scope.environment,
+                &key.id,
+            )
+            .unwrap()
+            .unwrap();
+        let projected = snapshot
+            .keys
+            .iter()
+            .find(|entry| entry.id == key.id)
+            .unwrap();
+        assert_eq!(projected.revision, current_key.revision);
+        assert_eq!(snapshot.api_access.len(), 1);
+        assert_eq!(
+            snapshot.api_access[0].service_name.as_deref(),
+            Some("Refresh fixture API")
+        );
+    }
+
     #[test]
     fn slow_clipboard_never_blocks_scope_selection_and_stale_completion_is_fenced() {
         let fixture = Fixture::new();
@@ -1147,10 +1391,11 @@ mod tests {
             );
             wait_ack(&worker)
         };
-        assert_eq!(
+        assert!(matches!(
             send(1, ProjectKeysAction::Refresh { key_id: None }).result,
-            Ok(ProjectKeysAckPayload::Done)
-        );
+            Ok(ProjectKeysAckPayload::Refreshed(snapshot))
+                if snapshot.scope == fixture.scope && snapshot.generation == generation && snapshot.error.is_none()
+        ));
         let snapshot = wait_snapshot(&worker, |snapshot| {
             snapshot
                 .keys
@@ -1175,10 +1420,11 @@ mod tests {
                 .any(|key| key.id == missing.id && key.storage_state == KeyStorageState::Locked)
         });
         fixture.store.1.store(false, Ordering::Release);
-        assert_eq!(
+        assert!(matches!(
             send(3, ProjectKeysAction::Refresh { key_id: None }).result,
-            Ok(ProjectKeysAckPayload::Done)
-        );
+            Ok(ProjectKeysAckPayload::Refreshed(snapshot))
+                if snapshot.scope == fixture.scope && snapshot.generation == generation && snapshot.error.is_none()
+        ));
         let snapshot = wait_snapshot(&worker, |snapshot| {
             snapshot
                 .keys
@@ -1279,10 +1525,11 @@ mod tests {
             Err(ProjectKeysError::Storage)
         );
         fail.store(false, Ordering::Release);
-        assert_eq!(
+        assert!(matches!(
             request(fixture.scope.clone(), generation, 2).result,
-            Ok(ProjectKeysAckPayload::Done)
-        );
+            Ok(ProjectKeysAckPayload::Refreshed(snapshot))
+                if snapshot.scope == fixture.scope && snapshot.generation == generation && snapshot.error.is_none()
+        ));
         wait_snapshot(&worker, |snapshot| {
             snapshot.error.is_none() && snapshot.keys.len() == 1
         });
@@ -1305,10 +1552,11 @@ mod tests {
                 .any(|project| project.id == fixture.scope.workspace_id)
         );
         let generation = worker.select_scope(fixture.scope.clone()).unwrap();
-        assert_eq!(
+        assert!(matches!(
             request(fixture.scope.clone(), generation, 4).result,
-            Ok(ProjectKeysAckPayload::Done)
-        );
+            Ok(ProjectKeysAckPayload::Refreshed(snapshot))
+                if snapshot.scope == fixture.scope && snapshot.generation == generation && snapshot.error.is_none()
+        ));
         wait_snapshot(&worker, |snapshot| {
             snapshot.scope == fixture.scope
                 && snapshot.generation == generation

@@ -476,6 +476,10 @@ pub enum SidebarAction {
     OpenSettings,
     /// 메모 본문이 바뀌었다. App이 디바운스해 DB에 쓴다(leaf는 IO를 하지 않는다).
     NoteEdited(String),
+    RegisterApi {
+        workspace_id: String,
+        prefill: Option<super::environment::EnvironmentPrefill>,
+    },
     /// root folder를 macOS가 거부한 상태에서 「개인정보 보호 및 보안 → 파일 및 폴더」를 연다.
     OpenMacosFileAccessSettings,
     /// 경로를 포커스된 터미널에 삽입 (FT-3)
@@ -3191,8 +3195,20 @@ impl FileTreeUi {
                 },
                 catalog,
             );
-            if let Some(super::notes::NotesAction::Edited(body)) = note_action {
-                action = Some(SidebarAction::NoteEdited(body));
+            match note_action {
+                Some(super::notes::NotesAction::Edited(body)) => {
+                    action = Some(SidebarAction::NoteEdited(body));
+                }
+                Some(super::notes::NotesAction::RegisterApi {
+                    workspace_id,
+                    prefill,
+                }) => {
+                    action = Some(SidebarAction::RegisterApi {
+                        workspace_id,
+                        prefill,
+                    });
+                }
+                None => {}
             }
             return action;
         }

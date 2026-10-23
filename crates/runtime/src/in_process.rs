@@ -343,6 +343,7 @@ impl InProcessRuntimeClient {
                     resize_records: std::collections::HashMap::new(),
                     terminal_controls: std::collections::HashMap::new(),
                     session_redaction_leases: std::collections::HashMap::new(),
+                    session_credential_guards: std::collections::HashMap::new(),
                     seed_redaction_lease: None,
                     logs: std::collections::HashMap::new(),
                     detectors: std::collections::HashMap::new(),
@@ -618,7 +619,30 @@ impl InProcessRuntimeClient {
         command: RuntimeCommand,
         admission: Option<crate::InputAdmission>,
     ) -> anyhow::Result<()> {
+        self.enqueue_command_with_split_target(command, admission, None)
+    }
+
+    fn enqueue_command_with_split_target(
+        &self,
+        command: RuntimeCommand,
+        admission: Option<crate::InputAdmission>,
+        split_target: Option<crate::MuxPaneId>,
+    ) -> anyhow::Result<()> {
         let mut queued = prepare_queued_command(command, &self.command_budget)?;
+        if let Some(pane) = split_target {
+            anyhow::ensure!(
+                matches!(queued.command, RuntimeCommand::SpawnAgent { .. }) && admission.is_none(),
+                "runtime_agent_split_command_invalid"
+            );
+            // Reuse the wire pane validation/canonicalization without adding a wire field.
+            let mut target = RuntimeCommand::FocusPane { pane };
+            crate::command::prepare_runtime_command_for_retention_internal(&mut target)?;
+            let RuntimeCommand::FocusPane { pane } = target else {
+                unreachable!("pane validation preserves the command kind")
+            };
+            let reservation = self.command_budget.reserve(pane.0.capacity())?;
+            queued.agent_split_target = Some((pane, reservation));
+        }
         queued.admission = admission;
         let Some(tx) = self.command_tx.as_ref() else {
             return Err(RuntimeCommandSendError::Disconnected.into());
@@ -731,6 +755,14 @@ impl RuntimeClient for InProcessRuntimeClient {}
 impl RuntimeHost for InProcessRuntimeClient {
     fn submit(&self, command: RuntimeCommand) -> anyhow::Result<()> {
         RuntimeCommandSink::send_command(self, command)
+    }
+
+    fn submit_agent_beside(
+        &self,
+        command: RuntimeCommand,
+        pane: crate::MuxPaneId,
+    ) -> anyhow::Result<()> {
+        self.enqueue_command_with_split_target(command, None, Some(pane))
     }
 
     fn command_dispatcher(&self) -> Option<RuntimeCommandDispatcher> {
@@ -878,6 +910,7 @@ struct QueuedRuntimeCommand {
     admission: Option<crate::InputAdmission>,
     screen_reply: Option<SyncSender<Option<String>>>,
     input_reply: Option<InputReplyProbe>,
+    agent_split_target: Option<(crate::MuxPaneId, RuntimeCommandQueueReservation)>,
 }
 
 impl QueuedRuntimeCommand {
@@ -888,6 +921,7 @@ impl QueuedRuntimeCommand {
             admission: _,
             screen_reply: _,
             input_reply: _,
+            agent_split_target: _,
         } = self;
         drop(reservation);
         command
@@ -920,6 +954,7 @@ fn prepare_queued_command_owned(
         admission: None,
         screen_reply: None,
         input_reply: None,
+        agent_split_target: None,
     })
 }
 
@@ -966,6 +1001,9 @@ struct Worker {
     resize_records: std::collections::HashMap<SessionId, crate::resize::ResizeRecord>,
     terminal_controls: std::collections::HashMap<SessionId, crate::terminal_control::ControlRecord>,
     session_redaction_leases: std::collections::HashMap<SessionId, Vec<RedactionLease>>,
+    /// Local caller resources belong to the real agent process, independently of config IDs
+    /// and of whether a durable event subscriber observes its spawn or exit.
+    session_credential_guards: std::collections::HashMap<SessionId, Box<dyn Send>>,
     /// Wire compatibility for `SeedRedaction`: one latest-only checked lease replaces the legacy
     /// permanent corpus registration. Production composition no longer sends this command.
     seed_redaction_lease: Option<RedactionLease>,
@@ -2104,6 +2142,7 @@ impl Worker {
         self.scrollback_results.remove(&session);
         self.archive_failed.remove(&session);
         self.session_redaction_leases.remove(&session);
+        self.session_credential_guards.remove(&session);
         self.input_sequences.remove(&session);
         let removed = self.sessions.remove(&session);
         if removed.is_some() {
@@ -2672,6 +2711,10 @@ impl Worker {
         }
         let admission = queued.admission.take();
         let input_reply = queued.input_reply.take();
+        let agent_split_target = queued.agent_split_target.take().map(|(pane, reservation)| {
+            drop(reservation);
+            pane
+        });
         let command = queued.into_command();
         if let Some(admission) = admission {
             match command {
@@ -2728,16 +2771,30 @@ impl Worker {
                 }
                 _ => self.reject_invalid_command(&command),
             }
+        } else if agent_split_target.is_some() {
+            self.handle_command_with_split_target(command, agent_split_target);
         } else {
             self.handle_command(command);
         }
     }
 
     fn handle_command(&mut self, command: RuntimeCommand) {
+        self.handle_command_with_split_target(command, None);
+    }
+
+    fn handle_command_with_split_target(
+        &mut self,
+        command: RuntimeCommand,
+        split_target: Option<crate::MuxPaneId>,
+    ) {
         self.expire_terminal_controls(Instant::now());
         // 하나의 복원 명령이 만든 세션 전체를 집계한 뒤 완료를 알린다.
         self.scrollback_batching = true;
-        self.handle_command_inner(command);
+        if split_target.is_some() {
+            self.handle_command_inner_with_cwd_and_split_target(command, None, split_target);
+        } else {
+            self.handle_command_inner(command);
+        }
         self.scrollback_batching = false;
         if self.scrollback_ack_pending {
             self.scrollback_ack_pending = false;
@@ -3750,8 +3807,17 @@ impl Worker {
     }
     fn handle_command_inner_with_cwd(
         &mut self,
+        command: RuntimeCommand,
+        scoped_cwd: Option<(Arc<crate::remote_worker::RemoteDirectory>, String)>,
+    ) {
+        self.handle_command_inner_with_cwd_and_split_target(command, scoped_cwd, None);
+    }
+
+    fn handle_command_inner_with_cwd_and_split_target(
+        &mut self,
         mut command: RuntimeCommand,
         scoped_cwd: Option<(Arc<crate::remote_worker::RemoteDirectory>, String)>,
+        local_split_target: Option<crate::MuxPaneId>,
     ) {
         // All production senders already use this primitive before queue retention. Reapplying it
         // here is an idempotent defense for direct/internal producers and preserves fail-closed
@@ -3760,7 +3826,8 @@ impl Worker {
             self.reject_invalid_command(&command);
             return;
         }
-        let (command, agent_split_target) = command.into_agent_spawn_target();
+        let (command, wire_split_target) = command.into_agent_spawn_target();
+        let agent_split_target = local_split_target.or(wire_split_target);
         match command {
             RuntimeCommand::InspectRemoteWorker { request_id } => {
                 self.inspect_remote_worker(request_id)
@@ -3882,10 +3949,32 @@ impl Worker {
                 let correlation_id = agent_config_id
                     .as_ref()
                     .map(|id| AgentConfigCorrelationId::from_validated(id.clone()));
+                let credential_ids = self
+                    .default_env_secrets
+                    .iter()
+                    .chain(&self.default_api_secrets)
+                    .chain(&env_secrets)
+                    .map(|(_, reference)| reference.clone())
+                    .collect::<Vec<_>>();
+                let credential_guard = match self
+                    .secret_resolver
+                    .retain_session_credentials(&credential_ids)
+                {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        self.emit(RuntimeEvent::SpawnFailed {
+                            kind: SpawnKind::Agent,
+                            message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
+                        });
+                        self.emit_agent_spawn_resolved(correlation_id, None);
+                        return;
+                    }
+                };
                 if agent_split_target
                     .as_ref()
                     .is_some_and(|pane| self.mux.tab_of_pane(pane).is_none())
                 {
+                    drop(credential_guard);
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
                         message: MessagePayload::new("runtime.split.target_missing"),
@@ -3894,6 +3983,7 @@ impl Worker {
                     return;
                 }
                 if self.suspended {
+                    drop(credential_guard);
                     self.emit(RuntimeEvent::SpawnFailed {
                         kind: SpawnKind::Agent,
                         message: MessagePayload::new("runtime.spawn_failed.suspended"),
@@ -3902,6 +3992,7 @@ impl Worker {
                     return;
                 }
                 if !self.session_capacity_available() {
+                    drop(credential_guard);
                     self.reject_session_capacity(SpawnKind::Agent, correlation_id);
                     return;
                 }
@@ -3912,6 +4003,7 @@ impl Worker {
                     match self.prepare_agent_env(env_plain, env_secrets) {
                         Ok(prepared) => prepared,
                         Err(_) => {
+                            drop(credential_guard);
                             self.emit(RuntimeEvent::SpawnFailed {
                                 kind: SpawnKind::Agent,
                                 message: MessagePayload::new("runtime.spawn_failed.agent_secret"),
@@ -3951,6 +4043,9 @@ impl Worker {
                 ) {
                     Ok(new_session) => {
                         self.insert_session(id, new_session);
+                        if let Some(guard) = credential_guard {
+                            self.session_credential_guards.insert(id, guard);
+                        }
                         self.retain_session_redaction_leases(id, redaction_leases);
                         let patterns = StatusPatterns::compile(
                             waiting_regex.as_deref(),
@@ -4008,6 +4103,7 @@ impl Worker {
                         self.push_watched_viewports();
                     }
                     Err(error) => {
+                        drop(credential_guard);
                         trace_runtime_failure("spawn_agent", "pty_spawn_failed", error);
                         self.emit(RuntimeEvent::SpawnFailed {
                             kind: SpawnKind::Agent,
@@ -6003,6 +6099,10 @@ impl Worker {
         }
         for (session, path, code) in resolved {
             self.agent_exit_watch.remove(&session);
+            // The wrapper can keep an interactive fallback shell alive after the agent
+            // has finished. Release its caller-owned guard independently of that shell;
+            // the caller may perform durable revocation asynchronously.
+            self.session_credential_guards.remove(&session);
             // Retire query ownership before removing the independent exit evidence.
             if let Some(live) = self.sessions.get(&session) {
                 live.retire_agent_query_owner();
@@ -6355,6 +6455,7 @@ impl Worker {
         // 증가 = spawn 순서)로 정렬해 결정적 LRU를 만든다 (오래된 것이 앞. codex 리뷰)
         exited.sort_by_key(|(s, _)| s.0);
         for (session, exit_code) in exited {
+            self.session_credential_guards.remove(&session);
             self.forget_terminal_control(session);
             let detail = exit_code.map(|c| format!("exit code {c}"));
             self.close_session_log(session, "exited", detail.as_deref());
@@ -8296,6 +8397,7 @@ mod tests {
                 resize_records: std::collections::HashMap::new(),
                 terminal_controls: std::collections::HashMap::new(),
                 session_redaction_leases: std::collections::HashMap::new(),
+                session_credential_guards: std::collections::HashMap::new(),
                 seed_redaction_lease: None,
                 secret_resolver: resolver,
                 logs: std::collections::HashMap::new(),
@@ -14447,6 +14549,217 @@ mod tests {
             probe.seen.get(correlations[0].saturating_sub(1)),
             Some(RuntimeEvent::AgentSpawned { session: spawned }) if *spawned == session
         ));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_credential_lifetime_guard_follows_real_process_not_config_correlation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        struct Resolver {
+            retained: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+        impl RuntimeSecretResolver for Resolver {
+            fn resolve(&self, _: &str) -> anyhow::Result<RuntimeSecret> {
+                Ok(RuntimeSecret::new("synthetic-lifetime-value".into()))
+            }
+            fn retain_session_credentials(
+                &self,
+                ids: &[String],
+            ) -> anyhow::Result<Option<Box<dyn Send>>> {
+                assert_eq!(ids, &["opaque-lifetime-reference"]);
+                self.retained.fetch_add(1, Ordering::AcqRel);
+                Ok(Some(Box::new(Guard(self.dropped.clone()))))
+            }
+        }
+        for (label, command, args) in [
+            (
+                "lifetime-exit",
+                "/bin/sh",
+                vec!["-c".into(), "sleep 0.2".into()],
+            ),
+            (
+                "lifetime-failure",
+                "/nonexistent/deppy-lifetime-fixture",
+                vec![],
+            ),
+            (
+                "lifetime-shutdown",
+                "/bin/sh",
+                vec!["-c".into(), "sleep 30".into()],
+            ),
+        ] {
+            let retained = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let client = InProcessRuntimeClient::try_with_shell_and_resolver(
+                5,
+                Arc::new(Resolver {
+                    retained: retained.clone(),
+                    dropped: dropped.clone(),
+                }),
+                test_logs_root(label),
+                RedactionService::new(),
+                pty::default_shell(),
+                None,
+            )
+            .unwrap();
+            let mut probe = Probe::new(client.subscribe());
+            client
+                .send_command(RuntimeCommand::SpawnAgent {
+                    agent_config_id: None,
+                    cols: 80,
+                    rows: 24,
+                    scrollback_lines: 100,
+                    command: command.into(),
+                    args,
+                    env_plain: vec![],
+                    env_secrets: vec![(
+                        "FIXTURE_LIFETIME".into(),
+                        "opaque-lifetime-reference".into(),
+                    )],
+                    waiting_regex: None,
+                    approval_regex: None,
+                    error_regex: None,
+                    done_regex: None,
+                    transient_args: vec![],
+                })
+                .unwrap();
+            eprintln!("{label}: waiting for spawn outcome");
+            if label == "lifetime-failure" {
+                probe.wait_for(Duration::from_secs(15), |event| {
+                    matches!(event, RuntimeEvent::SpawnFailed { .. }).then_some(())
+                });
+                assert_eq!(
+                    retained.load(Ordering::Acquire),
+                    1,
+                    "failed spawn must enter the lifetime port"
+                );
+                assert_eq!(
+                    dropped.load(Ordering::Acquire),
+                    1,
+                    "failed spawn must release resources"
+                );
+            } else {
+                let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+                    RuntimeEvent::AgentSpawned { session } => Some(*session),
+                    _ => None,
+                });
+                assert_eq!(
+                    retained.load(Ordering::Acquire),
+                    1,
+                    "real process must acquire its lifetime guard"
+                );
+                assert_eq!(
+                    dropped.load(Ordering::Acquire),
+                    0,
+                    "live process owns its resources"
+                );
+                if label == "lifetime-exit" {
+                    eprintln!("{label}: waiting for natural SessionExited");
+                    probe.wait_for(Duration::from_secs(15), |event| matches!(event, RuntimeEvent::SessionExited { session: exited, .. } if *exited == session).then_some(()));
+                    assert_eq!(
+                        dropped.load(Ordering::Acquire),
+                        1,
+                        "exited process must release resources"
+                    );
+                }
+            }
+            drop(client);
+            assert_eq!(
+                dropped.load(Ordering::Acquire),
+                1,
+                "worker shutdown releases every remaining guard once"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn agent_credential_lifetime_guard_releases_while_fallback_shell_still_runs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Guard(Arc<AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+        struct Resolver(Arc<AtomicUsize>);
+        impl RuntimeSecretResolver for Resolver {
+            fn resolve(&self, _: &str) -> anyhow::Result<RuntimeSecret> {
+                Ok(RuntimeSecret::new("synthetic-agent-completion".into()))
+            }
+            fn retain_session_credentials(
+                &self,
+                _: &[String],
+            ) -> anyhow::Result<Option<Box<dyn Send>>> {
+                Ok(Some(Box::new(Guard(self.0.clone()))))
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let client = InProcessRuntimeClient::try_with_shell_and_resolver(
+            5,
+            Arc::new(Resolver(dropped.clone())),
+            test_logs_root("lifetime-agent-completion"),
+            RedactionService::new(),
+            pty::default_shell(),
+            None,
+        )
+        .unwrap();
+        let mut probe = Probe::new(client.subscribe());
+        // Match the existing real-PTY exit-sentinel fixture. Keep the fallback process
+        // alive without depending on an interactive shell's startup/status behavior.
+        let script = r#""$@"; __deppy_exit=$?; printf '%s' "$__deppy_exit" > "${TMPDIR:-/tmp}/deppy-agent-exit-$$" 2>/dev/null || true; sleep 30"#;
+        client
+            .send_command(RuntimeCommand::SpawnAgent {
+                agent_config_id: None,
+                cols: 80,
+                rows: 24,
+                scrollback_lines: 100,
+                command: "/bin/sh".into(),
+                args: vec![
+                    "-c".into(),
+                    script.into(),
+                    crate::agent_wrapper::AGENT_SESSION_WRAPPER_NAME.into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "exit 3".into(),
+                ],
+                env_plain: vec![],
+                env_secrets: vec![(
+                    "FIXTURE_LIFETIME".into(),
+                    "opaque-completion-reference".into(),
+                )],
+                waiting_regex: None,
+                approval_regex: None,
+                error_regex: None,
+                done_regex: None,
+                transient_args: vec![],
+            })
+            .unwrap();
+        eprintln!("agent completion: waiting for AgentSpawned");
+        let session = probe.wait_for(Duration::from_secs(15), |event| match event {
+            RuntimeEvent::AgentSpawned { session } => Some(*session),
+            _ => None,
+        });
+        eprintln!("agent completion: waiting for exit-sentinel Error while fallback process runs");
+        probe.wait_for(Duration::from_secs(15), |event| matches!(event, RuntimeEvent::SessionStatusChanged { session: target, status: session::SessionStatus::Error } if *target == session).then_some(()));
+        assert!(!probe.seen.iter().any(|event| matches!(event, RuntimeEvent::SessionExited { session: target, .. } if *target == session)), "the fallback shell still runs");
+        assert_eq!(
+            dropped.load(Ordering::Acquire),
+            1,
+            "agent completion releases its guard before fallback shell exit"
+        );
+        client
+            .send_command(RuntimeCommand::KillSession { session })
+            .unwrap();
+        drop(client);
+        assert_eq!(dropped.load(Ordering::Acquire), 1);
     }
 
     #[test]

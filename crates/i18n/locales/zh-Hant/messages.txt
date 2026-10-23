@@ -2138,3 +2138,22 @@ workspace.ssh.status.connected = 已連線
 workspace.ssh.status.offline = 離線
 workspace.ssh.closing = 正在關閉遠端工作階段。請等待伺服器確認。
 workspace.ssh.close_unconfirmed = 無法確認遠端工作階段已關閉。重新連線前請檢查伺服器狀態。
+
+# Project API quick registration and compact editor
+project_keys.reload_latest = 重新載入最新狀態
+project_keys.reload_hint = 捨棄草稿並載入最新狀態。
+project_keys.add_title = 新增專案金鑰
+project_keys.api_add_title = 註冊 API
+project_keys.api_service_name = 服務名稱
+project_keys.api_service_hint = 例如：我的 API
+project_keys.api_binding = 執行變數名稱
+project_keys.api_description = 說明
+project_keys.api_documentation = 文件網址
+project_keys.api_agent_enabled = 允許此專案的代理使用
+project_keys.api_agent_hint = 僅新的授權執行使用目前金鑰。
+project_keys.api_storage_label = 已儲存的 API
+workspace.quick_register_api = 註冊 API…
+project_keys.quick_loading = 正在準備專案 API 註冊…
+project_keys.quick_ssh_unavailable = SSH 專案暫不支援直接註冊 API。此 Mac 的金鑰不會傳送至遠端伺服器。
+project_keys.api_details = 更多選項
+project_keys.api_binding_hint = 代理或建置使用時必填。

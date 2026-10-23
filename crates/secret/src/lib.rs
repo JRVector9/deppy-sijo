@@ -18,8 +18,8 @@ pub use diagnostic_scan::{
     DiagnosticFindingKind, DiagnosticScanReport, scan_diagnostic_bytes,
 };
 pub use redaction::{
-    RedactionCapacityError, RedactionClock, RedactionCorpusLimits, RedactionCorpusStats,
-    RedactionLease, RedactionService, RedactionSnapshot, StreamRedactor,
+    FixedStreamRedactor, RedactionCapacityError, RedactionClock, RedactionCorpusLimits,
+    RedactionCorpusStats, RedactionLease, RedactionService, RedactionSnapshot, StreamRedactor,
 };
 
 use anyhow::Context;

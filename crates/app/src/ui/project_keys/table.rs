@@ -85,9 +85,21 @@ pub(super) fn change_label(kind: ProjectKeyChangeKind, catalog: &i18n::Catalog) 
     )
 }
 
+#[cfg(test)]
 pub(super) fn row(
     ui: &mut Ui,
     key: &ProjectKey,
+    selected: bool,
+    enabled: bool,
+    catalog: &i18n::Catalog,
+) -> (Rect, Option<RowAction>) {
+    row_with_name(ui, key, &key.name, selected, enabled, catalog)
+}
+
+pub(super) fn row_with_name(
+    ui: &mut Ui,
+    key: &ProjectKey,
+    display_name: &str,
     selected: bool,
     enabled: bool,
     catalog: &i18n::Catalog,
@@ -97,7 +109,7 @@ pub(super) fn row(
         if !enabled {
             ui.disable();
         }
-        row_contents(ui, key, selected, enabled, catalog)
+        row_contents(ui, key, display_name, selected, enabled, catalog)
     })
     .inner
 }
@@ -105,6 +117,7 @@ pub(super) fn row(
 fn row_contents(
     ui: &mut Ui,
     key: &ProjectKey,
+    display_name: &str,
     selected: bool,
     enabled: bool,
     catalog: &i18n::Catalog,
@@ -138,11 +151,15 @@ fn row_contents(
     let name = ui.put(
         name_rect,
         egui::Button::new("")
-            .left_text(egui::RichText::new(&key.name).size(13.0).color(colors.text))
+            .left_text(
+                egui::RichText::new(display_name)
+                    .size(13.0)
+                    .color(colors.text),
+            )
             .frame(false)
             .truncate(),
     );
-    name.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, &key.name));
+    name.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, enabled, display_name));
     let origin = source_label(&key.source, catalog);
     let origin_rect = Rect::from_min_size(rect.min + vec2(10.0, 25.0), vec2(name_width, 17.0));
     ui.painter().with_clip_rect(origin_rect).text(
@@ -179,14 +196,14 @@ fn row_contents(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             enabled,
-            catalog.t("project_keys.edit_key", &[("name", &key.name)]),
+            catalog.t("project_keys.edit_key", &[("name", display_name)]),
         )
     });
     copy.widget_info(|| {
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             copy_enabled,
-            catalog.t("project_keys.copy_key", &[("name", &key.name)]),
+            catalog.t("project_keys.copy_key", &[("name", display_name)]),
         )
     });
     let value_left = rect.left() + name_width + 14.0;
@@ -227,7 +244,7 @@ fn row_contents(
         egui::WidgetInfo::labeled(
             egui::WidgetType::Button,
             copy_enabled,
-            catalog.t("project_keys.value_copy", &[("name", &key.name)]),
+            catalog.t("project_keys.value_copy", &[("name", display_name)]),
         )
     });
     let value = value.on_hover_text(catalog.t("project_keys.double_copy", &[]));

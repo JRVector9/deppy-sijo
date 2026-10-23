@@ -56,7 +56,14 @@ impl EnvironmentPrefill {
 }
 
 /// 워크스페이스는 이 요청을 소비하는 App이 원본 runtime에서 붙인다.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EnvironmentOpenKind {
+    Settings,
+    RegisterApi,
+}
+
 pub struct EnvironmentOpenRequest {
+    pub kind: EnvironmentOpenKind,
     pub session: Option<runtime::SessionId>,
     pub cwd: Option<String>,
     pub prefill: Option<EnvironmentPrefill>,
@@ -487,6 +494,7 @@ mod tests {
     fn environment_context_reactivated_cwd_requires_current_detection() {
         let session = runtime::SessionId(7);
         let request = EnvironmentOpenRequest {
+            kind: EnvironmentOpenKind::Settings,
             session: Some(session),
             cwd: Some("/old-project".into()),
             prefill: None,

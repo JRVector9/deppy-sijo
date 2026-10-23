@@ -164,6 +164,10 @@ impl ProjectKeysService {
                 self.db
                     .project_key_list(&scope.workspace_id, scope.environment),
             )?,
+            api_access: storage_error(
+                self.db
+                    .project_api_access_list(&scope.workspace_id, scope.environment),
+            )?,
             settings: storage_error(
                 self.db
                     .project_key_settings(&scope.workspace_id, scope.environment),

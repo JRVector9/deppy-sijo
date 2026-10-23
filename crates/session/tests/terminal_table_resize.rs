@@ -88,6 +88,72 @@ fn terminal_reflows_soft_wrapped_text_but_preserves_explicit_table_columns() {
     assert_eq!(backend.grid_dimensions().unwrap(), (80, 16));
 }
 
+#[test]
+fn restored_previous_output_reflows_after_alt_replay_and_archive_without_new_output() {
+    const ASCII: &str =
+        "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuv";
+    const MIXED: &str = "가나다라마바사아자차카타파하가나다라마바사아자차카타파하é👩\u{200d}💻";
+    let mut source = Vec::new();
+    for row in 0..450 {
+        source.extend_from_slice(
+            format!("A{row:03}|{ASCII}|END\r\n\x1b[1;31mM{row:03}|{MIXED}|끝\x1b[0m\r\n")
+                .as_bytes(),
+        );
+    }
+    source.extend_from_slice(b"\x1b[?1049hALT-REPLAY\r\n| A    | B    |\r\n| one  | two  |");
+    let mut replay = Session::restore_archived(
+        SessionId(10),
+        SessionKind::Agent,
+        60,
+        24,
+        4000,
+        Some(0),
+        &mut source.as_slice(),
+    );
+    assert!(replay.take_snapshot().unwrap().is_alt_screen);
+    replay.finish_ansi_replay().unwrap();
+    assert!(!replay.take_snapshot().unwrap().is_alt_screen);
+    let archive = replay.serialize_scrollback().unwrap();
+    let mut restored = Session::restore_archived(
+        SessionId(11),
+        SessionKind::Agent,
+        60,
+        24,
+        4000,
+        Some(0),
+        &mut archive.as_slice(),
+    );
+    assert!(!restored.lifecycle().is_running());
+    restored.scroll(10_000);
+    let narrow = restored.take_snapshot().unwrap();
+    assert!(narrow.scroll_offset > 512);
+    restored.resize_checked(120, 24).unwrap();
+    let wide = restored.take_snapshot().unwrap();
+    assert_eq!((wide.cols, wide.rows), (120, 24));
+    assert!(wide.history.unwrap().total_lines < narrow.history.unwrap().total_lines);
+    let mut text = String::new();
+    for (index, cell) in wide.visible_cells.iter().enumerate() {
+        if !cell.wide_spacer() {
+            wide.push_cell_text(index, &mut text);
+        }
+        if (index + 1).is_multiple_of(usize::from(wide.cols)) {
+            text.push('\n');
+        }
+    }
+    assert!(text.contains(&format!("A000|{ASCII}|END")), "{text}");
+    assert!(text.contains(&format!("M000|{MIXED}|끝")), "{text}");
+    let colored = wide
+        .visible_cells
+        .chunks(120)
+        .find(|row| row[0].c == 'M')
+        .unwrap();
+    assert!(colored[0].attrs().contains(terminal::CellAttrs::BOLD));
+    assert_ne!(colored[0].fg, wide.visible_cells[0].fg);
+    let rebuilt = String::from_utf8(restored.serialize_scrollback().unwrap()).unwrap();
+    assert!(rebuilt.contains("ALT-REPLAY"));
+    assert!(rebuilt.contains("| A    | B    |\r\n| one  | two  |"));
+}
+
 /// Manual diagnostic for a test-owned CLI with a synthetic saved conversation.
 /// The caller must isolate the CLI configuration and deny external networking.
 /// Never point this at a user's live session or transcript.

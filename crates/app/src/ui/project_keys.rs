@@ -13,6 +13,7 @@ use dialogs::{Dialog, EditDraft};
 enum PendingKind {
     General,
     Edit,
+    ReloadEdit,
     SourcePick,
     Preview,
     Import,
@@ -26,10 +27,17 @@ enum PendingKind {
 struct Pending {
     fence: ProjectKeysFence,
     kind: PendingKind,
+    dialog_epoch: Option<u64>,
 }
 struct KeyHistory {
     key: ProjectKey,
     result: Option<Result<Vec<ProjectKeyChange>, ProjectKeysError>>,
+}
+
+struct PendingOpen {
+    scope: ProjectKeysScope,
+    prefill: Option<(super::environment::EnvironmentSelectionKind, SensitiveDraft)>,
+    api: bool,
 }
 
 #[derive(Default)]
@@ -41,6 +49,9 @@ pub(crate) struct ProjectKeysUi {
     selected_recipe: Option<String>,
     query: String,
     dialog: Option<Dialog>,
+    dialog_epoch: u64,
+    dialog_error: Option<ProjectKeysError>,
+    pending_open: Option<PendingOpen>,
     pending: Option<Pending>,
     build_pending: Option<ProjectKeysFence>,
     build_recipe: Option<String>,
@@ -58,6 +69,8 @@ impl ProjectKeysUi {
         self.selected_recipe = None;
         self.query.clear();
         self.dialog = None;
+        self.dialog_error = None;
+        self.pending_open = None;
         self.pending = None;
         self.notice = None;
         self.history_pending = None;
@@ -67,6 +80,43 @@ impl ProjectKeysUi {
 
     pub(crate) fn has_dialog(&self) -> bool {
         self.dialog.is_some()
+    }
+
+    pub(crate) fn has_dialog_or_pending_open(&self) -> bool {
+        self.has_dialog() || self.pending_open.is_some()
+    }
+
+    pub(crate) fn begin_add(
+        &mut self,
+        scope: ProjectKeysScope,
+        prefill: Option<(super::environment::EnvironmentSelectionKind, SensitiveDraft)>,
+    ) {
+        self.reset();
+        self.pending_open = Some(PendingOpen {
+            scope,
+            prefill,
+            api: false,
+        });
+    }
+
+    pub(crate) fn begin_api_add(
+        &mut self,
+        scope: ProjectKeysScope,
+        prefill: Option<(super::environment::EnvironmentSelectionKind, SensitiveDraft)>,
+    ) {
+        self.begin_add(scope, prefill);
+        self.pending_open.as_mut().expect("staged API editor").api = true;
+    }
+
+    fn open_dialog(&mut self, dialog: Dialog) {
+        self.dialog_epoch = self.dialog_epoch.wrapping_add(1);
+        self.dialog_error = None;
+        self.dialog = Some(dialog);
+    }
+
+    fn close_dialog(&mut self) {
+        self.dialog = None;
+        self.dialog_error = None;
     }
 
     pub(crate) fn prefill(
@@ -80,10 +130,43 @@ impl ProjectKeysUi {
     pub(crate) fn prepare(&mut self, snapshot: &ProjectKeysSnapshot) {
         if self.scope.as_ref() != Some(&snapshot.scope) || self.generation != snapshot.generation {
             let prefill = self.prefill.take();
+            let pending_open = self.pending_open.take();
             self.reset();
             self.scope = Some(snapshot.scope.clone());
             self.generation = snapshot.generation;
             self.prefill = prefill;
+            self.pending_open = pending_open;
+        }
+        if self
+            .pending_open
+            .as_ref()
+            .is_some_and(|pending| pending.scope == snapshot.scope && snapshot.error.is_none())
+        {
+            let pending = self.pending_open.take().expect("matching pending editor");
+            let mut edit = EditDraft::new(new_key(&snapshot.scope));
+            if pending.api {
+                edit.begin_api();
+            }
+            if let Some((kind, mut value)) = pending.prefill {
+                match kind {
+                    super::environment::EnvironmentSelectionKind::ApiName if pending.api => {
+                        edit.api.as_mut().expect("API draft").access.service_name =
+                            Some(std::mem::take(value.text_mut()));
+                    }
+                    super::environment::EnvironmentSelectionKind::ApiValue if pending.api => {
+                        edit.value = value;
+                    }
+                    super::environment::EnvironmentSelectionKind::VariableName => {
+                        edit.key.name = std::mem::take(value.text_mut());
+                    }
+                    super::environment::EnvironmentSelectionKind::VariableValue => {
+                        edit.value = value
+                    }
+                    super::environment::EnvironmentSelectionKind::ApiName
+                    | super::environment::EnvironmentSelectionKind::ApiValue => return,
+                }
+            }
+            self.open_dialog(Dialog::Edit(Box::new(edit)));
         }
         if let Some((kind, mut value)) = self.prefill.take() {
             let mut edit = EditDraft::new(new_key(&snapshot.scope));
@@ -95,7 +178,7 @@ impl ProjectKeysUi {
                 super::environment::EnvironmentSelectionKind::ApiName
                 | super::environment::EnvironmentSelectionKind::ApiValue => return,
             }
-            self.dialog = Some(Dialog::Edit(edit));
+            self.open_dialog(Dialog::Edit(Box::new(edit)));
         }
         if self
             .selected
@@ -126,6 +209,10 @@ impl ProjectKeysUi {
             request_id: self.next_request,
         };
         self.notice = None;
+        let dialog_epoch = self.dialog.as_ref().map(|_| self.dialog_epoch);
+        if dialog_epoch.is_some() {
+            self.dialog_error = None;
+        }
         if build {
             if let ProjectKeysAction::RunRecipe { recipe_id, .. } = &action {
                 self.build_recipe = Some(recipe_id.clone());
@@ -135,6 +222,7 @@ impl ProjectKeysUi {
             self.pending = Some(Pending {
                 fence: fence.clone(),
                 kind,
+                dialog_epoch,
             });
         }
         Some(ProjectKeysIntent::Request { fence, action })
@@ -189,8 +277,42 @@ impl ProjectKeysUi {
             return;
         }
         let kind = pending.kind;
+        let dialog_is_current =
+            pending.dialog_epoch == Some(self.dialog_epoch) && self.dialog.is_some();
         self.pending = None;
         match &ack.result {
+            Ok(ProjectKeysAckPayload::Refreshed(snapshot))
+                if kind == PendingKind::ReloadEdit && dialog_is_current =>
+            {
+                let refreshed = (snapshot.scope == ack.fence.scope
+                    && snapshot.generation == ack.fence.generation
+                    && snapshot.error.is_none())
+                .then(|| {
+                    let Dialog::Edit(draft) = self.dialog.as_ref()? else {
+                        return None;
+                    };
+                    snapshot
+                        .keys
+                        .iter()
+                        .find(|key| {
+                            key.id == draft.key.id
+                                && key.workspace_id == snapshot.scope.workspace_id
+                                && key.environment == snapshot.scope.environment
+                        })
+                        .map(|key| existing_editor(snapshot, key))
+                })
+                .flatten();
+                if let Some(draft) = refreshed {
+                    // The accepted ACK owns this projection. Cached or delayed
+                    // watcher snapshots cannot rebase the reopened editor.
+                    self.open_dialog(Dialog::Edit(Box::new(draft)));
+                } else {
+                    self.dialog_error = Some(ProjectKeysError::Stale);
+                }
+            }
+            Ok(_) if kind == PendingKind::ReloadEdit && dialog_is_current => {
+                self.dialog_error = Some(ProjectKeysError::Storage);
+            }
             Ok(ProjectKeysAckPayload::CredentialsPage { choices, after }) => {
                 if let Some(Dialog::GitHub(draft)) = &mut self.dialog {
                     draft.set_credentials_page(choices, after);
@@ -219,20 +341,36 @@ impl ProjectKeysUi {
                         | PendingKind::Delete
                         | PendingKind::Conflict
                         | PendingKind::Sources
-                ) {
-                    self.dialog = None;
+                ) && dialog_is_current
+                {
+                    self.close_dialog();
                 }
             }
-            Err(_) => {
-                if let Some(Dialog::Edit(draft)) = &mut self.dialog {
-                    draft.failed_submission();
+            Err(error) => {
+                if dialog_is_current {
+                    self.dialog_error = Some(*error);
+                    if let Some(Dialog::Edit(draft)) = &mut self.dialog {
+                        draft.failed_submission();
+                    }
                 }
             }
         }
         self.notice = Some(ack.result.clone());
     }
 
+    #[cfg(test)]
     pub(crate) fn show(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &ProjectKeysSnapshot,
+        catalog: &i18n::Catalog,
+    ) -> Vec<ProjectKeysIntent> {
+        let mut intents = self.show_page(ui, snapshot, catalog);
+        intents.extend(self.show_dialog(ui.ctx(), snapshot, catalog));
+        intents
+    }
+
+    pub(crate) fn show_page(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &ProjectKeysSnapshot,
@@ -240,7 +378,7 @@ impl ProjectKeysUi {
     ) -> Vec<ProjectKeysIntent> {
         self.prepare(snapshot);
         let mut intents = Vec::new();
-        let modal = self.dialog.is_some();
+        let modal = self.has_dialog_or_pending_open();
         super::popup::set_pending_modal(ui.ctx(), modal);
         egui::ScrollArea::vertical()
             .id_salt("project_keys_page")
@@ -281,7 +419,18 @@ impl ProjectKeysUi {
                     self.build(ui, snapshot, catalog, &mut intents);
                 });
             });
-        if let Some((action, kind)) = self.render_dialog(ui.ctx(), snapshot, catalog)
+        intents
+    }
+
+    pub(crate) fn show_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &ProjectKeysSnapshot,
+        catalog: &i18n::Catalog,
+    ) -> Vec<ProjectKeysIntent> {
+        self.prepare(snapshot);
+        let mut intents = Vec::new();
+        if let Some((action, kind)) = self.render_dialog(ctx, snapshot, catalog)
             && let Some(intent) = self.request(action, kind)
         {
             intents.push(intent);
@@ -381,7 +530,7 @@ impl ProjectKeysUi {
             )
             .clicked()
             {
-                self.dialog = Some(Dialog::Source(dialogs::SourceDraft::new(snapshot)));
+                self.open_dialog(Dialog::Source(dialogs::SourceDraft::new(snapshot)));
             }
             let mut watch = snapshot.settings.watch_enabled;
             if ui
@@ -443,7 +592,9 @@ impl ProjectKeysUi {
             )
             .clicked()
             {
-                self.dialog = Some(Dialog::Edit(EditDraft::new(new_key(&snapshot.scope))));
+                self.open_dialog(Dialog::Edit(Box::new(EditDraft::new(new_key(
+                    &snapshot.scope,
+                )))));
             }
             if super::popup::action_button(
                 ui,
@@ -453,7 +604,7 @@ impl ProjectKeysUi {
             )
             .clicked()
             {
-                self.dialog = Some(Dialog::Source(dialogs::SourceDraft::new(snapshot)));
+                self.open_dialog(Dialog::Source(dialogs::SourceDraft::new(snapshot)));
             }
             if super::popup::action_button(
                 ui,
@@ -540,10 +691,14 @@ impl ProjectKeysUi {
         );
         table::header(ui, catalog);
         let query = self.query.to_lowercase();
-        let keys = snapshot
-            .keys
-            .iter()
-            .filter(|key| key.name.to_lowercase().contains(&query));
+        let keys = snapshot.keys.iter().filter(|key| {
+            key_display_name(snapshot, key, catalog)
+                .to_lowercase()
+                .contains(&query)
+                || api_access_for(snapshot, key)
+                    .and_then(|access| access.execution_name.as_ref())
+                    .is_some_and(|name| name.to_lowercase().contains(&query))
+        });
         let mut count = 0;
         egui::ScrollArea::vertical()
             .id_salt("project_keys_list")
@@ -552,9 +707,10 @@ impl ProjectKeysUi {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for key in keys {
                     count += 1;
-                    let (_, action) = table::row(
+                    let (_, action) = table::row_with_name(
                         ui,
                         key,
+                        &key_display_name(snapshot, key, catalog),
                         self.selected.as_deref() == Some(&key.id),
                         self.pending.is_none(),
                         catalog,
@@ -563,7 +719,9 @@ impl ProjectKeysUi {
                         Some(table::RowAction::Select) => self.selected = Some(key.id.clone()),
                         Some(table::RowAction::Edit) => {
                             self.selected = Some(key.id.clone());
-                            self.dialog = Some(Dialog::Edit(EditDraft::existing(key.clone())));
+                            self.open_dialog(Dialog::Edit(Box::new(existing_editor(
+                                snapshot, key,
+                            ))));
                         }
                         Some(table::RowAction::Copy) => {
                             if let Some(intent) = self.request(
@@ -631,8 +789,31 @@ impl ProjectKeysUi {
         egui::Frame::group(ui.style())
             .inner_margin(12)
             .show(ui, |ui| {
-                ui.label(egui::RichText::new(&key.name).size(15.0).strong());
+                ui.label(
+                    egui::RichText::new(key_display_name(snapshot, key, catalog))
+                        .size(15.0)
+                        .strong(),
+                );
                 ui.add_space(8.0);
+                if let Some(access) = api_access_for(snapshot, key) {
+                    detail_pair(
+                        ui,
+                        &catalog.t("project_keys.api_binding", &[]),
+                        access.execution_name.as_deref().unwrap_or("—"),
+                    );
+                    detail_pair(
+                        ui,
+                        &catalog.t("project_keys.api_agent_enabled", &[]),
+                        &catalog.t(
+                            if access.agent_enabled {
+                                "project_keys.enabled"
+                            } else {
+                                "project_keys.disabled"
+                            },
+                            &[],
+                        ),
+                    );
+                }
                 detail_pair(
                     ui,
                     &catalog.t("project_keys.source", &[]),
@@ -684,7 +865,7 @@ impl ProjectKeysUi {
                     )
                     .clicked()
                     {
-                        self.dialog = Some(Dialog::Edit(EditDraft::existing(key.clone())));
+                        self.open_dialog(Dialog::Edit(Box::new(existing_editor(snapshot, key))));
                     }
                     if super::popup::action_button(
                         ui,
@@ -713,7 +894,7 @@ impl ProjectKeysUi {
                     )
                     .clicked()
                     {
-                        self.dialog = Some(Dialog::Conflict(key.clone()));
+                        self.open_dialog(Dialog::Conflict(key.clone()));
                     }
                 } else if matches!(
                     key.storage_state,
@@ -798,23 +979,28 @@ impl ProjectKeysUi {
                             ui,
                             &catalog.t("project_keys.send", &[]),
                             super::popup::ActionTone::Secondary,
-                            self.pending.is_none() && key.source != KeySource::GitHubOnly,
+                            self.pending.is_none()
+                                && key.source != KeySource::GitHubOnly
+                                && has_execution_binding(snapshot, key),
                         )
                         .clicked()
                     {
-                        self.dialog =
-                            Some(Dialog::GitHub(dialogs::GitHubDraft::existing(key.clone())));
+                        self.open_dialog(Dialog::GitHub(dialogs::GitHubDraft::existing(
+                            key.clone(),
+                        )));
                     }
                     if super::popup::action_button(
                         ui,
                         &catalog.t("project_keys.github_configure", &[]),
                         super::popup::ActionTone::Secondary,
-                        self.pending.is_none(),
+                        self.pending.is_none() && has_execution_binding(snapshot, key),
                     )
+                    .on_hover_text(catalog.t("project_keys.api_binding_hint", &[]))
                     .clicked()
                     {
-                        self.dialog =
-                            Some(Dialog::GitHub(dialogs::GitHubDraft::existing(key.clone())));
+                        self.open_dialog(Dialog::GitHub(dialogs::GitHubDraft::existing(
+                            key.clone(),
+                        )));
                     }
                 });
                 super::hairline(ui);
@@ -868,7 +1054,7 @@ impl ProjectKeysUi {
                 )
                 .clicked()
                 {
-                    self.dialog = Some(Dialog::Delete(key.clone()));
+                    self.open_dialog(Dialog::Delete(key.clone()));
                 }
             });
     }
@@ -917,7 +1103,7 @@ impl ProjectKeysUi {
                 )
                 .clicked()
                 {
-                    self.dialog = Some(Dialog::Recipe(dialogs::RecipeDraft::existing(
+                    self.open_dialog(Dialog::Recipe(dialogs::RecipeDraft::existing(
                         recipe.clone(),
                     )));
                 }
@@ -967,7 +1153,7 @@ impl ProjectKeysUi {
                 .find(|p| p.id == snapshot.scope.workspace_id)
                 .map(|p| p.path.clone())
                 .unwrap_or_default();
-            self.dialog = Some(Dialog::Recipe(dialogs::RecipeDraft::new(
+            self.open_dialog(Dialog::Recipe(dialogs::RecipeDraft::new(
                 &snapshot.scope,
                 cwd,
             )));
@@ -1099,7 +1285,7 @@ fn new_key(scope: &ProjectKeysScope) -> ProjectKey {
     }
 }
 
-fn error_label(error: ProjectKeysError, catalog: &i18n::Catalog) -> String {
+pub(crate) fn error_label(error: ProjectKeysError, catalog: &i18n::Catalog) -> String {
     catalog.t(
         match error {
             ProjectKeysError::Locked => "project_keys.error_locked",
@@ -1122,4 +1308,66 @@ fn error_label(error: ProjectKeysError, catalog: &i18n::Catalog) -> String {
         },
         &[],
     )
+}
+
+fn api_access_for<'a>(
+    snapshot: &'a ProjectKeysSnapshot,
+    key: &ProjectKey,
+) -> Option<&'a deppy_core::project_api_access::ProjectApiAccess> {
+    snapshot
+        .api_access
+        .iter()
+        .filter(|access| {
+            access.key_id == key.id
+                && access.workspace_id == key.workspace_id
+                && access.environment == key.environment
+        })
+        .max_by_key(|access| access.revision)
+}
+
+fn key_display_name(
+    snapshot: &ProjectKeysSnapshot,
+    key: &ProjectKey,
+    catalog: &i18n::Catalog,
+) -> String {
+    if let Some(access) = api_access_for(snapshot, key) {
+        return access
+            .service_name
+            .as_ref()
+            .or(access.execution_name.as_ref())
+            .cloned()
+            .unwrap_or_else(|| catalog.t("project_keys.api_storage_label", &[]));
+    }
+    if is_unbound_api_storage_key(key) {
+        return catalog.t("project_keys.api_storage_label", &[]);
+    }
+    key.name.clone()
+}
+
+fn existing_editor(snapshot: &ProjectKeysSnapshot, key: &ProjectKey) -> EditDraft {
+    let mut draft = EditDraft::existing(key.clone());
+    if let Some(access) = api_access_for(snapshot, key) {
+        draft = draft.with_api(access.clone());
+    } else if is_unbound_api_storage_key(key) {
+        // Defend existing orphan storage identities; current creation writes
+        // the placeholder and API metadata together.
+        draft.begin_api();
+        draft.key.name.clear();
+    }
+    draft
+}
+
+fn has_execution_binding(snapshot: &ProjectKeysSnapshot, key: &ProjectKey) -> bool {
+    api_access_for(snapshot, key).map_or_else(
+        || !is_unbound_api_storage_key(key),
+        |access| access.execution_name.is_some(),
+    )
+}
+
+fn is_unbound_api_storage_key(key: &ProjectKey) -> bool {
+    key.source == KeySource::Vault
+        && key.usage == KeyUsage::StoreOnly
+        && uuid::Uuid::parse_str(&key.id).is_ok_and(|id| {
+            key.name == format!("DEPPY_API_{}", id.simple().to_string().to_ascii_uppercase())
+        })
 }

@@ -8556,6 +8556,17 @@ impl WorkspaceUi {
                 }
                 if super::context_menu::button(
                     ui,
+                    catalog.t("workspace.quick_register_api", &[]),
+                    super::context_menu::Icon::Settings,
+                )
+                .clicked()
+                {
+                    self.open_environment_requested =
+                        Some(self.api_registration_request(Some(session), None));
+                    ui.close();
+                }
+                if super::context_menu::button(
+                    ui,
                     catalog.t("workspace.open_environment", &[]),
                     super::context_menu::Icon::Settings,
                 )
@@ -9384,6 +9395,7 @@ impl WorkspaceUi {
         prefill: Option<super::environment::EnvironmentPrefill>,
     ) -> super::environment::EnvironmentOpenRequest {
         super::environment::EnvironmentOpenRequest {
+            kind: super::environment::EnvironmentOpenKind::Settings,
             session,
             cwd: session.and_then(|session| self.session_cwds.get(&session).cloned()),
             prefill,
@@ -9417,15 +9429,30 @@ impl WorkspaceUi {
                     )
                     .clicked()
                     {
-                        self.open_environment_requested = Some(self.environment_open_request(
-                            Some(session),
-                            EnvironmentPrefill::from_selection(kind, text),
-                        ));
+                        let prefill = EnvironmentPrefill::from_selection(kind, text);
+                        self.open_environment_requested = Some(match kind {
+                            K::ApiName | K::ApiValue => {
+                                self.api_registration_request(Some(session), prefill)
+                            }
+                            K::VariableName | K::VariableValue => {
+                                self.environment_open_request(Some(session), prefill)
+                            }
+                        });
                         ui.close();
                     }
                 }
             },
         );
+    }
+
+    fn api_registration_request(
+        &self,
+        session: Option<SessionId>,
+        prefill: Option<super::environment::EnvironmentPrefill>,
+    ) -> super::environment::EnvironmentOpenRequest {
+        let mut request = self.environment_open_request(session, prefill);
+        request.kind = super::environment::EnvironmentOpenKind::RegisterApi;
+        request
     }
 
     fn pane_context_menu(
@@ -9565,6 +9592,17 @@ impl WorkspaceUi {
                         self.session_folder_menu_items(ui, session, catalog);
                     },
                 );
+            }
+            if menu::button(
+                ui,
+                catalog.t("workspace.quick_register_api", &[]),
+                Icon::Settings,
+            )
+            .clicked()
+            {
+                self.open_environment_requested =
+                    Some(self.api_registration_request(session, None));
+                ui.close();
             }
             if menu::button(
                 ui,
@@ -11361,6 +11399,135 @@ mod tests {
     include!("../workspace_ui_test_support/workspace_table_resize_tests.rs");
     include!("../workspace_ui_test_support/workspace_application_wheel_tests.rs");
     include!("../workspace_ui_test_support/workspace_terminal_path_tests.rs");
+
+    #[test]
+    fn terminal_environment_settings_and_blank_api_registration_are_distinct_menu_intents() {
+        use crate::ui::environment::EnvironmentOpenKind;
+        use egui_kittest::kittest::Queryable;
+        for (label, expected) in [
+            ("Environment & API settings…", EnvironmentOpenKind::Settings),
+            ("Register API…", EnvironmentOpenKind::RegisterApi),
+        ] {
+            let catalog = catalog();
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, workspace: &mut WorkspaceUi| {
+                    let response = ui.button("Terminal context fixture");
+                    workspace.pane_context_menu(
+                        &response,
+                        &pane_id("api-menu-pane"),
+                        &TerminalConfig::default(),
+                        &catalog,
+                    );
+                },
+                WorkspaceUi::new(),
+            );
+            harness.run();
+            let pos = harness
+                .get_by_label("Terminal context fixture")
+                .rect()
+                .center();
+            harness.event(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+            }
+            harness.step();
+            harness.run();
+            harness.get_by_label(label).click();
+            harness.run();
+            let request = harness
+                .state_mut()
+                .take_open_environment()
+                .expect("menu request");
+            assert_eq!(request.kind, expected);
+            assert!(request.prefill.is_none());
+            assert!(request.session.is_none());
+        }
+    }
+
+    #[test]
+    fn terminal_selected_api_registration_keeps_kind_session_and_original_value() {
+        use crate::ui::environment::{EnvironmentOpenKind, EnvironmentSelectionKind};
+        use egui_kittest::kittest::Queryable;
+        for (label_key, expected_kind, expected_field) in [
+            (
+                "workspace.menu.use_as_api_name",
+                EnvironmentOpenKind::RegisterApi,
+                EnvironmentSelectionKind::ApiName,
+            ),
+            (
+                "workspace.menu.use_as_api_value",
+                EnvironmentOpenKind::RegisterApi,
+                EnvironmentSelectionKind::ApiValue,
+            ),
+            (
+                "workspace.menu.use_as_env_name",
+                EnvironmentOpenKind::Settings,
+                EnvironmentSelectionKind::VariableName,
+            ),
+            (
+                "workspace.menu.use_as_env_value",
+                EnvironmentOpenKind::Settings,
+                EnvironmentSelectionKind::VariableValue,
+            ),
+        ] {
+            let catalog = catalog();
+            let submenu = catalog.t("workspace.menu.add_to_environment", &[]);
+            let label = catalog.t(label_key, &[]);
+            let mut workspace = WorkspaceUi::new();
+            workspace
+                .session_cwds
+                .insert(SessionId(7), "/captured/project".into());
+            let mut harness = egui_kittest::Harness::new_ui_state(
+                move |ui, workspace: &mut WorkspaceUi| {
+                    let response = ui.button("Selected terminal context fixture");
+                    crate::ui::context_menu::show(&response, |ui| {
+                        workspace.environment_selection_menu(
+                            ui,
+                            SessionId(7),
+                            "FIXTURE_TOKEN",
+                            &catalog,
+                        );
+                    });
+                },
+                workspace,
+            );
+            harness.run();
+            let pos = harness
+                .get_by_label("Selected terminal context fixture")
+                .rect()
+                .center();
+            harness.event(egui::Event::PointerMoved(pos));
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                });
+                harness.step();
+            }
+            harness.run();
+            harness.get_by_label_contains(&submenu).hover();
+            harness.run_steps(3);
+            harness.get_by_label(&label).click();
+            harness.run();
+            let request = harness
+                .state_mut()
+                .take_open_environment()
+                .expect("selected menu request");
+            assert_eq!(request.kind, expected_kind);
+            assert_eq!(request.session, Some(SessionId(7)));
+            assert_eq!(request.cwd.as_deref(), Some("/captured/project"));
+            let (kind, value) = request.prefill.unwrap().into_parts();
+            assert_eq!(kind, expected_field);
+            assert_eq!(value.into_inner(), "FIXTURE_TOKEN");
+        }
+    }
 
     #[test]
     fn pr2_selected_text_keeps_captured_owner_and_bounded_no_submit_intent() {

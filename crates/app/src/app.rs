@@ -8,6 +8,10 @@ pub(crate) mod file_delete;
 #[path = "keychain_startup_tests.rs"]
 mod keychain_startup_tests;
 
+mod project_api_launch;
+mod project_api_registration;
+#[cfg(all(test, unix))]
+mod project_api_registration_tests;
 #[cfg(all(test, unix))]
 mod ssh_integration_tests;
 #[cfg(all(test, unix, feature = "ssh-workspaces"))]
@@ -1752,6 +1756,8 @@ enum PendingDotenvContinuation {
         command: runtime::RuntimeCommand,
         approval_ticket: Option<u64>,
         launcher_request_id: Option<u64>,
+        project_api: Option<project_api_launch::ProjectApiLaunchLease>,
+        split_target: Option<runtime::MuxPaneId>,
     },
 }
 
@@ -1776,7 +1782,22 @@ struct StartupDeferredDotenvContinuation {
 fn prepare_dotenv_continuation_retention(
     continuation: &mut PendingDotenvContinuation,
 ) -> Result<usize, runtime::RuntimeCommandPreparationErrorCode> {
-    match continuation {
+    let split_bytes = if let PendingDotenvContinuation::AgentLaunch {
+        split_target: Some(pane),
+        ..
+    } = continuation
+    {
+        let mut target = runtime::RuntimeCommand::FocusPane { pane: pane.clone() };
+        runtime::prepare_runtime_command_for_retention(&mut target)?;
+        let runtime::RuntimeCommand::FocusPane { pane: canonical } = target else {
+            unreachable!("pane validation preserves the command kind")
+        };
+        *pane = canonical;
+        pane.0.capacity()
+    } else {
+        0
+    };
+    let command_bytes = match continuation {
         PendingDotenvContinuation::WorkspaceProtocol { command, .. }
         | PendingDotenvContinuation::RuntimeCommand(command)
         | PendingDotenvContinuation::PrimaryPaneActivation { command, .. }
@@ -1784,7 +1805,8 @@ fn prepare_dotenv_continuation_retention(
             runtime::prepare_runtime_command_for_retention(command)
                 .map(runtime::RuntimeCommandRetention::retained_bytes)
         }
-    }
+    }?;
+    runtime::checked_runtime_command_retention_total(command_bytes, split_bytes)
 }
 
 fn runtime_command_requires_dotenv(command: &runtime::RuntimeCommand) -> bool {
@@ -3388,6 +3410,97 @@ fn cross_workspace_restore_command(pane: runtime::MuxPaneId) -> runtime::Runtime
     runtime::RuntimeCommand::RestoreWorkspacePane { pane }
 }
 
+impl crate::project_keys::repository::ProjectApiRepository for Db {
+    fn workspace_is_local(&self, workspace: &str) -> anyhow::Result<bool> {
+        Ok(self
+            .workspace_target(workspace)?
+            .is_some_and(|target| target.local_root().is_some()))
+    }
+
+    fn project_key_settings(
+        &self,
+        workspace: &str,
+        environment: deppy_core::project_keys::KeyEnvironment,
+    ) -> anyhow::Result<deppy_core::project_keys::ProjectKeySettings> {
+        Db::project_key_settings(self, workspace, environment)
+    }
+
+    fn project_key_list(
+        &self,
+        workspace: &str,
+        environment: deppy_core::project_keys::KeyEnvironment,
+    ) -> anyhow::Result<Vec<deppy_core::project_keys::ProjectKey>> {
+        Db::project_key_list(self, workspace, environment)
+    }
+
+    fn project_api_access_list(
+        &self,
+        workspace: &str,
+        environment: deppy_core::project_keys::KeyEnvironment,
+    ) -> anyhow::Result<Vec<deppy_core::project_api_access::ProjectApiAccess>> {
+        Db::project_api_access_list(self, workspace, environment)
+    }
+
+    fn project_api_granted_key_ids(
+        &self,
+        scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+        now: i64,
+    ) -> anyhow::Result<Vec<String>> {
+        Db::project_api_granted_key_ids(self, scope, now)
+    }
+
+    fn project_api_capability_save(
+        &self,
+        scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+        bearer_hash: &[u8; 32],
+        expires_at: i64,
+        now: i64,
+    ) -> anyhow::Result<()> {
+        Db::project_api_capability_save(self, scope, bearer_hash, expires_at, now)
+    }
+
+    fn project_api_local_grants_refresh(
+        &self,
+        scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+        bearer_hash: &[u8; 32],
+        now: i64,
+    ) -> anyhow::Result<()> {
+        Db::project_api_local_grants_refresh(self, scope, bearer_hash, now)
+    }
+
+    fn project_api_grant_revoke_scope(
+        &self,
+        scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+    ) -> anyhow::Result<()> {
+        Db::project_api_grant_revoke_scope(self, scope)
+    }
+
+    #[cfg(test)]
+    fn project_api_capability_allows(
+        &self,
+        scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+        bearer_hash: &[u8; 32],
+        now: i64,
+    ) -> anyhow::Result<bool> {
+        Db::project_api_capability_allows(self, scope, bearer_hash, now)
+    }
+}
+
+// Invoked only by the bounded cleanup worker. Keep native database construction here,
+// alongside the metadata/authorization adapter, rather than in a lifecycle leaf.
+fn revoke_project_api_scope(
+    path: &Path,
+    scope: &deppy_core::project_api_access::ProjectApiSessionScope,
+) -> bool {
+    // Avoid recreating a database removed before deferred cleanup can run.
+    if matches!(path.try_exists(), Ok(false)) {
+        return true;
+    }
+    Db::open(path)
+        .and_then(|db| db.project_api_grant_revoke_scope(scope))
+        .is_ok()
+}
+
 fn project_keys_service_factory(db_path: PathBuf) -> crate::project_keys::service::ServiceFactory {
     Arc::new(move || {
         let db = crate::project_keys::service::storage_error(Db::open(&db_path))?;
@@ -3440,10 +3553,34 @@ pub(crate) fn run_project_keys_cli(
             println!("{text}");
             Ok(Some(0))
         }
+        CliAction::Mcp(request) => {
+            let paths = crate::paths::AppPaths::init().map_err(|_| ProjectKeysError::Storage)?;
+            let db = Db::open(&paths.data_dir.join("metadata.sqlite3"))
+                .map_err(|_| ProjectKeysError::Storage)?;
+            crate::project_keys::cli::serve(
+                request,
+                &db,
+                std::io::stdin().lock(),
+                std::io::stdout().lock(),
+            )?;
+            Ok(Some(0))
+        }
+        CliAction::List(request) => {
+            // Discovery never initializes Keychain, a PTY, GUI, or the instance lock.
+            let paths = crate::paths::AppPaths::init().map_err(|_| ProjectKeysError::Storage)?;
+            let db = Db::open(&paths.data_dir.join("metadata.sqlite3"))
+                .map_err(|_| ProjectKeysError::Storage)?;
+            println!("{}", crate::project_keys::cli::list(request, &db)?);
+            Ok(Some(0))
+        }
         CliAction::Run(request) => {
             let paths = crate::paths::AppPaths::init().map_err(|_| ProjectKeysError::Storage)?;
+            let db_path = paths.data_dir.join("metadata.sqlite3");
+            let db = Db::open(&db_path).map_err(|_| ProjectKeysError::Storage)?;
+            crate::project_keys::cli::authorize_selected_request(&request, &db)?;
+            drop(db);
             secret::init_platform_store().map_err(|_| ProjectKeysError::Locked)?;
-            let service = project_keys_service_factory(paths.data_dir.join("metadata.sqlite3"))()?;
+            let service = project_keys_service_factory(db_path)()?;
             let runner = crate::project_keys::process::NativeProcessRunner::for_cli();
             let result = crate::project_keys::cli::run(request, &service, &runner);
             if runner.was_cancelled() {
@@ -3846,6 +3983,7 @@ struct PreparedAgentLaunch {
     done_regex: Option<String>,
     proxy: Option<PreparedProxyLaunch>,
     approval_ticket: Option<u64>,
+    project_api: Option<project_api_launch::ProjectApiLaunchLease>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4689,6 +4827,7 @@ fn prepare_agent_launch(
         done_regex: agent.done_regex,
         proxy,
         approval_ticket: None,
+        project_api: None,
     })
 }
 
@@ -4715,6 +4854,119 @@ fn prepare_quick_agent_launch(
     prepared.args = args;
     prepared.env_plain = env_plain;
     Ok(prepared)
+}
+
+fn requests_direct_project_api_registration(
+    request: &ui::environment::EnvironmentOpenRequest,
+) -> bool {
+    request.kind == ui::environment::EnvironmentOpenKind::RegisterApi
+}
+
+fn add_project_api_launch(
+    db: &Db,
+    db_path: &Path,
+    workspace_id: &str,
+    profile_id: Option<&str>,
+    prepared: &mut PreparedAgentLaunch,
+) {
+    // The settings project can differ from the active process destination. Its explicit
+    // profile selection must not implicitly grant that other project's API authority.
+    if workspace_id != prepared.runtime_workspace_id {
+        return;
+    }
+    use deppy_core::{project_api_access::*, project_keys::KeyEnvironment};
+    let provider =
+        crate::agent_launcher::AgentKind::from_stable_config_id(&prepared.agent_config_id)
+            .map(|kind| kind.id())
+            .or_else(|| {
+                Path::new(&prepared.command)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+            });
+    let Some(provider @ ("claude" | "codex" | "cursor" | "cursor-agent" | "grok")) = provider
+    else {
+        return;
+    };
+    let bootstrap = (|| -> anyhow::Result<_> {
+        anyhow::ensure!(
+            db.workspace_target(workspace_id)?
+                .is_some_and(|target| target.local_root().is_some()),
+            "project_api_remote_unavailable"
+        );
+        let environment = match profile_id {
+            Some(profile_id) => {
+                let profile = db
+                    .settings_agent_launch_rows(
+                        workspace_id,
+                        &prepared.agent_config_id,
+                        Some(profile_id),
+                    )?
+                    .profile
+                    .context("project_api_profile_unavailable")?;
+                if profile.is_production || profile.kind == "production" {
+                    KeyEnvironment::Production
+                } else {
+                    KeyEnvironment::Development
+                }
+            }
+            None => KeyEnvironment::Development,
+        };
+        let scope = ProjectApiSessionScope {
+            workspace_id: workspace_id.to_owned(),
+            environment,
+            principal_id: "local-agent".into(),
+            session_id: uuid::Uuid::new_v4().to_string(),
+            generation: uuid::Uuid::new_v4().to_string(),
+            actor_kind: ProjectApiActorKind::LocalSession,
+        };
+        Ok(project_api_launch::prepare(
+            db,
+            db_path,
+            provider,
+            scope,
+            &std::env::current_exe()?,
+            false,
+        ))
+    })();
+    let bootstrap = match bootstrap {
+        Ok(bootstrap) => bootstrap,
+        Err(_) => {
+            tracing::warn!(
+                error_code = "project_api_launch_unavailable",
+                "project API discovery is unavailable for this launch"
+            );
+            return;
+        }
+    };
+    let project_api_launch::PreparedProjectApiLaunch {
+        mut args,
+        unavailable_reason,
+        lease,
+    } = bootstrap;
+    if let Some(reason) = unavailable_reason {
+        tracing::warn!(
+            error_code = reason,
+            "project API discovery is unavailable for this launch"
+        );
+    }
+    let Some(lease) = lease else {
+        return;
+    };
+    if let Some(reference) = lease.credential_reference() {
+        use crate::project_keys::session_capability::CAPABILITY_ENV;
+        prepared
+            .env_plain
+            .retain(|(name, _)| name != CAPABILITY_ENV);
+        prepared
+            .env_secrets
+            .retain(|(name, _)| name != CAPABILITY_ENV);
+        prepared
+            .env_secrets
+            .push((CAPABILITY_ENV.into(), reference.to_owned()));
+    }
+    args.append(&mut prepared.transient_args);
+    prepared.transient_args = args;
+    prepared.project_api = Some(lease);
 }
 
 fn finalize_proxy_agent_launch(
@@ -5354,6 +5606,16 @@ fn execute_settings_job_with_repair(
                 runtime_workspace_id,
                 extra_arg,
             )
+            .map(|mut prepared| {
+                add_project_api_launch(
+                    db,
+                    db_path,
+                    &workspace_id,
+                    profile_id.as_deref(),
+                    &mut prepared,
+                );
+                prepared
+            })
             .map_err(|_| SettingsErrorCode::Launch),
         ),
         SettingsJobAction::PrepareQuickAgentLaunch {
@@ -5362,6 +5624,10 @@ fn execute_settings_job_with_repair(
             runtime_workspace_id,
         } => {
             let result = prepare_quick_agent_launch(db, &workspace_id, spec, runtime_workspace_id)
+                .map(|mut prepared| {
+                    add_project_api_launch(db, db_path, &workspace_id, None, &mut prepared);
+                    prepared
+                })
                 .map_err(|_| SettingsErrorCode::Launch);
             refresh = result.is_ok();
             SettingsOutcomeKind::QuickAgentLaunchPrepared { request_id, result }
@@ -6719,6 +6985,12 @@ impl AppRuntimeSecretResolver {
 }
 
 impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
+    fn retain_session_credentials(
+        &self,
+        references: &[String],
+    ) -> anyhow::Result<Option<Box<dyn Send>>> {
+        project_api_launch::retain_runtime_credentials(references)
+    }
     fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<runtime::RuntimeSecret> {
         self.resolve_versioned(logical_credential_id)
             .map(|(value, _)| value)
@@ -6727,6 +6999,9 @@ impl runtime::RuntimeSecretResolver for AppRuntimeSecretResolver {
         &self,
         logical_credential_id: &str,
     ) -> anyhow::Result<(runtime::RuntimeSecret, Option<String>)> {
+        if let Some(value) = project_api_launch::resolve_runtime_secret(logical_credential_id) {
+            return value.map(|value| (value, None));
+        }
         if logical_credential_id.starts_with(EPHEMERAL_MAIN_CREDENTIAL_PREFIX) {
             let value = ephemeral_main_credentials()
                 .lock()
@@ -8490,6 +8765,9 @@ struct WorkspaceRuntime {
     /// Monotonic identity for one concrete worker lifetime. Workspace IDs can be reused after a
     /// suspend/recreate, so async freshness checks must never key only by workspace ID.
     runtime_instance: u64,
+    /// Preparation remains alive until the worker retains its exact process lifetime guard.
+    /// This queue never correlates by agent config ID or event order.
+    pending_project_api_leases: Vec<project_api_launch::ProjectApiLaunchLease>,
     /// 이 worker 수명의 최신 스크롤백 요청과 실제 ACK만 보관한다.
     scrollback_delivery: crate::scrollback_policy::Delivery,
     /// Source stamp whose default env was accepted by this exact runtime lifetime.
@@ -9185,6 +9463,26 @@ pub(crate) fn top_provider_usage(
 // PROVIDER_USAGE_VIEW_END
 
 impl WorkspaceRuntime {
+    fn submit_agent_launch(
+        &mut self,
+        command: runtime::RuntimeCommand,
+        project_api: Option<project_api_launch::ProjectApiLaunchLease>,
+        split_target: Option<runtime::MuxPaneId>,
+    ) -> bool {
+        self.pending_project_api_leases
+            .retain(|lease| !lease.was_retained());
+        let submitted = match split_target {
+            Some(pane) => self.runtime.send_agent_beside(command, pane),
+            None => self.runtime.send_command(command),
+        };
+        if submitted.is_err() {
+            return false;
+        }
+        if let Some(lease) = project_api {
+            self.pending_project_api_leases.push(lease);
+        }
+        true
+    }
     /// 아직 종료(Exited)되지 않은 세션이 pane에 하나라도 있으면 true — 셸이든
     /// 에이전트든 떠 있는 것 자체가 실행 중이다. 이런 workspace는 Suspended(워커
     /// shutdown = PTY kill)로 내리면 안 된다 (2026-07-05 사용자 요구: 진행 중인
@@ -10695,6 +10993,7 @@ pub struct App {
     pending_project_keys:
         std::collections::VecDeque<crate::project_keys::contracts::ProjectKeysIntent>,
     project_keys_legacy_advanced: bool,
+    quick_project_api_origin: Option<project_api_registration::QuickProjectApiOrigin>,
     /// Render/logic producers stage at most one settings job; worker spawn/send/join happens only
     /// from logic on the next tick.
     pending_settings_job: Option<SettingsJob>,
@@ -19312,6 +19611,7 @@ impl App {
             project_keys_snapshot: None,
             pending_project_keys: Default::default(),
             project_keys_legacy_advanced: false,
+            quick_project_api_origin: None,
             pending_settings_job: None,
             settings_snapshot_generation: 0,
             settings_snapshot_revision: 0,
@@ -19742,6 +20042,7 @@ impl App {
         WorkspaceRuntime {
             id: workspace_id.to_owned(),
             runtime_instance,
+            pending_project_api_leases: Vec::new(),
             scrollback_delivery: crate::scrollback_policy::Delivery::new(
                 runtime_instance,
                 config.terminal.scrollback_lines,
@@ -28496,8 +28797,9 @@ impl App {
             || self.cross_workspace_open_warning.is_some()
             || (self.settings_open
                 && (self.env_project_close_confirm.is_some()
-                    || self.env_profiles_ui.has_pending_confirmation()
-                    || self.project_keys_ui.has_dialog()))
+                    || self.env_profiles_ui.has_pending_confirmation()))
+            || self.project_keys_ui.has_dialog_or_pending_open()
+            || self.quick_project_api_origin.is_some()
             || !self.document_pending_confirms.is_empty()
             || self
                 .file_tree
@@ -31035,8 +31337,14 @@ impl App {
                     })
                     .is_ok();
                 let delivered = match pending.continuation {
-                    PendingDotenvContinuation::AgentLaunch { command, .. } => {
-                        defaults_cleared && runtime.runtime.send_command(command).is_ok()
+                    PendingDotenvContinuation::AgentLaunch {
+                        command,
+                        project_api,
+                        split_target,
+                        ..
+                    } => {
+                        defaults_cleared
+                            && runtime.submit_agent_launch(command, project_api, split_target)
                     }
                     PendingDotenvContinuation::WorkspaceProtocol {
                         operation,
@@ -31326,8 +31634,17 @@ impl App {
                 // backpressure cannot permanently skip startup restore.
                 (false, None, policy_delivered)
             }
-            PendingDotenvContinuation::RuntimeCommand(command)
-            | PendingDotenvContinuation::AgentLaunch { command, .. } => (
+            PendingDotenvContinuation::AgentLaunch {
+                command,
+                project_api,
+                split_target,
+                ..
+            } => (
+                policy_delivered && runtime.submit_agent_launch(command, project_api, split_target),
+                None,
+                false,
+            ),
+            PendingDotenvContinuation::RuntimeCommand(command) => (
                 policy_delivered && runtime.runtime.send_command(command).is_ok(),
                 None,
                 false,
@@ -31634,6 +31951,12 @@ impl App {
     }
 
     fn observe_scrollback_policy(rt: &mut WorkspaceRuntime, events: &[runtime::RuntimeEvent]) {
+        if rt.events.is_disconnected() || rt.event_overflow_pending {
+            rt.pending_project_api_leases.clear();
+        } else {
+            rt.pending_project_api_leases
+                .retain(|lease| !lease.was_retained());
+        }
         rt.environment_application.observe(events);
         if events.iter().any(|event| matches!(event, runtime::RuntimeEvent::SpawnFailed { message, .. } if matches!(message.message_id.as_str(), "runtime.spawn_failed.shell_secret" | "runtime.spawn_failed.agent_secret"))) {
             // 회전된 physical slot은 다음 실행에서 다시 캡처한다.
@@ -32758,7 +33081,11 @@ impl App {
     /// 탐색이나 닫기에서만 초안과 이전 화면의 공개 요청을 정리한다.
     fn pump_project_keys(&mut self) {
         use crate::project_keys::contracts::*;
-        if self.settings_open && self.settings_category == ui::settings::Category::Environment {
+        self.validate_project_api_registration();
+        if self.quick_project_api_origin.is_none()
+            && self.settings_open
+            && self.settings_category == ui::settings::Category::Environment
+        {
             let workspace_id = self
                 .settings_workspace_id
                 .clone()
@@ -32785,6 +33112,9 @@ impl App {
         while let Some(intent) = self.pending_project_keys.pop_front() {
             match intent {
                 ProjectKeysIntent::SelectScope(scope) => {
+                    if self.quick_project_api_origin.is_some() {
+                        continue;
+                    }
                     self.settings_workspace_id = Some(scope.workspace_id.clone());
                     if self
                         .project_keys_worker
@@ -33161,6 +33491,7 @@ impl App {
             }
             return false;
         }
+        let project_api = prepared.project_api;
         let command = runtime::RuntimeCommand::SpawnAgent {
             agent_config_id: Some(prepared.agent_config_id),
             cols: 80,
@@ -33176,22 +33507,7 @@ impl App {
             done_regex: prepared.done_regex,
             transient_args: prepared.transient_args,
         };
-        let command = match split_target {
-            Some(target) => match command.with_right_split(target.pane) {
-                Ok(command) => command,
-                // 옆 분할 명령에는 이번 실행 인자 칸이 없다 — 인자를 버리지 않고 실행을 거절한다.
-                Err(_) => {
-                    if let Some(ticket_id) = ticket_id {
-                        self.approval_launch_tracker.cancel(ticket_id);
-                    }
-                    if let Some(request_id) = launcher_request_id {
-                        self.fail_agent_launcher_request(request_id);
-                    }
-                    return false;
-                }
-            },
-            None => command,
-        };
+        let split_target = split_target.map(|target| target.pane);
         let runtime_instance = self.active.runtime_instance;
         if self
             .stage_dotenv_continuation(
@@ -33200,6 +33516,8 @@ impl App {
                     command,
                     approval_ticket: ticket_id,
                     launcher_request_id,
+                    project_api,
+                    split_target,
                 },
             )
             .is_err()
@@ -39232,6 +39550,12 @@ impl eframe::App for App {
                 }
                 // Git은 2026-08-15 2차부터 pane 보조 탭이다 — 새로고침/원격 열기/파일
                 // diff는 이제 git 패널이 보조 본문 안에서 App에 직접 올린다.
+                Some(ui::file_tree::SidebarAction::RegisterApi {
+                    workspace_id,
+                    prefill,
+                }) => {
+                    self.open_project_api_registration(&workspace_id, prefill);
+                }
                 Some(ui::file_tree::SidebarAction::NoteEdited(body)) => {
                     // 기록은 여기서 하지 않는다 — 디바운스 만료와 깨우기는 logic()이
                     // 소유한다(check-boundary: App::ui는 repaint 타이머를 설치하지 않는다).
@@ -40773,6 +41097,13 @@ impl eframe::App for App {
                 environment_request = Some((workspace_id.clone(), request));
             }
         }
+        if environment_request
+            .as_ref()
+            .is_some_and(|(_, request)| requests_direct_project_api_registration(request))
+            && let Some((workspace, request)) = environment_request.take()
+        {
+            self.open_project_api_registration(&workspace, request.prefill);
+        }
         if environment_request.is_some() {
             self.set_settings_category(ui::settings::Category::Environment);
             self.request_settings_open();
@@ -41451,7 +41782,7 @@ impl eframe::App for App {
                         if !self.project_keys_legacy_advanced {
                             if let Some(snapshot) = project_keys_snapshot.as_deref() {
                                 project_keys_intents
-                                    .extend(self.project_keys_ui.show(ui, snapshot, &text));
+                                    .extend(self.project_keys_ui.show_page(ui, snapshot, &text));
                             } else {
                                 ui.add(egui::Spinner::new());
                                 ui.label(text.t("env.background.loading", &[]));
@@ -41783,6 +42114,7 @@ impl eframe::App for App {
                 }
             },
         );
+        project_keys_intents.extend(self.show_project_key_dialog(ui.ctx(), &text));
         for intent in project_keys_intents {
             if self.pending_project_keys.len() < 16 {
                 self.pending_project_keys.push_back(intent);
@@ -48682,6 +49014,8 @@ mod tests {
             },
             approval_ticket: Some(1),
             launcher_request_id: Some(2),
+            project_api: None,
+            split_target: None,
         };
         let restore =
             PendingDotenvContinuation::RuntimeCommand(runtime::RuntimeCommand::RestoreWorkspace);
@@ -57790,6 +58124,8 @@ mod tests {
                 },
                 approval_ticket: None,
                 launcher_request_id: None,
+                project_api: None,
+                split_target: None,
             }),
             "에이전트도 .env와 독립적으로 열려야 한다"
         );
@@ -59593,6 +59929,8 @@ mod tests {
             command,
             approval_ticket: None,
             launcher_request_id: Some(1),
+            project_api: None,
+            split_target: None,
         };
         assert!(dotenv_failure_allows_session(&continuation));
         assert!(dotenv_continuation_must_cancel_on_workspace_close(

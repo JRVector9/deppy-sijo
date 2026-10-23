@@ -160,6 +160,17 @@ impl WorkspaceRuntimeClient {
             )),
         }
     }
+    pub fn send_agent_beside(
+        &self,
+        command: RuntimeCommand,
+        pane: runtime::MuxPaneId,
+    ) -> anyhow::Result<()> {
+        match self {
+            Self::Local(client) => runtime::RuntimeHost::submit_agent_beside(client, command, pane),
+            Self::Remote { .. } => self.send_command(command.with_right_split(pane)?),
+            Self::Offline { .. } => Err(RuntimeCommandSendError::Disconnected.into()),
+        }
+    }
     pub fn inspect_screen(&self, session: SessionId) -> anyhow::Result<Receiver<Option<String>>> {
         match self {
             Self::Local(client) => client.inspect_screen(session),

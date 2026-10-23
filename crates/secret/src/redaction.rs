@@ -622,6 +622,40 @@ impl RedactionService {
         }
     }
 
+    /// Takes a fixed, owned corpus for an execution whose complete secret set is known before
+    /// spawn. Unlike the dynamic session stream, this stream releases proven-safe prompts
+    /// immediately and retains only a possible pattern prefix or unfinished ANSI context.
+    /// Later registrations and lease expiry do not change this snapshot. Acquire a checked
+    /// execution lease first; this method does not validate registration on the caller's behalf.
+    pub fn fixed_stream_redactor(&self) -> FixedStreamRedactor {
+        let mut patterns = self.inner.patterns.lock().expect("redaction patterns lock");
+        patterns.prune(self.inner.clock.now());
+        let entries = patterns
+            .entries
+            .iter()
+            .map(|entry| PatternEntry {
+                id: entry.id,
+                bytes: PatternBytes(entry.bytes.as_slice().to_vec()),
+                permanent: entry.permanent,
+                rotating_refs: entry.rotating_refs,
+                expires_at: entry.expires_at,
+            })
+            .collect::<Vec<_>>();
+        let prefix_tables = entries
+            .iter()
+            .map(|entry| kmp_prefix_table(entry.bytes.as_slice()))
+            .collect();
+        FixedStreamRedactor {
+            corpus: Arc::new(FixedCorpus {
+                entries,
+                prefix_tables,
+                carry_cap: (16 * 1024).max(patterns.max_len.saturating_mul(2)),
+                fail_closed: std::sync::atomic::AtomicBool::new(patterns.fail_closed),
+            }),
+            carry: ZeroizingBytes::default(),
+        }
+    }
+
     /// Redacts complete terminal text, including secrets split by rendered CR/LF row breaks.
     ///
     /// Exact and ANSI-insensitive matches are retained. A second, conservative pass ignores
@@ -1324,6 +1358,181 @@ fn ensure_capacity<'a>(
     Ok(())
 }
 
+struct FixedCorpus {
+    entries: Vec<PatternEntry>,
+    // Built once per snapshot and shared by stdout/stderr. The tables contain indices only;
+    // pattern bytes retain the existing zeroizing owner.
+    prefix_tables: Vec<Vec<usize>>,
+    carry_cap: usize,
+    fail_closed: std::sync::atomic::AtomicBool,
+}
+
+/// Prompt-safe streaming for a fixed, checked execution corpus. Never time-flush this stream:
+/// a delayed suffix can still complete a secret whose prefix is being retained.
+pub struct FixedStreamRedactor {
+    corpus: Arc<FixedCorpus>,
+    carry: ZeroizingBytes,
+}
+
+impl FixedStreamRedactor {
+    /// Creates an independent stream sharing the immutable zeroizing corpus and KMP cache.
+    /// Outputs that reach the same destination must be merged *before* either stream filters
+    /// them; independent buffers cannot protect a secret split across a shared destination.
+    pub fn new_stream(&self) -> Self {
+        Self {
+            corpus: self.corpus.clone(),
+            carry: ZeroizingBytes::default(),
+        }
+    }
+
+    pub fn redact_chunk(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.carry.0.extend_from_slice(chunk);
+        if self
+            .corpus
+            .fail_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.fail_closed();
+        }
+        // Replace complete matches before choosing a suffix. Otherwise an overlapping second
+        // pattern could cut a complete match in two and later emit its original halves.
+        let (mut redacted, _) = redact_buffer(&self.carry.0, &self.corpus.entries, false);
+        let (stripped, map) = strip_ansi_with_map(&redacted);
+        let stripped = ZeroizingBytes(stripped);
+        let mut keep = 0;
+        for (entry, table) in self.corpus.entries.iter().zip(&self.corpus.prefix_tables) {
+            let pattern = entry.bytes.as_slice();
+            // A proper prefix cannot exceed pattern.len()-1. Scanning only that tail bounds
+            // suffix work by the fixed corpus bytes, with no per-chunk prefix-table rebuild.
+            let tail = &stripped.0[stripped.0.len().saturating_sub(pattern.len() - 1)..];
+            let mut matched = 0;
+            for &byte in tail {
+                while matched > 0 && pattern[matched] != byte {
+                    matched = table[matched - 1];
+                }
+                if pattern[matched] == byte {
+                    matched += 1;
+                }
+            }
+            keep = keep.max(matched);
+        }
+        let start = if keep == 0 {
+            redacted.len()
+        } else {
+            map[map.len() - keep]
+        };
+        let (start, _) = fixed_ansi_context_start(&redacted, start);
+        if redacted.len() - start > self.corpus.carry_cap {
+            // Never release an arbitrary suffix of an unclosed escape or an escape-inflated
+            // prefix. Suppress this buffer and all future output rather than bypassing matches.
+            self.corpus
+                .fail_closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            drop(ZeroizingBytes(redacted));
+            return self.fail_closed();
+        }
+        self.carry = ZeroizingBytes(redacted.split_off(start));
+        redacted
+    }
+
+    pub fn flush(&mut self) -> Vec<u8> {
+        if self
+            .corpus
+            .fail_closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return self.fail_closed();
+        }
+        let (redacted, _) = redact_buffer(&self.carry.0, &self.corpus.entries, false);
+        let (_, incomplete) = fixed_ansi_context_start(&redacted, redacted.len());
+        self.carry = ZeroizingBytes::default();
+        if incomplete {
+            // EOF cannot prove how an unfinished ANSI header/payload would be interpreted by
+            // a downstream terminal or log reader. No unparsed raw bytes cross that boundary.
+            REPLACEMENT.to_vec()
+        } else {
+            redacted
+        }
+    }
+
+    fn fail_closed(&mut self) -> Vec<u8> {
+        let nonempty = !self.carry.0.is_empty();
+        self.carry = ZeroizingBytes::default();
+        if nonempty {
+            REPLACEMENT.to_vec()
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn kmp_prefix_table(pattern: &[u8]) -> Vec<usize> {
+    let mut table = vec![0; pattern.len()];
+    let mut matched = 0;
+    for index in 1..pattern.len() {
+        while matched > 0 && pattern[matched] != pattern[index] {
+            matched = table[matched - 1];
+        }
+        if pattern[matched] == pattern[index] {
+            matched += 1;
+        }
+        table[index] = matched;
+    }
+    table
+}
+
+/// Keeps parsing context when a possible suffix begins inside an OSC, and retains every
+/// incomplete escape. Its grammar deliberately matches strip_ansi_with_map, including OSC
+/// payload bytes (even ESC bytes) and both BEL / ESC-backslash terminators.
+fn fixed_ansi_context_start(buffer: &[u8], mut start: usize) -> (usize, bool) {
+    let mut index = 0;
+    while index < buffer.len() {
+        if buffer[index] != 0x1b {
+            index += 1;
+            continue;
+        }
+        let escape = index;
+        match buffer.get(index + 1) {
+            Some(b'[') => {
+                index += 2;
+                while index < buffer.len() && !(0x40..=0x7e).contains(&buffer[index]) {
+                    index += 1;
+                }
+                if index == buffer.len() {
+                    return (start.min(escape), true);
+                }
+                index += 1;
+            }
+            Some(b']') => {
+                index += 2;
+                let mut complete = false;
+                while index < buffer.len() {
+                    if buffer[index] == 0x07 {
+                        index += 1;
+                        complete = true;
+                        break;
+                    }
+                    if buffer[index] == 0x1b && buffer.get(index + 1) == Some(&b'\\') {
+                        index += 2;
+                        complete = true;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !complete {
+                    return (start.min(escape), true);
+                }
+                if start > escape && start < index {
+                    start = escape;
+                }
+            }
+            Some(_) => index += 2,
+            None => return (start.min(escape), true),
+        }
+    }
+    (start, false)
+}
+
 /// 세션 output 스트림 하나의 redaction 상태 (lookbehind carry 보유).
 pub struct StreamRedactor {
     service: RedactionService,
@@ -1650,6 +1859,189 @@ mod tests {
         let service = RedactionService::new();
         service.register(&SecretString::new(secret.into()));
         service
+    }
+
+    fn redact_fixed_all(redactor: &mut FixedStreamRedactor, chunks: &[&[u8]]) -> Vec<u8> {
+        let mut output = Vec::new();
+        for chunk in chunks {
+            output.extend(redactor.redact_chunk(chunk));
+        }
+        output.extend(redactor.flush());
+        output
+    }
+
+    #[test]
+    fn fixed_stream_releases_safe_prompts_without_releasing_secret_prefixes() {
+        let service = service_with("abcdef-secret");
+        let mut redactor = service.fixed_stream_redactor();
+        assert_eq!(
+            redactor.redact_chunk("✓ Continue?".as_bytes()),
+            "✓ Continue?".as_bytes()
+        );
+        assert!(redactor.redact_chunk(b"abc").is_empty());
+        assert_eq!(redactor.carry.0, b"abc");
+        // No idle/early flush is used: the prefix survives an arbitrarily delayed next chunk.
+        assert_eq!(redactor.redact_chunk(b"def-secret"), REPLACEMENT);
+        assert!(redactor.flush().is_empty());
+        assert_eq!(redactor.redact_chunk(b"prompt\x1b["), b"prompt");
+        assert_eq!(redactor.redact_chunk(b"31m?"), b"\x1b[31m?");
+        assert!(redactor.flush().is_empty());
+    }
+
+    #[test]
+    fn fixed_stream_preserves_utf8_and_redacts_every_registered_variant_at_every_split() {
+        let service = service_with("pa ss+wörd\"x");
+        let template = service.fixed_stream_redactor();
+        for entry in &template.corpus.entries {
+            let mut input = "安全 pre ".as_bytes().to_vec();
+            input.extend_from_slice(entry.bytes.as_slice());
+            input.extend_from_slice(" post ✓?".as_bytes());
+            for split in 0..=input.len() {
+                assert_eq!(
+                    redact_fixed_all(
+                        &mut template.new_stream(),
+                        &[&input[..split], &input[split..]]
+                    ),
+                    "安全 pre [REDACTED] post ✓?".as_bytes(),
+                    "variant/split length {} / {split}",
+                    entry.bytes.len(),
+                );
+            }
+            let byte_chunks = input.chunks(1).collect::<Vec<_>>();
+            assert_eq!(
+                redact_fixed_all(&mut template.new_stream(), &byte_chunks),
+                "安全 pre [REDACTED] post ✓?".as_bytes(),
+            );
+        }
+        let bytes = b"safe \xff\xfe \xe2\x9c\x93?";
+        assert_eq!(
+            redact_fixed_all(
+                &mut template.new_stream(),
+                &bytes.chunks(1).collect::<Vec<_>>()
+            ),
+            bytes
+        );
+    }
+
+    #[test]
+    fn fixed_stream_preserves_split_csi_and_osc_context_before_matching_suffixes() {
+        let template = service_with("abcdef-secret").fixed_stream_redactor();
+        for input in [
+            b"abc\x1b[31mdef-secret".as_slice(),
+            b"\x1b]abcdef-secret\x07".as_slice(),
+            b"\x1b]abcdef-secret\x1b\\".as_slice(),
+            b"\x1b]abc\x07def-secret".as_slice(),
+            b"\x1b]abc\x1b\\def-secret".as_slice(),
+        ] {
+            for split in 0..=input.len() {
+                let output = redact_fixed_all(
+                    &mut template.new_stream(),
+                    &[&input[..split], &input[split..]],
+                );
+                assert!(
+                    !output
+                        .windows(b"abcdef-secret".len())
+                        .any(|value| value == b"abcdef-secret")
+                );
+                assert!(
+                    output
+                        .windows(REPLACEMENT.len())
+                        .any(|value| value == REPLACEMENT),
+                    "split {split}"
+                );
+            }
+            let output = redact_fixed_all(
+                &mut template.new_stream(),
+                &input.chunks(1).collect::<Vec<_>>(),
+            );
+            assert!(
+                output
+                    .windows(REPLACEMENT.len())
+                    .any(|value| value == REPLACEMENT)
+            );
+        }
+        // An OSC payload may itself contain CSI-looking bytes. Its header must accompany a
+        // retained payload prefix even when that OSC has already terminated.
+        let mut redactor = service_with("abc\x1b[31mdef").fixed_stream_redactor();
+        assert!(redactor.redact_chunk(b"\x1b]abc\x1b[31mde\x07").is_empty());
+        let mut output = redactor.redact_chunk(b"f");
+        output.extend(redactor.flush());
+        assert_eq!(output, REPLACEMENT);
+    }
+
+    #[test]
+    fn fixed_stream_redacts_complete_matches_before_overlapping_prefix_cuts() {
+        let service = service_with("abcdefgh");
+        service.register(&SecretString::new("fghijk".into()));
+        let template = service.fixed_stream_redactor();
+        for suffix in [b"".as_slice(), b"Z".as_slice(), b"ijk".as_slice()] {
+            let mut expected = REPLACEMENT.to_vec();
+            expected.extend_from_slice(suffix);
+            assert_eq!(
+                redact_fixed_all(&mut template.new_stream(), &[b"abcdefgh", suffix]),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn fixed_stream_bounds_unfinished_ansi_and_fails_closed_at_eof() {
+        let template = service_with("abcdef-secret").fixed_stream_redactor();
+        for header in [b"\x1b[".as_slice(), b"\x1b]".as_slice()] {
+            let mut redactor = template.new_stream();
+            assert!(redactor.redact_chunk(header).is_empty());
+            assert_eq!(redactor.flush(), REPLACEMENT);
+            assert!(redactor.flush().is_empty());
+        }
+        let mut redactor = template.new_stream();
+        assert!(redactor.redact_chunk(b"abc").is_empty());
+        assert_eq!(redactor.flush(), b"abc");
+        let mut redactor = template.new_stream();
+        assert!(redactor.redact_chunk(b"\x1b[").is_empty());
+        let pathological = vec![b'0'; redactor.corpus.carry_cap];
+        assert_eq!(redactor.redact_chunk(&pathological), REPLACEMENT);
+        assert!(redactor.carry.0.is_empty());
+        assert_eq!(redactor.redact_chunk(b"abcdef-secret"), REPLACEMENT);
+        assert_eq!(
+            template.new_stream().redact_chunk(b"other output"),
+            REPLACEMENT
+        );
+        assert!(redactor.flush().is_empty());
+    }
+
+    #[test]
+    fn fixed_stream_owns_stable_zeroizing_snapshot_and_shares_cached_prefix_tables() {
+        let (service, clock) = bounded_service(64, 100_000, Duration::from_secs(1));
+        let value = SecretString::new("fixed-snapshot-secret".into());
+        let lease = service.acquire_execution_lease(&[&value]).unwrap();
+        let template = service.fixed_stream_redactor();
+        let other = template.new_stream();
+        assert!(Arc::ptr_eq(&template.corpus, &other.corpus));
+        assert_eq!(
+            template
+                .corpus
+                .prefix_tables
+                .iter()
+                .map(Vec::len)
+                .sum::<usize>(),
+            template
+                .corpus
+                .entries
+                .iter()
+                .map(|entry| entry.bytes.len())
+                .sum::<usize>(),
+        );
+        drop(lease);
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(service.corpus_stats().items, 0);
+        service.register(&SecretString::new("new-registration-secret".into()));
+        assert_eq!(
+            redact_fixed_all(
+                &mut other.new_stream(),
+                &[b"fixed-snapshot-secret new-registration-secret"]
+            ),
+            b"[REDACTED] new-registration-secret",
+        );
     }
 
     #[test]

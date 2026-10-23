@@ -2138,3 +2138,22 @@ workspace.ssh.status.connected = 연결됨
 workspace.ssh.status.offline = 오프라인
 workspace.ssh.closing = 원격 세션을 종료하고 있습니다. 서버 확인을 기다려 주세요.
 workspace.ssh.close_unconfirmed = 원격 세션 종료를 확인하지 못했습니다. 다시 연결하기 전에 서버 상태를 확인해 주세요.
+
+# Project API quick registration and compact editor
+project_keys.reload_latest = 최신 상태 다시 불러오기
+project_keys.reload_hint = 입력한 변경을 버리고 최신 상태를 불러옵니다.
+project_keys.add_title = 프로젝트 키 추가
+project_keys.api_add_title = API 바로 등록
+project_keys.api_service_name = 서비스 이름
+project_keys.api_service_hint = 예: 내 API
+project_keys.api_binding = 실행 변수명
+project_keys.api_description = 설명
+project_keys.api_documentation = 문서 주소
+project_keys.api_agent_enabled = 이 프로젝트 에이전트에서 사용
+project_keys.api_agent_hint = 허용한 새 실행에서만 최신 키를 사용합니다.
+project_keys.api_storage_label = API 보관 항목
+workspace.quick_register_api = API 바로 등록…
+project_keys.quick_loading = 프로젝트 API 등록을 준비하고 있습니다…
+project_keys.quick_ssh_unavailable = SSH 프로젝트는 API 바로 등록을 지원하지 않습니다. 이 Mac의 키는 원격 서버에 전달되지 않습니다.
+project_keys.api_details = 추가 옵션
+project_keys.api_binding_hint = 에이전트·빌드에서 사용할 때 입력하세요.

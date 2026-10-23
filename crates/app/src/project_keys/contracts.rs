@@ -131,6 +131,7 @@ pub struct ProjectKeysSnapshot {
     pub scope: ProjectKeysScope,
     pub generation: u64,
     pub keys: Vec<ProjectKey>,
+    pub api_access: Vec<deppy_core::project_api_access::ProjectApiAccess>,
     pub settings: ProjectKeySettings,
     pub recipes: Vec<ProjectBuildRecipe>,
     pub receipts: Vec<ProjectBuildReceipt>,
@@ -152,6 +153,7 @@ impl ProjectKeysSnapshot {
             scope,
             generation,
             keys: vec![],
+            api_access: vec![],
             recipes: vec![],
             receipts: vec![],
             projects: vec![],
@@ -170,6 +172,10 @@ pub enum ConflictResolution {
 pub enum ProjectKeysAction {
     Refresh {
         key_id: Option<String>,
+    },
+    /// Read current editor metadata without observing sources or secrets.
+    ReloadEditor {
+        key_id: String,
     },
     LoadCredentials {
         after: Option<String>,
@@ -200,6 +206,13 @@ pub enum ProjectKeysAction {
         key: Box<ProjectKey>,
         expected_revision: Option<u64>,
         value: ValueEdit,
+    },
+    SaveApiKey {
+        key: Box<ProjectKey>,
+        expected_revision: Option<u64>,
+        value: ValueEdit,
+        access: Box<deppy_core::project_api_access::ProjectApiAccess>,
+        expected_access_revision: Option<u64>,
     },
     DeleteKey {
         key_id: String,
@@ -252,6 +265,7 @@ pub enum ProjectKeysAckPayload {
         changes: Vec<ProjectKeyChange>,
     },
     Done,
+    Refreshed(Box<ProjectKeysSnapshot>),
     RuntimeChanged,
     Copied,
     DeletedKey {

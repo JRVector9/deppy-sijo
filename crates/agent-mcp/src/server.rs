@@ -1076,6 +1076,7 @@ fn process(
                         | "acquire_control"
                         | "release_control"
                 ) || crate::is_main_tool(s)
+                    || crate::is_project_api_tool(s)
             }) else {
                 return rpc_error(id, -32602, "unknown_tool");
             };
@@ -1103,9 +1104,15 @@ fn process(
             if !args.is_object() {
                 return rpc_error(id, -32602, "invalid_arguments");
             }
+            if crate::is_project_api_tool(tool)
+                && crate::parse_project_api_call(tool, &args).is_err()
+            {
+                return rpc_error(id, -32602, "invalid_arguments");
+            }
             let poll = matches!(
                 tool,
                 "list_sessions"
+                    | "list_project_apis"
                     | "read_output"
                     | "read_history"
                     | "get_run"

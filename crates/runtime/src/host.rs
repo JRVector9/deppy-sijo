@@ -41,6 +41,15 @@ impl fmt::Debug for RuntimeSecret {
 /// runtime remains independent of those concrete adapter types.
 pub trait RuntimeSecretResolver: Send + Sync + 'static {
     fn resolve(&self, logical_credential_id: &str) -> anyhow::Result<RuntimeSecret>;
+    /// Retain caller-owned launch resources for the concrete process lifetime. The runtime
+    /// owns the returned guard after admission and drops it on spawn failure or process exit.
+    /// This local port never adds credentials or ownership objects to the wire protocol.
+    fn retain_session_credentials(
+        &self,
+        _logical_credential_ids: &[String],
+    ) -> anyhow::Result<Option<Box<dyn Send>>> {
+        Ok(None)
+    }
     fn resolve_versioned(
         &self,
         logical_credential_id: &str,
@@ -110,6 +119,14 @@ pub type RuntimeCommandDispatcher = Arc<dyn Fn(RuntimeCommand) -> anyhow::Result
 /// preserve that guarantee.
 pub trait RuntimeHost: RuntimeEventStream + Send {
     fn submit(&self, command: RuntimeCommand) -> anyhow::Result<()>;
+    /// Local launch admission can preserve transient arguments when targeting an existing pane.
+    fn submit_agent_beside(
+        &self,
+        command: RuntimeCommand,
+        pane: crate::MuxPaneId,
+    ) -> anyhow::Result<()> {
+        self.submit(command.with_right_split(pane)?)
+    }
     fn command_dispatcher(&self) -> Option<RuntimeCommandDispatcher>;
     fn subscribe_with_wake(&self, wake: RuntimeWake) -> RuntimeEventReceiver;
     fn subscribe_with_wake_background(&self, wake: RuntimeWake) -> RuntimeEventReceiver;

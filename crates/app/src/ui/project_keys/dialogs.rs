@@ -3,7 +3,7 @@ use super::*;
 use std::collections::BTreeSet;
 
 pub(super) enum Dialog {
-    Edit(EditDraft),
+    Edit(Box<EditDraft>),
     Source(SourceDraft),
     GitHub(Box<GitHubDraft>),
     Recipe(RecipeDraft),
@@ -20,6 +20,12 @@ pub(super) struct EditDraft {
     rejected: bool,
     input_state: DraftTextEditState,
     remote_source_allowed: bool,
+    pub(super) api: Option<ApiDraft>,
+}
+
+pub(super) struct ApiDraft {
+    pub(super) access: deppy_core::project_api_access::ProjectApiAccess,
+    expected: Option<u64>,
 }
 impl EditDraft {
     pub fn new(key: ProjectKey) -> Self {
@@ -32,6 +38,7 @@ impl EditDraft {
             rejected: false,
             input_state: DraftTextEditState::default(),
             remote_source_allowed: true,
+            api: None,
         }
     }
     pub fn existing(key: ProjectKey) -> Self {
@@ -45,9 +52,84 @@ impl EditDraft {
     pub fn failed_submission(&mut self) {
         self.replacement_required = self.replacement_submitted;
     }
+    pub(super) fn begin_api(&mut self) {
+        self.key.usage = KeyUsage::StoreOnly;
+        self.remote_source_allowed = false;
+        self.api = Some(ApiDraft {
+            access: deppy_core::project_api_access::ProjectApiAccess {
+                key_id: self.key.id.clone(),
+                workspace_id: self.key.workspace_id.clone(),
+                environment: self.key.environment,
+                revision: 1,
+                execution_name: None,
+                service_name: None,
+                description: None,
+                documentation_url: None,
+                agent_enabled: false,
+            },
+            expected: None,
+        });
+    }
+
+    pub(super) fn with_api(
+        mut self,
+        access: deppy_core::project_api_access::ProjectApiAccess,
+    ) -> Self {
+        self.key.name = access.execution_name.clone().unwrap_or_default();
+        if self.key.source == KeySource::Vault
+            && self.key.storage_state == KeyStorageState::NotStored
+            && self.key.credential_id.is_none()
+        {
+            self.replacement_required = true;
+        }
+        self.api = Some(ApiDraft {
+            expected: Some(access.revision),
+            access,
+        });
+        self
+    }
+
+    fn access(&self) -> Option<deppy_core::project_api_access::ProjectApiAccess> {
+        let mut access = self.api.as_ref()?.access.clone();
+        access.execution_name = (!self.key.name.is_empty()).then(|| self.key.name.clone());
+        Some(access)
+    }
+
+    fn api_snapshot_changed(&self, snapshot: &ProjectKeysSnapshot) -> bool {
+        let Some(api) = &self.api else {
+            return false;
+        };
+        if snapshot.error.is_some()
+            || snapshot.scope.workspace_id != self.key.workspace_id
+            || snapshot.scope.environment != self.key.environment
+        {
+            return false;
+        }
+        let key_revision = snapshot
+            .keys
+            .iter()
+            .find(|key| key.id == self.key.id)
+            .map(|key| key.revision);
+        let access_revision = api_access_for(snapshot, &self.key).map(|access| access.revision);
+        key_revision != self.expected || access_revision != api.expected
+    }
+
     pub(super) fn valid(&self) -> bool {
+        let metadata_valid = if let Some(access) = self.access() {
+            let unbound_storage = self.key.name.is_empty()
+                && self.key.usage == KeyUsage::StoreOnly
+                && !access.agent_enabled;
+            (unbound_storage || self.key.validate().is_ok())
+                && access.validate().is_ok()
+                && access
+                    .service_name
+                    .as_ref()
+                    .is_some_and(|name| !name.trim().is_empty())
+        } else {
+            self.key.validate().is_ok()
+        };
         !self.rejected
-            && self.key.validate().is_ok()
+            && metadata_valid
             && (self.key.source == KeySource::GitHubOnly
                 || !self.value.is_empty()
                 || (self.expected.is_some() && !self.replacement_required))
@@ -60,6 +142,15 @@ impl EditDraft {
         } else {
             ValueEdit::Keep
         };
+        if let Some(access) = self.access() {
+            return ProjectKeysAction::SaveApiKey {
+                key: Box::new(self.key.clone()),
+                expected_revision: self.expected,
+                value,
+                access: Box::new(access),
+                expected_access_revision: self.api.as_ref().and_then(|api| api.expected),
+            };
+        }
         ProjectKeysAction::SaveKey {
             key: Box::new(self.key.clone()),
             expected_revision: self.expected,
@@ -294,7 +385,15 @@ impl ProjectKeysUi {
         let (case, title, subtitle, target) = match &dialog {
             Dialog::Edit(draft) => (
                 "project_key_edit",
-                "project_keys.edit_title",
+                if draft.expected.is_none() {
+                    if draft.api.is_some() {
+                        "project_keys.api_add_title"
+                    } else {
+                        "project_keys.add_title"
+                    }
+                } else {
+                    "project_keys.edit_title"
+                },
                 "project_keys.edit_hint",
                 draft.key.id.as_str(),
             ),
@@ -330,42 +429,82 @@ impl ProjectKeysUi {
             ),
         };
         let action_scope = popup::prepare_target(ctx, egui::Id::new(case), egui::Id::new(target));
+        let edit = matches!(dialog, Dialog::Edit(_));
+        let subtitle = if let Dialog::Edit(draft) = &dialog {
+            let project = snapshot
+                .projects
+                .iter()
+                .find(|project| project.id == snapshot.scope.workspace_id)
+                .map(|project| project.name.as_str())
+                .unwrap_or(snapshot.scope.workspace_id.as_str());
+            let scope = format!(
+                "{project} · {}",
+                environment_label(snapshot.scope.environment, catalog)
+            );
+            if draft.expected.is_some() {
+                let name = draft
+                    .api
+                    .as_ref()
+                    .and_then(|api| api.access.service_name.as_deref())
+                    .unwrap_or(&draft.key.name);
+                if name.is_empty() {
+                    scope
+                } else {
+                    format!("{scope} · {name}")
+                }
+            } else {
+                scope
+            }
+        } else {
+            catalog.t(subtitle, &[])
+        };
         let mut action = None;
         let mut cancel = false;
         let closed = popup::show(
             ctx,
             popup::PopupSpec {
                 id: egui::Id::new(case),
-                width: 480.0,
+                width: if edit { 560.0 } else { 480.0 },
                 title: &catalog.t(title, &[]),
-                subtitle: &catalog.t(subtitle, &[]),
+                subtitle: &subtitle,
                 close_label: &catalog.t("popup.dismiss", &[]),
                 close_enabled: !busy,
             },
             |ui| {
                 popup::body(ui, |ui| {
                     ui.push_id(action_scope, |ui| {
-                        if let Some(Err(error)) = &self.notice {
+                        if let Some(error) = self.dialog_error.or(snapshot.error) {
                             popup::notice(
                                 ui,
-                                &error_label(*error, catalog),
+                                &error_label(error, catalog),
                                 popup::NoticeTone::Error,
                             );
                         }
-                        ui.add_enabled_ui(!busy, |ui| match &mut dialog {
-                            Dialog::Edit(draft) => edit_body(ui, draft, snapshot, catalog),
-                            Dialog::Source(draft) => {
-                                source_body(ui, draft, snapshot, catalog, &mut action)
-                            }
-                            Dialog::GitHub(draft) => {
-                                github_body(ui, draft, snapshot, catalog, &mut action)
-                            }
-                            Dialog::Recipe(draft) => recipe_body(ui, draft, catalog),
-                            Dialog::Delete(key) | Dialog::Conflict(key) => {
-                                ui.label(egui::RichText::new(&key.name).strong());
-                                ui.label(table::source_label(&key.source, catalog));
-                            }
-                        });
+                        ui.add_enabled_ui(
+                            !busy && snapshot.error.is_none(),
+                            |ui| match &mut dialog {
+                                Dialog::Edit(draft) if draft.api.is_some() => {
+                                    api_body(ui, draft, snapshot, catalog)
+                                }
+                                Dialog::Edit(draft) => edit_body(ui, draft, snapshot, catalog),
+                                Dialog::Source(draft) => {
+                                    source_body(ui, draft, snapshot, catalog, &mut action)
+                                }
+                                Dialog::GitHub(draft) => {
+                                    github_body(ui, draft, snapshot, catalog, &mut action)
+                                }
+                                Dialog::Recipe(draft) => recipe_body(ui, draft, catalog),
+                                Dialog::Delete(key) | Dialog::Conflict(key) => {
+                                    ui.label(
+                                        egui::RichText::new(key_display_name(
+                                            snapshot, key, catalog,
+                                        ))
+                                        .strong(),
+                                    );
+                                    ui.label(table::source_label(&key.source, catalog));
+                                }
+                            },
+                        );
                         if busy {
                             popup::notice(
                                 ui,
@@ -379,11 +518,33 @@ impl ProjectKeysUi {
                     ui.push_id(action_scope, |ui| {
                         match &mut dialog {
                             Dialog::Edit(draft) => {
+                                let stale = matches!(
+                                    self.dialog_error,
+                                    Some(ProjectKeysError::Stale | ProjectKeysError::ScopeChanged)
+                                ) || (self.dialog_error.is_some()
+                                    && draft.api_snapshot_changed(snapshot));
+                                if stale
+                                    && popup::action_button(
+                                        ui,
+                                        &catalog.t("project_keys.reload_latest", &[]),
+                                        popup::ActionTone::Primary,
+                                        !busy,
+                                    )
+                                    .on_hover_text(catalog.t("project_keys.reload_hint", &[]))
+                                    .clicked()
+                                {
+                                    action = Some((
+                                        ProjectKeysAction::ReloadEditor {
+                                            key_id: draft.key.id.clone(),
+                                        },
+                                        PendingKind::ReloadEdit,
+                                    ));
+                                }
                                 if popup::action_button(
                                     ui,
                                     &catalog.t("action.save", &[]),
                                     popup::ActionTone::Primary,
-                                    !busy && draft.valid(),
+                                    !busy && snapshot.error.is_none() && !stale && draft.valid(),
                                 )
                                 .clicked()
                                 {
@@ -594,10 +755,15 @@ impl ProjectKeysUi {
         );
         if !(closed || cancel) {
             self.dialog = Some(dialog);
+        } else {
+            self.dialog_error = None;
         }
         action
     }
 }
+
+const EDITOR_GAP: f32 = 12.0;
+const EDITOR_TWO_COLUMN_MIN: f32 = 452.0;
 
 fn edit_body(
     ui: &mut egui::Ui,
@@ -605,16 +771,93 @@ fn edit_body(
     snapshot: &ProjectKeysSnapshot,
     catalog: &i18n::Catalog,
 ) {
-    if draft.expected.is_some() {
-        ui.label(egui::RichText::new(&draft.key.name).strong());
-    } else {
+    ui.spacing_mut().item_spacing = egui::vec2(EDITOR_GAP, EDITOR_GAP);
+    if draft.expected.is_none() {
         input(
             ui,
             &catalog.t("project_keys.name", &[]),
             &mut draft.key.name,
-            Some(&catalog.t("project_keys.name_hint", &[])),
+            None,
         );
     }
+    let wide = ui.available_width() >= EDITOR_TWO_COLUMN_MIN;
+    if wide {
+        ui.columns(2, |columns| {
+            edit_source(&mut columns[0], draft, snapshot, catalog);
+            edit_kind(&mut columns[1], draft, catalog);
+        });
+    } else {
+        edit_source(ui, draft, snapshot, catalog);
+        edit_kind(ui, draft, catalog);
+    }
+    let remote_only = draft.key.source == KeySource::GitHubOnly;
+    if remote_only {
+        draft.value.clear();
+        draft.rejected = false;
+        draft.replacement_required = false;
+        draft.input_state.clear();
+        draft.key.usage = KeyUsage::StoreOnly;
+        draft.key.required = false;
+        draft.key.delivery = KeyDelivery::Environment;
+        draft.key.credential_id = None;
+        draft.key.last_good_revision = None;
+        draft.key.last_good_at = None;
+        draft.key.storage_state = KeyStorageState::NotStored;
+        draft.key.legacy_reference = None;
+        if let Some(remote) = &mut draft.key.github {
+            remote.target.auto_send = false;
+        }
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.remote_only_hint", &[]),
+            popup::NoticeTone::Info,
+        );
+    }
+    edit_value(ui, draft, catalog);
+    if draft.replacement_required && draft.value.is_empty() {
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.reenter", &[]),
+            popup::NoticeTone::Error,
+        );
+    }
+    if draft.rejected {
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.too_long", &[]),
+            popup::NoticeTone::Error,
+        );
+    }
+    ui.add_enabled_ui(!remote_only, |ui| {
+        if wide {
+            ui.columns(2, |columns| {
+                edit_usage(&mut columns[0], draft, catalog);
+                edit_delivery(&mut columns[1], draft, catalog);
+            });
+        } else {
+            edit_usage(ui, draft, catalog);
+            edit_delivery(ui, draft, catalog);
+        }
+        ui.checkbox(
+            &mut draft.key.required,
+            catalog.t("project_keys.required", &[]),
+        );
+    });
+    if draft.key.validate().is_err() && !draft.key.name.is_empty() {
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.error_input", &[]),
+            popup::NoticeTone::Error,
+        );
+    }
+}
+
+fn edit_source(
+    ui: &mut egui::Ui,
+    draft: &mut EditDraft,
+    snapshot: &ProjectKeysSnapshot,
+    catalog: &i18n::Catalog,
+) {
     let old_source = draft.key.source.clone();
     popup::field(ui, &catalog.t("project_keys.source", &[]), None, |ui| {
         popup::choice_input(
@@ -647,29 +890,143 @@ fn edit_body(
     if draft.key.source != old_source {
         draft.key.source_baseline_credential_id = None;
     }
-    let remote_only = draft.key.source == KeySource::GitHubOnly;
-    if remote_only {
-        draft.value.clear();
-        draft.rejected = false;
-        draft.replacement_required = false;
-        draft.input_state.clear();
-        draft.key.usage = KeyUsage::StoreOnly;
-        draft.key.required = false;
-        draft.key.delivery = KeyDelivery::Environment;
-        draft.key.credential_id = None;
-        draft.key.last_good_revision = None;
-        draft.key.last_good_at = None;
-        draft.key.storage_state = KeyStorageState::NotStored;
-        draft.key.legacy_reference = None;
-        if let Some(remote) = &mut draft.key.github {
-            remote.target.auto_send = false;
-        }
+}
+
+fn api_metadata_input(
+    ui: &mut egui::Ui,
+    label: &str,
+    value: &mut Option<String>,
+    placeholder: &str,
+    max_bytes: usize,
+) {
+    popup::field(ui, label, None, |ui| {
+        let mut rejected = false;
+        let mut buffer = BoundedTextBuffer {
+            text: value.get_or_insert_with(String::new),
+            max_bytes,
+            rejected: &mut rejected,
+            normalize_nfc: false,
+        };
+        popup::text_input(ui, &mut buffer, placeholder);
+    });
+    if value.as_ref().is_some_and(String::is_empty) {
+        *value = None;
+    }
+}
+
+fn api_body(
+    ui: &mut egui::Ui,
+    draft: &mut EditDraft,
+    snapshot: &ProjectKeysSnapshot,
+    catalog: &i18n::Catalog,
+) {
+    ui.spacing_mut().item_spacing = egui::vec2(EDITOR_GAP, EDITOR_GAP);
+    let wide = ui.available_width() >= EDITOR_TWO_COLUMN_MIN;
+    let service = |ui: &mut egui::Ui, draft: &mut EditDraft| {
+        api_metadata_input(
+            ui,
+            &catalog.t("project_keys.api_service_name", &[]),
+            &mut draft.api.as_mut().expect("API editor").access.service_name,
+            &catalog.t("project_keys.api_service_hint", &[]),
+            256,
+        );
+    };
+    let binding = |ui: &mut egui::Ui, draft: &mut EditDraft| {
+        let bound = draft.expected.is_some()
+            && draft
+                .api
+                .as_ref()
+                .is_some_and(|api| api.access.execution_name.is_some());
+        ui.add_enabled_ui(!bound, |ui| {
+            input(
+                ui,
+                &catalog.t("project_keys.api_binding", &[]),
+                &mut draft.key.name,
+                Some(&catalog.t("project_keys.api_binding_hint", &[])),
+            );
+        });
+    };
+    if wide {
+        ui.columns(2, |columns| {
+            service(&mut columns[0], draft);
+            binding(&mut columns[1], draft);
+        });
+    } else {
+        service(ui, draft);
+        binding(ui, draft);
+    }
+    edit_value(ui, draft, catalog);
+    if draft.replacement_required && draft.value.is_empty() {
         popup::notice(
             ui,
-            &catalog.t("project_keys.remote_only_hint", &[]),
-            popup::NoticeTone::Info,
+            &catalog.t("project_keys.reenter", &[]),
+            popup::NoticeTone::Error,
         );
     }
+    if draft.rejected {
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.too_long", &[]),
+            popup::NoticeTone::Error,
+        );
+    }
+    ui.checkbox(
+        &mut draft.api.as_mut().expect("API editor").access.agent_enabled,
+        catalog.t("project_keys.api_agent_enabled", &[]),
+    )
+    .on_hover_text(catalog.t("project_keys.api_agent_hint", &[]));
+    egui::CollapsingHeader::new(catalog.t("project_keys.api_details", &[]))
+        .id_salt("api_details")
+        .show(ui, |ui| {
+            if wide {
+                ui.columns(2, |columns| {
+                    edit_source(&mut columns[0], draft, snapshot, catalog);
+                    edit_kind(&mut columns[1], draft, catalog);
+                });
+                ui.columns(2, |columns| {
+                    edit_usage(&mut columns[0], draft, catalog);
+                    edit_delivery(&mut columns[1], draft, catalog);
+                });
+            } else {
+                edit_source(ui, draft, snapshot, catalog);
+                edit_kind(ui, draft, catalog);
+                edit_usage(ui, draft, catalog);
+                edit_delivery(ui, draft, catalog);
+            }
+            ui.checkbox(
+                &mut draft.key.required,
+                catalog.t("project_keys.required", &[]),
+            );
+            let api = &mut draft.api.as_mut().expect("API editor").access;
+            api_metadata_input(
+                ui,
+                &catalog.t("project_keys.api_description", &[]),
+                &mut api.description,
+                "",
+                2048,
+            );
+            api_metadata_input(
+                ui,
+                &catalog.t("project_keys.api_documentation", &[]),
+                &mut api.documentation_url,
+                "https://",
+                2048,
+            );
+        });
+    if !draft.key.name.is_empty() && draft.key.validate().is_err()
+        || draft
+            .access()
+            .is_some_and(|access| access.validate().is_err())
+    {
+        popup::notice(
+            ui,
+            &catalog.t("project_keys.error_input", &[]),
+            popup::NoticeTone::Error,
+        );
+    }
+}
+
+fn edit_kind(ui: &mut egui::Ui, draft: &mut EditDraft, catalog: &i18n::Catalog) {
     popup::field(ui, &catalog.t("project_keys.kind", &[]), None, |ui| {
         popup::choice_input(
             ui,
@@ -687,102 +1044,85 @@ fn edit_body(
             },
         );
     });
+}
+
+fn edit_value(ui: &mut egui::Ui, draft: &mut EditDraft, catalog: &i18n::Catalog) {
     let multiline = draft.key.kind == KeyKind::PrivateKey;
-    if !remote_only {
-        popup::field(
+    if draft.key.source != KeySource::GitHubOnly {
+        popup::field(ui, &catalog.t("project_keys.value", &[]), None, |ui| {
+            let id = ui.make_persistent_id("project_key_secret");
+            draft.input_state.track(ui.ctx(), id);
+            let state = egui::TextEdit::load_state(ui.ctx(), id);
+            let mut buffer =
+                popup::MaskedSecretBuffer::new(draft.value.text_mut(), SECRET_INPUT_BYTES_MAX);
+            let response = popup::secret_input(
+                ui,
+                &mut buffer,
+                id,
+                &catalog.t(
+                    if draft.expected.is_some() && !draft.replacement_required {
+                        "project_keys.keep_blank"
+                    } else {
+                        "project_keys.value_hint"
+                    },
+                    &[],
+                ),
+                multiline,
+            );
+            let rejected = buffer.finish();
+            if rejected {
+                draft.rejected = true;
+                if let Some(mut state) = state {
+                    state.clear_undoer();
+                    state.store(ui.ctx(), id);
+                }
+            } else if response.changed() {
+                draft.rejected = false;
+            }
+        });
+    }
+}
+
+fn edit_usage(ui: &mut egui::Ui, draft: &mut EditDraft, catalog: &i18n::Catalog) {
+    popup::field(ui, &catalog.t("project_keys.usage", &[]), None, |ui| {
+        popup::choice_input(
             ui,
-            &catalog.t("project_keys.value", &[]),
-            Some(&catalog.t(
-                if draft.expected.is_some() {
-                    "project_keys.keep_blank"
-                } else {
-                    "project_keys.value_hint"
-                },
-                &[],
-            )),
+            "edit_usage",
+            &table::usage_label(draft.key.usage, catalog),
             |ui| {
-                let id = ui.make_persistent_id("project_key_secret");
-                draft.input_state.track(ui.ctx(), id);
-                let state = egui::TextEdit::load_state(ui.ctx(), id);
-                let mut buffer =
-                    popup::MaskedSecretBuffer::new(draft.value.text_mut(), SECRET_INPUT_BYTES_MAX);
-                let response = popup::secret_input(ui, &mut buffer, id, "", multiline);
-                let rejected = buffer.finish();
-                if rejected {
-                    draft.rejected = true;
-                    if let Some(mut state) = state {
-                        state.clear_undoer();
-                        state.store(ui.ctx(), id);
-                    }
-                } else if response.changed() {
-                    draft.rejected = false;
+                for usage in [KeyUsage::Build, KeyUsage::StoreOnly, KeyUsage::LegacyAgent] {
+                    ui.selectable_value(
+                        &mut draft.key.usage,
+                        usage,
+                        table::usage_label(usage, catalog),
+                    );
                 }
             },
         );
-    }
-    if draft.replacement_required && draft.value.is_empty() {
-        popup::notice(
+    });
+}
+
+fn edit_delivery(ui: &mut egui::Ui, draft: &mut EditDraft, catalog: &i18n::Catalog) {
+    popup::field(ui, &catalog.t("project_keys.delivery", &[]), None, |ui| {
+        popup::choice_input(
             ui,
-            &catalog.t("project_keys.reenter", &[]),
-            popup::NoticeTone::Error,
-        );
-    }
-    if draft.rejected {
-        popup::notice(
-            ui,
-            &catalog.t("project_keys.too_long", &[]),
-            popup::NoticeTone::Error,
-        );
-    }
-    ui.add_enabled_ui(!remote_only, |ui| {
-        popup::field(ui, &catalog.t("project_keys.usage", &[]), None, |ui| {
-            popup::choice_input(
-                ui,
-                "edit_usage",
-                &table::usage_label(draft.key.usage, catalog),
-                |ui| {
-                    for usage in [KeyUsage::Build, KeyUsage::StoreOnly, KeyUsage::LegacyAgent] {
-                        ui.selectable_value(
-                            &mut draft.key.usage,
-                            usage,
-                            table::usage_label(usage, catalog),
-                        );
-                    }
-                },
-            );
-        });
-        popup::field(ui, &catalog.t("project_keys.delivery", &[]), None, |ui| {
-            popup::choice_input(
-                ui,
-                "edit_delivery",
-                &delivery_label(draft.key.delivery, catalog),
-                |ui| {
-                    for delivery in [
-                        KeyDelivery::Environment,
-                        KeyDelivery::FilePath,
-                        KeyDelivery::TemporaryFile,
-                    ] {
-                        ui.selectable_value(
-                            &mut draft.key.delivery,
-                            delivery,
-                            delivery_label(delivery, catalog),
-                        );
-                    }
-                },
-            );
-        });
-        ui.checkbox(
-            &mut draft.key.required,
-            catalog.t("project_keys.required", &[]),
+            "edit_delivery",
+            &delivery_label(draft.key.delivery, catalog),
+            |ui| {
+                for delivery in [
+                    KeyDelivery::Environment,
+                    KeyDelivery::FilePath,
+                    KeyDelivery::TemporaryFile,
+                ] {
+                    ui.selectable_value(
+                        &mut draft.key.delivery,
+                        delivery,
+                        delivery_label(delivery, catalog),
+                    );
+                }
+            },
         );
     });
-    if draft.key.validate().is_err() && !draft.key.name.is_empty() {
-        popup::notice(
-            ui,
-            &catalog.t("project_keys.error_input", &[]),
-            popup::NoticeTone::Error,
-        );
-    }
 }
 
 fn source_body(
@@ -1245,6 +1585,17 @@ fn kind_label(kind: KeyKind, catalog: &i18n::Catalog) -> String {
         &[],
     )
 }
+
+fn environment_label(environment: KeyEnvironment, catalog: &i18n::Catalog) -> String {
+    catalog.t(
+        match environment {
+            KeyEnvironment::Development => "project_keys.development",
+            KeyEnvironment::Production => "project_keys.production",
+        },
+        &[],
+    )
+}
+
 fn delivery_label(delivery: KeyDelivery, catalog: &i18n::Catalog) -> String {
     catalog.t(
         match delivery {

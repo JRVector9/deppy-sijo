@@ -4,6 +4,7 @@ pub mod credential_env;
 pub mod env_sources;
 pub mod fs;
 pub mod process_identity;
+pub mod project_api_access;
 pub mod project_keys;
 pub mod time;
 pub mod work_management;

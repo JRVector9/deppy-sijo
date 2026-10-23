@@ -54,6 +54,30 @@ fn request(
 }
 
 #[test]
+fn project_api_cloud_tools_are_explicitly_unsupported_without_secret_effects() {
+    let (mut bridge, target) = setup();
+    let named = client(&bridge, "API boundary bot");
+    bridge
+        .set_connection_access(&named.id, &target, true, true)
+        .unwrap();
+    for tool in ["list_project_apis", "run_project_api_recipe"] {
+        let args = if tool == "list_project_apis" {
+            json!({"session_id":target.id,"generation":target.generation})
+        } else {
+            json!({"session_id":target.id,"generation":target.generation,"operation_id":"once","recipe_id":"recipe","key_ids":["key"]})
+        };
+        let (req, rx) = request(&bridge, &named, tool, args);
+        bridge.handle_and_drain(req, |_, _| {
+            panic!("unsupported API tools cannot send effects")
+        });
+        assert_eq!(
+            rx.recv().unwrap().unwrap_err(),
+            "project_api_cloud_unavailable_no_effect"
+        );
+    }
+}
+
+#[test]
 fn completion_opt_in_requires_original_transport_before_any_input_effect() {
     let (mut bridge, target) = setup();
     let named = client(&bridge, "Completion bot");

@@ -55,6 +55,7 @@ fn snapshot() -> ProjectKeysSnapshot {
             },
         ],
         auth_credentials: vec![],
+        api_access: vec![],
         source_preview: None,
         error: None,
     }
@@ -184,7 +185,9 @@ fn late_ack_after_scope_switch_cannot_close_new_editor_or_show_success() {
     second.scope.workspace_id = "project-b".into();
     second.generation = 8;
     manager.prepare(&second);
-    manager.dialog = Some(Dialog::Edit(EditDraft::new(new_key(&second.scope))));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::new(new_key(
+        &second.scope,
+    )))));
     manager.apply_ack(&ProjectKeysAck {
         fence,
         result: Ok(ProjectKeysAckPayload::Copied),
@@ -259,7 +262,7 @@ fn failed_replacement_requires_reentry_and_preserves_editor_metadata() {
     ));
     let mut manager = ProjectKeysUi::default();
     manager.prepare(&data);
-    manager.dialog = Some(Dialog::Edit(edit));
+    manager.dialog = Some(Dialog::Edit(Box::new(edit)));
     let Some(ProjectKeysIntent::Request { fence, .. }) = manager.request(action, PendingKind::Edit)
     else {
         panic!()
@@ -281,7 +284,9 @@ fn successful_mutation_closes_editor_only_after_matching_ack() {
     let data = snapshot();
     let mut manager = ProjectKeysUi::default();
     manager.prepare(&data);
-    manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+        data.keys[0].clone(),
+    ))));
     let Some(ProjectKeysIntent::Request { fence, .. }) = manager.request(
         ProjectKeysAction::Refresh { key_id: None },
         PendingKind::Edit,
@@ -303,7 +308,9 @@ fn project_change_clears_draft_query_selection_and_text_edit_history() {
     manager.prepare(&data);
     manager.query = "old project".into();
     manager.selected = Some("file-key".into());
-    manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+        data.keys[0].clone(),
+    ))));
     let mut next = data;
     next.scope.environment = KeyEnvironment::Production;
     next.generation += 1;
@@ -314,12 +321,865 @@ fn project_change_clears_draft_query_selection_and_text_edit_history() {
 }
 
 #[test]
-fn edit_popup_uses_480_shell_36_fields_34_footer_and_narrow_internal_scroll() {
+fn quick_api_name_prefill_opens_a_freeform_service_field() {
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.begin_api_add(
+        data.scope.clone(),
+        Some((
+            super::super::environment::EnvironmentSelectionKind::ApiName,
+            SensitiveDraft::new("내 API".into()).unwrap(),
+        )),
+    );
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let service_label = catalog.t("project_keys.api_service_name", &[]);
+    let binding_label = catalog.t("project_keys.api_binding", &[]);
+    let mut h = egui_kittest::Harness::new_ui_state(
+        move |ui, manager: &mut ProjectKeysUi| {
+            let _ = manager.show_dialog(ui.ctx(), &data, &catalog);
+        },
+        manager,
+    );
+    h.set_size(egui::vec2(1280.0, 800.0));
+    h.run();
+    h.get_by_label(&service_label);
+    h.get_by_label(&binding_label);
+    assert!(
+        h.get_all_by_role(egui::accesskit::Role::TextInput)
+            .any(|node| node.accesskit_node().value().as_deref() == Some("내 API"))
+    );
+    assert!(h.state().has_dialog());
+}
+
+#[test]
+fn quick_api_value_prefill_stays_masked_in_the_direct_editor() {
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.begin_api_add(
+        data.scope.clone(),
+        Some((
+            super::super::environment::EnvironmentSelectionKind::ApiValue,
+            SensitiveDraft::new("fixture-api-value".into()).unwrap(),
+        )),
+    );
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let mut h = egui_kittest::Harness::new_ui_state(
+        move |ui, manager: &mut ProjectKeysUi| {
+            let _ = manager.show_dialog(ui.ctx(), &data, &catalog);
+        },
+        manager,
+    );
+    h.set_size(egui::vec2(1280.0, 800.0));
+    h.run();
+    let secret = h.get_by_role(egui::accesskit::Role::PasswordInput);
+    assert!(
+        secret
+            .accesskit_node()
+            .value()
+            .is_some_and(|value| !value.contains("fixture-api-value"))
+    );
+    assert!(h.output().shapes.iter().all(|shape| match &shape.shape {
+        egui::Shape::Text(text) => !text.galley.text().contains("fixture-api-value"),
+        _ => true,
+    }));
+}
+
+fn api_access(key: &ProjectKey) -> deppy_core::project_api_access::ProjectApiAccess {
+    deppy_core::project_api_access::ProjectApiAccess {
+        key_id: key.id.clone(),
+        workspace_id: key.workspace_id.clone(),
+        environment: key.environment,
+        revision: 11,
+        execution_name: None,
+        service_name: Some("내 API".into()),
+        description: Some("Project service".into()),
+        documentation_url: Some("https://example.test/docs".into()),
+        agent_enabled: false,
+    }
+}
+
+#[test]
+fn quick_api_unbound_storage_sends_one_scoped_action_without_an_internal_name() {
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.begin_api_add(data.scope.clone(), None);
+    manager.prepare(&data);
+    let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+        panic!()
+    };
+    assert_eq!(draft.key.usage, KeyUsage::StoreOnly);
+    assert_eq!(draft.key.source, KeySource::Vault);
+    assert!(!draft.api.as_ref().unwrap().access.agent_enabled);
+    draft.api.as_mut().unwrap().access.service_name = Some("내 API".into());
+    draft.value = SensitiveDraft::new("fixture-api-value".into()).unwrap();
+    assert!(draft.valid());
+    let ProjectKeysAction::SaveApiKey {
+        key,
+        expected_revision,
+        value,
+        access,
+        expected_access_revision,
+    } = draft.submit()
+    else {
+        panic!("single API save action required")
+    };
+    assert_eq!(key.name, "");
+    assert_eq!(key.workspace_id, data.scope.workspace_id);
+    assert_eq!(key.environment, data.scope.environment);
+    assert_eq!(access.key_id, key.id);
+    assert_eq!(access.service_name.as_deref(), Some("내 API"));
+    assert!(access.execution_name.is_none());
+    assert!(!access.agent_enabled);
+    assert!(expected_revision.is_none());
+    assert!(expected_access_revision.is_none());
+    assert!(matches!(value, ValueEdit::Replace(_)));
+}
+
+#[test]
+fn api_agent_permission_requires_binding_and_preserves_usage() {
+    let data = snapshot();
+    let mut draft = EditDraft::new(new_key(&data.scope));
+    draft.begin_api();
+    draft.api.as_mut().unwrap().access.service_name = Some("Weather API".into());
+    draft.value = SensitiveDraft::new("fixture-api-value".into()).unwrap();
+    draft.api.as_mut().unwrap().access.agent_enabled = true;
+    assert!(!draft.valid());
+    assert_eq!(draft.key.usage, KeyUsage::StoreOnly);
+    draft.key.name = "WEATHER_TOKEN".into();
+    assert!(draft.valid());
+    let ProjectKeysAction::SaveApiKey { key, access, .. } = draft.submit() else {
+        panic!()
+    };
+    assert_eq!(key.usage, KeyUsage::StoreOnly);
+    assert_eq!(access.execution_name.as_deref(), Some("WEATHER_TOKEN"));
+    assert!(access.agent_enabled);
+}
+
+#[test]
+fn api_edit_retains_both_cas_revisions_and_hides_storage_identity() {
+    let mut data = snapshot();
+    let mut key = data.keys[1].clone();
+    key.id = "00000000-0000-0000-0000-000000000001".into();
+    key.name = "DEPPY_API_00000000000000000000000000000001".into();
+    key.storage_state = KeyStorageState::Stored;
+    key.credential_id = Some("fixture-protected-reference".into());
+    key.last_good_revision = Some(key.revision);
+    data.api_access.push(api_access(&key));
+    let mut draft = existing_editor(&data, &key);
+    assert!(draft.key.name.is_empty());
+    assert!(draft.valid());
+    let ProjectKeysAction::SaveApiKey {
+        key: saved,
+        expected_revision,
+        expected_access_revision,
+        value,
+        access,
+    } = draft.submit()
+    else {
+        panic!()
+    };
+    assert_eq!(saved.id, key.id);
+    assert!(saved.name.is_empty());
+    assert_eq!(expected_revision, Some(key.revision));
+    assert_eq!(expected_access_revision, Some(11));
+    assert_eq!(access.description.as_deref(), Some("Project service"));
+    assert!(matches!(value, ValueEdit::Keep));
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    assert_eq!(key_display_name(&data, &key, &catalog), "내 API");
+    data.api_access.clear();
+    assert_eq!(key_display_name(&data, &key, &catalog), "Stored API");
+    assert!(existing_editor(&data, &key).key.name.is_empty());
+}
+
+#[test]
+fn ordinary_deppy_api_prefix_keeps_the_actual_display_name() {
+    let mut data = snapshot();
+    data.keys[0].name = "DEPPY_API_TOKEN".into();
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    assert!(data.api_access.is_empty());
+    assert_eq!(
+        key_display_name(&data, &data.keys[0], &catalog),
+        "DEPPY_API_TOKEN"
+    );
+}
+
+#[test]
+fn ordinary_deppy_api_prefix_keeps_the_generic_saved_editor_contract() {
+    for usage in [KeyUsage::Build, KeyUsage::LegacyAgent] {
+        for name in [
+            "DEPPY_API_TOKEN",
+            "DEPPY_API_00000000000000000000000000000001",
+        ] {
+            let mut data = snapshot();
+            let mut key = github_key(GitHubRemoteState::Sent);
+            key.id = "00000000-0000-0000-0000-000000000001".into();
+            key.name = name.into();
+            key.source = KeySource::Vault;
+            key.usage = usage;
+            data.keys[0] = key.clone();
+            assert!(data.api_access.is_empty());
+            let mut draft = existing_editor(&data, &key);
+            assert!(
+                draft.api.is_none(),
+                "an ordinary key must retain the generic editor"
+            );
+            assert!(draft.valid());
+            let ProjectKeysAction::SaveKey {
+                key: saved,
+                expected_revision,
+                value,
+            } = draft.submit()
+            else {
+                panic!("an ordinary key must retain the SaveKey action")
+            };
+            assert_eq!(
+                *saved, key,
+                "name, usage, source and GitHub binding must be preserved"
+            );
+            assert_eq!(expected_revision, Some(key.revision));
+            assert!(matches!(value, ValueEdit::Keep));
+        }
+    }
+}
+
+#[test]
+fn ordinary_deppy_api_prefix_keeps_github_binding_actions_enabled() {
+    let mut data = snapshot();
+    let mut key = github_key(GitHubRemoteState::Sent);
+    key.name = "DEPPY_API_TOKEN".into();
+    data.keys[0] = key.clone();
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let configure = catalog.t("project_keys.github_configure", &[]);
+    let send = catalog.t("project_keys.send", &[]);
+    let mut manager = ProjectKeysUi::default();
+    manager.prepare(&data);
+    manager.selected = Some(key.id);
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        move |ui, (manager, intents): &mut (ProjectKeysUi, Vec<ProjectKeysIntent>)| {
+            manager.detail(ui, &data, &catalog, intents);
+        },
+        (manager, Vec::new()),
+    );
+    harness.set_size(egui::vec2(600.0, 1000.0));
+    harness.run();
+    assert!(
+        !harness
+            .get_by_label(&configure)
+            .accesskit_node()
+            .is_disabled()
+    );
+    assert!(!harness.get_by_label(&send).accesskit_node().is_disabled());
+}
+
+#[test]
+fn api_open_waits_through_a_matching_snapshot_error() {
+    let mut data = snapshot();
+    data.error = Some(ProjectKeysError::Storage);
+    let mut manager = ProjectKeysUi::default();
+    manager.begin_api_add(data.scope.clone(), None);
+    manager.prepare(&data);
+    assert!(!manager.has_dialog());
+    assert!(manager.has_dialog_or_pending_open());
+    data.error = None;
+    manager.prepare(&data);
+    assert!(manager.has_dialog());
+    assert!(manager.pending_open.is_none());
+}
+
+#[test]
+fn api_save_failure_keeps_metadata_and_permission_unacknowledged() {
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.begin_api_add(data.scope.clone(), None);
+    manager.prepare(&data);
+    let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+        panic!()
+    };
+    draft.key.name = "WEATHER_TOKEN".into();
+    draft.api.as_mut().unwrap().access.service_name = Some("Weather API".into());
+    draft.api.as_mut().unwrap().access.agent_enabled = true;
+    draft.value = SensitiveDraft::new("fixture-api-value".into()).unwrap();
+    let action = draft.submit();
+    let ProjectKeysIntent::Request { fence, .. } =
+        manager.request(action, PendingKind::Edit).unwrap()
+    else {
+        panic!()
+    };
+    assert!(manager.has_dialog());
+    assert!(manager.notice.is_none());
+    manager.apply_ack(&ProjectKeysAck {
+        fence,
+        result: Err(ProjectKeysError::Storage),
+    });
+    let Some(Dialog::Edit(draft)) = &manager.dialog else {
+        panic!("failure must retain API editor")
+    };
+    assert_eq!(
+        draft.api.as_ref().unwrap().access.service_name.as_deref(),
+        Some("Weather API")
+    );
+    assert!(!draft.valid());
+    assert_eq!(manager.dialog_error, Some(ProjectKeysError::Storage));
+    assert!(matches!(
+        manager.notice,
+        Some(Err(ProjectKeysError::Storage))
+    ));
+}
+
+#[test]
+fn partial_api_save_failure_offers_explicit_reload_without_rebasing_the_draft() {
+    for (new, key_changed, access_changed) in [
+        (true, true, true),
+        (false, false, true),
+        (false, true, false),
+    ] {
+        let mut data = snapshot();
+        let mut manager = ProjectKeysUi::default();
+        manager.prepare(&data);
+        let mut draft = if new {
+            let mut draft = EditDraft::new(new_key(&data.scope));
+            draft.begin_api();
+            draft
+        } else {
+            let mut access = api_access(&data.keys[1]);
+            access.execution_name = Some(data.keys[1].name.clone());
+            access.agent_enabled = true;
+            data.api_access.push(access);
+            existing_editor(&data, &data.keys[1])
+        };
+        if new {
+            draft.key.name = "WEATHER_TOKEN".into();
+        }
+        draft.api.as_mut().unwrap().access.service_name = Some("Weather API".into());
+        draft.api.as_mut().unwrap().access.agent_enabled = true;
+        draft.value = SensitiveDraft::new("consumed-fixture-value".into()).unwrap();
+        let key = draft.key.clone();
+        let access = draft.api.as_ref().unwrap().access.clone();
+        let action = draft.submit();
+        manager.open_dialog(Dialog::Edit(Box::new(draft)));
+        let ProjectKeysIntent::Request { fence, .. } =
+            manager.request(action, PendingKind::Edit).unwrap()
+        else {
+            panic!()
+        };
+        manager.apply_ack(&ProjectKeysAck {
+            fence,
+            result: Err(ProjectKeysError::Storage),
+        });
+        let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+            panic!()
+        };
+        assert!(
+            draft.value.is_empty(),
+            "the consumed secret must not be restored"
+        );
+        assert!(
+            !draft.valid(),
+            "a failed replacement requires explicit reentry"
+        );
+        draft.value = SensitiveDraft::new("retry-fixture-value".into()).unwrap();
+        assert!(draft.valid());
+
+        let mut latest = data.clone();
+        let mut saved_key = key.clone();
+        if key_changed && !new {
+            saved_key.revision += 1;
+        }
+        if new {
+            latest.keys.push(saved_key.clone());
+        } else {
+            *latest
+                .keys
+                .iter_mut()
+                .find(|saved| saved.id == key.id)
+                .unwrap() = saved_key.clone();
+        }
+        let mut saved_access = access;
+        saved_access.agent_enabled = false;
+        if access_changed && !new {
+            saved_access.revision += 1;
+        }
+        if new {
+            latest.api_access.push(saved_access.clone());
+        } else {
+            *latest
+                .api_access
+                .iter_mut()
+                .find(|saved| saved.key_id == key.id)
+                .unwrap() = saved_access.clone();
+        }
+
+        let mut h = harness(latest.clone(), manager);
+        h.set_size(egui::vec2(1280.0, 800.0));
+        h.run();
+        let reload = i18n::Catalog::load("en-US")
+            .unwrap()
+            .t("project_keys.reload_latest", &[]);
+        h.get_by_label(&reload);
+        assert!(
+            h.get_by_label("Save").accesskit_node().is_disabled(),
+            "a revision-changing partial failure must require reload immediately"
+        );
+        h.get_by_label(&reload).click();
+        h.run();
+        let ProjectKeysIntent::Request {
+            fence,
+            action: ProjectKeysAction::ReloadEditor { key_id },
+        } = h.state().1.last().unwrap()
+        else {
+            panic!("reload must request metadata, never resubmit the failed save")
+        };
+        assert_eq!(key_id, &key.id);
+        let fence = fence.clone();
+        let Some(Dialog::Edit(draft)) = &mut h.state_mut().0.dialog else {
+            panic!()
+        };
+        let ProjectKeysAction::SaveApiKey {
+            expected_revision,
+            expected_access_revision,
+            access,
+            ..
+        } = draft.submit()
+        else {
+            panic!()
+        };
+        assert_eq!(
+            expected_revision,
+            (!new).then_some(key.revision),
+            "snapshot arrival and a pending refresh must not rebase the key revision"
+        );
+        assert_eq!(
+            expected_access_revision,
+            (!new).then_some(11),
+            "snapshot arrival and a pending refresh must not rebase the access revision"
+        );
+        assert!(
+            access.agent_enabled,
+            "unsaved metadata remains in the draft until the refresh ACK"
+        );
+        h.state_mut().0.apply_ack(&ProjectKeysAck {
+            fence,
+            result: Ok(ProjectKeysAckPayload::Refreshed(Box::new(latest.clone()))),
+        });
+        h.state_mut().0.prepare(&latest);
+        let Some(Dialog::Edit(draft)) = &mut h.state_mut().0.dialog else {
+            panic!()
+        };
+        let ProjectKeysAction::SaveApiKey {
+            expected_revision,
+            expected_access_revision,
+            access,
+            ..
+        } = draft.submit()
+        else {
+            panic!()
+        };
+        assert_eq!(expected_revision, Some(saved_key.revision));
+        assert_eq!(expected_access_revision, Some(saved_access.revision));
+        assert!(!access.agent_enabled);
+    }
+}
+
+#[test]
+fn reloading_an_unstored_vault_api_requires_a_replacement_value() {
+    let mut data = snapshot();
+    let key = data.keys[1].clone();
+    assert_eq!(key.source, KeySource::Vault);
+    assert_eq!(key.storage_state, KeyStorageState::NotStored);
+    assert!(key.credential_id.is_none());
+    data.api_access.push(api_access(&key));
+    let mut draft = existing_editor(&data, &key);
+    assert!(
+        !draft.valid(),
+        "a placeholder without a stored value must require reentry after reload"
+    );
+    draft.value = SensitiveDraft::new("reentered-fixture-value".into()).unwrap();
+    assert!(draft.valid());
+    let ProjectKeysAction::SaveApiKey {
+        expected_revision,
+        value,
+        ..
+    } = draft.submit()
+    else {
+        panic!()
+    };
+    assert_eq!(expected_revision, Some(key.revision));
+    assert!(matches!(value, ValueEdit::Replace(_)));
+
+    let mut stored = key;
+    stored.storage_state = KeyStorageState::Stored;
+    stored.credential_id = Some("fixture-protected-reference".into());
+    stored.last_good_revision = Some(stored.revision);
+    let mut draft = existing_editor(&data, &stored);
+    assert!(
+        draft.valid(),
+        "existing stored API values still support Keep"
+    );
+    assert!(matches!(
+        draft.submit(),
+        ProjectKeysAction::SaveApiKey {
+            value: ValueEdit::Keep,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn existing_api_binding_is_read_only_after_first_binding() {
+    for bound in [true, false] {
+        let mut data = snapshot();
+        let key = &mut data.keys[1];
+        key.storage_state = KeyStorageState::Stored;
+        key.credential_id = Some("fixture-protected-reference".into());
+        key.last_good_revision = Some(key.revision);
+        let mut access = api_access(key);
+        if bound {
+            access.execution_name = Some(key.name.clone());
+        } else {
+            key.name = "DEPPY_API_00000000000000000000000000000001".into();
+        }
+        let binding = access.execution_name.clone().unwrap_or_default();
+        data.api_access.push(access);
+        let mut manager = ProjectKeysUi::default();
+        manager.prepare(&data);
+        manager.open_dialog(Dialog::Edit(Box::new(existing_editor(
+            &data,
+            &data.keys[1],
+        ))));
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut h = egui_kittest::Harness::new_ui_state(
+            move |ui, manager: &mut ProjectKeysUi| {
+                let _ = manager.show_dialog(ui.ctx(), &data, &catalog);
+            },
+            manager,
+        );
+        h.set_size(egui::vec2(1280.0, 800.0));
+        h.run();
+        let field = h
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.accesskit_node().value().as_deref() == Some(binding.as_str()))
+            .expect("execution binding field");
+        assert_eq!(
+            field.accesskit_node().is_disabled(),
+            bound,
+            "an existing bound variable is immutable; the first binding remains editable"
+        );
+        let service = h
+            .get_all_by_role(egui::accesskit::Role::TextInput)
+            .find(|node| node.accesskit_node().value().as_deref() == Some("내 API"))
+            .expect("freeform service field");
+        assert!(!service.accesskit_node().is_disabled());
+        assert!(
+            !h.get_by_role(egui::accesskit::Role::PasswordInput)
+                .accesskit_node()
+                .is_disabled()
+        );
+    }
+}
+
+#[test]
+fn begin_add_waits_for_the_exact_scope_snapshot() {
+    let first = snapshot();
+    let mut second = first.clone();
+    second.scope.workspace_id = "project-b".into();
+    second.generation += 1;
+    let mut manager = ProjectKeysUi::default();
+    manager.prepare(&first);
+    manager.begin_add(
+        second.scope.clone(),
+        Some((
+            super::super::environment::EnvironmentSelectionKind::VariableValue,
+            SensitiveDraft::new("fixture-scoped-prefill".into()).unwrap(),
+        )),
+    );
+    assert!(manager.has_dialog_or_pending_open());
+    manager.prepare(&first);
+    assert!(!manager.has_dialog());
+    assert!(manager.has_dialog_or_pending_open());
+    manager.prepare(&second);
+    let Some(Dialog::Edit(draft)) = &manager.dialog else {
+        panic!("matching scope must open the staged editor");
+    };
+    assert_eq!(draft.key.workspace_id, "project-b");
+    assert!(!draft.value.is_empty());
+    manager.close_dialog();
+    manager.prepare(&second);
+    assert!(!manager.has_dialog_or_pending_open());
+}
+
+#[test]
+fn authoritative_reload_ack_keeps_both_revisions_despite_missing_or_older_cached_projection() {
+    let mut cached = snapshot();
+    let mut key = cached.keys[1].clone();
+    key.storage_state = KeyStorageState::Stored;
+    key.credential_id = Some("fixture-protected-reference".into());
+    key.last_good_revision = Some(key.revision);
+    cached.keys[1] = key.clone();
+    cached.api_access.push(api_access(&key));
+    let mut manager = ProjectKeysUi::default();
+    manager.prepare(&cached);
+    manager.open_dialog(Dialog::Edit(Box::new(existing_editor(&cached, &key))));
+    let ProjectKeysIntent::Request { fence, .. } = manager
+        .request(
+            ProjectKeysAction::ReloadEditor {
+                key_id: key.id.clone(),
+            },
+            PendingKind::ReloadEdit,
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    let mut refreshed = cached.clone();
+    refreshed.keys[1].revision += 2;
+    refreshed.api_access[0].revision += 3;
+    refreshed.api_access[0].service_name = Some("Latest API label".into());
+    let expected_key = refreshed.keys[1].revision;
+    let expected_access = refreshed.api_access[0].revision;
+    manager.apply_ack(&ProjectKeysAck {
+        fence,
+        result: Ok(ProjectKeysAckPayload::Refreshed(Box::new(refreshed))),
+    });
+    // No prepare call models an unavailable snapshot try_lock immediately after
+    // the ACK. A later old projection models cached data or a delayed watcher.
+    for older_projection in [false, true] {
+        if older_projection {
+            manager.prepare(&cached);
+        }
+        let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+            panic!("the refreshed editor must remain visible")
+        };
+        let ProjectKeysAction::SaveApiKey {
+            expected_revision,
+            expected_access_revision,
+            access,
+            ..
+        } = draft.submit()
+        else {
+            panic!()
+        };
+        assert_eq!(expected_revision, Some(expected_key));
+        assert_eq!(expected_access_revision, Some(expected_access));
+        assert_eq!(access.service_name.as_deref(), Some("Latest API label"));
+    }
+}
+
+#[test]
+fn authoritative_reload_ack_rejects_mismatched_scope_or_generation_without_rebasing() {
+    for wrong_scope in [true, false] {
+        let mut cached = snapshot();
+        let key = cached.keys[1].clone();
+        cached.api_access.push(api_access(&key));
+        let mut manager = ProjectKeysUi::default();
+        manager.prepare(&cached);
+        manager.open_dialog(Dialog::Edit(Box::new(existing_editor(&cached, &key))));
+        let ProjectKeysIntent::Request { fence, .. } = manager
+            .request(
+                ProjectKeysAction::ReloadEditor {
+                    key_id: key.id.clone(),
+                },
+                PendingKind::ReloadEdit,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        let mut foreign = cached.clone();
+        foreign.keys[1].revision += 7;
+        foreign.api_access[0].revision += 8;
+        if wrong_scope {
+            foreign.scope.workspace_id = "another-workspace".into();
+        } else {
+            foreign.generation += 1;
+        }
+        manager.apply_ack(&ProjectKeysAck {
+            fence,
+            result: Ok(ProjectKeysAckPayload::Refreshed(Box::new(foreign))),
+        });
+        manager.prepare(&cached);
+        let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+            panic!("an invalid refresh projection must preserve the current editor")
+        };
+        let ProjectKeysAction::SaveApiKey {
+            expected_revision,
+            expected_access_revision,
+            ..
+        } = draft.submit()
+        else {
+            panic!()
+        };
+        assert_eq!(expected_revision, Some(key.revision));
+        assert_eq!(
+            expected_access_revision,
+            Some(cached.api_access[0].revision)
+        );
+    }
+}
+
+#[test]
+fn stale_editor_requires_explicit_reload_before_using_the_latest_revision() {
+    fn revision(manager: &mut ProjectKeysUi) -> Option<u64> {
+        let Some(Dialog::Edit(draft)) = &mut manager.dialog else {
+            panic!()
+        };
+        let ProjectKeysAction::SaveKey {
+            expected_revision, ..
+        } = draft.submit()
+        else {
+            panic!()
+        };
+        expected_revision
+    }
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.prepare(&data);
+    let mut draft = EditDraft::existing(data.keys[0].clone());
+    let action = draft.submit();
+    manager.open_dialog(Dialog::Edit(Box::new(draft)));
+    let Some(ProjectKeysIntent::Request { fence, .. }) = manager.request(action, PendingKind::Edit)
+    else {
+        panic!("edit request expected");
+    };
+    manager.apply_ack(&ProjectKeysAck {
+        fence,
+        result: Err(ProjectKeysError::Stale),
+    });
+    let mut h = harness(data.clone(), manager);
+    h.set_size(egui::vec2(1280.0, 800.0));
+    h.run();
+    let label = i18n::Catalog::load("en-US")
+        .unwrap()
+        .t("project_keys.reload_latest", &[]);
+    h.get_by_label(&label).click();
+    h.run();
+    let Some(ProjectKeysIntent::Request {
+        fence,
+        action: ProjectKeysAction::ReloadEditor { key_id },
+    }) = h.state().1.last()
+    else {
+        panic!("reload must request the original key metadata without resubmitting edits");
+    };
+    assert_eq!(key_id, "file-key");
+    let fence = fence.clone();
+    let mut latest = data;
+    latest.keys[0].revision = 4;
+    h.state_mut().0.prepare(&latest);
+    assert_eq!(
+        revision(&mut h.state_mut().0),
+        Some(3),
+        "snapshot arrival must not silently rebase an edit"
+    );
+    h.state_mut().0.apply_ack(&ProjectKeysAck {
+        fence,
+        result: Ok(ProjectKeysAckPayload::Refreshed(Box::new(latest.clone()))),
+    });
+    h.state_mut().0.prepare(&latest);
+    assert_eq!(revision(&mut h.state_mut().0), Some(4));
+    let Some(Dialog::Edit(draft)) = &h.state().0.dialog else {
+        panic!()
+    };
+    assert!(draft.value.is_empty());
+    assert!(h.state().0.dialog_error.is_none());
+}
+
+#[test]
+fn compact_editor_keeps_all_controls_above_footer_on_desktop() {
+    for (kind, size) in [
+        (KeyKind::ApiToken, egui::vec2(1280.0, 720.0)),
+        (KeyKind::PrivateKey, egui::vec2(1280.0, 720.0)),
+    ] {
+        let data = snapshot();
+        let mut manager = ProjectKeysUi::default();
+        manager.prepare(&data);
+        let mut key = data.keys[0].clone();
+        key.kind = kind;
+        manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(key))));
+        let catalog = i18n::Catalog::load("en-US").unwrap();
+        let mut harness = egui_kittest::Harness::new_ui_state(
+            move |ui, manager: &mut ProjectKeysUi| {
+                let _ = manager.render_dialog(ui.ctx(), &data, &catalog);
+            },
+            manager,
+        );
+        harness.set_size(size);
+        harness.run();
+        let modal = harness
+            .ctx
+            .memory(|memory| memory.area_rect(egui::Id::new("project_key_edit")))
+            .unwrap();
+        assert!((modal.width() - 562.0).abs() < 1.0, "{modal:?}");
+        let save = harness.get_by_label("Save").rect();
+        let source = harness.get_by_label("Source").rect();
+        let kind_label = harness.get_by_label("Key type").rect();
+        assert!((source.top() - kind_label.top()).abs() < 0.5);
+        let usage = harness.get_by_label("Usage").rect();
+        let delivery = harness.get_by_label("Build delivery").rect();
+        assert!((usage.top() - delivery.top()).abs() < 0.5);
+        let secret = harness.get_by_role(egui::accesskit::Role::PasswordInput);
+        assert!(
+            (secret.rect().height()
+                - if kind == KeyKind::PrivateKey {
+                    80.0
+                } else {
+                    36.0
+                })
+            .abs()
+                < 0.5
+        );
+        for rect in harness
+            .get_all_by_role(egui::accesskit::Role::ComboBox)
+            .map(|node| node.rect())
+            .chain(std::iter::once(secret.rect()))
+            .chain(std::iter::once(
+                harness.get_by_label("Required for build").rect(),
+            ))
+        {
+            assert!(
+                rect.top() >= source.top(),
+                "control clipped above body: {rect:?}"
+            );
+            assert!(
+                rect.bottom() < save.top() - 12.0,
+                "control clipped below body: {rect:?}, footer={save:?}"
+            );
+        }
+        assert!((save.height() - 34.0).abs() < 0.5);
+        assert!(modal.top() >= 0.0 && modal.bottom() <= size.y);
+    }
+}
+
+#[test]
+fn page_error_is_not_inherited_by_a_fresh_editor() {
+    let data = snapshot();
+    let mut manager = ProjectKeysUi::default();
+    manager.prepare(&data);
+    manager.notice = Some(Err(ProjectKeysError::Stale));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+        data.keys[0].clone(),
+    ))));
+    let catalog = i18n::Catalog::load("en-US").unwrap();
+    let error = error_label(ProjectKeysError::Stale, &catalog);
+    let mut harness = egui_kittest::Harness::new_ui_state(
+        move |ui, manager: &mut ProjectKeysUi| {
+            let _ = manager.render_dialog(ui.ctx(), &data, &catalog);
+        },
+        manager,
+    );
+    harness.set_size(egui::vec2(1280.0, 800.0));
+    harness.run();
+    assert!(harness.query_by_label(&error).is_none());
+    assert_eq!(harness.state().notice, Some(Err(ProjectKeysError::Stale)));
+}
+
+#[test]
+fn edit_popup_uses_560_shell_36_fields_34_footer_and_narrow_internal_scroll() {
     for width in [800.0, 390.0] {
         let data = design_snapshot();
         let mut manager = ProjectKeysUi::default();
         manager.prepare(&data);
-        manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+        manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+            data.keys[0].clone(),
+        ))));
         let mut harness = harness(data, manager);
         harness.set_size(egui::vec2(width, 600.0));
         harness.run();
@@ -327,12 +1187,12 @@ fn edit_popup_uses_480_shell_36_fields_34_footer_and_narrow_internal_scroll() {
             .ctx
             .memory(|m| m.area_rect(egui::Id::new("project_key_edit")))
             .unwrap();
-        // The shared frame adds its 1pt border on both sides of the 480pt body.
-        assert!(rect.width() <= 482.5, "{rect:?}");
+        // The shared frame adds its 1pt border on both sides of the 560pt body.
+        assert!(rect.width() <= 562.5, "{rect:?}");
         assert!(rect.left() >= 0.0 && rect.right() <= width, "{rect:?}");
         assert!(rect.top() >= 0.0 && rect.bottom() <= 600.0, "{rect:?}");
         if width >= 800.0 {
-            assert!((rect.width() - 482.0).abs() < 1.0, "{rect:?}");
+            assert!((rect.width() - 562.0).abs() < 1.0, "{rect:?}");
         }
         let save = harness.get_by_label("Save").rect();
         assert!((save.height() - 34.0).abs() < 0.5);
@@ -797,7 +1657,9 @@ fn project_key_secret_accepts_korean_ime_commit_and_preserves_rejected_selection
     let data = snapshot();
     let mut manager = ProjectKeysUi::default();
     manager.prepare(&data);
-    manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+        data.keys[0].clone(),
+    ))));
     let mut h = harness(data, manager);
     h.set_size(egui::vec2(850.0, 1000.0));
     h.run();
@@ -954,7 +1816,9 @@ fn korean_popup_with_app_fonts_keeps_fields_and_footer_inside_narrow_viewport() 
     let data = design_snapshot();
     let mut manager = ProjectKeysUi::default();
     manager.prepare(&data);
-    manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+    manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+        data.keys[0].clone(),
+    ))));
     let catalog = i18n::Catalog::load("ko-KR").unwrap();
     let mut harness = egui_kittest::Harness::new_ui_state(
         move |ui, manager: &mut ProjectKeysUi| {
@@ -1051,6 +1915,7 @@ fn render_project_keys_design_review() {
         ("desktop", egui::vec2(1360.0, 900.0), false),
         ("narrow", egui::vec2(390.0, 900.0), false),
         ("edit", egui::vec2(800.0, 700.0), true),
+        ("api-quick-add", egui::vec2(1280.0, 720.0), false),
     ] {
         let data = design_snapshot();
         let mut manager = ProjectKeysUi::default();
@@ -1081,7 +1946,17 @@ fn render_project_keys_design_review() {
             },
         ];
         if dialog {
-            manager.dialog = Some(Dialog::Edit(EditDraft::existing(data.keys[0].clone())));
+            manager.dialog = Some(Dialog::Edit(Box::new(EditDraft::existing(
+                data.keys[0].clone(),
+            ))));
+        } else if name == "api-quick-add" {
+            manager.begin_api_add(
+                data.scope.clone(),
+                Some((
+                    super::super::environment::EnvironmentSelectionKind::ApiName,
+                    SensitiveDraft::new("Weather API".into()).unwrap(),
+                )),
+            );
         }
         let catalog = i18n::Catalog::load("ko-KR").unwrap();
         let mut harness = egui_kittest::Harness::new_ui_state(
@@ -1446,7 +2321,7 @@ fn new_remote_only_source_saves_metadata_without_secret_and_keeps_config_action(
     edit.value = SensitiveDraft::new("discard-on-remote-choice".into()).unwrap();
     let mut manager = ProjectKeysUi::default();
     manager.prepare(&data);
-    manager.dialog = Some(Dialog::Edit(edit));
+    manager.dialog = Some(Dialog::Edit(Box::new(edit)));
     let mut h = harness(data, manager);
     h.set_size(egui::vec2(850.0, 950.0));
     h.run();

@@ -1,0 +1,8 @@
+{
+  "verified_utc": "2026-10-23T19:28:33.149480+00:00",
+  "build_evidence_commit": "95d40c78245773b432028550a648605df6815936",
+  "remote_main": "95d40c78245773b432028550a648605df6815936",
+  "canonical_main_uncommitted": false,
+  "scope": "Verified after pushing version+build evidence; this final handoff-only commit follows.",
+  "restart_performed": false
+}

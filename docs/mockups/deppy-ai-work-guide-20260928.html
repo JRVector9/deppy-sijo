@@ -1,0 +1,324 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Deppy AI 작업 기능 가이드 — 배치 스폰과 브로드캐스트</title>
+  <style>
+    :root {
+      --page: #0b0e14;
+      --surface: #151a23;
+      --surface-2: #1b222e;
+      --surface-3: #222b38;
+      --line: #323b4b;
+      --muted: #9aa6b8;
+      --text: #eef2f8;
+      --cyan: #72d9df;
+      --blue: #85a9ff;
+      --amber: #f5c675;
+      --green: #95dbaf;
+      --red: #f09898;
+      --radius: 16px;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 80% -20%, #1b2b41 0, transparent 40%), var(--page);
+      color: var(--text);
+      font: 15px/1.6 -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Noto Sans KR", sans-serif;
+    }
+    button, select, input, textarea { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+      outline: 2px solid var(--cyan); outline-offset: 3px;
+    }
+    .shell { max-width: 1500px; margin: 0 auto; padding: 26px clamp(18px, 3vw, 44px) 64px; }
+    .topline { display: flex; justify-content: space-between; align-items: center; gap: 16px; color: var(--muted); font-size: 13px; }
+    .brand { display: flex; align-items: center; gap: 11px; font-weight: 750; color: var(--text); letter-spacing: .02em; }
+    .brandmark { width: 28px; height: 28px; border-radius: 9px; display: grid; place-items: center; background: #61d4db; color: #082024; font-weight: 900; }
+    .topnote { border: 1px solid var(--line); padding: 5px 11px; border-radius: 999px; }
+    .hero { padding: 44px 0 31px; max-width: 960px; }
+    .eyebrow { color: var(--cyan); letter-spacing: .14em; text-transform: uppercase; font-weight: 750; font-size: 12px; }
+    h1 { font-size: clamp(31px, 4vw, 55px); line-height: 1.18; letter-spacing: -.045em; margin: 11px 0 15px; }
+    .hero p { margin: 0; color: #b9c4d2; font-size: clamp(15px, 1.4vw, 18px); max-width: 760px; }
+    .quick-rule { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 24px; }
+    .rule { background: #141a24; border: 1px solid var(--line); border-radius: 13px; padding: 15px; min-height: 100px; text-align: left; color: var(--text); transition: border-color .18s, background .18s, transform .18s; }
+    .rule:hover { border-color: #647993; transform: translateY(-2px); }
+    .rule.active { border-color: var(--cyan); background: #14232c; box-shadow: inset 0 0 0 1px #43838a; }
+    .rule .count { color: var(--cyan); font-size: 12px; font-weight: 800; }
+    .rule strong { display: block; font-size: 16px; margin: 3px 0; }
+    .rule span:last-child { display: block; color: var(--muted); font-size: 13px; line-height: 1.4; }
+    .main { display: grid; grid-template-columns: minmax(305px, 390px) minmax(0, 1fr); gap: 20px; align-items: start; }
+    .story, .app-frame { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); overflow: hidden; box-shadow: 0 25px 70px #0004; }
+    .story { padding: 24px; position: sticky; top: 18px; }
+    .story-kicker { font-size: 12px; color: var(--cyan); font-weight: 800; letter-spacing: .08em; }
+    .story h2 { margin: 7px 0 8px; font-size: 25px; line-height: 1.27; letter-spacing: -.025em; }
+    .story .summary { margin: 0 0 18px; color: #c1ccda; }
+    .label { color: var(--muted); text-transform: uppercase; letter-spacing: .08em; font-size: 11px; font-weight: 800; margin: 18px 0 7px; }
+    .scenario-box { background: #202a37; border: 1px solid #3c5064; border-radius: 12px; padding: 14px; }
+    .scenario-box strong { display: block; margin-bottom: 5px; }
+    .scenario-box p { margin: 0; color: #c6d0dc; font-size: 14px; }
+    .steps { margin: 0; padding: 0; list-style: none; }
+    .steps li { display: flex; gap: 11px; margin: 10px 0; color: #d9e1ec; font-size: 14px; }
+    .stepnum { flex: 0 0 21px; height: 21px; border: 1px solid #5e8290; border-radius: 50%; display: grid; place-items: center; color: var(--cyan); font-size: 12px; font-weight: 750; line-height: 1; margin-top: 1px; }
+    .fact { border-top: 1px solid var(--line); padding-top: 14px; margin-top: 18px; color: #b8c5d3; font-size: 13px; }
+    .fact strong { color: var(--amber); }
+    .story-action { width: 100%; margin-top: 19px; border: 0; border-radius: 10px; padding: 12px 16px; background: var(--cyan); color: #0b2228; font-weight: 800; }
+    .story-action:hover { background: #a1edf0; }
+    .app-bar { display: flex; align-items: center; gap: 7px; height: 40px; padding: 0 14px; border-bottom: 1px solid var(--line); background: #1a202a; color: var(--muted); font-size: 12px; }
+    .traffic { display: flex; gap: 5px; margin-right: 9px; }
+    .traffic i { display: block; width: 8px; height: 8px; border-radius: 50%; background: #657183; }
+    .app-layout { display: grid; grid-template-columns: 158px minmax(0,1fr); min-height: 584px; }
+    .app-nav { border-right: 1px solid var(--line); padding: 17px 9px; background: #141922; }
+    .nav-title { color: #8391a3; font-size: 11px; letter-spacing: .09em; padding: 0 10px 7px; }
+    .nav-item { padding: 8px 10px; color: #9aa7b7; border-radius: 8px; font-size: 13px; }
+    .nav-item.selected { background: #25313d; color: #d5f8f7; font-weight: 700; }
+    .nav-item + .nav-title { margin-top: 26px; }
+    .app-main { min-width: 0; padding: 20px; }
+    .app-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; flex-wrap: wrap; }
+    .app-head h3 { margin: 0; font-size: 23px; line-height: 1.2; }
+    .app-head small { color: var(--muted); font-size: 12px; font-weight: 500; padding-left: 8px; }
+    .app-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .mini-btn { background: #222b38; color: #e2e9f2; border: 1px solid #4a5668; border-radius: 7px; padding: 6px 9px; font-size: 12px; white-space: nowrap; }
+    .mini-btn:hover, .mini-btn.highlight { border-color: var(--cyan); color: #c5f6f4; }
+    .mini-btn.primary { background: #2a5c62; border-color: #47858a; color: #e0fcfa; }
+    .status-strip { display: flex; flex-wrap: wrap; gap: 13px; border-bottom: 1px solid var(--line); padding: 17px 0 15px; font-size: 12px; color: #b6c2d0; }
+    .status-strip b { color: var(--text); }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; background: #8392a4; vertical-align: 1px; }
+    .dot.waiting { background: var(--amber); } .dot.working { background: var(--blue); } .dot.idle { background: var(--green); } .dot.done { background: #8493a5; }
+    .section-title { display: flex; align-items: center; justify-content: space-between; margin: 20px 0 8px; font-size: 13px; color: #b2becc; font-weight: 750; }
+    .session-list { display: grid; gap: 7px; }
+    .session { background: #1b2330; border: 1px solid #303d4f; border-radius: 9px; padding: 10px 11px; display: flex; align-items: center; gap: 10px; min-width: 0; }
+    .session.new { border-color: var(--cyan); animation: rise .3s ease-out; }
+    @keyframes rise { from { opacity: .2; transform: translateY(7px); } to { opacity: 1; transform: translateY(0); } }
+    .session .dot { flex: 0 0 7px; margin: 0; }
+    .session-main { flex: 1; min-width: 0; }
+    .session-main strong { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13px; font-weight: 650; }
+    .session-main span { display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; color: var(--muted); font-size: 11px; }
+    .session-tag { font-size: 10px; color: #b9c5d2; border: 1px solid #495466; border-radius: 999px; padding: 2px 6px; white-space: nowrap; }
+    .session .card-action { border: 1px solid #475365; background: transparent; color: #b6c8d8; border-radius: 6px; font-size: 11px; padding: 3px 6px; white-space: nowrap; }
+    .session .card-action:hover { border-color: var(--cyan); }
+    .activity { border-top: 1px solid var(--line); background: #111721; padding: 12px 20px; color: #bfd0dc; font-size: 12px; min-height: 44px; }
+    .activity b { color: var(--cyan); margin-right: 8px; }
+    .compare { margin-top: 28px; }
+    .compare h2 { font-size: 23px; margin: 0 0 11px; }
+    .table-scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; min-width: 700px; background: #151b25; font-size: 13px; }
+    th, td { text-align: left; padding: 12px 14px; border-bottom: 1px solid var(--line); vertical-align: top; }
+    th { background: #1e2733; color: #e4effa; font-size: 12px; }
+    td:first-child { color: var(--cyan); font-weight: 750; white-space: nowrap; }
+    tr:last-child td { border-bottom: 0; }
+    .footnote { color: var(--muted); font-size: 12px; margin-top: 12px; }
+    dialog { width: min(510px, calc(100vw - 28px)); border: 1px solid #587183; background: #1b2330; color: var(--text); border-radius: 14px; padding: 0; box-shadow: 0 30px 90px #000b; }
+    dialog::backdrop { background: #050910b8; backdrop-filter: blur(3px); }
+    .modal-head { display: flex; justify-content: space-between; align-items: center; padding: 17px 20px; border-bottom: 1px solid var(--line); }
+    .modal-head h3 { margin: 0; font-size: 18px; }
+    .close { border: 0; background: transparent; color: #b6c3d1; font-size: 24px; line-height: 1; padding: 0 5px; }
+    .modal-body { padding: 19px 20px 22px; }
+    .field { margin-bottom: 15px; }
+    .field label { display: block; color: #c8d3de; margin-bottom: 6px; font-size: 13px; font-weight: 650; }
+    .field select, .field input, .field textarea { width: 100%; background: #111923; border: 1px solid #4b5b6c; color: var(--text); border-radius: 8px; padding: 9px 10px; }
+    .field textarea { min-height: 96px; resize: vertical; }
+    .field-help { color: var(--muted); font-size: 12px; margin-top: 5px; }
+    .preview { background: #111923; border: 1px solid #39495a; padding: 12px; border-radius: 8px; color: #cad8e4; white-space: pre-wrap; font-size: 13px; }
+    .recipient-list { max-height: 190px; overflow: auto; border: 1px solid #3b4857; border-radius: 8px; }
+    .recipient { display: flex; align-items: start; gap: 8px; padding: 9px 10px; border-bottom: 1px solid #323c49; font-size: 13px; cursor: pointer; }
+    .recipient:last-child { border-bottom: 0; }
+    .recipient input { accent-color: #72d9df; margin-top: 3px; }
+    .recipient small { display: block; color: var(--muted); }
+    .modal-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 18px; }
+    .modal-foot .hint { color: var(--muted); font-size: 12px; }
+    .do-btn { background: var(--cyan); color: #0d2226; font-weight: 800; border: 0; border-radius: 8px; padding: 10px 14px; white-space: nowrap; }
+    .do-btn:disabled { opacity: .45; cursor: not-allowed; }
+    .confirm { background: #493b26; color: #f9dda7; border: 1px solid #947440; border-radius: 8px; padding: 10px; margin-top: 10px; font-size: 13px; }
+    .confirm button { display: block; margin-top: 9px; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    @media (max-width: 1020px) { .main { grid-template-columns: 1fr; } .story { position: static; } .quick-rule { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    @media (max-width: 660px) { .shell { padding: 18px 12px 40px; } .hero { padding: 30px 3px 24px; } .quick-rule { gap: 7px; } .rule { min-height: 112px; padding: 10px; } .rule strong { font-size: 14px; } .app-layout { grid-template-columns: 1fr; } .app-nav { display: none; } .app-main { padding: 16px 12px; } .app-head h3 { width: 100%; } .topnote { display: none; } .session-tag { display: none; } }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="topline"><div class="brand"><span class="brandmark">D</span> Deppy <span style="color:#637285;font-weight:500">/ 기능 가이드</span></div><div class="topnote">현재 코드 기준 · 브라우저 시뮬레이션</div></div>
+    <header class="hero">
+      <div class="eyebrow">AI WORKFLOW, EXPLAINED</div>
+      <h1>에이전트를 몇 개 열고,<br>언제 무엇을 보낼까요?</h1>
+      <p>Deppy의 <strong>작업</strong> 화면은 여러 워크스페이스의 AI 세션을 한곳에서 보여줍니다. 아래 네 가지 상황을 누르면 실제 메뉴 흐름과 예시 결과를 볼 수 있습니다.</p>
+    </header>
+
+    <p class="footnote" style="margin:-14px 0 22px">기본 단위: <strong style="color:#dce8f2">워크스페이스</strong>는 프로젝트 작업 공간, <strong style="color:#dce8f2">세션</strong>은 에이전트와 대화하는 독립된 창, <strong style="color:#dce8f2">저장된 프롬프트</strong>는 여러 세션에 재사용할 지시문입니다. <strong style="color:#dce8f2">작업</strong> 화면은 그 세션의 상태와 승인·입력 대기를 모아 보여줍니다.</p>
+
+    <nav class="quick-rule" aria-label="상황 선택">
+      <button type="button" class="rule" data-mode="single" aria-pressed="false"><span class="count">01 · 하나만 시작</span><strong>+ 새 에이전트</strong><span>새 세션 1개에서 작업을 맡길 때</span></button>
+      <button type="button" class="rule active" data-mode="batch" aria-pressed="true"><span class="count">02 · 여럿 새로 시작</span><strong>배치 스폰</strong><span>같은 에이전트 세션을 여러 개 만들 때</span></button>
+      <button type="button" class="rule" data-mode="broadcast" aria-pressed="false"><span class="count">03 · 열린 세션에 전달</span><strong>브로드캐스트</strong><span>선택한 세션들에 같은 말을 지금 보낼 때</span></button>
+      <button type="button" class="rule" data-mode="followup" aria-pressed="false"><span class="count">04 · 끝난 뒤 이어서</span><strong>다음 단계 예약</strong><span>한 세션의 현재 턴이 끝나면 보낼 때</span></button>
+    </nav>
+
+    <div class="main">
+      <section class="story" aria-live="polite">
+        <div class="story-kicker" id="story-kicker">SCENARIO 02</div>
+        <h2 id="story-title">같은 코드를 세 번 독립 검토</h2>
+        <p class="summary" id="story-summary">한 사람이 놓칠 수 있는 문제를 찾으려고 Codex 세션 3개를 같은 워크스페이스에서 시작합니다.</p>
+        <div class="label">예시 상황</div>
+        <div class="scenario-box"><strong id="story-example-title">결제 모듈 배포 전 점검</strong><p id="story-example">저장된 “변경 코드 검토” 프롬프트를 골라 독립적인 세션 3개에 같은 질문을 줍니다. 각 세션의 결과를 직접 비교합니다.</p></div>
+        <div class="label">Deppy에서 누르는 순서</div>
+        <ol class="steps" id="story-steps"></ol>
+        <div class="fact" id="story-fact"></div>
+        <button type="button" class="story-action" id="try-button">배치 스폰 화면 체험하기 →</button>
+      </section>
+
+      <section class="app-frame" aria-label="Deppy 작업 화면 시뮬레이션">
+        <div class="app-bar"><span class="traffic"><i></i><i></i><i></i></span>Deppy · 시연 화면 <span style="margin-left:auto">실제 세션에는 연결되지 않습니다</span></div>
+        <div class="app-layout">
+          <aside class="app-nav"><div class="nav-title">워크스페이스</div><div class="nav-item selected">▣ 쇼핑몰</div><div class="nav-item">▣ 모바일 앱</div><div class="nav-title">전체</div><div class="nav-item selected">◫ 작업</div><div class="nav-item">▤ 프롬프트</div></aside>
+          <div class="app-main">
+            <div class="app-head"><h3>작업 <small id="session-count">4개 세션</small></h3><div class="app-actions"><button type="button" class="mini-btn" id="batch-button">배치 스폰</button><button type="button" class="mini-btn" id="broadcast-button">브로드캐스트</button><button type="button" class="mini-btn primary" id="single-button">+ 새 에이전트</button></div></div>
+            <div class="status-strip"><span><i class="dot waiting"></i>막힌 것 <b id="count-waiting">0</b></span><span><i class="dot working"></i>진행 중 <b id="count-working">0</b></span><span><i class="dot"></i>오류 <b>0</b></span><span><i class="dot done"></i>끝남 <b id="count-done">0</b></span></div>
+            <div id="session-sections"></div>
+          </div>
+        </div>
+        <div class="activity" aria-live="polite"><b>시연 기록</b><span id="activity-message">상황을 선택하고 왼쪽 버튼을 눌러보세요.</span></div>
+      </section>
+    </div>
+
+    <section class="compare">
+      <h2>기능 차이 한눈에 보기</h2>
+      <div class="table-scroll"><table><thead><tr><th>기능</th><th>대상</th><th>프롬프트</th><th>언제 전달되나</th><th>결과가 모이는 곳</th></tr></thead><tbody>
+        <tr><td>+ 새 에이전트</td><td>새 세션 1개</td><td>새 세션에서 입력</td><td>직접 입력할 때</td><td>그 세션의 터미널</td></tr>
+        <tr><td>배치 스폰</td><td>현재 워크스페이스에 새 세션 N개</td><td>저장된 프롬프트 1개 또는 빈 세션</td><td>프롬프트를 골랐다면 각 세션 시작 시</td><td>각 세션의 터미널</td></tr>
+        <tr><td>브로드캐스트</td><td>선택한 기존 PTY 세션 여러 개</td><td>저장된 프롬프트 1개</td><td>전송 버튼을 누르면 즉시</td><td>각 수신 세션의 터미널</td></tr>
+        <tr><td>다음 단계 예약</td><td>기존 PTY 세션 1개</td><td>직접 입력 또는 저장된 프롬프트 삽입</td><td>현재 턴 완료 신호 뒤 한 번</td><td>예약한 세션의 터미널</td></tr>
+      </tbody></table></div>
+      <p class="footnote">시연 데이터는 예시입니다. 배치 스폰은 같은 등록 에이전트 설정을 순서대로 실행하며 자동 역할 분담이나 결과 합치기를 하지 않습니다. 브로드캐스트의 구조화(App Server) 세션은 대상에서 제외됩니다.</p>
+    </section>
+  </div>
+
+  <dialog id="demo-dialog" aria-labelledby="dialog-title"><div class="modal-head"><h3 id="dialog-title"></h3><button type="button" class="close" id="close-dialog" aria-label="닫기">×</button></div><div class="modal-body" id="dialog-body"></div></dialog>
+
+  <script>
+    const stories = {
+      single: {
+        kicker: 'SCENARIO 01', title: '버그 하나를 한 에이전트에게',
+        summary: '일반적인 작업은 새 세션 하나에서 시작합니다. 세션을 열어 직접 대화하며 진행합니다.',
+        exampleTitle: '로그인 오류 수정', example: '쇼핑몰 워크스페이스에서 Codex 한 개를 열고 “로그인 실패 재현 후 원인을 고쳐줘”라고 입력합니다.',
+        steps: ['작업 화면에서 + 새 에이전트를 누릅니다.', '에이전트를 골라 새 세션을 엽니다.', '그 세션에 작업 지시를 입력합니다.'],
+        fact: '<strong>기억할 점</strong> 하나의 새 세션을 시작합니다. 여러 작업을 동시에 시작할 필요가 없다면 이 흐름이 가장 간단합니다.',
+        button: '+ 새 에이전트 화면 체험하기 →'
+      },
+      batch: {
+        kicker: 'SCENARIO 02', title: '같은 코드를 세 번 독립 검토',
+        summary: '한 사람이 놓칠 수 있는 문제를 찾으려고 Codex 세션 3개를 같은 워크스페이스에서 시작합니다.',
+        exampleTitle: '결제 모듈 배포 전 점검', example: '저장된 “변경 코드 검토” 프롬프트를 골라 독립적인 세션 3개에 같은 질문을 줍니다. 각 세션의 결과를 직접 비교합니다.',
+        steps: ['검토할 프로젝트의 워크스페이스를 활성화합니다.', '배치 스폰에서 에이전트와 개수 3을 선택합니다.', '저장된 프롬프트를 고르거나 빈 세션으로 시작합니다.', '새로 열린 세션 각각에서 결과를 확인합니다.'],
+        fact: '<strong>기억할 점</strong> 한 번의 배치에는 같은 등록 에이전트 설정과 같은 초기 프롬프트가 적용됩니다. 새 세션은 순서대로 준비되고, 결과는 각 세션에 남습니다. 같은 파일을 여러 세션이 동시에 수정하면 충돌할 수 있습니다.',
+        button: '배치 스폰 화면 체험하기 →'
+      },
+      broadcast: {
+        kicker: 'SCENARIO 03', title: '이미 열린 세션들에 같은 질문',
+        summary: '새 에이전트를 만들지 않고, 지금 실행 중인 여러 세션에 공통 질문을 바로 전달합니다.',
+        exampleTitle: '오후 작업 현황 수집', example: '각자 다른 작업을 맡은 유휴 세션 2개에 “현재 상태와 막힌 점을 세 줄로 보고해줘”라는 저장 프롬프트를 보냅니다.',
+        steps: ['프롬프트 라이브러리에 공통 질문을 저장합니다.', '작업 화면에서 브로드캐스트를 누릅니다.', '프롬프트와 받을 세션을 체크하고 전송합니다.', '응답은 각 수신 세션에서 확인합니다.'],
+        fact: '<strong>기억할 점</strong> 선택한 기존 PTY 세션에 즉시 Enter까지 보냅니다. 기본 선택은 작업 중인 세션을 피합니다. 구조화(App Server) 세션에는 보내지 않습니다. 대상이 3개 이상이면 확인 단계가 한 번 더 나옵니다.',
+        button: '브로드캐스트 화면 체험하기 →'
+      },
+      followup: {
+        kicker: 'SCENARIO 04', title: '이 일이 끝나면 같은 세션에서 다음 일',
+        summary: '현재 에이전트를 방해하지 않고, 그 세션의 다음 작업 한 건을 미리 적어 둡니다.',
+        exampleTitle: '구현 다음에 코드 리뷰', example: '“로그인 오류 수정”을 진행 중인 세션 카드에서 “다음 단계 예약”을 열고 “수정한 코드를 리뷰하고 테스트 결과를 보고해줘”를 적습니다.',
+        steps: ['진행 중인 PTY 세션 카드의 다음 단계 예약을 엽니다.', '이어질 작업을 입력하고 예약합니다.', '현재 턴 완료 신호가 오면 Deppy가 그 세션에 한 번 보냅니다.'],
+        fact: '<strong>기억할 점</strong> 에이전트가 승인이나 답변을 기다리는 동안은 보내지 않습니다. 턴 완료 신호를 받은 뒤 전달되므로, 단순히 화면이 잠잠해졌다는 이유로 바로 보내지는 않습니다.',
+        button: '다음 단계 예약 체험하기 →'
+      }
+    };
+    const baseSessions = [
+      { id:'fix', title:'로그인 오류 수정', workspace:'쇼핑몰', agent:'Codex · gpt-6-sol · high', state:'working', type:'pty' },
+      { id:'review', title:'결제 코드 검토', workspace:'쇼핑몰', agent:'Codex · gpt-6-astra · high', state:'idle', type:'pty' },
+      { id:'docs', title:'배포 문서 정리', workspace:'모바일 앱', agent:'Claude · Opus 5.5', state:'idle', type:'pty' },
+      { id:'structured', title:'화면 설계 검토', workspace:'모바일 앱', agent:'Codex App', state:'working', type:'structured' }
+    ];
+    let sessions = baseSessions.map(s => ({...s}));
+    let mode = 'batch';
+    let confirmed = false;
+    const $ = id => document.getElementById(id);
+    const escapeHtml = value => String(value).replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    const stateLabel = state => ({working:'작업 중', idle:'유휴', waiting:'대기', done:'완료'}[state] || state);
+    function renderStory() {
+      const s = stories[mode];
+      $('story-kicker').textContent = s.kicker;
+      $('story-title').textContent = s.title;
+      $('story-summary').textContent = s.summary;
+      $('story-example-title').textContent = s.exampleTitle;
+      $('story-example').textContent = s.example;
+      $('story-steps').innerHTML = s.steps.map((step, i) => `<li><span class="stepnum">${i+1}</span><span>${escapeHtml(step)}</span></li>`).join('');
+      $('story-fact').innerHTML = s.fact;
+      $('try-button').textContent = s.button;
+      document.querySelectorAll('[data-mode]').forEach(button => {
+        const active = button.dataset.mode === mode;
+        button.classList.toggle('active', active);
+        button.setAttribute('aria-pressed', String(active));
+      });
+      ['single','batch','broadcast'].forEach(key => $(key+'-button').classList.toggle('highlight', key === mode));
+    }
+    function renderSessions() {
+      $('session-count').textContent = `${sessions.length}개 세션`;
+      $('count-waiting').textContent = sessions.filter(s => s.state === 'waiting').length;
+      $('count-working').textContent = sessions.filter(s => s.state === 'working' || s.state === 'idle').length;
+      $('count-done').textContent = sessions.filter(s => s.state === 'done').length;
+      const groups = [
+        ['진행 중', sessions.filter(s => s.state === 'working' || s.state === 'idle')],
+        ['끝남', sessions.filter(s => s.state === 'done')]
+      ];
+      $('session-sections').innerHTML = groups.filter(([,items]) => items.length).map(([label,items]) =>
+        `<div class="section-title">${label}<span>${items.length}</span></div><div class="session-list">${items.map(s =>
+          `<div class="session ${s.new ? 'new' : ''}"><i class="dot ${s.state}"></i><div class="session-main"><strong>${escapeHtml(s.title)}</strong><span>${escapeHtml(s.workspace)} · ${escapeHtml(s.agent)} · ${stateLabel(s.state)}${s.followup ? ' · 다음 단계 예약됨' : ''}</span></div>${s.type === 'structured' ? '<span class="session-tag">App Server</span>' : `<button type="button" class="card-action" data-followup="${escapeHtml(s.id)}" title="이 세션의 다음 단계 예약">다음 단계 예약</button>`}</div>`
+        ).join('')}</div>`).join('');
+      document.querySelectorAll('[data-followup]').forEach(button => button.addEventListener('click', () => openDialog('followup', button.dataset.followup)));
+    }
+    function activity(message) { $('activity-message').textContent = message; }
+    function chooseMode(next, reset=true) {
+      mode = next;
+      if (reset) sessions = baseSessions.map(s => ({...s}));
+      renderStory(); renderSessions();
+      activity('상황을 선택했습니다. 왼쪽 체험 버튼이나 Deppy 화면의 버튼을 눌러보세요.');
+    }
+    function openDialog(kind, targetId='fix') {
+      confirmed = false;
+      $('dialog-title').textContent = ({single:'새 에이전트',batch:'배치 스폰',broadcast:'프롬프트 브로드캐스트',followup:'다음 단계 예약'})[kind];
+      const body = $('dialog-body');
+      if (kind === 'single') {
+        body.innerHTML = `<div class="field"><label for="single-agent">에이전트</label><select id="single-agent"><option>Codex</option><option>Claude</option></select><div class="field-help">현재 워크스페이스: 쇼핑몰</div></div><div class="modal-foot"><span class="hint">세션 1개가 열립니다.</span><button class="do-btn" id="do-action">세션 열기</button></div>`;
+        $('do-action').addEventListener('click', () => { sessions.push({id:'single-'+Date.now(), title:'새 에이전트',workspace:'쇼핑몰',agent:$('single-agent').value,state:'idle',type:'pty',new:true}); finish('쇼핑몰에 새 에이전트 세션 1개가 열렸습니다. 작업 지시는 그 세션에 입력합니다.'); });
+      } else if (kind === 'batch') {
+        body.innerHTML = `<div class="field"><label for="batch-agent">에이전트 설정</label><select id="batch-agent"><option>Codex</option><option>Claude</option></select></div><div class="field"><label for="batch-count">개수</label><input id="batch-count" type="number" min="1" max="6" value="1"><div class="field-help">기본값은 1개입니다. 실제 앱의 상한은 설정에서 1~16 사이로 바꿀 수 있으며 기본 상한은 6개입니다.</div></div><div class="field"><label for="batch-prompt">프롬프트 (선택)</label><select id="batch-prompt"><option value="none">(없음) — 빈 세션</option><option value="review">변경 코드 검토</option></select></div><div class="preview" id="batch-preview">초기 프롬프트 없이 세션만 엽니다.</div><div class="modal-foot"><span class="hint">예시대로 하려면 3개와 검토 프롬프트를 선택하세요.</span><button class="do-btn" id="do-action">1개 시작</button></div>`;
+        $('batch-prompt').addEventListener('change', () => $('batch-preview').textContent = $('batch-prompt').value === 'none' ? '초기 프롬프트 없이 세션만 엽니다.' : '이 워크스페이스의 변경 코드를 검토하고 결함과 위험을 보고해줘.');
+        $('batch-count').addEventListener('input', () => $('do-action').textContent = `${$('batch-count').value || 0}개 시작`);
+        $('do-action').addEventListener('click', () => { const count = Number($('batch-count').value); if (!Number.isInteger(count) || count < 1 || count > 6) { activity('시연에서는 1~6개를 선택하세요.'); return; } const prompted = $('batch-prompt').value !== 'none'; const agent = $('batch-agent').value; for (let i=1; i<=count; i++) sessions.push({id:'batch-'+Date.now()+'-'+i,title:prompted ? `변경 코드 검토 ${i}` : `새 에이전트 ${i}`,workspace:'쇼핑몰',agent,state:prompted?'working':'idle',type:'pty',new:true}); finish(`쇼핑몰에 ${agent} 세션 ${count}개를 순서대로 시작했습니다.${prompted ? ' 같은 초기 프롬프트가 각 세션에 전달됐습니다.' : ' 빈 세션으로 열렸습니다.'}`); });
+      } else if (kind === 'broadcast') {
+        const targets = sessions.filter(s => s.type === 'pty');
+        body.innerHTML = `<div class="field"><label for="broadcast-prompt">저장된 프롬프트</label><select id="broadcast-prompt"><option value="status">현재 상태 보고</option><option value="tests">테스트 결과 보고</option></select></div><div class="preview" id="broadcast-preview">현재 상태와 막힌 점을 세 줄로 보고해줘.</div><div class="field" style="margin-top:14px"><label>받을 세션 (실행 중인 PTY)</label><div class="recipient-list">${targets.map(s => `<label class="recipient"><input type="checkbox" value="${escapeHtml(s.id)}" ${s.state === 'working' ? '' : 'checked'}><span>${escapeHtml(s.title)}<small>${escapeHtml(s.workspace)} · ${stateLabel(s.state)}</small></span></label>`).join('')}</div><div class="field-help">작업 중 세션은 처음에 선택하지 않습니다. App Server 세션은 대상에서 빠집니다.</div></div><div class="modal-foot"><span class="hint">전송 시 Enter까지 보냅니다.</span><button class="do-btn" id="do-action">2개에 전송</button></div><div id="broadcast-confirm"></div>`;
+        $('broadcast-prompt').addEventListener('change', () => $('broadcast-preview').textContent = $('broadcast-prompt').value === 'status' ? '현재 상태와 막힌 점을 세 줄로 보고해줘.' : '담당 작업의 테스트 결과를 보고해줘.');
+        const boxes = [...body.querySelectorAll('.recipient input')];
+        function updateCount() { const n = boxes.filter(b => b.checked).length; $('do-action').textContent = `${n}개에 전송`; $('do-action').disabled = n === 0; $('broadcast-confirm').innerHTML = ''; confirmed = false; }
+        boxes.forEach(box => box.addEventListener('change', updateCount)); updateCount();
+        $('do-action').addEventListener('click', () => { const ids = boxes.filter(b => b.checked).map(b => b.value); if (ids.length >= 3 && !confirmed) { confirmed = true; $('broadcast-confirm').innerHTML = `<div class="confirm">선택한 ${ids.length}개 세션 모두에 같은 프롬프트를 전송할까요?<button type="button" class="do-btn" id="confirm-action">확정 전송</button></div>`; $('confirm-action').addEventListener('click', send); return; } send(); function send() { ids.forEach(id => { const s = sessions.find(x => x.id === id); if (s) s.state = 'working'; }); finish(`${ids.length}개 기존 PTY 세션에 같은 저장 프롬프트를 즉시 전송했습니다. 각 세션에서 답변을 확인합니다.`); } });
+      } else {
+        const target = sessions.find(s => s.id === targetId && s.type === 'pty') || sessions.find(s => s.type === 'pty');
+        body.innerHTML = `<div class="field"><label>대상 세션</label><div class="preview">${escapeHtml(target.title)} · ${escapeHtml(target.workspace)}</div></div><div class="field"><label for="followup-text">다음에 시킬 일</label><textarea id="followup-text">수정한 코드를 리뷰하고 테스트 결과를 보고해줘.</textarea><div class="field-help">현재 턴이 끝나면 이 세션에 한 번 전달합니다.</div></div><div class="modal-foot"><span class="hint">지금은 전송하지 않습니다.</span><button class="do-btn" id="do-action">예약</button></div>`;
+        $('do-action').addEventListener('click', () => { const value = $('followup-text').value.trim(); if (!value) return; target.followup = value; finish(`“${target.title}” 세션의 다음 단계가 예약됐습니다. 현재 턴 완료 신호가 오면 한 번 전송합니다.`); });
+      }
+      $('demo-dialog').showModal();
+    }
+    function finish(message) { $('demo-dialog').close(); renderSessions(); activity(message); }
+    document.querySelectorAll('[data-mode]').forEach(button => button.addEventListener('click', () => chooseMode(button.dataset.mode)));
+    $('try-button').addEventListener('click', () => openDialog(mode));
+    $('single-button').addEventListener('click', () => { chooseMode('single', false); openDialog('single'); });
+    $('batch-button').addEventListener('click', () => { chooseMode('batch', false); openDialog('batch'); });
+    $('broadcast-button').addEventListener('click', () => { chooseMode('broadcast', false); openDialog('broadcast'); });
+    $('close-dialog').addEventListener('click', () => $('demo-dialog').close());
+    renderStory(); renderSessions();
+  </script>
+</body>
+</html>

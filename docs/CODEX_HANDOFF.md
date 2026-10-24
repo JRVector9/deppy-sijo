@@ -1,3 +1,37 @@
+# Explicit 0.19.1 restart complete — 2026-10-24
+
+## Current objective / completed work
+
+Latest user request “재실행해” explicitly authorized this restart. Gracefully quit old0.16.0 PID31144 using normal AppleEvent quit (exit0); old process exited without signals or force kill. Launched the previously verified0.19.1 bundle, exact executable PID49989, retaining DEPPY_COMMAND_CENTER_V2=1. Confirmed one main app only, process alive after10seconds, AppKit finishedLaunching=true/terminated=false, and native Deppy window/accessibility controls visible through cua.getApp. Restart is complete. Earlier “no restart” entries below describe previous build-only tasks.
+
+## Modified files / key decisions
+
+Only docs/CODEX_HANDOFF.md and docs/qa/assets/restart-0.19.1-20261024/restart-result.json changed. No product code/build/version change; reused signed0.19.1 artifact from source de785879f57eb53cd691380144400f7da892a183. CLI and both plist versions rechecked0.19.1; executable SHA256 exactly matches the original build receipt. That original receipt remains unchanged and correctly records that the preceding build task did not restart. Used canonical integration-20261023 main, never the older nominal Fleet source tree. Existing old bundles and unrelated processes untouched.
+
+## Checks / results / limits
+
+- Pre-stop exact PID/path check PASS; normal quit exit0 and old app exit PASS.
+- New process exact bundle path, one main process, distinct PID,10second liveness and AppKit startup checks PASS.
+- Native window/accessibility tree observed. This verifies app launch/display, not all restored sessions, agent health, input or provider operations; none were exercised by this operational task.
+- No new source tests run or claimed; existing build/test evidence remains in local-0.19.1-20261024.
+- No failed restart approach. Temporary detached controller/log in /tmp/deppy-restart-0.19.1-20261024.py and .log; durable result JSON has exact timestamps, PID/path/hash/version and launch command.
+
+## Remaining work / exact commands
+
+No restart work remains. Publish this documentation/evidence checkpoint and verify clean main. Do not restart again without a new explicit request.
+
+```sh
+cd /Users/jr/Desktop/projects/deppy-sijo-integration-20261023
+git status --short --branch
+git diff --check
+python3 -m json.tool docs/qa/assets/restart-0.19.1-20261024/restart-result.json
+ps -p 49989 -o pid=,etime=,stat=,command=
+git ls-remote origin refs/heads/main
+# Active bundle: target/bundle-0.19.1/Deppy Sijo.app.
+```
+
+---
+
 # Security and legacy-document fixes complete — 2026-10-24
 
 ## Current objective / completed work

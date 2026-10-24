@@ -1,0 +1,52 @@
+{
+  "authorized_request": "재실행해",
+  "started_utc": "2026-10-24T04:00:38.668363+00:00",
+  "source_commit": "de785879f57eb53cd691380144400f7da892a183",
+  "new_bundle": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.19.1/Deppy Sijo.app",
+  "stop_actions": [
+    {
+      "kind": "graceful AppleEvent quit",
+      "pid": 31144,
+      "exit_code": 0,
+      "stderr": ""
+    }
+  ],
+  "status": "PASS",
+  "binary_sha256": "f313839709ccb09806b938c2dc46b2e0322c17e1adeb6a3064f6820ff5558249",
+  "reported_version": "Deppy Sijo 0.19.1",
+  "plist_versions": {
+    "CFBundleShortVersionString": "0.19.1",
+    "CFBundleVersion": "0.19.1"
+  },
+  "previous": [
+    {
+      "pid": 31144,
+      "executable": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.16.0/Deppy Sijo.app/Contents/MacOS/deppy-sijo"
+    }
+  ],
+  "previous_process_exited": true,
+  "launch_command": [
+    "/usr/bin/open",
+    "-n",
+    "--env",
+    "DEPPY_COMMAND_CENTER_V2=1",
+    "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.19.1/Deppy Sijo.app"
+  ],
+  "new_process": {
+    "pid": 49989,
+    "executable": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.19.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo"
+  },
+  "appkit_observation": {
+    "pid": 49989,
+    "executable": "/Users/jr/Desktop/projects/deppy-sijo-integration-20261023/target/bundle-0.19.1/Deppy Sijo.app/Contents/MacOS/deppy-sijo",
+    "finishedLaunching": true,
+    "terminated": false
+  },
+  "process_liveness": "PASS: exact new executable alive after 10 seconds; AppKit finishedLaunching true and terminated false",
+  "finished_utc": "2026-10-24T04:00:50.525466+00:00",
+  "ui_observation": {
+    "method": "cua.getApp with exact versioned bundle path",
+    "result": "Native Deppy Sijo standard window and accessibility tree observed; main agent, terminal, history and composer controls present",
+    "scope": "Launch/window visibility only; no session input, restored agent state or provider operation tested"
+  }
+}
